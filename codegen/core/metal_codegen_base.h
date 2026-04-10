@@ -22,6 +22,8 @@ namespace codegen {
 
 using ConsumerFn = std::function<void()>;
 
+class MetalCodegen;
+
 class MetalCodegen {
 public:
     virtual ~MetalCodegen() = default;
@@ -87,6 +89,19 @@ public:
     void addBitmapReadParam(const std::string& name, const std::string& sizeExpr);
     void addBitmapWriteParam(const std::string& name, const std::string& sizeExpr);
 
+    // Hash map shorthand: atomic keys + lo/hi value buffers + size scalar
+    // Registers 3 atomic buffers (keys, valuesLo, valuesHi) + 1 scalar (n_mapName)
+    void addHashMapParam(const std::string& mapName,
+                         const std::string& keysName,
+                         const std::string& valuesLoName,
+                         const std::string& valuesHiName,
+                         const std::string& sizeExpr);
+    // Read-only hash map (for lookup phases, already allocated by build)
+    void addHashMapReadParam(const std::string& mapName,
+                             const std::string& keysName,
+                             const std::string& valuesLoName,
+                             const std::string& valuesHiName);
+
     // ---------------------------------------------------------------
     // Global buffer size registration
     // ---------------------------------------------------------------
@@ -109,7 +124,7 @@ public:
     // ---------------------------------------------------------------
     // Code generation — produce final Metal source
     // ---------------------------------------------------------------
-    std::string print() const;
+    std::string print();
 
     // Access phase info (for executor dispatch configuration)
     struct PhaseInfo {
@@ -152,7 +167,19 @@ private:
     std::string indent() const;
     std::string generateSignature(const PhaseInfo& phase) const;
     static std::string commonHeader();
-    void assignBufferIndices(PhaseInfo& phase) const;
+    void assignBufferIndices(PhaseInfo& phase);
+};
+
+// RAII guard for indentation scope — automatically decrements on destruction.
+// Ensures indent level is always restored even if exceptions are thrown.
+class IndentGuard {
+public:
+    explicit IndentGuard(MetalCodegen& cg) : cg_(cg) { cg_.increaseIndent(); }
+    ~IndentGuard() { cg_.decreaseIndent(); }
+    IndentGuard(const IndentGuard&) = delete;
+    IndentGuard& operator=(const IndentGuard&) = delete;
+private:
+    MetalCodegen& cg_;
 };
 
 } // namespace codegen

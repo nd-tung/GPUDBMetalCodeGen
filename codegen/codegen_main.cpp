@@ -105,9 +105,9 @@ static void runCodegenQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
 
         // Debug: dump generated source to file
         {
-            std::ofstream dbg("codegen_debug_" + queryName + ".metal");
+            std::ofstream dbg("debug/codegen_debug_" + queryName + ".metal");
             dbg << metalSource;
-            printf("  (written to codegen_debug_%s.metal)\n", queryName.c_str());
+            printf("  (written to debug/codegen_debug_%s.metal)\n", queryName.c_str());
         }
 
         // 4. Compile

@@ -138,15 +138,7 @@ BufferMap MetalGenericExecutor::allocatePhaseBuffers(
                     buffers[key] = allocatedBuffers_[key];
                 } else if (!b.sizeExpr.empty()) {
                     size_t count = sizeResolver_.resolve(b.sizeExpr);
-                    // Determine element size from type
-                    size_t elemSize = 4; // default: uint/int/float
-                    if (b.elementType == "long" || b.elementType == "double" ||
-                        b.elementType == "ulong")
-                        elemSize = 8;
-                    else if (b.elementType == "char" || b.elementType == "uchar")
-                        elemSize = 1;
-                    else if (b.elementType == "short" || b.elementType == "ushort")
-                        elemSize = 2;
+                    size_t elemSize = b.elemSizeBytes();
 
                     size_t totalBytes = count * elemSize;
                     if (totalBytes == 0) totalBytes = elemSize; // minimum 1 element

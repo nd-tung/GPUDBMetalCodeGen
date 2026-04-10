@@ -13,14 +13,18 @@ OBJ_DIR      = $(BUILD_DIR)/obj
 
 CXX      = clang++
 CXXFLAGS = -std=c++20 -Wall -Wextra -O3
-INCLUDES = -Ithird_party/metal-cpp -Ithird_party/libpg_query -Icodegen -Isrc
+INCLUDES = -Ithird_party/metal-cpp -Ithird_party/libpg_query \
+           -Icodegen -Icodegen/core -Icodegen/operators -Icodegen/execution -Icodegen/planning \
+           -Isrc
 FRAMEWORKS = -framework Metal -framework Foundation -framework QuartzCore \
              -L/opt/homebrew/opt/llvm/lib/c++ -Wl,-rpath,/opt/homebrew/opt/llvm/lib/c++
 
-# Codegen sources
-CODEGEN_ALL_SOURCES = $(wildcard $(CODEGEN_DIR)/*.cpp)
-CODEGEN_LIB_SOURCES = $(filter-out $(CODEGEN_DIR)/codegen_main.cpp, $(CODEGEN_ALL_SOURCES))
-CODEGEN_LIB_OBJECTS = $(CODEGEN_LIB_SOURCES:$(CODEGEN_DIR)/%.cpp=$(OBJ_DIR)/codegen_%.o)
+# Codegen subdirectories
+CODEGEN_SUBDIRS = core operators execution planning
+
+# Codegen sources — gather from subdirs (main stays at codegen/ root)
+CODEGEN_SUB_SOURCES = $(foreach d,$(CODEGEN_SUBDIRS),$(wildcard $(CODEGEN_DIR)/$(d)/*.cpp))
+CODEGEN_LIB_OBJECTS = $(foreach src,$(CODEGEN_SUB_SOURCES),$(OBJ_DIR)/codegen_$(notdir $(basename $(src))).o)
 CODEGEN_MAIN_OBJ    = $(OBJ_DIR)/codegen_codegen_main.o
 
 # Shared infra
@@ -46,7 +50,23 @@ $(TARGET): $(CODEGEN_MAIN_OBJ) $(CODEGEN_LIB_OBJECTS) $(INFRA_OBJ) | $(BIN_DIR)
 	$(CXX) $(CODEGEN_MAIN_OBJ) $(CODEGEN_LIB_OBJECTS) $(INFRA_OBJ) $(PG_QUERY_LIB) $(FRAMEWORKS) -o $@
 	@echo "Build complete: $@"
 
-$(OBJ_DIR)/codegen_%.o: $(CODEGEN_DIR)/%.cpp | $(OBJ_DIR)
+$(OBJ_DIR)/codegen_codegen_main.o: $(CODEGEN_DIR)/codegen_main.cpp | $(OBJ_DIR)
+	@echo "Compiling $<..."
+	$(CXX) $(CXXFLAGS) $(INCLUDES) -c $< -o $@
+
+$(OBJ_DIR)/codegen_%.o: $(CODEGEN_DIR)/core/%.cpp | $(OBJ_DIR)
+	@echo "Compiling $<..."
+	$(CXX) $(CXXFLAGS) $(INCLUDES) -c $< -o $@
+
+$(OBJ_DIR)/codegen_%.o: $(CODEGEN_DIR)/operators/%.cpp | $(OBJ_DIR)
+	@echo "Compiling $<..."
+	$(CXX) $(CXXFLAGS) $(INCLUDES) -c $< -o $@
+
+$(OBJ_DIR)/codegen_%.o: $(CODEGEN_DIR)/execution/%.cpp | $(OBJ_DIR)
+	@echo "Compiling $<..."
+	$(CXX) $(CXXFLAGS) $(INCLUDES) -c $< -o $@
+
+$(OBJ_DIR)/codegen_%.o: $(CODEGEN_DIR)/planning/%.cpp | $(OBJ_DIR)
 	@echo "Compiling $<..."
 	$(CXX) $(CXXFLAGS) $(INCLUDES) -c $< -o $@
 

@@ -33,6 +33,8 @@ inline uint nextPow2(uint v) {
 // Global dataset configuration
 extern std::string g_dataset_path;
 extern bool g_sf100_mode;
+extern size_t g_chunk_rows_override;  // 0 = use adaptive, >0 = fixed chunk size
+extern bool g_double_buffer;          // true = 2 slots (overlap), false = 1 slot
 
 // ===================================================================
 // SF100 CHUNKED EXECUTION INFRASTRUCTURE
@@ -42,7 +44,6 @@ extern bool g_sf100_mode;
 struct ChunkConfig {
     static constexpr size_t DEFAULT_CHUNK_ROWS = 10 * 1024 * 1024; // 10M rows
     static constexpr size_t MIN_CHUNK_ROWS = 1 * 1024 * 1024;      // 1M
-    static constexpr size_t MAX_CHUNK_ROWS = 50 * 1024 * 1024;     // 50M
     static constexpr size_t NUM_BUFFERS = 2;                         // double-buffer
 
     static size_t adaptiveChunkSize(MTL::Device* device, size_t bytesPerRow, size_t totalRows) {
@@ -50,7 +51,6 @@ struct ChunkConfig {
         size_t perBufferBytes = availableBytes / NUM_BUFFERS;
         size_t maxRows = perBufferBytes / bytesPerRow;
         maxRows = std::max(maxRows, MIN_CHUNK_ROWS);
-        maxRows = std::min(maxRows, MAX_CHUNK_ROWS);
         maxRows = std::min(maxRows, totalRows);
         return maxRows;
     }
@@ -842,9 +842,9 @@ ChunkedStreamTiming chunkedStreamLoop(
         MTL::CommandBuffer* cmdBuf = commandQueue->commandBuffer();
         dispatchGPU(slot, (uint)rowsThisChunk, cmdBuf);
 
-        // Double-buffer: parse next chunk while GPU runs
+        // Double-buffer: parse next chunk while GPU runs (only if numSlots > 1)
         size_t nextOffset = offset + rowsThisChunk;
-        if (nextOffset < totalRows) {
+        if (numSlots > 1 && nextOffset < totalRows) {
             size_t nextRows = std::min(chunkRows, totalRows - nextOffset);
             SlotT& nextSlot = slots[(t.chunkCount + 1) % numSlots];
             auto t0 = std::chrono::high_resolution_clock::now();
@@ -855,6 +855,15 @@ ChunkedStreamTiming chunkedStreamLoop(
 
         cmdBuf->waitUntilCompleted();
         t.gpuMs += (cmdBuf->GPUEndTime() - cmdBuf->GPUStartTime()) * 1000.0;
+
+        // Single-buffer: parse next chunk AFTER GPU completes (no overlap)
+        if (numSlots == 1 && nextOffset < totalRows) {
+            size_t nextRows = std::min(chunkRows, totalRows - nextOffset);
+            auto t0 = std::chrono::high_resolution_clock::now();
+            parseChunk(slots[0], nextOffset, nextRows);
+            auto t1 = std::chrono::high_resolution_clock::now();
+            t.parseMs += std::chrono::duration<double, std::milli>(t1 - t0).count();
+        }
 
         auto p0 = std::chrono::high_resolution_clock::now();
         onChunkDone((uint)rowsThisChunk, t.chunkCount);

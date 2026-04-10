@@ -1,4 +1,5 @@
 #include "metal_codegen_base.h"
+#include "metal_common_header.h"
 #include <sstream>
 #include <algorithm>
 #include <stdexcept>
@@ -6,108 +7,11 @@
 namespace codegen {
 
 // ===================================================================
-// Common Metal header — SIMD reductions, bitmap ops, atomics
+// Common Metal header — now maintained in metal_common_header.h
 // ===================================================================
 
 std::string MetalCodegen::commonHeader() {
-    return R"METAL(#include <metal_stdlib>
-using namespace metal;
-
-// --- SIMD reduction for long (int64) via 2×uint shuffle ---
-inline long simd_reduce_add_long(long v) {
-    for (uint d = 16; d >= 1; d >>= 1) {
-        uint lo = simd_shuffle_down((uint)(v), d);
-        uint hi = simd_shuffle_down((uint)((ulong)v >> 32), d);
-        v += (long)(((ulong)hi << 32) | (ulong)lo);
-    }
-    return v;
-}
-
-inline float tg_reduce_float(float val, uint tid, uint tg_size,
-                             threadgroup float* shared) {
-    float sv = simd_sum(val);
-    uint lane = tid & 31u;
-    uint gid  = tid >> 5u;
-    uint ng   = (tg_size + 31u) >> 5u;
-    if (lane == 0u) shared[gid] = sv;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    float r = 0.0f;
-    if (gid == 0u) {
-        float v2 = (lane < ng) ? shared[lane] : 0.0f;
-        r = simd_sum(v2);
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    return r;
-}
-
-inline uint tg_reduce_uint(uint val, uint tid, uint tg_size,
-                           threadgroup uint* shared) {
-    uint sv = simd_sum(val);
-    uint lane = tid & 31u;
-    uint gid  = tid >> 5u;
-    uint ng   = (tg_size + 31u) >> 5u;
-    if (lane == 0u) shared[gid] = sv;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    uint r = 0u;
-    if (gid == 0u) {
-        uint v2 = (lane < ng) ? shared[lane] : 0u;
-        r = simd_sum(v2);
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    return r;
-}
-
-inline long tg_reduce_long(long val, uint tid, uint tg_size,
-                           threadgroup long* shared) {
-    long sv = simd_reduce_add_long(val);
-    uint lane = tid & 31u;
-    uint gid  = tid >> 5u;
-    uint ng   = (tg_size + 31u) >> 5u;
-    if (lane == 0u) shared[gid] = sv;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    long r = 0;
-    if (gid == 0u) {
-        long v2 = (lane < ng) ? shared[lane] : 0;
-        r = simd_reduce_add_long(v2);
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    return r;
-}
-
-inline bool bitmap_test(const device uint* bitmap, int key) {
-    return (bitmap[(uint)key >> 5] >> ((uint)key & 31u)) & 1u;
-}
-
-inline void bitmap_set(device atomic_uint* bitmap, int key) {
-    atomic_fetch_or_explicit(&bitmap[(uint)key >> 5],
-                             1u << ((uint)key & 31u),
-                             memory_order_relaxed);
-}
-
-inline void atomic_add_long_pair(device atomic_uint* lo,
-                                 device atomic_uint* hi,
-                                 long val) {
-    ulong uval = as_type<ulong>(val);
-    uint add_lo = (uint)(uval);
-    uint add_hi = (uint)(uval >> 32);
-    uint old_lo = atomic_fetch_add_explicit(lo, add_lo, memory_order_relaxed);
-    uint new_lo = old_lo + add_lo;
-    uint carry = (new_lo < old_lo) ? 1u : 0u;
-    if (add_hi != 0 || carry != 0)
-        atomic_fetch_add_explicit(hi, add_hi + carry, memory_order_relaxed);
-}
-
-inline long load_long_pair(const device uint* lo, const device uint* hi) {
-    ulong v = ((ulong)(*hi) << 32) | (ulong)(*lo);
-    return as_type<long>(v);
-}
-
-inline uint next_pow2(uint v) {
-    v--; v |= v >> 1; v |= v >> 2; v |= v >> 4; v |= v >> 8; v |= v >> 16;
-    return v + 1;
-}
-
-)METAL";
+    return kMetalCommonHeader;
 }
 
 // ===================================================================
@@ -349,6 +253,27 @@ void MetalCodegen::addBitmapWriteParam(const std::string& name, const std::strin
     addAtomicBufferParam(name, "atomic_uint", sizeExpr);
 }
 
+void MetalCodegen::addHashMapParam(const std::string& mapName,
+                                    const std::string& keysName,
+                                    const std::string& valuesLoName,
+                                    const std::string& valuesHiName,
+                                    const std::string& sizeExpr) {
+    addAtomicBufferParam(keysName, "atomic_uint", sizeExpr);
+    addAtomicBufferParam(valuesLoName, "atomic_uint", sizeExpr);
+    addAtomicBufferParam(valuesHiName, "atomic_uint", sizeExpr);
+    addScalarParam("n_" + mapName, "uint");
+}
+
+void MetalCodegen::addHashMapReadParam(const std::string& mapName,
+                                        const std::string& keysName,
+                                        const std::string& valuesLoName,
+                                        const std::string& valuesHiName) {
+    addBufferParam(keysName, "uint", "", false);
+    addBufferParam(valuesLoName, "uint", "", false);
+    addBufferParam(valuesHiName, "uint", "", false);
+    addScalarParam("n_" + mapName, "uint");
+}
+
 // ===================================================================
 // Global buffer sizes
 // ===================================================================
@@ -427,7 +352,7 @@ const MetalResultSchema& MetalCodegen::getResultSchema() const {
 // Buffer index assignment
 // ===================================================================
 
-void MetalCodegen::assignBufferIndices(PhaseInfo& phase) const {
+void MetalCodegen::assignBufferIndices(PhaseInfo& phase) {
     int nextIndex = 0;
     for (auto& b : phase.bindings) {
         b.bufferIndex = nextIndex++;
@@ -474,7 +399,7 @@ std::string MetalCodegen::generateSignature(const PhaseInfo& phase) const {
 // Final output assembly
 // ===================================================================
 
-std::string MetalCodegen::print() const {
+std::string MetalCodegen::print() {
     std::ostringstream out;
 
     // 1. Common header (SIMD reductions, bitmap, atomics)
@@ -486,14 +411,11 @@ std::string MetalCodegen::print() const {
         out << helperCode_ << "\n";
     }
 
-    // 3. Each phase → one kernel function
+    // 3. Assign buffer indices and emit each phase as one kernel function
     for (size_t pi = 0; pi < phases_.size(); pi++) {
-        PhaseInfo phase = phases_[pi]; // copy so we can assign indices
-        const_cast<MetalCodegen*>(this)->assignBufferIndices(
-            const_cast<PhaseInfo&>(phases_[pi]));
-        // Re-read after assignment
-        phase = phases_[pi];
+        assignBufferIndices(phases_[pi]);
 
+        const auto& phase = phases_[pi];
         out << "\n// === Phase " << pi << ": " << phase.name << " ===\n";
         out << generateSignature(phase) << " {\n";
         out << phase.code;

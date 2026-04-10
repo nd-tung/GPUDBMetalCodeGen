@@ -17,6 +17,12 @@ public:
     // Get or create a pipeline state for a kernel name from a compiled library.
     MTL::ComputePipelineState* getPipeline(MTL::Library* lib, const std::string& kernelName);
 
+    // Clear pipeline cache (releases all cached PSOs)
+    void clearCache();
+
+    // Number of cached pipelines
+    size_t cacheSize() const { return pipelineCache_.size(); }
+
     // Compiled query: library + pipeline states for each phase
     struct CompiledQuery {
         MTL::Library* library = nullptr;

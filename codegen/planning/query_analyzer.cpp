@@ -3,7 +3,7 @@
 extern "C" {
 #include "pg_query.h"
 }
-#include "../third_party/nlohmann/json.hpp"
+#include "../../third_party/nlohmann/json.hpp"
 
 #include <stdexcept>
 #include <algorithm>

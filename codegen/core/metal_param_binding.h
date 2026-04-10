@@ -37,6 +37,15 @@ struct MetalParamBinding {
     bool readOnly = false;       // hint for storage mode
     size_t hostCopyBytes = 0;    // for ConstantData: how many bytes
     int bufferIndex = -1;        // auto-assigned [[buffer(N)]]
+
+    // Return the byte size of one element based on elementType.
+    // Centralises type→size mapping that was previously scattered as string checks.
+    size_t elemSizeBytes() const {
+        if (elementType == "long"  || elementType == "ulong"  || elementType == "double") return 8;
+        if (elementType == "char"  || elementType == "uchar")  return 1;
+        if (elementType == "short" || elementType == "ushort") return 2;
+        return 4; // uint, int, float, atomic_uint, atomic_int, …
+    }
 };
 
 // ===================================================================

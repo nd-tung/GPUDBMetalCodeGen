@@ -6,8 +6,13 @@
 namespace codegen {
 
 RuntimeCompiler::~RuntimeCompiler() {
+    clearCache();
+}
+
+void RuntimeCompiler::clearCache() {
     for (auto& [name, pso] : pipelineCache_)
         pso->release();
+    pipelineCache_.clear();
 }
 
 MTL::Library* RuntimeCompiler::compile(const std::string& source) {
