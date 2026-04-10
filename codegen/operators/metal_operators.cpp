@@ -643,6 +643,64 @@ std::string MetalStringMatch::describe() const {
 }
 
 // ===================================================================
+// MetalArrayMaxReduction
+// ===================================================================
+
+MetalArrayMaxReduction::MetalArrayMaxReduction(
+    std::unique_ptr<MetalOperator> child,
+    const std::string& inputArrayName,
+    const std::string& outputName,
+    const std::string& phaseName,
+    const std::string& sizeVarName,
+    const std::string& valueType)
+    : MetalUnaryOperator(std::move(child)),
+      inputArrayName_(inputArrayName), outputName_(outputName),
+      phaseName_(phaseName), sizeVarName_(sizeVarName),
+      valueType_(valueType) {}
+
+void MetalArrayMaxReduction::produce(MetalCodegen& cg, ConsumerFn consume) {
+    // Phase 1: child produces data (has its own phase)
+    child_->produce(cg, [](){});
+    cg.endPhase();
+
+    // Phase 2: max reduction over input array
+    cg.beginPhase(phaseName_);
+    cg.setPhaseScannedTable("");  // no table scan, we iterate the array
+
+    cg.addBufferParam(inputArrayName_, valueType_, "", false);
+    cg.addAtomicBufferParam(outputName_ + "_lo", "atomic_uint", "1");
+    cg.addAtomicBufferParam(outputName_ + "_hi", "atomic_uint", "1");
+    cg.addScalarParam(sizeVarName_, "uint");
+
+    // Grid-stride loop to find local max
+    cg.addLine("long localMax = 0;");
+    cg.addBlock("for (uint i = tid; i < " + sizeVarName_ + "; i += tpg)", [&]() {
+        if (valueType_ == "long") {
+            cg.addLine("long v = (long)" + inputArrayName_ + "[i];");
+        } else {
+            cg.addLine("long v = (long)" + inputArrayName_ + "[i];");
+        }
+        cg.addIf("v > localMax", [&]() {
+            cg.addLine("localMax = v;");
+        });
+    });
+
+    // Threadgroup max reduction
+    cg.addLine("threadgroup long tg_max_shared[32];");
+    cg.addLine("long tg_max = tg_reduce_max_long(localMax, lid, tg_size, tg_max_shared);");
+    cg.addIf("lid == 0", [&]() {
+        cg.addLine("atomic_max_long_pair(" + outputName_ + "_lo, " +
+                   outputName_ + "_hi, tg_max);");
+    });
+
+    consume();
+}
+
+std::string MetalArrayMaxReduction::describe() const {
+    return "ArrayMaxReduction(" + inputArrayName_ + " -> " + outputName_ + ")";
+}
+
+// ===================================================================
 // MetalHistogram
 // ===================================================================
 

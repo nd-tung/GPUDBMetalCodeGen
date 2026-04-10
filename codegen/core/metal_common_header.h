@@ -105,6 +105,59 @@ inline uint next_pow2(uint v) {
     return v + 1;
 }
 
+// --- SIMD max reduction for long via 2×uint shuffle ---
+inline long simd_reduce_max_long(long v) {
+    for (uint d = 16; d >= 1; d >>= 1) {
+        uint lo = simd_shuffle_down((uint)(v), d);
+        uint hi = simd_shuffle_down((uint)((ulong)v >> 32), d);
+        long other = (long)(((ulong)hi << 32) | (ulong)lo);
+        v = (other > v) ? other : v;
+    }
+    return v;
+}
+
+inline long tg_reduce_max_long(long val, uint tid, uint tg_size,
+                               threadgroup long* shared) {
+    long sv = simd_reduce_max_long(val);
+    uint lane = tid & 31u;
+    uint gid  = tid >> 5u;
+    uint ng   = (tg_size + 31u) >> 5u;
+    if (lane == 0u) shared[gid] = sv;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    long r = 0;
+    if (gid == 0u) {
+        long v2 = (lane < ng) ? shared[lane] : 0;
+        r = simd_reduce_max_long(v2);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    return r;
+}
+
+// --- Atomic max for long via CAS on lo/hi uint pair ---
+inline void atomic_max_long_pair(device atomic_uint* lo,
+                                 device atomic_uint* hi,
+                                 long val) {
+    // Simple approach: atomic CAS loop on hi word, then lo word
+    // For correctness with 64-bit pairs, we use a two-word CAS pattern
+    ulong uval = as_type<ulong>(val);
+    uint new_lo = (uint)(uval);
+    uint new_hi = (uint)(uval >> 32);
+
+    while (true) {
+        uint old_hi = atomic_load_explicit(hi, memory_order_relaxed);
+        uint old_lo = atomic_load_explicit(lo, memory_order_relaxed);
+        long old_val = as_type<long>(((ulong)old_hi << 32) | (ulong)old_lo);
+        if (val <= old_val) return; // already bigger
+        // Try to update hi first
+        if (atomic_compare_exchange_weak_explicit(hi, &old_hi, new_hi,
+                                                   memory_order_relaxed,
+                                                   memory_order_relaxed)) {
+            atomic_store_explicit(lo, new_lo, memory_order_relaxed);
+            return;
+        }
+    }
+}
+
 )METAL";
 
 } // namespace codegen

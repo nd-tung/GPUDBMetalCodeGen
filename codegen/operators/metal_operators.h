@@ -429,6 +429,33 @@ private:
 };
 
 // ===================================================================
+// ARRAY MAX REDUCTION — threadgroup tree reduction for MAX()
+// ===================================================================
+// Ported from CUDA ArrayMaxReduction.
+// Reads an input array, finds maximum via threadgroup reduction,
+// writes result to a single-element output buffer.
+// Creates a NEW phase (child produces data in its own phase).
+
+class MetalArrayMaxReduction : public MetalUnaryOperator {
+public:
+    MetalArrayMaxReduction(std::unique_ptr<MetalOperator> child,
+                           const std::string& inputArrayName,
+                           const std::string& outputName,
+                           const std::string& phaseName,
+                           const std::string& sizeVarName,
+                           const std::string& valueType = "long");
+    void produce(MetalCodegen& cg, ConsumerFn consume) override;
+    std::string describe() const override;
+
+private:
+    std::string inputArrayName_;
+    std::string outputName_;
+    std::string phaseName_;
+    std::string sizeVarName_;
+    std::string valueType_;
+};
+
+// ===================================================================
 // HISTOGRAM — count distribution
 // ===================================================================
 
