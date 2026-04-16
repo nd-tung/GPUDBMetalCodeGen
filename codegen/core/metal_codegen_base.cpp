@@ -109,6 +109,12 @@ void MetalCodegen::setPhaseSingleThread(bool single) {
     currentPhase_->isSingleThread = single;
 }
 
+void MetalCodegen::setPhaseMaxThreadgroups(int max) {
+    if (!currentPhase_)
+        throw std::runtime_error("setPhaseMaxThreadgroups: no active phase");
+    currentPhase_->maxThreadgroups = max;
+}
+
 // ===================================================================
 // Parameter registration
 // ===================================================================

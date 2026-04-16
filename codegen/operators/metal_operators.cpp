@@ -290,10 +290,6 @@ void MetalTGReduce::addAccumulator(const std::string& name,
     acc.type = type;
     acc.loBuffer = loBuffer.empty() ? (outputPrefix_ + "_" + name + "_lo") : loBuffer;
     acc.hiBuffer = hiBuffer.empty() ? (type == "long" ? (outputPrefix_ + "_" + name + "_hi") : "") : hiBuffer;
-    // For float type, we also need hi buffer for the long pair approach
-    if (acc.type == "float" && acc.hiBuffer.empty()) {
-        acc.hiBuffer = outputPrefix_ + "_" + name + "_hi";
-    }
     acc.binIndex = static_cast<int>(accumulators_.size());
     accumulators_.push_back(acc);
 }
@@ -303,39 +299,61 @@ void MetalTGReduce::setResultAlias(const std::string& displayName, int scaleDown
 }
 
 void MetalTGReduce::produce(MetalCodegen& cg, ConsumerFn consume) {
-    // Register output buffers — always use lo/hi atomic_uint pair
-    // This avoids the broken float atomic approach and uses atomic_add_long_pair()
+    // Register output buffers
     for (const auto& acc : accumulators_) {
-        cg.addAtomicBufferParam(acc.loBuffer, "atomic_uint", "1");
-        cg.addAtomicBufferParam(acc.hiBuffer, "atomic_uint", "1");
+        if (acc.type == "float") {
+            // Float path: single atomic_uint buffer (reinterpreted as float via CAS)
+            cg.addAtomicBufferParam(acc.loBuffer, "atomic_uint", "1");
+        } else {
+            // Long path: lo/hi atomic_uint pair
+            cg.addAtomicBufferParam(acc.loBuffer, "atomic_uint", "1");
+            cg.addAtomicBufferParam(acc.hiBuffer, "atomic_uint", "1");
+        }
     }
 
-    // Declare local accumulators — always accumulate as long for correctness
+    // Declare local accumulators
     for (const auto& acc : accumulators_) {
-        cg.addLine("long local_" + acc.name + " = 0;");
+        if (acc.type == "float") {
+            cg.addLine("float local_" + acc.name + " = 0.0f;");
+        } else {
+            cg.addLine("long local_" + acc.name + " = 0;");
+        }
     }
 
     // Child produces rows; inside the loop we accumulate
     child_->produce(cg, [&]() {
         for (const auto& acc : accumulators_) {
-            cg.addLine("local_" + acc.name + " += (long)(" + acc.valueExpr + ");");
+            if (acc.type == "float") {
+                cg.addLine("local_" + acc.name + " += (float)(" + acc.valueExpr + ");");
+            } else {
+                cg.addLine("local_" + acc.name + " += (long)(" + acc.valueExpr + ");");
+            }
         }
         consume();
     });
 
-    // After the loop: SIMD + threadgroup reduction → atomic_add_long_pair
+    // After the loop: SIMD + threadgroup reduction → atomic write
     cg.addComment("--- Threadgroup reduction ---");
     for (const auto& acc : accumulators_) {
         std::string localVar = "local_" + acc.name;
         std::string tgVar = "tg_" + acc.name;
 
-        cg.addLine("threadgroup long tg_shared_" + acc.name + "[32];");
-        cg.addLine("long " + tgVar + " = tg_reduce_long(" + localVar +
-                   ", lid, tg_size, tg_shared_" + acc.name + ");");
-        cg.addIf("lid == 0", [&]() {
-            cg.addLine("atomic_add_long_pair(" + acc.loBuffer + ", " +
-                       acc.hiBuffer + ", " + tgVar + ");");
-        });
+        if (acc.type == "float") {
+            cg.addLine("threadgroup float tg_shared_" + acc.name + "[32];");
+            cg.addLine("float " + tgVar + " = tg_reduce_float(" + localVar +
+                       ", lid, tg_size, tg_shared_" + acc.name + ");");
+            cg.addIf("lid == 0", [&]() {
+                cg.addLine("atomic_add_float(" + acc.loBuffer + ", " + tgVar + ");");
+            });
+        } else {
+            cg.addLine("threadgroup long tg_shared_" + acc.name + "[32];");
+            cg.addLine("long " + tgVar + " = tg_reduce_long(" + localVar +
+                       ", lid, tg_size, tg_shared_" + acc.name + ");");
+            cg.addIf("lid == 0", [&]() {
+                cg.addLine("atomic_add_long_pair(" + acc.loBuffer + ", " +
+                           acc.hiBuffer + ", " + tgVar + ");");
+            });
+        }
     }
 
     // Register result schema
@@ -383,33 +401,110 @@ void MetalKeyedAgg::produce(MetalCodegen& cg, ConsumerFn consume) {
         : sizeExpr_;
     cg.addAtomicBufferParam(outputArrayName_, "atomic_uint", sz);
 
-    child_->produce(cg, [&]() {
-        cg.addLine("int _bucket = " + bucketExpr_ + ";");
+    // --- Thread-local accumulation + TG reduction strategy ---
+    // Instead of per-row global atomics, accumulate in thread-local arrays,
+    // then do threadgroup SIMD reduction and a single atomic per TG per bucket.
+    // This reduces atomic operations from O(rows) to O(threadgroups × buckets).
+
+    // Check if all aggregates are "add" (reduction-compatible)
+    bool allAdds = true;
+    for (const auto& agg : aggregates_) {
+        if (agg.atomicOp != "add") { allAdds = false; break; }
+    }
+
+    // Only use TG reduction when there are enough aggregates per row to justify
+    // the reduction overhead. With few aggs (e.g. 1 count), the barrier cost
+    // exceeds the atomic savings, especially for low-selectivity joins.
+    if (allAdds && numBuckets_ <= 64 && aggregates_.size() >= 3) {
+        // === OPTIMIZED PATH: thread-local + TG reduction ===
+        cg.setPhaseMaxThreadgroups(1024);
+
+        // Declare thread-local accumulator arrays (before the scan loop)
         for (const auto& agg : aggregates_) {
-            std::string base = "_bucket * " + std::to_string(valuesPerBucket_);
-            if (agg.isLongPair && agg.atomicOp == "add") {
-                // 64-bit accumulation via lo/hi atomic_uint pair
-                std::string loIdx = base + " + " + std::to_string(agg.offset);
-                std::string hiIdx = base + " + " + std::to_string(agg.offset + 1);
-                cg.addLine("atomic_add_long_pair(&" + outputArrayName_ + "[" + loIdx +
-                           "], &" + outputArrayName_ + "[" + hiIdx +
-                           "], (long)(" + agg.valueExpr + "));");
+            if (agg.isLongPair) {
+                cg.addLine("long _local_" + agg.name + "[" + std::to_string(numBuckets_) + "];");
+                cg.addBlock("for (int _b = 0; _b < " + std::to_string(numBuckets_) + "; _b++)", [&]() {
+                    cg.addLine("_local_" + agg.name + "[_b] = 0;");
+                });
             } else {
-                std::string idx = base + " + " + std::to_string(agg.offset);
-                if (agg.atomicOp == "add") {
-                    cg.addLine("atomic_fetch_add_explicit(&" + outputArrayName_ + "[" + idx +
-                               "], (uint)(" + agg.valueExpr + "), memory_order_relaxed);");
-                } else if (agg.atomicOp == "min") {
-                    cg.addLine("atomic_fetch_min_explicit(&" + outputArrayName_ + "[" + idx +
-                               "], (uint)(" + agg.valueExpr + "), memory_order_relaxed);");
-                } else if (agg.atomicOp == "max") {
-                    cg.addLine("atomic_fetch_max_explicit(&" + outputArrayName_ + "[" + idx +
-                               "], (uint)(" + agg.valueExpr + "), memory_order_relaxed);");
-                }
+                cg.addLine("uint _local_" + agg.name + "[" + std::to_string(numBuckets_) + "];");
+                cg.addBlock("for (int _b = 0; _b < " + std::to_string(numBuckets_) + "; _b++)", [&]() {
+                    cg.addLine("_local_" + agg.name + "[_b] = 0;");
+                });
             }
         }
-        consume();
-    });
+
+        // Child produces rows; inside the loop we accumulate locally (no atomics)
+        child_->produce(cg, [&]() {
+            cg.addLine("int _bucket = " + bucketExpr_ + ";");
+            for (const auto& agg : aggregates_) {
+                if (agg.isLongPair) {
+                    cg.addLine("_local_" + agg.name + "[_bucket] += (long)(" + agg.valueExpr + ");");
+                } else {
+                    cg.addLine("_local_" + agg.name + "[_bucket] += (uint)(" + agg.valueExpr + ");");
+                }
+            }
+            consume();
+        });
+
+        // After the loop: TG reduction per bucket per aggregate, then single atomic
+        cg.addComment("--- Threadgroup reduction for keyed aggregation ---");
+        for (const auto& agg : aggregates_) {
+            if (agg.isLongPair) {
+                cg.addLine("threadgroup long _tg_shared_" + agg.name + "[32];");
+                cg.addBlock("for (int _b = 0; _b < " + std::to_string(numBuckets_) + "; _b++)", [&]() {
+                    cg.addLine("long _tg_val = tg_reduce_long(_local_" + agg.name +
+                               "[_b], lid, tg_size, _tg_shared_" + agg.name + ");");
+                    cg.addIf("lid == 0 && _tg_val != 0", [&]() {
+                        std::string loIdx = "_b * " + std::to_string(valuesPerBucket_) + " + " + std::to_string(agg.offset);
+                        std::string hiIdx = "_b * " + std::to_string(valuesPerBucket_) + " + " + std::to_string(agg.offset + 1);
+                        cg.addLine("atomic_add_long_pair(&" + outputArrayName_ + "[" + loIdx +
+                                   "], &" + outputArrayName_ + "[" + hiIdx +
+                                   "], _tg_val);");
+                    });
+                });
+            } else {
+                cg.addLine("threadgroup uint _tg_shared_" + agg.name + "[32];");
+                cg.addBlock("for (int _b = 0; _b < " + std::to_string(numBuckets_) + "; _b++)", [&]() {
+                    cg.addLine("uint _tg_val = tg_reduce_uint(_local_" + agg.name +
+                               "[_b], lid, tg_size, _tg_shared_" + agg.name + ");");
+                    cg.addIf("lid == 0 && _tg_val != 0", [&]() {
+                        std::string idx = "_b * " + std::to_string(valuesPerBucket_) + " + " + std::to_string(agg.offset);
+                        cg.addLine("atomic_fetch_add_explicit(&" + outputArrayName_ + "[" + idx +
+                                   "], _tg_val, memory_order_relaxed);");
+                    });
+                });
+            }
+        }
+    } else {
+        // === FALLBACK: per-row global atomics (for min/max or high-cardinality) ===
+        child_->produce(cg, [&]() {
+            cg.addLine("int _bucket = " + bucketExpr_ + ";");
+            for (const auto& agg : aggregates_) {
+                std::string base = "_bucket * " + std::to_string(valuesPerBucket_);
+                if (agg.isLongPair && agg.atomicOp == "add") {
+                    std::string loIdx = base + " + " + std::to_string(agg.offset);
+                    std::string hiIdx = base + " + " + std::to_string(agg.offset + 1);
+                    cg.addLine("atomic_add_long_pair(&" + outputArrayName_ + "[" + loIdx +
+                               "], &" + outputArrayName_ + "[" + hiIdx +
+                               "], (long)(" + agg.valueExpr + "));");
+                } else {
+                    std::string idx = base + " + " + std::to_string(agg.offset);
+                    if (agg.atomicOp == "add") {
+                        cg.addLine("atomic_fetch_add_explicit(&" + outputArrayName_ + "[" + idx +
+                                   "], (uint)(" + agg.valueExpr + "), memory_order_relaxed);");
+                    } else if (agg.atomicOp == "min") {
+                        cg.addLine("atomic_fetch_min_explicit(&" + outputArrayName_ + "[" + idx +
+                                   "], (uint)(" + agg.valueExpr + "), memory_order_relaxed);");
+                    } else if (agg.atomicOp == "max") {
+                        cg.addLine("atomic_fetch_max_explicit(&" + outputArrayName_ + "[" + idx +
+                                   "], (uint)(" + agg.valueExpr + "), memory_order_relaxed);");
+                    }
+                }
+            }
+            consume();
+        });
+    }
 
     // Register result schema with slot layout
     std::vector<MetalResultSchema::KeyedAggSlot> slots;
@@ -468,11 +563,47 @@ MetalAtomicCount::MetalAtomicCount(std::unique_ptr<MetalOperator> child,
 void MetalAtomicCount::produce(MetalCodegen& cg, ConsumerFn consume) {
     cg.addAtomicBufferParam(arrayName_, "atomic_uint", sizeExpr_);
 
-    child_->produce(cg, [&]() {
-        cg.addLine("atomic_fetch_add_explicit(&" + arrayName_ + "[" + bucketExpr_ +
-                   "], 1u, memory_order_relaxed);");
-        consume();
-    });
+    // Parse sizeExpr to determine if we can use threadgroup-local histogram.
+    // For small, statically-known bucket counts (≤ 256), use TG-local histogram
+    // to drastically reduce global atomic contention.
+    int staticSize = 0;
+    try { staticSize = std::stoi(sizeExpr_); } catch (...) {}
+
+    if (staticSize > 0 && staticSize <= 256) {
+        // === OPTIMIZED: Threadgroup-local histogram ===
+        cg.setPhaseMaxThreadgroups(1024);
+        std::string szStr = std::to_string(staticSize);
+
+        // Declare threadgroup-local histogram and zero-initialize
+        cg.addLine("threadgroup uint _tg_hist_" + arrayName_ + "[" + szStr + "];");
+        cg.addBlock("for (uint _h = lid; _h < " + szStr + "u; _h += tg_size)", [&]() {
+            cg.addLine("_tg_hist_" + arrayName_ + "[_h] = 0;");
+        });
+        cg.addLine("threadgroup_barrier(mem_flags::mem_threadgroup);");
+
+        // Child scan loop — accumulate into threadgroup-local histogram
+        child_->produce(cg, [&]() {
+            cg.addLine("atomic_fetch_add_explicit((threadgroup atomic_uint*)&_tg_hist_" +
+                       arrayName_ + "[" + bucketExpr_ + "], 1u, memory_order_relaxed);");
+            consume();
+        });
+
+        // Barrier, then flush non-zero bins to global
+        cg.addLine("threadgroup_barrier(mem_flags::mem_threadgroup);");
+        cg.addBlock("for (uint _h = lid; _h < " + szStr + "u; _h += tg_size)", [&]() {
+            cg.addIf("_tg_hist_" + arrayName_ + "[_h] > 0", [&]() {
+                cg.addLine("atomic_fetch_add_explicit(&" + arrayName_ + "[_h], " +
+                           "_tg_hist_" + arrayName_ + "[_h], memory_order_relaxed);");
+            });
+        });
+    } else {
+        // === FALLBACK: per-row global atomics ===
+        child_->produce(cg, [&]() {
+            cg.addLine("atomic_fetch_add_explicit(&" + arrayName_ + "[" + bucketExpr_ +
+                       "], 1u, memory_order_relaxed);");
+            consume();
+        });
+    }
 }
 
 std::string MetalAtomicCount::describe() const {
@@ -722,13 +853,43 @@ void MetalHistogram::produce(MetalCodegen& cg, ConsumerFn consume) {
                             histSizeExpr_.empty() ? std::to_string(maxBuckets_ + 1) : histSizeExpr_);
     cg.addScalarParam("n_" + inputCountArray_, "uint");
 
-    cg.addBlock("for (uint i = tid; i < n_" + inputCountArray_ + "; i += tpg)", [&]() {
-        cg.addLine("uint cnt = " + inputCountArray_ + "[i];");
-        cg.addIf("cnt > 0 && cnt <= " + std::to_string(maxBuckets_), [&]() {
-            cg.addLine("atomic_fetch_add_explicit(&" + outputHistArray_ +
-                       "[cnt], 1u, memory_order_relaxed);");
+    // Use threadgroup-local histogram to reduce global atomic contention
+    int tgHistSize = maxBuckets_ + 1;
+    if (tgHistSize <= 256) {
+        // === OPTIMIZED: Threadgroup-local histogram ===
+        cg.setPhaseMaxThreadgroups(1024);
+        std::string szStr = std::to_string(tgHistSize);
+
+        cg.addLine("threadgroup uint _tg_hist[" + szStr + "];");
+        cg.addBlock("for (uint _h = lid; _h < " + szStr + "u; _h += tg_size)", [&]() {
+            cg.addLine("_tg_hist[_h] = 0;");
         });
-    });
+        cg.addLine("threadgroup_barrier(mem_flags::mem_threadgroup);");
+
+        cg.addBlock("for (uint i = tid; i < n_" + inputCountArray_ + "; i += tpg)", [&]() {
+            cg.addLine("uint cnt = " + inputCountArray_ + "[i];");
+            cg.addIf("cnt > 0 && cnt <= " + std::to_string(maxBuckets_), [&]() {
+                cg.addLine("atomic_fetch_add_explicit((threadgroup atomic_uint*)&_tg_hist[cnt], 1u, memory_order_relaxed);");
+            });
+        });
+
+        cg.addLine("threadgroup_barrier(mem_flags::mem_threadgroup);");
+        cg.addBlock("for (uint _h = lid; _h < " + szStr + "u; _h += tg_size)", [&]() {
+            cg.addIf("_tg_hist[_h] > 0", [&]() {
+                cg.addLine("atomic_fetch_add_explicit(&" + outputHistArray_ +
+                           "[_h], _tg_hist[_h], memory_order_relaxed);");
+            });
+        });
+    } else {
+        // === FALLBACK: per-element global atomics ===
+        cg.addBlock("for (uint i = tid; i < n_" + inputCountArray_ + "; i += tpg)", [&]() {
+            cg.addLine("uint cnt = " + inputCountArray_ + "[i];");
+            cg.addIf("cnt > 0 && cnt <= " + std::to_string(maxBuckets_), [&]() {
+                cg.addLine("atomic_fetch_add_explicit(&" + outputHistArray_ +
+                           "[cnt], 1u, memory_order_relaxed);");
+            });
+        });
+    }
 
     consume();
 }

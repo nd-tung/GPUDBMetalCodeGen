@@ -84,7 +84,7 @@ private:
             {"l_commitdate",    11, DataType::DATE},
             {"l_receiptdate",   12, DataType::DATE},
             {"l_shipinstruct",  13, DataType::CHAR_FIXED, 25},
-            {"l_shipmode",      14, DataType::CHAR_FIXED, 10},
+            {"l_shipmode",      14, DataType::CHAR_FIXED, 2},
             {"l_comment",       15, DataType::CHAR_FIXED, 44},
         });
 
@@ -95,7 +95,7 @@ private:
             {"o_orderstatus",   2, DataType::CHAR1},
             {"o_totalprice",    3, DataType::FLOAT},
             {"o_orderdate",     4, DataType::DATE},
-            {"o_orderpriority", 5, DataType::CHAR_FIXED, 15},
+            {"o_orderpriority", 5, DataType::CHAR1},
             {"o_clerk",         6, DataType::CHAR_FIXED, 15},
             {"o_shippriority",  7, DataType::INT},
             {"o_comment",       8, DataType::CHAR_FIXED, 79},
@@ -109,7 +109,7 @@ private:
             {"c_nationkey",  3, DataType::INT},
             {"c_phone",      4, DataType::CHAR_FIXED, 15},
             {"c_acctbal",    5, DataType::FLOAT},
-            {"c_mktsegment", 6, DataType::CHAR_FIXED, 10},
+            {"c_mktsegment", 6, DataType::CHAR1},
             {"c_comment",    7, DataType::CHAR_FIXED, 117},
         });
 

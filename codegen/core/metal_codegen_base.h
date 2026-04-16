@@ -56,6 +56,7 @@ public:
     void setPhaseScannedTable(const std::string& tableName);
     void setPhaseThreadgroupSize(int size);
     void setPhaseSingleThread(bool single);
+    void setPhaseMaxThreadgroups(int max);
 
     // ---------------------------------------------------------------
     // Parameter registration (creates MetalParamBinding entries)
@@ -132,6 +133,7 @@ public:
         std::string code;
         std::string scannedTable;
         int threadgroupSize = 1024;
+        int maxThreadgroups = 0;
         bool isSingleThread = false;
         std::vector<MetalParamBinding> bindings;
     };

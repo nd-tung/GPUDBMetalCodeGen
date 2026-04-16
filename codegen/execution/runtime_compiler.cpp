@@ -19,6 +19,7 @@ MTL::Library* RuntimeCompiler::compile(const std::string& source) {
     NS::Error* error = nullptr;
     auto* sourceStr = NS::String::string(source.c_str(), NS::UTF8StringEncoding);
     auto* opts = MTL::CompileOptions::alloc()->init();
+    opts->setFastMathEnabled(true);
     auto* library = device_->newLibrary(sourceStr, opts, &error);
     opts->release();
 

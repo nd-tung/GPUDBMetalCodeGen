@@ -443,10 +443,10 @@ static std::optional<MetalQueryPlan> buildQ14Plan(const AnalyzedQuery& aq) {
         std::string revenue = "l_extendedprice[" + idxVar + "] * (1.0f - l_discount[" + idxVar + "] * 0.01f)";
         auto reduce = std::make_unique<MetalTGReduce>(std::move(filtered), "d_q14");
         reduce->addAccumulator("promo",
-            "(long)(bitmap_test(d_promo_bitmap, l_partkey[" + idxVar + "]) ? " + revenue + " * 100.0f : 0)", "long");
-        reduce->addAccumulator("total", "(long)(" + revenue + " * 100.0f)", "long");
-        reduce->setResultAlias("promo_revenue", 100);
-        reduce->setResultAlias("total_revenue", 100);
+            "bitmap_test(d_promo_bitmap, l_partkey[" + idxVar + "]) ? " + revenue + " : 0.0f", "float");
+        reduce->addAccumulator("total", revenue, "float");
+        reduce->setResultAlias("promo_revenue", 0);
+        reduce->setResultAlias("total_revenue", 0);
 
         MetalQueryPlan::Phase phase;
         phase.name = "Q14_reduce";
@@ -550,8 +550,8 @@ static std::optional<MetalQueryPlan> buildQ4Plan(const AnalyzedQuery& aq) {
             "o_orderkey[" + idxVar + "]");
 
         // KeyedAgg: 5 priority bins (o_orderpriority first char '1'..'5' → bins 0..4)
-        // o_orderpriority is CHAR_FIXED(15), first char at o_orderpriority[i * 15]
-        std::string bucketExpr = "(o_orderpriority[" + idxVar + " * 15] - '1')";
+        // o_orderpriority is CHAR1, first char at o_orderpriority[i]
+        std::string bucketExpr = "(o_orderpriority[" + idxVar + "] - '1')";
         auto agg = std::make_unique<MetalKeyedAgg>(
             std::move(probed), "d_q4_counts", bucketExpr,
             /*numBuckets=*/5, /*valuesPerBucket=*/1, "5");
@@ -606,9 +606,9 @@ static std::optional<MetalQueryPlan> buildQ12Plan(const AnalyzedQuery& aq) {
         scan->addColumn("o_orderkey", "int");
         scan->addColumn("o_orderpriority", "char");
 
-        // o_orderpriority CHAR_FIXED(15), first char: '1' or '2' → high priority
+        // o_orderpriority CHAR1, first char: '1' or '2' → high priority
         auto filter = std::make_unique<MetalSelection>(std::move(scan),
-            "o_orderpriority[" + idxVar + " * 15] == '1' || o_orderpriority[" + idxVar + " * 15] == '2'");
+            "o_orderpriority[" + idxVar + "] == '1' || o_orderpriority[" + idxVar + "] == '2'");
 
         auto bitmapBuild = std::make_unique<MetalBitmapBuild>(
             std::move(filter), "d_priority_bitmap",
@@ -635,7 +635,7 @@ static std::optional<MetalQueryPlan> buildQ12Plan(const AnalyzedQuery& aq) {
         // 2. l_commitdate < l_receiptdate
         // 3. l_shipdate < l_commitdate
         // 4. l_receiptdate >= start_date AND l_receiptdate < end_date
-        // l_shipmode is CHAR_FIXED(10), first char at l_shipmode[i * 10]
+        // l_shipmode is CHAR_FIXED(2), first char at l_shipmode[i * 2]
 
         // Extract date filters from analyzed query
         std::vector<PredPtr> dateFilters;
@@ -648,7 +648,7 @@ static std::optional<MetalQueryPlan> buildQ12Plan(const AnalyzedQuery& aq) {
         std::string dateCond = combineFilters(dateFilters, idxVar);
 
         std::string filterCond =
-            "(l_shipmode[" + idxVar + " * 10] == 'M' || l_shipmode[" + idxVar + " * 10] == 'S') && "
+            "(l_shipmode[" + idxVar + " * 2] == 'M' || l_shipmode[" + idxVar + " * 2] == 'S') && "
             "l_commitdate[" + idxVar + "] < l_receiptdate[" + idxVar + "] && "
             "l_shipdate[" + idxVar + "] < l_commitdate[" + idxVar + "]";
         if (!dateCond.empty()) filterCond += " && " + dateCond;
@@ -659,7 +659,7 @@ static std::optional<MetalQueryPlan> buildQ12Plan(const AnalyzedQuery& aq) {
         // shipmode MAIL(0)/SHIP(2), crossed with high(+0)/low(+1) priority
         // Bucket = (l_shipmode first char == 'S' ? 2 : 0) + (bitmap_test ? 0 : 1)
         std::string bucketExpr =
-            "((l_shipmode[" + idxVar + " * 10] == 'S' ? 2 : 0) + "
+            "((l_shipmode[" + idxVar + " * 2] == 'S' ? 2 : 0) + "
             "(bitmap_test(d_priority_bitmap, l_orderkey[" + idxVar + "]) ? 0 : 1))";
 
         auto agg = std::make_unique<MetalKeyedAgg>(
@@ -1318,7 +1318,7 @@ static std::optional<MetalQueryPlan> buildQ3Plan_byName() {
         scan->addColumn("c_mktsegment", "char");
 
         auto filtered = std::make_unique<MetalSelection>(std::move(scan),
-            "c_mktsegment[" + idx + " * 10] == 'B'");
+            "c_mktsegment[" + idx + "] == 'B'");
 
         auto bitmap = std::make_unique<MetalBitmapBuild>(
             std::move(filtered), "d_cust_bitmap",
@@ -1405,15 +1405,16 @@ static std::optional<MetalQueryPlan> buildQ13Plan_byName() {
     plan.helpers.push_back(R"(
 static bool q13_comment_match(const device char* comment, uint idx) {
     const device char* c = comment + idx * 79;
-    for (int p = 0; p <= 72; p++) {
+    for (int p = 0; p <= 72 && c[p] != '\0'; p++) {
         if (c[p]=='s' && c[p+1]=='p' && c[p+2]=='e' && c[p+3]=='c' &&
             c[p+4]=='i' && c[p+5]=='a' && c[p+6]=='l') {
-            for (int q = p + 7; q <= 71; q++) {
+            for (int q = p + 7; q <= 71 && c[q] != '\0'; q++) {
                 if (c[q]=='r' && c[q+1]=='e' && c[q+2]=='q' && c[q+3]=='u' &&
                     c[q+4]=='e' && c[q+5]=='s' && c[q+6]=='t' && c[q+7]=='s') {
                     return true;
                 }
             }
+            break;
         }
     }
     return false;
@@ -1436,7 +1437,7 @@ static bool q13_comment_match(const device char* comment, uint idx) {
         MetalQueryPlan::Phase phase;
         phase.name = "Q13_count_orders";
         phase.root = std::move(count);
-        phase.threadgroupSize = 256;
+        phase.threadgroupSize = 1024;
         plan.phases.push_back(std::move(phase));
     }
 
@@ -1666,7 +1667,7 @@ static int container_match(const device char* cont, uint idx) {
         // l_shipmode IN ('AIR', 'REG AIR') — 'A..' or 'RE..'
         // l_shipinstruct = 'DELIVER IN PERSON' — first char 'D'
         auto filtered = std::make_unique<MetalSelection>(std::move(scan),
-            "(l_shipmode[" + idx + " * 10] == 'A' || (l_shipmode[" + idx + " * 10] == 'R' && l_shipmode[" + idx + " * 10 + 1] == 'E')) && l_shipinstruct[" + idx + " * 25] == 'D'");
+            "(l_shipmode[" + idx + " * 2] == 'A' || (l_shipmode[" + idx + " * 2] == 'R' && l_shipmode[" + idx + " * 2 + 1] == 'E')) && l_shipinstruct[" + idx + " * 25] == 'D'");
 
         auto lookup = std::make_unique<MetalArrayLookup>(
             std::move(filtered), "d_part_cond",
@@ -1768,9 +1769,14 @@ static std::optional<MetalQueryPlan> buildQ17Plan_byName() {
         scan->addColumn("l_quantity", "float");
         scan->addColumn("l_extendedprice", "float");
 
+        // First filter: bitmap test for qualifying parts (Brand#23 + MED BOX)
+        auto bitmapFilter = std::make_unique<MetalSelection>(
+            std::move(scan),
+            "bitmap_test(d_q17_bitmap, l_partkey[" + idx + "])");
+
         // Lookup pre-computed threshold: 0.0f means non-qualifying part
         auto lookup = std::make_unique<MetalArrayLookup>(
-            std::move(scan), "d_q17_threshold",
+            std::move(bitmapFilter), "d_q17_threshold",
             "l_partkey[" + idx + "]", "_thresh", "float", 0);
 
         // Filter: l_quantity < threshold for this partkey
@@ -1778,14 +1784,15 @@ static std::optional<MetalQueryPlan> buildQ17Plan_byName() {
             std::move(lookup),
             "l_quantity[" + idx + "] < _thresh");
 
-        // TGReduce revenue
+        // TGReduce revenue (float path)
         auto reduce = std::make_unique<MetalTGReduce>(std::move(filtered), "d_q17");
-        reduce->addAccumulator("revenue", "(long)(l_extendedprice[" + idx + "] * 100.0f)", "float");
+        reduce->addAccumulator("revenue", "l_extendedprice[" + idx + "]", "float");
 
         MetalQueryPlan::Phase phase;
         phase.name = "Q17_reduce";
         phase.root = std::move(reduce);
         phase.threadgroupSize = 1024;
+        phase.bitmapReads.push_back({"d_q17_bitmap", ""});
         plan.phases.push_back(std::move(phase));
     }
 

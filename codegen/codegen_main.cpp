@@ -371,6 +371,10 @@ static void runCodegenQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
                 auto* threshBuf = device->newBuffer(threshold.data(), mapSize * sizeof(float),
                                                      MTL::ResourceStorageModeShared);
                 executor.registerAllocatedBuffer("d_q17_threshold", threshBuf);
+
+                auto* bitmapBuf = device->newBuffer(bitmap.data(), bitmap.size() * sizeof(uint32_t),
+                                                     MTL::ResourceStorageModeShared);
+                executor.registerAllocatedBuffer("d_q17_bitmap", bitmapBuf);
             }
         }
 
@@ -1198,13 +1202,11 @@ static void runCodegenQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
         // Q17: read revenue and divide by 7.0
         if (plan.name == "Q17") {
             auto* revLoBuf = executor.getAllocatedBuffer("d_q17_revenue_lo");
-            auto* revHiBuf = executor.getAllocatedBuffer("d_q17_revenue_hi");
-            if (revLoBuf && revHiBuf) {
-                uint32_t lo = *(const uint32_t*)revLoBuf->contents();
-                uint32_t hi = *(const uint32_t*)revHiBuf->contents();
-                uint64_t combined = ((uint64_t)hi << 32) | (uint64_t)lo;
-                long rawCents = (long)combined;
-                double revenue = rawCents / 100.0;
+            if (revLoBuf) {
+                uint32_t raw = *(const uint32_t*)revLoBuf->contents();
+                float fval;
+                memcpy(&fval, &raw, sizeof(float));
+                double revenue = (double)fval;
                 double avgYearly = revenue / 7.0;
                 printf("  +------------------+\n");
                 printf("  |      avg_yearly  |\n");

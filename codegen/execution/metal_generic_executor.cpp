@@ -294,11 +294,13 @@ MetalExecutionResult MetalGenericExecutor::execute(
                     if (sizeResolver_.hasSymbol(sym)) {
                         size_t rowCount = sizeResolver_.getSymbol(sym);
                         NS::UInteger computed = (rowCount + tgSize - 1) / tgSize;
-                        // Ensure at least 1024 TGs for GPU occupancy,
-                        // but scale up for large tables (SF10+)
                         if (computed > 1024) numTG = computed;
                         if (numTG > 65535) numTG = 65535;
                     }
+                }
+                // Cap threadgroups for phases with TG reduction
+                if (phase.maxThreadgroups > 0 && numTG > (NS::UInteger)phase.maxThreadgroups) {
+                    numTG = phase.maxThreadgroups;
                 }
                 encoder->dispatchThreadgroups(MTL::Size::Make(numTG, 1, 1),
                                               MTL::Size::Make(tgSize, 1, 1));

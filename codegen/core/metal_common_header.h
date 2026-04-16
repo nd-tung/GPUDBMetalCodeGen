@@ -100,6 +100,21 @@ inline long load_long_pair(const device uint* lo, const device uint* hi) {
     return as_type<long>(v);
 }
 
+inline void atomic_add_float(device atomic_uint* addr, float val) {
+    uint old_val = atomic_load_explicit(addr, memory_order_relaxed);
+    while (true) {
+        float new_f = as_type<float>(old_val) + val;
+        uint new_val = as_type<uint>(new_f);
+        if (atomic_compare_exchange_weak_explicit(addr, &old_val, new_val,
+                                                   memory_order_relaxed,
+                                                   memory_order_relaxed)) break;
+    }
+}
+
+inline float load_float_atomic(const device uint* addr) {
+    return as_type<float>(*addr);
+}
+
 inline uint next_pow2(uint v) {
     v--; v |= v >> 1; v |= v >> 2; v |= v >> 4; v |= v >> 8; v |= v >> 16;
     return v + 1;
