@@ -16,12 +16,67 @@
 #include <cmath>
 #include <cstring>
 #include <functional>
+#include <thread>
+#include <atomic>
+#include <sys/sysctl.h>
 
 // mmap for SF100 chunked streaming
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <unistd.h>
+
+// ===================================================================
+// SYSTEM INFO (chip name + memory)
+// ===================================================================
+struct SystemInfo {
+    std::string chip;
+    std::string os;
+    std::string gpu;
+    size_t      ramBytes      = 0;
+    size_t      gpuWorkingSet = 0;
+};
+
+inline std::string sysctlString(const char* key) {
+    size_t len = 0;
+    if (sysctlbyname(key, nullptr, &len, nullptr, 0) != 0 || len == 0) return {};
+    std::string out(len, '\0');
+    if (sysctlbyname(key, out.data(), &len, nullptr, 0) != 0) return {};
+    if (!out.empty() && out.back() == '\0') out.pop_back();
+    return out;
+}
+
+inline SystemInfo getSystemInfo(MTL::Device* device = nullptr) {
+    SystemInfo info;
+    info.chip = sysctlString("machdep.cpu.brand_string");
+    info.os   = sysctlString("kern.osproductversion");
+    if (!info.os.empty()) info.os = "macOS " + info.os;
+
+    size_t len = sizeof(info.ramBytes);
+    sysctlbyname("hw.memsize", &info.ramBytes, &len, nullptr, 0);
+
+    if (device) {
+        auto* name = device->name();
+        if (name) info.gpu = name->utf8String();
+        info.gpuWorkingSet = static_cast<size_t>(device->recommendedMaxWorkingSetSize());
+    }
+    return info;
+}
+
+inline void printSystemInfo(const SystemInfo& s) {
+    auto gib = [](size_t b) { return (double)b / (1024.0 * 1024.0 * 1024.0); };
+    printf("System:\n");
+    if (!s.chip.empty()) printf("  CPU:        %s\n", s.chip.c_str());
+    if (!s.os.empty())   printf("  OS:         %s\n", s.os.c_str());
+    if (!s.gpu.empty())  printf("  GPU:        %s\n", s.gpu.c_str());
+    if (s.ramBytes)      printf("  RAM:        %.1f GiB\n", gib(s.ramBytes));
+    if (s.gpuWorkingSet) printf("  GPU Budget: %.1f GiB (recommendedMaxWorkingSetSize)\n",
+                                 gib(s.gpuWorkingSet));
+    // Machine-readable single line for CSV harvesting.
+    printf("SYSINFO_CSV,%s,%s,%s,%zu,%zu\n",
+           s.chip.c_str(), s.os.c_str(), s.gpu.c_str(),
+           s.ramBytes, s.gpuWorkingSet);
+}
 
 // Round up to next power of 2 (host-side, must match GPU-side next_pow2)
 inline uint nextPow2(uint v) {
@@ -360,6 +415,227 @@ inline LoadedColumns loadColumnsMulti(const std::string& filePath, const std::ve
     return result;
 }
 
+// ===================================================================
+// OUT-OF-CORE LOADER (mmap + parallel-parse, exact pre-size)
+// -------------------------------------------------------------------
+// Drop-in replacement for loadColumnsMulti() when file size is large.
+// - mmap'd file: avoids loading the whole .tbl into the heap (page
+//   cache is recyclable by the OS; no anonymous RSS for raw text).
+// - Pre-sized vectors: no geometric-growth 2x spike during parse.
+// - Parallel parse: N threads carve up row ranges independently.
+// This keeps peak RSS ~= (final columns only) instead of
+// (raw .tbl + final columns + growth overhead).
+// ===================================================================
+inline size_t countLinesParallel(const char* base, size_t size, int nThreads) {
+    if (nThreads < 1) nThreads = 1;
+    std::vector<size_t> parts(nThreads, 0);
+    std::vector<std::thread> ts;
+    ts.reserve(nThreads);
+    for (int t = 0; t < nThreads; t++) {
+        size_t lo = (size * t) / nThreads;
+        size_t hi = (size * (t + 1)) / nThreads;
+        ts.emplace_back([base, lo, hi, t, &parts]() {
+            size_t c = 0;
+            for (size_t i = lo; i < hi; i++) if (base[i] == '\n') c++;
+            parts[t] = c;
+        });
+    }
+    for (auto& th : ts) th.join();
+    size_t total = 0;
+    for (size_t c : parts) total += c;
+    return total;
+}
+
+// Build line start index in parallel (offsets[i] = file offset of line i, offsets.size() == nLines)
+inline std::vector<size_t> buildLineIndexParallel(const char* base, size_t size,
+                                                   size_t nLines, int nThreads) {
+    std::vector<size_t> offsets(nLines);
+    if (nThreads < 1) nThreads = 1;
+    // First pass: per-thread count to compute start index
+    std::vector<size_t> threadCounts(nThreads, 0);
+    std::vector<size_t> threadStarts(nThreads, 0);
+    std::vector<size_t> threadLo(nThreads, 0), threadHi(nThreads, 0);
+    {
+        std::vector<std::thread> ts; ts.reserve(nThreads);
+        for (int t = 0; t < nThreads; t++) {
+            threadLo[t] = (size * t) / nThreads;
+            threadHi[t] = (size * (t + 1)) / nThreads;
+            ts.emplace_back([base, t, &threadCounts, &threadLo, &threadHi]() {
+                size_t c = 0;
+                for (size_t i = threadLo[t]; i < threadHi[t]; i++) if (base[i] == '\n') c++;
+                threadCounts[t] = c;
+            });
+        }
+        for (auto& th : ts) th.join();
+    }
+    size_t acc = 0;
+    for (int t = 0; t < nThreads; t++) { threadStarts[t] = acc; acc += threadCounts[t]; }
+
+    // Second pass: write offsets
+    // Line 0 starts at offset 0; every subsequent line starts at (pos of '\n') + 1
+    // We record: offsets[k] = start of line k
+    // A thread's first "line start" (if its lo > 0) is the byte after the first '\n' it sees.
+    // Simpler: record positions right after newlines, plus the implicit start at 0.
+    std::vector<std::thread> ts; ts.reserve(nThreads);
+    for (int t = 0; t < nThreads; t++) {
+        ts.emplace_back([base, t, nLines, &offsets, &threadLo, &threadHi, &threadStarts]() {
+            size_t writeIdx = threadStarts[t];
+            // Thread 0 owns line 0 start.
+            if (t == 0) {
+                if (writeIdx < nLines) offsets[writeIdx++] = 0;
+            }
+            for (size_t i = threadLo[t]; i < threadHi[t]; i++) {
+                if (base[i] == '\n') {
+                    size_t next = i + 1;
+                    // Skip the terminal newline (would record past-EOF as a line start).
+                    if (writeIdx < nLines) offsets[writeIdx++] = next;
+                }
+            }
+        });
+    }
+    for (auto& th : ts) th.join();
+    // offsets may contain one past-end entry if the file ends with \n; trim if needed.
+    // By construction writeIdx == threadStarts[t+1] for each t except the last, so fine.
+    return offsets;
+}
+
+// mmap+parallel variant of loadColumnsMulti (drop-in result shape).
+inline LoadedColumns loadColumnsMultiMmap(const std::string& filePath,
+                                           const std::vector<ColSpec>& specs,
+                                           int nThreads = 0) {
+    LoadedColumns result;
+
+    // Open+mmap
+    MappedFile mf;
+    if (!mf.open(filePath)) return result;
+    const char* base = (const char*)mf.data;
+
+    if (nThreads <= 0) {
+        nThreads = (int)std::thread::hardware_concurrency();
+        if (nThreads <= 0) nThreads = 4;
+    }
+
+    // Count lines & build offset index (parallel)
+    size_t nLines = countLinesParallel(base, mf.size, nThreads);
+    std::vector<size_t> lineIndex = buildLineIndexParallel(base, mf.size, nLines, nThreads);
+
+    // Pre-allocate exact-size storage. Fill handlers + maps.
+    struct ColHandler {
+        int columnIndex;
+        ColType type;
+        int fixedWidth;
+        size_t storageIdx;
+    };
+    std::vector<ColHandler> handlers;
+    int maxCol = 0;
+    for (const auto& s : specs) {
+        ColHandler h{s.columnIndex, s.type, s.fixedWidth, 0};
+        maxCol = std::max(maxCol, s.columnIndex);
+        switch (s.type) {
+            case ColType::INT:
+            case ColType::DATE:
+                h.storageIdx = result.intCols.size();
+                result.intMap[s.columnIndex] = h.storageIdx;
+                result.intCols.emplace_back(nLines);
+                break;
+            case ColType::FLOAT:
+                h.storageIdx = result.floatCols.size();
+                result.floatMap[s.columnIndex] = h.storageIdx;
+                result.floatCols.emplace_back(nLines);
+                break;
+            case ColType::CHAR1:
+                h.storageIdx = result.charCols.size();
+                result.charMap[s.columnIndex] = h.storageIdx;
+                result.charCols.emplace_back(nLines);
+                break;
+            case ColType::CHAR_FIXED:
+                h.storageIdx = result.charCols.size();
+                result.charMap[s.columnIndex] = h.storageIdx;
+                result.charCols.emplace_back(nLines * s.fixedWidth, '\0');
+                break;
+        }
+        handlers.push_back(h);
+    }
+
+    // Parallel parse: each thread owns a disjoint row range.
+    std::vector<std::thread> workers;
+    workers.reserve(nThreads);
+    for (int t = 0; t < nThreads; t++) {
+        size_t lo = (nLines * t) / nThreads;
+        size_t hi = (nLines * (t + 1)) / nThreads;
+        workers.emplace_back([&, lo, hi]() {
+            const char* fileEnd = base + mf.size;
+            for (size_t r = lo; r < hi; r++) {
+                const char* line = base + lineIndex[r];
+                // For each handler, scan to its column from line start.
+                for (const auto& h : handlers) {
+                    const char* p = line;
+                    int col = 0;
+                    while (col < h.columnIndex) {
+                        while (p < fileEnd && *p != '|' && *p != '\n') p++;
+                        if (p >= fileEnd || *p == '\n') { p = nullptr; break; }
+                        p++; col++;
+                    }
+                    if (!p) continue;
+                    const char* s = p;
+                    const char* e = s;
+                    while (e < fileEnd && *e != '|' && *e != '\n') e++;
+                    switch (h.type) {
+                        case ColType::INT:
+                            result.intCols[h.storageIdx][r] = atoi(s);
+                            break;
+                        case ColType::FLOAT:
+                            result.floatCols[h.storageIdx][r] = strtof(s, nullptr);
+                            break;
+                        case ColType::DATE: {
+                            int y = 0, m = 0, d = 0;
+                            const char* q = s;
+                            while (q < e && *q >= '0' && *q <= '9') { y = y * 10 + (*q - '0'); q++; }
+                            if (q < e) q++;
+                            while (q < e && *q >= '0' && *q <= '9') { m = m * 10 + (*q - '0'); q++; }
+                            if (q < e) q++;
+                            while (q < e && *q >= '0' && *q <= '9') { d = d * 10 + (*q - '0'); q++; }
+                            result.intCols[h.storageIdx][r] = y * 10000 + m * 100 + d;
+                            break;
+                        }
+                        case ColType::CHAR1:
+                            result.charCols[h.storageIdx][r] = (s < e) ? *s : '\0';
+                            break;
+                        case ColType::CHAR_FIXED: {
+                            int len = (int)(e - s);
+                            int cp = len < h.fixedWidth ? len : h.fixedWidth;
+                            char* dst = result.charCols[h.storageIdx].data() + r * h.fixedWidth;
+                            memcpy(dst, s, cp);
+                            // tail already '\0' (vector was zero-init)
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+    }
+    for (auto& w : workers) w.join();
+    // MappedFile closed by destructor.
+    return result;
+}
+
+// Dispatcher: use mmap+parallel path for large files; keep ifstream path
+// for small files (fast startup, no mmap setup overhead).
+// Threshold: 1 GB.
+inline LoadedColumns loadColumnsMultiAuto(const std::string& filePath,
+                                           const std::vector<ColSpec>& specs) {
+    struct stat st{};
+    if (::stat(filePath.c_str(), &st) != 0) {
+        // Fall back to ifstream path which will report the error.
+        return loadColumnsMulti(filePath, specs);
+    }
+    constexpr off_t THRESHOLD = 1LL * 1024 * 1024 * 1024; // 1 GiB
+    if (st.st_size >= THRESHOLD) {
+        return loadColumnsMultiMmap(filePath, specs);
+    }
+    return loadColumnsMulti(filePath, specs);
+}
+
 // --- Standard Column Loaders (file-based, for SF1/SF10) ---
 template<typename T, typename ParseFn>
 inline std::vector<T> loadColumn(const std::string& filePath, int columnIndex, ParseFn parse) {
@@ -516,9 +792,9 @@ inline void printTimingSummary(double parseMs, double gpuMs, double postMs) {
 }
 
 // --- Detailed Timing Summary (codegen pipeline breakdown) ---
-// Prints each pipeline stage, per-kernel GPU time, and totals.
-// Any stage <= 0 is skipped.
 struct DetailedTiming {
+    std::string queryName;
+    std::string scaleFactor;
     double analyzeMs     = 0.0;
     double planMs        = 0.0;
     double codegenMs     = 0.0;
@@ -532,37 +808,58 @@ struct DetailedTiming {
 };
 
 inline void printDetailedTimingSummary(const DetailedTiming& t) {
-    auto row = [](const char* label, double ms) {
-        if (ms > 0.0) printf("  %-22s %10.3f ms\n", label, ms);
+    const double cpuCodegen = t.analyzeMs + t.planMs + t.codegenMs +
+                              t.compileMs + t.psoMs;
+    const double cpuTotal   = cpuCodegen + t.dataLoadMs + t.bufferAllocMs + t.postMs;
+    const double end2end    = cpuTotal + t.gpuTotalMs;
+
+    auto bar = []() {
+        printf("  +------------------------+---------------+\n");
     };
-    printf("\nTiming Breakdown:\n");
-    printf("  --- Codegen pipeline (CPU) ---\n");
-    row("SQL Analyze:",        t.analyzeMs);
-    row("Plan Build:",         t.planMs);
-    row("Metal Codegen:",      t.codegenMs);
-    row("Metal Compile:",      t.compileMs);
-    row("PSO Creation:",       t.psoMs);
-    row("Data Load (.tbl):",   t.dataLoadMs);
-    row("GPU Buffer Alloc:",   t.bufferAllocMs);
+    auto row = [](const char* label, double ms) {
+        printf("  | %-22s | %10.3f ms |\n", label, ms);
+    };
 
-    double cpuCodegen = t.analyzeMs + t.planMs + t.codegenMs +
-                        t.compileMs + t.psoMs;
-    double cpuTotal   = cpuCodegen + t.dataLoadMs + t.bufferAllocMs + t.postMs;
+    printf("\n  Timing Breakdown");
+    if (!t.queryName.empty()) printf(" — %s", t.queryName.c_str());
+    if (!t.scaleFactor.empty()) printf(" @ %s", t.scaleFactor.c_str());
+    printf("\n");
 
-    printf("  --- GPU execution ---\n");
+    bar();
+    printf("  | %-22s | %-13s |\n", "Stage", "Time");
+    bar();
+    row("SQL Analyze",      t.analyzeMs);
+    row("Plan Build",       t.planMs);
+    row("Metal Codegen",    t.codegenMs);
+    row("Metal Compile",    t.compileMs);
+    row("PSO Creation",     t.psoMs);
+    row("Data Load (.tbl)", t.dataLoadMs);
+    row("GPU Buffer Alloc", t.bufferAllocMs);
+    bar();
     if (!t.phaseKernelMs.empty()) {
         for (const auto& [name, ms] : t.phaseKernelMs) {
-            printf("    kernel %-18s %10.3f ms\n", name.c_str(), ms);
+            char label[64];
+            snprintf(label, sizeof(label), "  kernel %s", name.c_str());
+            row(label, ms);
         }
+        bar();
     }
-    row("GPU Total:",          t.gpuTotalMs);
-    printf("  --- Post-processing (CPU) ---\n");
-    row("CPU Post Process:",   t.postMs);
-    printf("  ------------------------------\n");
-    printf("  %-22s %10.3f ms\n", "CPU Codegen (sum):", cpuCodegen);
-    printf("  %-22s %10.3f ms\n", "CPU Total:",         cpuTotal);
-    printf("  %-22s %10.3f ms  (CPU total + GPU)\n",
-           "End-to-End:", cpuTotal + t.gpuTotalMs);
+    row("GPU Total",        t.gpuTotalMs);
+    row("CPU Post Process", t.postMs);
+    bar();
+    row("CPU Codegen (sum)", cpuCodegen);
+    row("CPU Total",         cpuTotal);
+    row("End-to-End",        end2end);
+    bar();
+
+    // Machine-readable single line for CSV harvesting.
+    // Fields: tag, sf, query, analyze, plan, codegen, compile, pso,
+    //         dataload, bufalloc, gpu, post, cpu_codegen, cpu_total, end2end
+    printf("TIMING_CSV,%s,%s,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f\n",
+           t.scaleFactor.c_str(), t.queryName.c_str(),
+           t.analyzeMs, t.planMs, t.codegenMs, t.compileMs, t.psoMs,
+           t.dataLoadMs, t.bufferAllocMs, t.gpuTotalMs, t.postMs,
+           cpuCodegen, cpuTotal, end2end);
 }
 
 // --- Bitmap Buffer Creation ---

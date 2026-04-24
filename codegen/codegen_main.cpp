@@ -84,6 +84,18 @@ static void runCodegenQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
             return std::chrono::duration<double, std::milli>(b - a).count();
         };
         DetailedTiming timing{};
+        timing.queryName = queryName;
+        {
+            // Derive short SF label from g_dataset_path (e.g. "data/SF-1/" → "SF1")
+            const std::string& p = g_dataset_path;
+            auto s = p.find("SF-");
+            if (s != std::string::npos) {
+                std::string digits;
+                for (size_t i = s + 3; i < p.size() && isdigit((unsigned char)p[i]); i++)
+                    digits += p[i];
+                timing.scaleFactor = "SF" + digits;
+            }
+        }
 
         // 1. Analyze SQL
         auto tAnalyze0 = clk::now();
@@ -181,7 +193,7 @@ static void runCodegenQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
                 specs.emplace_back(cdef.index, ct, cdef.fixedWidth);
             }
 
-            auto cols = loadColumnsMulti(g_dataset_path + tableName + ".tbl", specs);
+            auto cols = loadColumnsMultiAuto(g_dataset_path + tableName + ".tbl", specs);
 
             size_t rowCount = 0;
             for (const auto& colName : colNames) {
@@ -331,7 +343,7 @@ static void runCodegenQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
 
         // Q17: build per-partkey threshold from loaded data
         if (plan.name == "Q17") {
-            auto pCols = loadColumnsMulti(g_dataset_path + "part.tbl",
+            auto pCols = loadColumnsMultiAuto(g_dataset_path + "part.tbl",
                 {{0, ColType::INT}, {3, ColType::CHAR_FIXED, 10}, {6, ColType::CHAR_FIXED, 10}});
             auto& p_partkey = pCols.ints(0);
             auto& p_brand = pCols.chars(3);
@@ -396,28 +408,28 @@ static void runCodegenQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
 
         // Q9: build green-parts bitmap, lookup arrays, and partsupp HT
         if (plan.name == "Q9") {
-            auto pCols = loadColumnsMulti(g_dataset_path + "part.tbl",
+            auto pCols = loadColumnsMultiAuto(g_dataset_path + "part.tbl",
                 {{0, ColType::INT}, {1, ColType::CHAR_FIXED, 55}});
             auto& p_partkey = pCols.ints(0);
             auto& p_name = pCols.chars(1);
 
-            auto sCols = loadColumnsMulti(g_dataset_path + "supplier.tbl",
+            auto sCols = loadColumnsMultiAuto(g_dataset_path + "supplier.tbl",
                 {{0, ColType::INT}, {3, ColType::INT}});
             auto& s_suppkey = sCols.ints(0);
             auto& s_nationkey = sCols.ints(3);
 
-            auto oCols = loadColumnsMulti(g_dataset_path + "orders.tbl",
+            auto oCols = loadColumnsMultiAuto(g_dataset_path + "orders.tbl",
                 {{0, ColType::INT}, {4, ColType::DATE}});
             auto& o_orderkey = oCols.ints(0);
             auto& o_orderdate = oCols.ints(4);
 
-            auto psCols = loadColumnsMulti(g_dataset_path + "partsupp.tbl",
+            auto psCols = loadColumnsMultiAuto(g_dataset_path + "partsupp.tbl",
                 {{0, ColType::INT}, {1, ColType::INT}, {3, ColType::FLOAT}});
             auto& ps_partkey = psCols.ints(0);
             auto& ps_suppkey = psCols.ints(1);
             auto& ps_supplycost = psCols.floats(3);
 
-            auto nCols = loadColumnsMulti(g_dataset_path + "nation.tbl",
+            auto nCols = loadColumnsMultiAuto(g_dataset_path + "nation.tbl",
                 {{0, ColType::INT}, {1, ColType::CHAR_FIXED, 25}});
             auto& n_nationkey = nCols.ints(0);
             auto& n_name = nCols.chars(1);
@@ -515,25 +527,25 @@ static void runCodegenQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
 
         // Q20: build forest% bitmap, partsupp HT, CANADA filter
         if (plan.name == "Q20") {
-            auto pCols = loadColumnsMulti(g_dataset_path + "part.tbl",
+            auto pCols = loadColumnsMultiAuto(g_dataset_path + "part.tbl",
                 {{0, ColType::INT}, {1, ColType::CHAR_FIXED, 55}});
             auto& p_partkey = pCols.ints(0);
             auto& p_name = pCols.chars(1);
 
-            auto psCols = loadColumnsMulti(g_dataset_path + "partsupp.tbl",
+            auto psCols = loadColumnsMultiAuto(g_dataset_path + "partsupp.tbl",
                 {{0, ColType::INT}, {1, ColType::INT}, {2, ColType::INT}});
             auto& ps_partkey = psCols.ints(0);
             auto& ps_suppkey = psCols.ints(1);
             auto& ps_availqty = psCols.ints(2);
 
-            auto sCols = loadColumnsMulti(g_dataset_path + "supplier.tbl",
+            auto sCols = loadColumnsMultiAuto(g_dataset_path + "supplier.tbl",
                 {{0, ColType::INT}, {1, ColType::CHAR_FIXED, 25}, {2, ColType::CHAR_FIXED, 40}, {3, ColType::INT}});
             auto& s_suppkey = sCols.ints(0);
             auto& s_name = sCols.chars(1);
             auto& s_address = sCols.chars(2);
             auto& s_nationkey = sCols.ints(3);
 
-            auto nCols = loadColumnsMulti(g_dataset_path + "nation.tbl",
+            auto nCols = loadColumnsMultiAuto(g_dataset_path + "nation.tbl",
                 {{0, ColType::INT}, {1, ColType::CHAR_FIXED, 25}});
             auto& n_nationkey = nCols.ints(0);
             auto& n_name = nCols.chars(1);
@@ -621,12 +633,12 @@ static void runCodegenQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
 
         // Q2: build EUROPE supplier bitmap, allocate part bitmap (filled by GPU Phase 1)
         if (plan.name == "Q2") {
-            auto pCols = loadColumnsMulti(g_dataset_path + "part.tbl",
+            auto pCols = loadColumnsMultiAuto(g_dataset_path + "part.tbl",
                 {{0, ColType::INT}, {2, ColType::CHAR_FIXED, 25}});
             auto& p_partkey = pCols.ints(0);
             auto& p_mfgr = pCols.chars(2);
 
-            auto sCols = loadColumnsMulti(g_dataset_path + "supplier.tbl", {
+            auto sCols = loadColumnsMultiAuto(g_dataset_path + "supplier.tbl", {
                 {0, ColType::INT}, {1, ColType::CHAR_FIXED, 25}, {2, ColType::CHAR_FIXED, 40},
                 {3, ColType::INT}, {4, ColType::CHAR_FIXED, 15}, {5, ColType::FLOAT},
                 {6, ColType::CHAR_FIXED, 101}
@@ -639,19 +651,19 @@ static void runCodegenQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
             auto& s_acctbal = sCols.floats(5);
             auto& s_comment = sCols.chars(6);
 
-            auto psCols = loadColumnsMulti(g_dataset_path + "partsupp.tbl",
+            auto psCols = loadColumnsMultiAuto(g_dataset_path + "partsupp.tbl",
                 {{0, ColType::INT}, {1, ColType::INT}, {3, ColType::FLOAT}});
             auto& ps_partkey = psCols.ints(0);
             auto& ps_suppkey = psCols.ints(1);
             auto& ps_supplycost = psCols.floats(3);
 
-            auto nCols = loadColumnsMulti(g_dataset_path + "nation.tbl",
+            auto nCols = loadColumnsMultiAuto(g_dataset_path + "nation.tbl",
                 {{0, ColType::INT}, {1, ColType::CHAR_FIXED, 25}, {2, ColType::INT}});
             auto& n_nationkey = nCols.ints(0);
             auto& n_name = nCols.chars(1);
             auto& n_regionkey = nCols.ints(2);
 
-            auto rCols = loadColumnsMulti(g_dataset_path + "region.tbl",
+            auto rCols = loadColumnsMultiAuto(g_dataset_path + "region.tbl",
                 {{0, ColType::INT}, {1, ColType::CHAR_FIXED, 25}});
             auto& r_regionkey = rCols.ints(0);
             auto& r_name = rCols.chars(1);
@@ -730,7 +742,7 @@ static void runCodegenQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
 
         // Q16: build part_group_map, allocate complaint bitmap (filled by GPU Phase 1)
         if (plan.name == "Q16") {
-            auto pCols = loadColumnsMulti(g_dataset_path + "part.tbl",
+            auto pCols = loadColumnsMultiAuto(g_dataset_path + "part.tbl",
                 {{0, ColType::INT}, {3, ColType::CHAR_FIXED, 10}, {4, ColType::CHAR_FIXED, 25}, {5, ColType::INT}});
             auto& p_partkey = pCols.ints(0);
             auto& p_brand = pCols.chars(3);
@@ -824,7 +836,7 @@ static void runCodegenQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
 
         // Q18: preload orders.tbl for post-processing (avoids reloading during post)
         if (plan.name == "Q18") {
-            auto oCols = loadColumnsMulti(g_dataset_path + "orders.tbl",
+            auto oCols = loadColumnsMultiAuto(g_dataset_path + "orders.tbl",
                 {{0, ColType::INT}, {1, ColType::INT}, {3, ColType::FLOAT}, {4, ColType::DATE}});
             auto& okeys = oCols.ints(0);
             g_q18Post.o_custkey = std::move(oCols.ints(1));
@@ -841,13 +853,13 @@ static void runCodegenQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
         // Q21: allocate GPU buffers for phases, build SA-supp bitmap (tiny)
         if (plan.name == "Q21") {
             // Load supplier/nation for SA bitmap + post-processing (small tables)
-            auto sCols = loadColumnsMulti(g_dataset_path + "supplier.tbl",
+            auto sCols = loadColumnsMultiAuto(g_dataset_path + "supplier.tbl",
                 {{0, ColType::INT}, {1, ColType::CHAR_FIXED, 25}, {3, ColType::INT}});
             auto& s_suppkey = sCols.ints(0);
             auto& s_name = sCols.chars(1);
             auto& s_nationkey = sCols.ints(3);
 
-            auto nCols = loadColumnsMulti(g_dataset_path + "nation.tbl",
+            auto nCols = loadColumnsMultiAuto(g_dataset_path + "nation.tbl",
                 {{0, ColType::INT}, {1, ColType::CHAR_FIXED, 25}});
             auto& n_nationkey = nCols.ints(0);
             auto& n_name = nCols.chars(1);
@@ -1246,7 +1258,7 @@ static void runCodegenQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
             auto* profitBuf = executor.getAllocatedBuffer("d_q9_profit");
             if (profitBuf) {
                 const float* profits = (const float*)profitBuf->contents();
-                auto nCols = loadColumnsMulti(g_dataset_path + "nation.tbl",
+                auto nCols = loadColumnsMultiAuto(g_dataset_path + "nation.tbl",
                     {{0, ColType::INT}, {1, ColType::CHAR_FIXED, 25}});
                 auto& n_nk = nCols.ints(0);
                 auto& n_nm = nCols.chars(1);
@@ -1530,8 +1542,6 @@ static void runCodegenQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
         double postMs = std::chrono::duration<double, std::milli>(postEnd - postStart).count();
         timing.postMs = postMs;
 
-        printf("\nTiming:\n");
-        printTimingSummary(result.parseTimeMs, result.totalKernelTimeMs, postMs);
         printDetailedTimingSummary(timing);
 
         executor.releaseAllocatedBuffers();
@@ -1550,19 +1560,20 @@ int main(int argc, const char* argv[]) {
         std::string arg(argv[i]);
         if (arg == "help" || arg == "--help" || arg == "-h") {
             printf("GPU Database Codegen\n");
-            printf("Usage: GPUDBCodegen [sf1|sf10|sf100] q<N>\n");
+            printf("Usage: GPUDBCodegen [sf1|sf10|sf50|sf100] q<N>\n");
             printf("  q1..q22  - Run TPC-H query via codegen pipeline\n");
             printf("  all      - Run all 22 queries\n");
             return 0;
         }
         if (arg == "sf1")  { g_dataset_path = "data/SF-1/"; continue; }
         if (arg == "sf10") { g_dataset_path = "data/SF-10/"; continue; }
+        if (arg == "sf50") { g_dataset_path = "data/SF-50/"; continue; }
         if (arg == "sf100") { g_dataset_path = "data/SF-100/"; continue; }
         query = arg;
     }
 
     if (query.empty()) {
-        std::cerr << "Usage: GPUDBCodegen [sf1|sf10|sf100] q<N>" << std::endl;
+        std::cerr << "Usage: GPUDBCodegen [sf1|sf10|sf50|sf100] q<N>" << std::endl;
         return 1;
     }
 
@@ -1574,6 +1585,8 @@ int main(int argc, const char* argv[]) {
     }
     device->setShouldMaximizeConcurrentCompilation(true);
     MTL::CommandQueue* cmdQueue = device->newCommandQueue();
+
+    printSystemInfo(getSystemInfo(device));
 
     auto runQuery = [&](int qNum) {
         std::string path = "sql/q" + std::to_string(qNum) + ".sql";
