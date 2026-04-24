@@ -36,12 +36,18 @@ PG_QUERY_LIB = $(PG_QUERY_DIR)/libpg_query.a
 
 TARGET = $(BIN_DIR)/$(PROJECT_NAME)
 
+# Colbin ingestion tool
+TBL2COLBIN_SRC = tools/tbl_to_colbin.cpp
+TBL2COLBIN_OBJ = $(OBJ_DIR)/tbl_to_colbin.o
+TBL2COLBIN     = $(BIN_DIR)/tbl_to_colbin
+
 # ---------------------------------------------------------------------------
 # Build
 # ---------------------------------------------------------------------------
-.PHONY: all rebuild clean run
+.PHONY: all rebuild clean run tools colbin-sf1 colbin-sf10 colbin-sf50 colbin-sf100 clean-colbin
 
 all: $(TARGET)
+tools: $(TBL2COLBIN)
 
 rebuild: clean all
 
@@ -74,6 +80,15 @@ $(INFRA_OBJ): $(SOURCE_DIR)/infra.cpp | $(OBJ_DIR)
 	@echo "Compiling $<..."
 	$(CXX) $(CXXFLAGS) $(INCLUDES) -c $< -o $@
 
+$(TBL2COLBIN_OBJ): $(TBL2COLBIN_SRC) | $(OBJ_DIR)
+	@echo "Compiling $<..."
+	$(CXX) $(CXXFLAGS) $(INCLUDES) -c $< -o $@
+
+$(TBL2COLBIN): $(TBL2COLBIN_OBJ) $(INFRA_OBJ) | $(BIN_DIR)
+	@echo "Linking tbl_to_colbin..."
+	$(CXX) $(TBL2COLBIN_OBJ) $(INFRA_OBJ) $(FRAMEWORKS) -o $@
+	@echo "Build complete: $@"
+
 $(BIN_DIR) $(OBJ_DIR) $(BUILD_DIR):
 	@mkdir -p $@
 
@@ -89,3 +104,25 @@ SF ?=
 Q  ?=
 run: all
 	@./$(TARGET) $(SF) $(Q)
+
+# ---------------------------------------------------------------------------
+# Columnar binary format (.colbin) — primary on-disk column store. Generates
+# <data_dir>/<table>.colbin for every TPC-H table that has a .tbl. Regenerates
+# automatically when the underlying .tbl's size or mtime changes.
+# ---------------------------------------------------------------------------
+colbin-sf1: $(TBL2COLBIN)
+	./$(TBL2COLBIN) data/SF-1
+
+colbin-sf10: $(TBL2COLBIN)
+	./$(TBL2COLBIN) data/SF-10
+
+colbin-sf50: $(TBL2COLBIN)
+	./$(TBL2COLBIN) data/SF-50
+
+colbin-sf100: $(TBL2COLBIN)
+	./$(TBL2COLBIN) data/SF-100
+
+clean-colbin:
+	@echo "Removing .colbin binaries under data/SF-*/..."
+	@find data -maxdepth 2 -name '*.colbin' -print -delete 2>/dev/null || true
+	@find data -maxdepth 2 -name '*.colbin.tmp' -print -delete 2>/dev/null || true

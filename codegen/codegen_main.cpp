@@ -161,6 +161,7 @@ static void runCodegenQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
 
         // 5. Load data — determine which columns to load from bindings
         auto parseStart = std::chrono::high_resolution_clock::now();
+        loadStats().reset();  // track per-query load source + byte count
 
         codegen::MetalGenericExecutor executor(device, cmdQueue);
         const auto& schema = codegen::TPCHSchema::instance();
@@ -942,7 +943,14 @@ static void runCodegenQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
         // 6. Execute
         auto parseEnd = std::chrono::high_resolution_clock::now();
         double parseMs = std::chrono::duration<double, std::milli>(parseEnd - parseStart).count();
-        timing.dataLoadMs = parseMs;
+        // One-time .tbl->column ingest (only when .colbin is missing) is
+        // reported separately via timing.ingestMs and excluded from e2e.
+        const double ingestMs = loadStats().excludedMs;
+        timing.dataLoadMs = parseMs - ingestMs;
+        if (timing.dataLoadMs < 0.0) timing.dataLoadMs = 0.0;
+        timing.ingestMs   = ingestMs;
+        timing.loadSource = loadStats().source();
+        timing.loadBytes  = loadStats().bytes;
 
         auto result = executor.execute(compiled, cg, 2, 1);
         result.parseTimeMs = static_cast<float>(parseMs);
@@ -1573,7 +1581,7 @@ int main(int argc, const char* argv[]) {
     }
 
     if (query.empty()) {
-        std::cerr << "Usage: GPUDBCodegen [sf1|sf10|sf50|sf100] q<N>" << std::endl;
+        std::cerr << "Usage: GPUDBCodegen [sf1|sf10|sf100] q<N>" << std::endl;
         return 1;
     }
 

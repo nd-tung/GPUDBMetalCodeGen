@@ -622,20 +622,342 @@ inline LoadedColumns loadColumnsMultiMmap(const std::string& filePath,
 // Dispatcher: use mmap+parallel path for large files; keep ifstream path
 // for small files (fast startup, no mmap setup overhead).
 // Threshold: 1 GB.
+// Per-thread load-source tracker. Populated by loadColumnsMultiAuto.
+// Reset with loadStats().reset() at the start of each query.
+struct LoadStats {
+    size_t bytes       = 0;
+    int    tblCalls    = 0;
+    int    colbinCalls = 0;
+    double excludedMs  = 0.0;   // one-time .tbl->column ingest, subtracted from e2e
+    void reset() { bytes = 0; tblCalls = 0; colbinCalls = 0; excludedMs = 0.0; }
+    void recordBinary(size_t b) { bytes += b; colbinCalls++; }
+    void recordText(size_t b)   { bytes += b; tblCalls++; }
+    void recordExcluded(double ms) { excludedMs += ms; }
+    std::string source() const {
+        if (tblCalls && colbinCalls) return "mixed";
+        if (colbinCalls)             return "colbin";
+        if (tblCalls)                return "tbl";
+        return "none";
+    }
+};
+inline LoadStats& loadStats() { thread_local LoadStats s; return s; }
+
+// Forward decl so binary-format utilities below can be inlined before the definition.
 inline LoadedColumns loadColumnsMultiAuto(const std::string& filePath,
-                                           const std::vector<ColSpec>& specs) {
-    struct stat st{};
-    if (::stat(filePath.c_str(), &st) != 0) {
-        // Fall back to ifstream path which will report the error.
-        return loadColumnsMulti(filePath, specs);
+                                           const std::vector<ColSpec>& specs);
+
+// ===================================================================
+// COLUMNAR BINARY FORMAT (.colbin) — primary on-disk column store.
+// -------------------------------------------------------------------
+// Layout:
+//   [magic 8B "TPCHCB01"]
+//   [u32 version][u32 n_cols][u64 n_rows]
+//   [u64 source_size][i64 source_mtime_ns][u64 pad]  -> 48 B header
+//   n_cols * ColDesc (each 32 B)
+//   [payloads, each aligned to 16 B]
+// ===================================================================
+
+namespace colbin {
+static constexpr char     MAGIC[8]   = {'T','P','C','H','C','B','0','1'};
+static constexpr uint32_t VERSION    = 1;
+static constexpr size_t   ALIGN      = 16;
+
+struct FileHeader {
+    char     magic[8];
+    uint32_t version;
+    uint32_t n_cols;
+    uint64_t n_rows;
+    uint64_t source_size;
+    int64_t  source_mtime_ns;
+    uint64_t _pad;
+};
+static_assert(sizeof(FileHeader) == 48, "FileHeader size drift");
+
+struct ColDesc {
+    int32_t  columnIndex;
+    uint8_t  dtype;
+    uint8_t  _pad0;
+    uint16_t fixedWidth;
+    uint64_t offset;
+    uint64_t size_bytes;
+    uint64_t _pad1;
+};
+static_assert(sizeof(ColDesc) == 32, "ColDesc size drift");
+
+inline uint8_t encodeType(ColType t) {
+    switch (t) {
+        case ColType::INT:        return 0;
+        case ColType::FLOAT:      return 1;
+        case ColType::DATE:       return 2;
+        case ColType::CHAR1:      return 3;
+        case ColType::CHAR_FIXED: return 4;
     }
-    constexpr off_t THRESHOLD = 1LL * 1024 * 1024 * 1024; // 1 GiB
-    if (st.st_size >= THRESHOLD) {
-        return loadColumnsMultiMmap(filePath, specs);
+    return 0;
+}
+inline ColType decodeType(uint8_t b) {
+    switch (b) {
+        case 0: return ColType::INT;
+        case 1: return ColType::FLOAT;
+        case 2: return ColType::DATE;
+        case 3: return ColType::CHAR1;
+        default: return ColType::CHAR_FIXED;
     }
-    return loadColumnsMulti(filePath, specs);
 }
 
+inline std::string binaryPath(const std::string& tblPath) {
+    auto pos = tblPath.rfind('.');
+    std::string base = (pos == std::string::npos) ? tblPath : tblPath.substr(0, pos);
+    return base + ".colbin";
+}
+
+inline bool statFile(const std::string& p, size_t& sz, int64_t& mtimeNs) {
+    struct stat st{};
+    if (::stat(p.c_str(), &st) != 0) return false;
+    sz = (size_t)st.st_size;
+#ifdef __APPLE__
+    mtimeNs = (int64_t)st.st_mtimespec.tv_sec * 1000000000LL + st.st_mtimespec.tv_nsec;
+#else
+    mtimeNs = (int64_t)st.st_mtim.tv_sec * 1000000000LL + st.st_mtim.tv_nsec;
+#endif
+    return true;
+}
+
+inline bool loadColumnsFromBinary(const std::string& tblPath,
+                                  const std::vector<ColSpec>& specs,
+                                  LoadedColumns& out)
+{
+    const std::string cp = binaryPath(tblPath);
+    size_t tblSize = 0; int64_t tblMtime = 0;
+    if (!statFile(tblPath, tblSize, tblMtime)) return false;
+
+    MappedFile mf;
+    if (!mf.open(cp)) return false;
+    if (mf.size < sizeof(FileHeader)) return false;
+
+    const char* base = (const char*)mf.data;
+    FileHeader hdr;
+    memcpy(&hdr, base, sizeof(hdr));
+    if (memcmp(hdr.magic, MAGIC, 8) != 0) return false;
+    if (hdr.version != VERSION) return false;
+    if (hdr.source_size != tblSize) return false;
+    if (hdr.source_mtime_ns != tblMtime) return false;
+    if (sizeof(FileHeader) + hdr.n_cols * sizeof(ColDesc) > mf.size) return false;
+
+    const ColDesc* descs = (const ColDesc*)(base + sizeof(FileHeader));
+    std::unordered_map<int, const ColDesc*> byIdx;
+    byIdx.reserve(hdr.n_cols);
+    for (uint32_t i = 0; i < hdr.n_cols; i++) byIdx[descs[i].columnIndex] = &descs[i];
+
+    LoadedColumns result;
+    const size_t n = hdr.n_rows;
+    for (const auto& s : specs) {
+        auto it = byIdx.find(s.columnIndex);
+        if (it == byIdx.end()) return false;
+        const ColDesc* d = it->second;
+        if (d->offset + d->size_bytes > mf.size) return false;
+        if (decodeType(d->dtype) != s.type) return false;
+        if (s.type == ColType::CHAR_FIXED && d->fixedWidth != s.fixedWidth) return false;
+        const char* src = base + d->offset;
+        switch (s.type) {
+            case ColType::INT:
+            case ColType::DATE: {
+                if (d->size_bytes != n * sizeof(int32_t)) return false;
+                size_t idx = result.intCols.size();
+                result.intMap[s.columnIndex] = idx;
+                result.intCols.emplace_back(n);
+                memcpy(result.intCols[idx].data(), src, d->size_bytes);
+                break;
+            }
+            case ColType::FLOAT: {
+                if (d->size_bytes != n * sizeof(float)) return false;
+                size_t idx = result.floatCols.size();
+                result.floatMap[s.columnIndex] = idx;
+                result.floatCols.emplace_back(n);
+                memcpy(result.floatCols[idx].data(), src, d->size_bytes);
+                break;
+            }
+            case ColType::CHAR1: {
+                if (d->size_bytes != n) return false;
+                size_t idx = result.charCols.size();
+                result.charMap[s.columnIndex] = idx;
+                result.charCols.emplace_back(n);
+                memcpy(result.charCols[idx].data(), src, d->size_bytes);
+                break;
+            }
+            case ColType::CHAR_FIXED: {
+                if (d->size_bytes != n * (size_t)s.fixedWidth) return false;
+                size_t idx = result.charCols.size();
+                result.charMap[s.columnIndex] = idx;
+                result.charCols.emplace_back(d->size_bytes);
+                memcpy(result.charCols[idx].data(), src, d->size_bytes);
+                break;
+            }
+        }
+    }
+    out = std::move(result);
+    return true;
+}
+
+inline bool writeColbin(const std::string& tblPath,
+                         const std::vector<ColSpec>& specs,
+                         const LoadedColumns& parsed)
+{
+    size_t tblSize = 0; int64_t tblMtime = 0;
+    if (!statFile(tblPath, tblSize, tblMtime)) return false;
+    const std::string cp  = binaryPath(tblPath);
+    const std::string tmp = cp + ".tmp";
+    if (specs.empty()) return false;
+
+    size_t nRows = 0;
+    {
+        const auto& s = specs.front();
+        switch (s.type) {
+            case ColType::INT:
+            case ColType::DATE:
+                nRows = parsed.ints(s.columnIndex).size(); break;
+            case ColType::FLOAT:
+                nRows = parsed.floats(s.columnIndex).size(); break;
+            case ColType::CHAR1:
+                nRows = parsed.chars(s.columnIndex).size(); break;
+            case ColType::CHAR_FIXED: {
+                const auto& v = parsed.chars(s.columnIndex);
+                nRows = s.fixedWidth > 0 ? v.size() / (size_t)s.fixedWidth : v.size();
+                break;
+            }
+        }
+    }
+
+    std::vector<ColDesc> descs(specs.size());
+    size_t cursor = sizeof(FileHeader) + specs.size() * sizeof(ColDesc);
+    cursor = (cursor + ALIGN - 1) & ~(ALIGN - 1);
+    for (size_t i = 0; i < specs.size(); i++) {
+        const auto& s = specs[i];
+        ColDesc& d = descs[i];
+        d.columnIndex = s.columnIndex;
+        d.dtype       = encodeType(s.type);
+        d._pad0       = 0;
+        d.fixedWidth  = (uint16_t)s.fixedWidth;
+        d._pad1       = 0;
+        size_t bytes = 0;
+        switch (s.type) {
+            case ColType::INT:
+            case ColType::DATE:       bytes = nRows * sizeof(int32_t); break;
+            case ColType::FLOAT:      bytes = nRows * sizeof(float);   break;
+            case ColType::CHAR1:      bytes = nRows;                   break;
+            case ColType::CHAR_FIXED: bytes = nRows * (size_t)s.fixedWidth; break;
+        }
+        d.size_bytes = bytes;
+        d.offset     = cursor;
+        cursor += bytes;
+        cursor = (cursor + ALIGN - 1) & ~(ALIGN - 1);
+    }
+    size_t total = cursor;
+
+    int fd = ::open(tmp.c_str(), O_CREAT | O_RDWR | O_TRUNC, 0644);
+    if (fd < 0) { std::cerr << "colbin: cannot open " << tmp << "\n"; return false; }
+    if (::ftruncate(fd, (off_t)total) != 0) {
+        std::cerr << "colbin: ftruncate failed on " << tmp << "\n";
+        ::close(fd); ::unlink(tmp.c_str()); return false;
+    }
+
+    FileHeader hdr{};
+    memcpy(hdr.magic, MAGIC, 8);
+    hdr.version         = VERSION;
+    hdr.n_cols          = (uint32_t)specs.size();
+    hdr.n_rows          = nRows;
+    hdr.source_size     = tblSize;
+    hdr.source_mtime_ns = tblMtime;
+    hdr._pad            = 0;
+    if (::pwrite(fd, &hdr, sizeof(hdr), 0) != (ssize_t)sizeof(hdr)) {
+        ::close(fd); ::unlink(tmp.c_str()); return false;
+    }
+    if (::pwrite(fd, descs.data(), descs.size() * sizeof(ColDesc), sizeof(FileHeader))
+         != (ssize_t)(descs.size() * sizeof(ColDesc))) {
+        ::close(fd); ::unlink(tmp.c_str()); return false;
+    }
+
+    for (size_t i = 0; i < specs.size(); i++) {
+        const auto& s = specs[i];
+        const ColDesc& d = descs[i];
+        const void* src = nullptr;
+        switch (s.type) {
+            case ColType::INT:
+            case ColType::DATE:
+                src = parsed.ints(s.columnIndex).data(); break;
+            case ColType::FLOAT:
+                src = parsed.floats(s.columnIndex).data(); break;
+            case ColType::CHAR1:
+            case ColType::CHAR_FIXED:
+                src = parsed.chars(s.columnIndex).data(); break;
+        }
+        size_t remaining = d.size_bytes;
+        off_t off = (off_t)d.offset;
+        const char* p = (const char*)src;
+        while (remaining > 0) {
+            size_t chunk = remaining > (size_t)(1u << 30) ? (size_t)(1u << 30) : remaining;
+            ssize_t w = ::pwrite(fd, p, chunk, off);
+            if (w <= 0) {
+                std::cerr << "colbin: payload write failed at col " << s.columnIndex << "\n";
+                ::close(fd); ::unlink(tmp.c_str()); return false;
+            }
+            p += w; off += w; remaining -= (size_t)w;
+        }
+    }
+
+    ::fsync(fd);
+    ::close(fd);
+    if (::rename(tmp.c_str(), cp.c_str()) != 0) {
+        ::unlink(tmp.c_str()); return false;
+    }
+    return true;
+}
+
+} // namespace colbin
+
+inline LoadedColumns loadColumnsMultiAuto(const std::string& filePath,
+                                           const std::vector<ColSpec>& specs) {
+    // .colbin is the preferred load path; .tbl parsing is the fallback.
+    // Set GPUDB_NO_BINARY=1 to force the .tbl parser (useful for diagnostics).
+    static const bool binaryEnabled = []() {
+        const char* e = ::getenv("GPUDB_NO_BINARY");
+        return !(e && e[0] == '1');
+    }();
+    if (binaryEnabled) {
+        LoadedColumns fromBinary;
+        if (colbin::loadColumnsFromBinary(filePath, specs, fromBinary)) {
+            size_t bsz = 0; int64_t bmt = 0;
+            (void)colbin::statFile(colbin::binaryPath(filePath), bsz, bmt);
+            loadStats().recordBinary(bsz);
+            return fromBinary;
+        }
+        static std::unordered_map<std::string, bool> warned;
+        if (!warned[filePath]) {
+            warned[filePath] = true;
+            std::cerr << "[infra] .colbin missing/stale for " << filePath
+                      << " — using .tbl parser (run `make colbin-sfN` to accelerate).\n";
+        }
+    }
+    struct stat st{};
+    if (::stat(filePath.c_str(), &st) != 0) {
+        loadStats().recordText(0);
+        return loadColumnsMulti(filePath, specs);
+    }
+    loadStats().recordText((size_t)st.st_size);
+    constexpr off_t THRESHOLD = 1LL * 1024 * 1024 * 1024; // 1 GiB
+    // .tbl parse is a one-time ingest cost: time it and report it to
+    // loadStats so callers can subtract it from end-to-end timing.
+    auto _ingest0 = std::chrono::high_resolution_clock::now();
+    LoadedColumns _out = (st.st_size >= THRESHOLD)
+        ? loadColumnsMultiMmap(filePath, specs)
+        : loadColumnsMulti(filePath, specs);
+    auto _ingest1 = std::chrono::high_resolution_clock::now();
+    double _ingestMs = std::chrono::duration<double, std::milli>(_ingest1 - _ingest0).count();
+    loadStats().recordExcluded(_ingestMs);
+    std::cerr << "[tbl-ingest] " << filePath << ": "
+              << std::fixed << std::setprecision(1) << _ingestMs
+              << " ms (one-time, excluded from e2e)\n";
+    return _out;
+}
 // --- Standard Column Loaders (file-based, for SF1/SF10) ---
 template<typename T, typename ParseFn>
 inline std::vector<T> loadColumn(const std::string& filePath, int columnIndex, ParseFn parse) {
@@ -804,20 +1126,45 @@ struct DetailedTiming {
     double bufferAllocMs = 0.0;
     double gpuTotalMs    = 0.0;
     double postMs        = 0.0;
+    std::string loadSource;
+    size_t loadBytes     = 0;
+    double ingestMs      = 0.0;  // one-time .tbl->column ingest (excluded from e2e)
     std::vector<std::pair<std::string, double>> phaseKernelMs; // per-kernel GPU time
 };
 
 inline void printDetailedTimingSummary(const DetailedTiming& t) {
-    const double cpuCodegen = t.analyzeMs + t.planMs + t.codegenMs +
-                              t.compileMs + t.psoMs;
-    const double cpuTotal   = cpuCodegen + t.dataLoadMs + t.bufferAllocMs + t.postMs;
-    const double end2end    = cpuTotal + t.gpuTotalMs;
+    // Terminology (used in the table and the CSV):
+    //   Compile Overhead = SQL analyze + plan + metal codegen/compile + PSO
+    //                      (one-time per query; independent of input size)
+    //   Data Load (I/O)  = time to bring the query's columns into host memory
+    //   Buffer Setup     = Metal buffer allocation (pointers only, no copy)
+    //   GPU Compute      = GPU kernel execution time
+    //   CPU Compute      = CPU post-processing (sort/merge/format)
+    //   Query Compute    = GPU Compute + CPU Compute  (THE actual query work)
+    //   End-to-End       = Compile Overhead + Data Load + Buffer Setup + Query Compute
+    const double compileOverheadMs = t.analyzeMs + t.planMs + t.codegenMs +
+                                     t.compileMs + t.psoMs;
+    const double cpuComputeMs      = t.postMs;
+    const double gpuComputeMs      = t.gpuTotalMs;
+    const double queryComputeMs    = cpuComputeMs + gpuComputeMs;
+    const double end2end           = compileOverheadMs + t.dataLoadMs +
+                                     t.bufferAllocMs + queryComputeMs;
 
     auto bar = []() {
-        printf("  +------------------------+---------------+\n");
+        printf("  +------------------------+-----------------+\n");
     };
-    auto row = [](const char* label, double ms) {
-        printf("  | %-22s | %10.3f ms |\n", label, ms);
+    auto head = [](const char* title) {
+        printf("  | %-38s |\n", title);
+    };
+    auto rowMs = [](const char* label, double ms) {
+        printf("  | %-22s | %12.3f ms |\n", label, ms);
+    };
+    auto rowMsHi = [](const char* label, double ms) {
+        // Trailing "<<" marker draws the eye to the headline metric.
+        printf("  | %-22s | %12.3f ms | <<\n", label, ms);
+    };
+    auto rowStr = [](const char* label, const char* value) {
+        printf("  | %-22s | %15s |\n", label, value);
     };
 
     printf("\n  Timing Breakdown");
@@ -825,41 +1172,90 @@ inline void printDetailedTimingSummary(const DetailedTiming& t) {
     if (!t.scaleFactor.empty()) printf(" @ %s", t.scaleFactor.c_str());
     printf("\n");
 
+    // --- 1. Compile Overhead (one-time per query) -----------------------
     bar();
-    printf("  | %-22s | %-13s |\n", "Stage", "Time");
+    head("Compile Overhead  (one-time)");
     bar();
-    row("SQL Analyze",      t.analyzeMs);
-    row("Plan Build",       t.planMs);
-    row("Metal Codegen",    t.codegenMs);
-    row("Metal Compile",    t.compileMs);
-    row("PSO Creation",     t.psoMs);
-    row("Data Load (.tbl)", t.dataLoadMs);
-    row("GPU Buffer Alloc", t.bufferAllocMs);
+    rowMs("SQL Analyze",    t.analyzeMs);
+    rowMs("Plan Build",     t.planMs);
+    rowMs("Metal Codegen",  t.codegenMs);
+    rowMs("Metal Compile",  t.compileMs);
+    rowMs("PSO Creation",   t.psoMs);
+    rowMs("  subtotal",     compileOverheadMs);
     bar();
-    if (!t.phaseKernelMs.empty()) {
-        for (const auto& [name, ms] : t.phaseKernelMs) {
-            char label[64];
-            snprintf(label, sizeof(label), "  kernel %s", name.c_str());
-            row(label, ms);
-        }
-        bar();
+
+    // --- 2. Data Load (host I/O) ----------------------------------------
+    {
+        char title[64];
+        const char* src = t.loadSource.empty() ? "colbin" : t.loadSource.c_str();
+        snprintf(title, sizeof(title), "Data Load  (I/O, %s)", src);
+        head(title);
     }
-    row("GPU Total",        t.gpuTotalMs);
-    row("CPU Post Process", t.postMs);
     bar();
-    row("CPU Codegen (sum)", cpuCodegen);
-    row("CPU Total",         cpuTotal);
-    row("End-to-End",        end2end);
+    rowMs("Load Time", t.dataLoadMs);
+    if (t.loadBytes > 0) {
+        char buf[32];
+        snprintf(buf, sizeof(buf), "%.1f MiB", (double)t.loadBytes / (1024.0 * 1024.0));
+        rowStr("Bytes", buf);
+    }
+    if (t.loadBytes > 0 && t.dataLoadMs > 0.0) {
+        const double mibps = ((double)t.loadBytes / (1024.0 * 1024.0)) / (t.dataLoadMs / 1000.0);
+        char buf[32];
+        snprintf(buf, sizeof(buf), "%.1f MiB/s", mibps);
+        rowStr("Throughput", buf);
+    }
+    if (t.ingestMs > 0.0) {
+        const char* show = ::getenv("GPUDB_SHOW_INGEST");
+        if (show && show[0] == '1') {
+            rowMs("tbl->col ingest (1x)", t.ingestMs);
+        }
+    }
+    bar();
+
+    // --- 3. Query Execution (the actual compute) ------------------------
+    head("Query Execution  (actual compute)");
+    bar();
+    rowMs("Buffer Setup",   t.bufferAllocMs);
+    for (const auto& [name, ms] : t.phaseKernelMs) {
+        char label[64];
+        snprintf(label, sizeof(label), "  GPU kernel %s", name.c_str());
+        rowMs(label, ms);
+    }
+    rowMs("GPU Compute",    gpuComputeMs);
+    rowMs("CPU Compute",    cpuComputeMs);
+    rowMsHi("Query Compute",     queryComputeMs);
+    bar();
+
+    // --- 4. Totals ------------------------------------------------------
+    head("Totals");
+    bar();
+    rowMs("Compile Overhead",  compileOverheadMs);
+    rowMs("Data Load",         t.dataLoadMs);
+    rowMs("Buffer Setup",      t.bufferAllocMs);
+    rowMs("Query Compute",     queryComputeMs);
+    rowMsHi("End-to-End",      end2end);
     bar();
 
     // Machine-readable single line for CSV harvesting.
-    // Fields: tag, sf, query, analyze, plan, codegen, compile, pso,
-    //         dataload, bufalloc, gpu, post, cpu_codegen, cpu_total, end2end
-    printf("TIMING_CSV,%s,%s,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f\n",
+    // Kept back-compatible with prior field order. Renamed fields (same slot):
+    //   gpu_ms      -> gpu_compute_ms
+    //   post_ms     -> cpu_compute_ms
+    //   cpu_codegen -> compile_overhead_ms
+    //   cpu_total   -> compile_overhead + data_load + buffer_setup + cpu_compute
+    //                  (retained for legacy scripts; excludes GPU)
+    // Appended: query_compute_ms = cpu_compute_ms + gpu_compute_ms
+    double loadMibps = (t.dataLoadMs > 0.0 && t.loadBytes > 0)
+        ? ((double)t.loadBytes / (1024.0*1024.0)) / (t.dataLoadMs / 1000.0)
+        : 0.0;
+    const double cpuTotalLegacy = compileOverheadMs + t.dataLoadMs +
+                                  t.bufferAllocMs + cpuComputeMs;
+    printf("TIMING_CSV,%s,%s,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%s,%zu,%.3f,%.3f,%.3f\n",
            t.scaleFactor.c_str(), t.queryName.c_str(),
            t.analyzeMs, t.planMs, t.codegenMs, t.compileMs, t.psoMs,
-           t.dataLoadMs, t.bufferAllocMs, t.gpuTotalMs, t.postMs,
-           cpuCodegen, cpuTotal, end2end);
+           t.dataLoadMs, t.bufferAllocMs, gpuComputeMs, cpuComputeMs,
+           compileOverheadMs, cpuTotalLegacy, end2end,
+           t.loadSource.empty() ? "none" : t.loadSource.c_str(),
+           t.loadBytes, loadMibps, t.ingestMs, queryComputeMs);
 }
 
 // --- Bitmap Buffer Creation ---

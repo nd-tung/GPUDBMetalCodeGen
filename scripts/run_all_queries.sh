@@ -70,7 +70,7 @@ GIT_COMMIT="$(git rev-parse --short HEAD 2>/dev/null || echo none)"
     echo "# git_commit=$GIT_COMMIT"
     echo "# timestamp=$TS"
     # NOTE: gpu/gpu_budget extracted from first SYSINFO_CSV line below
-    echo "scale_factor,query,status,analyze_ms,plan_ms,codegen_ms,compile_ms,pso_ms,dataload_ms,bufalloc_ms,gpu_ms,post_ms,cpu_codegen_ms,cpu_total_ms,end2end_ms,gpu_name,gpu_budget_bytes"
+    echo "scale_factor,query,status,analyze_ms,plan_ms,codegen_ms,compile_ms,pso_ms,dataload_ms,bufalloc_ms,gpu_compute_ms,cpu_compute_ms,compile_overhead_ms,cpu_total_ms,end2end_ms,load_source,load_bytes,load_mibps,ingest_ms,query_compute_ms,gpu_name,gpu_budget_bytes"
 } > "$OUTPUT"
 
 GPU_NAME=""
@@ -100,20 +100,20 @@ run_one() {
     local timing
     timing="$(grep -m1 '^TIMING_CSV,' "$log" || true)"
     if [[ -z "$timing" ]]; then
-        echo "${sf},${q},NO_TIMING,,,,,,,,,,,,,${GPU_NAME},${GPU_BUDGET}" >> "$OUTPUT"
+        echo "${sf},${q},NO_TIMING,,,,,,,,,,,,,,,,,,${GPU_NAME},${GPU_BUDGET}" >> "$OUTPUT"
         return
     fi
 
-    # TIMING_CSV,sf,query,analyze,plan,codegen,compile,pso,dataload,bufalloc,gpu,post,cpu_codegen,cpu_total,end2end
+    # TIMING_CSV,sf,query,analyze,plan,codegen,compile,pso,dataload,bufalloc,
+    #           gpu_compute,cpu_compute,compile_overhead,cpu_total,end2end,
+    #           load_source,load_bytes,load_mibps,ingest_ms,query_compute
     local body="${timing#TIMING_CSV,}"
-    # Append status=OK, and gpu_name/gpu_budget to keep each row fully self-describing.
-    echo "${body/,/,},OK,${body#*,*,},${GPU_NAME},${GPU_BUDGET}" >/dev/null 2>&1 || true
-    # Cleaner: reconstruct with awk.
     awk -v gpu="$GPU_NAME" -v bud="$GPU_BUDGET" -F',' '
     {
-        # $1=sf, $2=query, $3..$15 = timings
+        # $1=sf, $2=query, $3..$15 numeric timings,
+        # $16=src, $17=bytes, $18=mibps, $19=ingest, $20=query_compute
         printf "%s,%s,OK", $1, $2;
-        for (i = 3; i <= 15; i++) printf ",%s", $i;
+        for (i = 3; i <= 20; i++) printf ",%s", $i;
         printf ",%s,%s\n", gpu, bud;
     }' <<< "$body" >> "$OUTPUT"
 }
