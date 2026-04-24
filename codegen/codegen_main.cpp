@@ -79,15 +79,24 @@ static void runCodegenQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
                             const std::string& sql, const std::string& queryName) {
     printf("\n=== Codegen: %s ===\n", queryName.c_str());
     try {
+        using clk = std::chrono::high_resolution_clock;
+        auto elapsedMs = [](clk::time_point a, clk::time_point b) {
+            return std::chrono::duration<double, std::milli>(b - a).count();
+        };
+        DetailedTiming timing{};
+
         // 1. Analyze SQL
+        auto tAnalyze0 = clk::now();
         codegen::AnalyzedQuery analyzed;
         try {
             analyzed = codegen::analyzeSQL(sql);
         } catch (...) {
             // Name-based builders don't need analyzed query
         }
+        timing.analyzeMs = elapsedMs(tAnalyze0, clk::now());
 
         // 2. Build operator-based plan
+        auto tPlan0 = clk::now();
         auto maybePlan = codegen::buildMetalPlan(analyzed, queryName);
         if (!maybePlan) {
             std::cerr << "Codegen: query pattern not yet supported for " << queryName << std::endl;
@@ -95,10 +104,13 @@ static void runCodegenQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
         }
         auto& plan = *maybePlan;
         plan.name = queryName;
+        timing.planMs = elapsedMs(tPlan0, clk::now());
 
         // 3. Generate Metal source via producer-consumer operators
+        auto tCodegen0 = clk::now();
         auto cg = codegen::generateFromPlan(plan);
         std::string metalSource = cg.print();
+        timing.codegenMs = elapsedMs(tCodegen0, clk::now());
 
         printf("Generated Metal source (%zu bytes, %d phase(s))\n",
                metalSource.size(), cg.phaseCount());
@@ -110,15 +122,18 @@ static void runCodegenQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
             printf("  (written to debug/codegen_debug_%s.metal)\n", queryName.c_str());
         }
 
-        // 4. Compile
+        // 4. Compile Metal source → MTLLibrary
+        auto tCompile0 = clk::now();
         codegen::RuntimeCompiler compiler(device);
         auto* library = compiler.compile(metalSource);
+        timing.compileMs = elapsedMs(tCompile0, clk::now());
         if (!library) {
             std::cerr << "Codegen: Metal compilation failed" << std::endl;
             return;
         }
 
         // Build CompiledQuery with PSOs for each phase
+        auto tPso0 = clk::now();
         codegen::RuntimeCompiler::CompiledQuery compiled;
         compiled.library = library;
         for (const auto& phase : cg.getPhases()) {
@@ -130,6 +145,7 @@ static void runCodegenQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
             compiled.pipelines.push_back(pso);
             compiled.kernelNames.push_back(phase.name);
         }
+        timing.psoMs = elapsedMs(tPso0, clk::now());
 
         // 5. Load data — determine which columns to load from bindings
         auto parseStart = std::chrono::high_resolution_clock::now();
@@ -914,9 +930,18 @@ static void runCodegenQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
         // 6. Execute
         auto parseEnd = std::chrono::high_resolution_clock::now();
         double parseMs = std::chrono::duration<double, std::milli>(parseEnd - parseStart).count();
+        timing.dataLoadMs = parseMs;
 
         auto result = executor.execute(compiled, cg, 2, 1);
         result.parseTimeMs = static_cast<float>(parseMs);
+        timing.bufferAllocMs = result.bufferAllocTimeMs;
+        timing.gpuTotalMs    = result.totalKernelTimeMs;
+        timing.phaseKernelMs.clear();
+        for (size_t i = 0; i < result.phaseTimesMs.size(); i++) {
+            const std::string name = (i < result.phaseNames.size())
+                ? result.phaseNames[i] : ("phase" + std::to_string(i));
+            timing.phaseKernelMs.emplace_back(name, (double)result.phaseTimesMs[i]);
+        }
 
         auto postStart = std::chrono::high_resolution_clock::now();
 
@@ -1503,9 +1528,11 @@ static void runCodegenQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
 
         auto postEnd = std::chrono::high_resolution_clock::now();
         double postMs = std::chrono::duration<double, std::milli>(postEnd - postStart).count();
+        timing.postMs = postMs;
 
         printf("\nTiming:\n");
         printTimingSummary(result.parseTimeMs, result.totalKernelTimeMs, postMs);
+        printDetailedTimingSummary(timing);
 
         executor.releaseAllocatedBuffers();
     } catch (const std::exception& e) {

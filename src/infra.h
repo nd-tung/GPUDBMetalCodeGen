@@ -515,6 +515,56 @@ inline void printTimingSummary(double parseMs, double gpuMs, double postMs) {
     printf("  Total Execution:    %10.2f ms  (GPU + CPU post)\n", gpuMs + postMs);
 }
 
+// --- Detailed Timing Summary (codegen pipeline breakdown) ---
+// Prints each pipeline stage, per-kernel GPU time, and totals.
+// Any stage <= 0 is skipped.
+struct DetailedTiming {
+    double analyzeMs     = 0.0;
+    double planMs        = 0.0;
+    double codegenMs     = 0.0;
+    double compileMs     = 0.0;
+    double psoMs         = 0.0;
+    double dataLoadMs    = 0.0;
+    double bufferAllocMs = 0.0;
+    double gpuTotalMs    = 0.0;
+    double postMs        = 0.0;
+    std::vector<std::pair<std::string, double>> phaseKernelMs; // per-kernel GPU time
+};
+
+inline void printDetailedTimingSummary(const DetailedTiming& t) {
+    auto row = [](const char* label, double ms) {
+        if (ms > 0.0) printf("  %-22s %10.3f ms\n", label, ms);
+    };
+    printf("\nTiming Breakdown:\n");
+    printf("  --- Codegen pipeline (CPU) ---\n");
+    row("SQL Analyze:",        t.analyzeMs);
+    row("Plan Build:",         t.planMs);
+    row("Metal Codegen:",      t.codegenMs);
+    row("Metal Compile:",      t.compileMs);
+    row("PSO Creation:",       t.psoMs);
+    row("Data Load (.tbl):",   t.dataLoadMs);
+    row("GPU Buffer Alloc:",   t.bufferAllocMs);
+
+    double cpuCodegen = t.analyzeMs + t.planMs + t.codegenMs +
+                        t.compileMs + t.psoMs;
+    double cpuTotal   = cpuCodegen + t.dataLoadMs + t.bufferAllocMs + t.postMs;
+
+    printf("  --- GPU execution ---\n");
+    if (!t.phaseKernelMs.empty()) {
+        for (const auto& [name, ms] : t.phaseKernelMs) {
+            printf("    kernel %-18s %10.3f ms\n", name.c_str(), ms);
+        }
+    }
+    row("GPU Total:",          t.gpuTotalMs);
+    printf("  --- Post-processing (CPU) ---\n");
+    row("CPU Post Process:",   t.postMs);
+    printf("  ------------------------------\n");
+    printf("  %-22s %10.3f ms\n", "CPU Codegen (sum):", cpuCodegen);
+    printf("  %-22s %10.3f ms\n", "CPU Total:",         cpuTotal);
+    printf("  %-22s %10.3f ms  (CPU total + GPU)\n",
+           "End-to-End:", cpuTotal + t.gpuTotalMs);
+}
+
 // --- Bitmap Buffer Creation ---
 inline MTL::Buffer* createBitmapBuffer(MTL::Device* device, int maxKey) {
     const uint ints = (maxKey + 31) / 32 + 1;

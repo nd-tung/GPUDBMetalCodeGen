@@ -22,10 +22,23 @@ namespace codegen {
 
 struct MetalExecutionResult {
     GenericResult result;
+    // GPU totals (measured run only)
     float totalKernelTimeMs = 0.0f;
-    std::vector<float> phaseTimesMs;
-    float parseTimeMs = 0.0f;
-    float postTimeMs = 0.0f;
+    std::vector<float> phaseTimesMs;        // per-phase GPU time on the measured run
+    std::vector<std::string> phaseNames;    // parallel to phaseTimesMs
+
+    // CPU-side sub-phases (filled by caller)
+    float analyzeTimeMs    = 0.0f;  // SQL → AnalyzedQuery
+    float planTimeMs       = 0.0f;  // AnalyzedQuery → MetalQueryPlan
+    float codegenTimeMs    = 0.0f;  // Plan → Metal source
+    float compileTimeMs    = 0.0f;  // Metal source → MTLLibrary
+    float psoTimeMs        = 0.0f;  // MTLLibrary → pipeline states
+    float dataLoadTimeMs   = 0.0f;  // .tbl parse + host buffer fill + per-query setup
+    float bufferAllocTimeMs = 0.0f; // GPU buffer allocation / upload inside execute()
+
+    // Legacy aggregate (== dataLoadTimeMs), kept for backwards compatibility
+    float parseTimeMs      = 0.0f;
+    float postTimeMs       = 0.0f;
 };
 
 class MetalGenericExecutor {

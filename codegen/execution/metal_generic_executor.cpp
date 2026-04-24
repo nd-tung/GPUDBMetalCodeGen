@@ -243,7 +243,8 @@ MetalExecutionResult MetalGenericExecutor::execute(
         return execResult;
     }
 
-    // Pre-allocate all buffers across all phases
+    // Pre-allocate all buffers across all phases (timed)
+    auto allocStart = std::chrono::high_resolution_clock::now();
     BufferMap allBuffers;
     for (const auto& phase : phases) {
         auto phaseBuffers = allocatePhaseBuffers(phase);
@@ -252,6 +253,9 @@ MetalExecutionResult MetalGenericExecutor::execute(
                 allBuffers[k] = v;
         }
     }
+    auto allocEnd = std::chrono::high_resolution_clock::now();
+    execResult.bufferAllocTimeMs = static_cast<float>(
+        std::chrono::duration<double, std::milli>(allocEnd - allocStart).count());
 
     int totalRuns = warmupRuns + measuredRuns;
 
@@ -261,10 +265,67 @@ MetalExecutionResult MetalGenericExecutor::execute(
             zeroInitBuffers(phase, allBuffers);
         }
 
-        auto* cmdBuf = cmdQueue_->commandBuffer();
-        auto* encoder = cmdBuf->computeCommandEncoder();
+        const bool isMeasured = (iter == totalRuns - 1);
 
-        std::vector<float> phaseTimes;
+        if (!isMeasured) {
+            // Warmup run: single command buffer for all phases (fastest path)
+            auto* cmdBuf = cmdQueue_->commandBuffer();
+            auto* encoder = cmdBuf->computeCommandEncoder();
+
+            for (size_t pi = 0; pi < phases.size(); pi++) {
+                const auto& phase = phases[pi];
+                auto* pso = findPSO(compiled, phase.name);
+                if (!pso) {
+                    std::cerr << "MetalGenericExecutor: PSO not found for '"
+                              << phase.name << "'\n";
+                    continue;
+                }
+                encoder->setComputePipelineState(pso);
+                bindPhaseBuffers(encoder, phase, allBuffers);
+
+                NS::UInteger tgSize = pso->maxTotalThreadsPerThreadgroup();
+                if (tgSize > (NS::UInteger)phase.threadgroupSize)
+                    tgSize = phase.threadgroupSize;
+
+                if (phase.isSingleThread) {
+                    encoder->dispatchThreadgroups(MTL::Size::Make(1, 1, 1),
+                                                  MTL::Size::Make(1, 1, 1));
+                } else {
+                    NS::UInteger numTG = 1024;
+                    if (!phase.scannedTable.empty()) {
+                        std::string sym = "n_" + phase.scannedTable;
+                        if (sizeResolver_.hasSymbol(sym)) {
+                            size_t rowCount = sizeResolver_.getSymbol(sym);
+                            NS::UInteger computed = (rowCount + tgSize - 1) / tgSize;
+                            if (computed > 1024) numTG = computed;
+                            if (numTG > 65535) numTG = 65535;
+                        }
+                    }
+                    if (phase.maxThreadgroups > 0 &&
+                        numTG > (NS::UInteger)phase.maxThreadgroups) {
+                        numTG = phase.maxThreadgroups;
+                    }
+                    encoder->dispatchThreadgroups(MTL::Size::Make(numTG, 1, 1),
+                                                  MTL::Size::Make(tgSize, 1, 1));
+                }
+
+                if (pi + 1 < phases.size()) {
+                    encoder->memoryBarrier(MTL::BarrierScopeBuffers);
+                }
+            }
+
+            encoder->endEncoding();
+            cmdBuf->commit();
+            cmdBuf->waitUntilCompleted();
+            continue;
+        }
+
+        // Measured run: one command buffer per phase for per-kernel timing.
+        double totalGpuSec = 0.0;
+        execResult.phaseTimesMs.clear();
+        execResult.phaseNames.clear();
+        execResult.phaseTimesMs.reserve(phases.size());
+        execResult.phaseNames.reserve(phases.size());
 
         for (size_t pi = 0; pi < phases.size(); pi++) {
             const auto& phase = phases[pi];
@@ -272,13 +333,17 @@ MetalExecutionResult MetalGenericExecutor::execute(
             if (!pso) {
                 std::cerr << "MetalGenericExecutor: PSO not found for '"
                           << phase.name << "'\n";
+                execResult.phaseTimesMs.push_back(0.0f);
+                execResult.phaseNames.push_back(phase.name);
                 continue;
             }
+
+            auto* cmdBuf = cmdQueue_->commandBuffer();
+            auto* encoder = cmdBuf->computeCommandEncoder();
 
             encoder->setComputePipelineState(pso);
             bindPhaseBuffers(encoder, phase, allBuffers);
 
-            // Dispatch configuration
             NS::UInteger tgSize = pso->maxTotalThreadsPerThreadgroup();
             if (tgSize > (NS::UInteger)phase.threadgroupSize)
                 tgSize = phase.threadgroupSize;
@@ -287,8 +352,7 @@ MetalExecutionResult MetalGenericExecutor::execute(
                 encoder->dispatchThreadgroups(MTL::Size::Make(1, 1, 1),
                                               MTL::Size::Make(1, 1, 1));
             } else {
-                // Dynamic grid sizing: compute threadgroup count from scanned table size
-                NS::UInteger numTG = 1024; // default fallback
+                NS::UInteger numTG = 1024;
                 if (!phase.scannedTable.empty()) {
                     std::string sym = "n_" + phase.scannedTable;
                     if (sizeResolver_.hasSymbol(sym)) {
@@ -298,29 +362,25 @@ MetalExecutionResult MetalGenericExecutor::execute(
                         if (numTG > 65535) numTG = 65535;
                     }
                 }
-                // Cap threadgroups for phases with TG reduction
-                if (phase.maxThreadgroups > 0 && numTG > (NS::UInteger)phase.maxThreadgroups) {
+                if (phase.maxThreadgroups > 0 &&
+                    numTG > (NS::UInteger)phase.maxThreadgroups) {
                     numTG = phase.maxThreadgroups;
                 }
                 encoder->dispatchThreadgroups(MTL::Size::Make(numTG, 1, 1),
                                               MTL::Size::Make(tgSize, 1, 1));
             }
 
-            // Add memory barrier between phases
-            if (pi + 1 < phases.size()) {
-                encoder->memoryBarrier(MTL::BarrierScopeBuffers);
-            }
+            encoder->endEncoding();
+            cmdBuf->commit();
+            cmdBuf->waitUntilCompleted();
+
+            double phaseSec = cmdBuf->GPUEndTime() - cmdBuf->GPUStartTime();
+            totalGpuSec += phaseSec;
+            execResult.phaseTimesMs.push_back(static_cast<float>(phaseSec * 1000.0));
+            execResult.phaseNames.push_back(phase.name);
         }
 
-        encoder->endEncoding();
-        cmdBuf->commit();
-        cmdBuf->waitUntilCompleted();
-
-        // Measure last run
-        if (iter == totalRuns - 1) {
-            execResult.totalKernelTimeMs =
-                static_cast<float>((cmdBuf->GPUEndTime() - cmdBuf->GPUStartTime()) * 1000.0);
-        }
+        execResult.totalKernelTimeMs = static_cast<float>(totalGpuSec * 1000.0);
     }
 
     // Collect results
