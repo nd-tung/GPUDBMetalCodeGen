@@ -176,8 +176,8 @@ static void runCodegenQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
             }
         }
 
-        // Load each table's columns and register with executor
-        std::vector<std::pair<std::string, LoadedColumns>> loadedTables;
+        // Load each table's columns and register with executor (zero-copy via QueryColumns).
+        std::vector<std::pair<std::string, QueryColumns>> loadedTables;
         for (auto& [tableName, colNames] : tableCols) {
             const auto& tdef = schema.table(tableName);
             std::vector<ColSpec> specs;
@@ -194,39 +194,20 @@ static void runCodegenQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
                 specs.emplace_back(cdef.index, ct, cdef.fixedWidth);
             }
 
-            auto cols = loadColumnsMultiAuto(g_dataset_path + tableName + ".tbl", specs);
+            auto cols = loadQueryColumns(device, g_dataset_path + tableName + ".tbl", specs);
 
-            size_t rowCount = 0;
+            size_t rowCount = cols.rows();
             for (const auto& colName : colNames) {
                 auto& cdef = tdef.col(colName);
-                switch (cdef.type) {
-                    case codegen::DataType::INT:
-                    case codegen::DataType::DATE: {
-                        auto& data = cols.ints(cdef.index);
-                        rowCount = data.size();
-                        executor.registerColumn(colName, data.data(), data.size(), sizeof(int));
-                        break;
-                    }
-                    case codegen::DataType::FLOAT: {
-                        auto& data = cols.floats(cdef.index);
-                        rowCount = data.size();
-                        executor.registerColumn(colName, data.data(), data.size(), sizeof(float));
-                        break;
-                    }
-                    case codegen::DataType::CHAR1: {
-                        auto& data = cols.chars(cdef.index);
-                        rowCount = data.size();
-                        executor.registerColumn(colName, data.data(), data.size(), sizeof(char));
-                        break;
-                    }
-                    case codegen::DataType::CHAR_FIXED: {
-                        auto& data = cols.chars(cdef.index);
-                        int fw = cdef.fixedWidth > 0 ? cdef.fixedWidth : 1;
-                        rowCount = data.size() / fw;
-                        executor.registerColumn(colName, data.data(), rowCount, fw);
-                        break;
-                    }
+                MTL::Buffer* buf = cols.buffer(cdef.index);
+                if (!buf) continue;
+                size_t count = rowCount;
+                if (cdef.type == codegen::DataType::CHAR_FIXED) {
+                    // rowCount is already rows; registerTableBuffer expects row count.
+                } else if (cdef.type == codegen::DataType::CHAR1) {
+                    // one char per row; rowCount == bytes.
                 }
+                executor.registerTableBuffer(colName, buf, count);
             }
 
             executor.registerTableRowCount(tableName, rowCount);
@@ -240,19 +221,21 @@ static void runCodegenQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
             int maxCk = 0, maxSk = 0, maxOk = 0, maxPk = 0;
             for (auto& [tblName, cols] : loadedTables) {
                 const auto& tdef = schema.table(tblName);
+                size_t nRows = cols.rows();
                 for (const auto& colName : tableCols[tblName]) {
                     auto& cdef = tdef.col(colName);
                     if (cdef.type != codegen::DataType::INT && cdef.type != codegen::DataType::DATE)
                         continue;
-                    auto& data = cols.ints(cdef.index);
+                    const int* data = cols.ints(cdef.index);
+                    if (!data) continue;
                     if (colName == "c_custkey" || colName == "o_custkey")
-                        for (int k : data) maxCk = std::max(maxCk, k);
+                        for (size_t i = 0; i < nRows; ++i) maxCk = std::max(maxCk, data[i]);
                     else if (colName == "s_suppkey" || colName == "l_suppkey" || colName == "ps_suppkey")
-                        for (int k : data) maxSk = std::max(maxSk, k);
+                        for (size_t i = 0; i < nRows; ++i) maxSk = std::max(maxSk, data[i]);
                     else if (colName == "o_orderkey" || colName == "l_orderkey")
-                        for (int k : data) maxOk = std::max(maxOk, k);
+                        for (size_t i = 0; i < nRows; ++i) maxOk = std::max(maxOk, data[i]);
                     else if (colName == "p_partkey" || colName == "l_partkey" || colName == "ps_partkey")
-                        for (int k : data) maxPk = std::max(maxPk, k);
+                        for (size_t i = 0; i < nRows; ++i) maxPk = std::max(maxPk, data[i]);
                 }
             }
             executor.registerSymbol("maxCustkey", maxCk + 1);
@@ -310,9 +293,9 @@ static void runCodegenQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
             for (auto& [tblName, cols] : loadedTables) {
                 if (tblName == "customer") {
                     const auto& tdef = codegen::TPCHSchema::instance().table("customer");
-                    auto& phoneCols = cols.chars(tdef.col("c_phone").index);
-                    auto& balCols = cols.floats(tdef.col("c_acctbal").index);
-                    size_t custCount = balCols.size();
+                    const char*  phoneCols = cols.chars(tdef.col("c_phone").index);
+                    const float* balCols   = cols.floats(tdef.col("c_acctbal").index);
+                    size_t custCount = cols.rows();
                     double sumBal = 0.0;
                     int countBal = 0;
                     for (size_t j = 0; j < custCount; j++) {
@@ -351,15 +334,15 @@ static void runCodegenQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
             auto& p_container = pCols.chars(6);
             size_t partRows = p_partkey.size();
 
-            std::vector<int>* pl_partkey = nullptr;
-            std::vector<float>* pl_quantity = nullptr;
+            const int*   pl_partkey = nullptr;
+            const float* pl_quantity = nullptr;
             size_t liRows = 0;
             const auto& tpchSchema = codegen::TPCHSchema::instance();
             for (auto& [tblName, cols] : loadedTables) {
                 if (tblName == "lineitem") {
-                    pl_partkey = &cols.ints(tpchSchema.table("lineitem").col("l_partkey").index);
-                    pl_quantity = &cols.floats(tpchSchema.table("lineitem").col("l_quantity").index);
-                    liRows = pl_partkey->size();
+                    pl_partkey  = cols.ints  (tpchSchema.table("lineitem").col("l_partkey").index);
+                    pl_quantity = cols.floats(tpchSchema.table("lineitem").col("l_quantity").index);
+                    liRows = cols.rows();
                 }
             }
             if (pl_partkey) {
@@ -383,9 +366,9 @@ static void runCodegenQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
                 std::vector<double> sumQty(mapSize, 0.0);
                 std::vector<int> cntQty(mapSize, 0);
                 for (size_t i = 0; i < liRows; i++) {
-                    int pk = (*pl_partkey)[i];
+                    int pk = pl_partkey[i];
                     if (pk >= 0 && (size_t)pk < mapSize && (bitmap[pk / 32] >> (pk % 32)) & 1) {
-                        sumQty[pk] += (*pl_quantity)[i];
+                        sumQty[pk] += pl_quantity[i];
                         cntQty[pk]++;
                     }
                 }
@@ -755,8 +738,9 @@ static void runCodegenQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
             const auto& tpchSchema3 = codegen::TPCHSchema::instance();
             for (auto& [tblName, cols] : loadedTables) {
                 if (tblName == "supplier") {
-                    auto& skCol = cols.ints(tpchSchema3.table("supplier").col("s_suppkey").index);
-                    for (int sk : skCol) maxSk = std::max(maxSk, sk);
+                    const int* skCol = cols.ints(tpchSchema3.table("supplier").col("s_suppkey").index);
+                    size_t n = cols.rows();
+                    if (skCol) for (size_t i = 0; i < n; ++i) maxSk = std::max(maxSk, skCol[i]);
                 }
             }
             size_t complaintBmpInts = ((size_t)maxSk + 32) / 32;
@@ -894,8 +878,9 @@ static void runCodegenQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
             const auto& tpchSchema2 = codegen::TPCHSchema::instance();
             for (auto& [tblName, cols] : loadedTables) {
                 if (tblName == "orders") {
-                    auto& okCol = cols.ints(tpchSchema2.table("orders").col("o_orderkey").index);
-                    for (int ok : okCol) maxOk = std::max(maxOk, ok);
+                    const int* okCol = cols.ints(tpchSchema2.table("orders").col("o_orderkey").index);
+                    size_t n = cols.rows();
+                    if (okCol) for (size_t i = 0; i < n; ++i) maxOk = std::max(maxOk, okCol[i]);
                 }
             }
 
@@ -1568,11 +1553,16 @@ int main(int argc, const char* argv[]) {
         std::string arg(argv[i]);
         if (arg == "help" || arg == "--help" || arg == "-h") {
             printf("GPU Database Codegen\n");
-            printf("Usage: GPUDBCodegen [sf1|sf10|sf50|sf100] q<N>\n");
-            printf("  q1..q22  - Run TPC-H query via codegen pipeline\n");
-            printf("  all      - Run all 22 queries\n");
+            printf("Usage: GPUDBCodegen [flags] [sf1|sf10|sf50|sf100] q<N>\n");
+            printf("  q1..q22       - Run TPC-H query via codegen pipeline\n");
+            printf("  all           - Run all 22 queries\n");
+            printf("Flags:\n");
+            printf("  --no-zerocopy - Disable zero-copy mmap path (force buffer copies)\n");
+            printf("  --no-binary   - Disable .colbin binary loader (force .tbl parser)\n");
             return 0;
         }
+        if (arg == "--no-zerocopy") { ::setenv("GPUDB_NO_ZEROCOPY", "1", 1); continue; }
+        if (arg == "--no-binary")   { ::setenv("GPUDB_NO_BINARY",   "1", 1); continue; }
         if (arg == "sf1")  { g_dataset_path = "data/SF-1/"; continue; }
         if (arg == "sf10") { g_dataset_path = "data/SF-10/"; continue; }
         if (arg == "sf50") { g_dataset_path = "data/SF-50/"; continue; }

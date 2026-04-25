@@ -659,8 +659,8 @@ inline LoadedColumns loadColumnsMultiAuto(const std::string& filePath,
 
 namespace colbin {
 static constexpr char     MAGIC[8]   = {'T','P','C','H','C','B','0','1'};
-static constexpr uint32_t VERSION    = 1;
-static constexpr size_t   ALIGN      = 16;
+static constexpr uint32_t VERSION    = 2;
+static constexpr size_t   ALIGN      = 16384;
 
 struct FileHeader {
     char     magic[8];
@@ -913,6 +913,281 @@ inline bool writeColbin(const std::string& tblPath,
 }
 
 } // namespace colbin
+
+// ===================================================================
+// ZERO-COPY COLUMN BUFFERS (requires .colbin v2 with page-aligned payloads)
+// -------------------------------------------------------------------
+// Instead of memcpy'ing column data through std::vector and then a second
+// memcpy into an MTLBuffer, we mmap the .colbin file once and ask Metal to
+// wrap each page-aligned payload directly as an MTL::Buffer (via
+// newBufferWithBytesNoCopy). On Apple Silicon the GPU shares page tables
+// with the CPU, so these buffers are immediately GPU-readable without any
+// copy or coherence pass. This eliminates both the tbl-parse cost and the
+// host->buffer staging cost on the warm path.
+// ===================================================================
+struct MappedColumns {
+    std::unordered_map<int, MTL::Buffer*> buffers;
+    size_t nRows = 0;
+    void*  mapBase = nullptr;
+    size_t mapSize = 0;
+
+    MappedColumns() = default;
+    MappedColumns(const MappedColumns&) = delete;
+    MappedColumns& operator=(const MappedColumns&) = delete;
+    MappedColumns(MappedColumns&& o) noexcept
+      : buffers(std::move(o.buffers)), nRows(o.nRows),
+        mapBase(o.mapBase), mapSize(o.mapSize) {
+        o.mapBase = nullptr; o.mapSize = 0;
+    }
+    MappedColumns& operator=(MappedColumns&& o) noexcept {
+        if (this != &o) {
+            reset();
+            buffers  = std::move(o.buffers);
+            nRows    = o.nRows;
+            mapBase  = o.mapBase;
+            mapSize  = o.mapSize;
+            o.mapBase = nullptr; o.mapSize = 0;
+        }
+        return *this;
+    }
+    ~MappedColumns() { reset(); }
+
+    MTL::Buffer* get(int col) const {
+        auto it = buffers.find(col);
+        return it == buffers.end() ? nullptr : it->second;
+    }
+    bool valid() const { return mapBase != nullptr && !buffers.empty(); }
+
+    void reset() {
+        for (auto& [k, b] : buffers) if (b) b->release();
+        buffers.clear();
+        if (mapBase && mapSize) ::munmap(mapBase, mapSize);
+        mapBase = nullptr; mapSize = 0;
+    }
+};
+
+namespace colbin {
+
+inline MappedColumns loadColumnsAsBuffers(MTL::Device* device,
+                                           const std::string& tblPath,
+                                           const std::vector<ColSpec>& specs) {
+    MappedColumns out;
+    if (!device) return out;
+
+    const std::string cp = binaryPath(tblPath);
+    size_t tblSize = 0; int64_t tblMtime = 0;
+    if (!statFile(tblPath, tblSize, tblMtime)) return out;
+
+    int fd = ::open(cp.c_str(), O_RDONLY);
+    if (fd < 0) return out;
+
+    struct stat st{};
+    if (::fstat(fd, &st) != 0) { ::close(fd); return out; }
+    size_t fileSize = (size_t)st.st_size;
+    if (fileSize < sizeof(FileHeader)) { ::close(fd); return out; }
+
+    void* base = ::mmap(nullptr, fileSize, PROT_READ, MAP_PRIVATE, fd, 0);
+    ::close(fd);
+    if (base == MAP_FAILED) return out;
+
+    FileHeader hdr;
+    memcpy(&hdr, base, sizeof(hdr));
+    if (memcmp(hdr.magic, MAGIC, 8) != 0 ||
+        hdr.version != VERSION ||
+        hdr.source_size != tblSize ||
+        hdr.source_mtime_ns != tblMtime) {
+        ::munmap(base, fileSize);
+        return out;
+    }
+    if (sizeof(FileHeader) + hdr.n_cols * sizeof(ColDesc) > fileSize) {
+        ::munmap(base, fileSize);
+        return out;
+    }
+
+    const ColDesc* descs = (const ColDesc*)((const char*)base + sizeof(FileHeader));
+    std::unordered_map<int, const ColDesc*> byIdx;
+    byIdx.reserve(hdr.n_cols);
+    for (uint32_t i = 0; i < hdr.n_cols; i++) byIdx[descs[i].columnIndex] = &descs[i];
+
+    for (const auto& s : specs) {
+        auto it = byIdx.find(s.columnIndex);
+        if (it == byIdx.end())                 { ::munmap(base, fileSize); return MappedColumns{}; }
+        const ColDesc* d = it->second;
+        if (decodeType(d->dtype) != s.type)    { ::munmap(base, fileSize); return MappedColumns{}; }
+        if (s.type == ColType::CHAR_FIXED && d->fixedWidth != s.fixedWidth) {
+            ::munmap(base, fileSize); return MappedColumns{};
+        }
+        if (d->offset % ALIGN != 0) {
+            ::munmap(base, fileSize); return MappedColumns{};
+        }
+        if (d->offset + d->size_bytes > fileSize) {
+            ::munmap(base, fileSize); return MappedColumns{};
+        }
+        void* colPtr = (char*)base + d->offset;
+        MTL::Buffer* buf = device->newBuffer(colPtr, d->size_bytes,
+                                              MTL::ResourceStorageModeShared,
+                                              nullptr /* no deallocator: we own the mmap */);
+        if (!buf) {
+            ::munmap(base, fileSize);
+            return MappedColumns{};
+        }
+        out.buffers[s.columnIndex] = buf;
+    }
+    out.nRows   = hdr.n_rows;
+    out.mapBase = base;
+    out.mapSize = fileSize;
+    return out;
+}
+
+} // namespace colbin (zero-copy API re-opened)
+
+inline bool zeroCopyEnabled() {
+    static const bool v = []() {
+        const char* e = ::getenv("GPUDB_NO_ZEROCOPY");
+        return !(e && e[0] == '1');
+    }();
+    return v;
+}
+
+// ===================================================================
+// QueryColumns — unified column source for GPU queries.
+// Backed by either zero-copy mmap (default) or copy-path fallback.
+// GPUDB_NO_ZEROCOPY=1 forces the legacy copy path for A/B testing.
+// ===================================================================
+class QueryColumns {
+public:
+    QueryColumns() = default;
+    QueryColumns(const QueryColumns&) = delete;
+    QueryColumns& operator=(const QueryColumns&) = delete;
+    QueryColumns(QueryColumns&& o) noexcept { moveFrom(std::move(o)); }
+    QueryColumns& operator=(QueryColumns&& o) noexcept {
+        if (this != &o) { releaseOwned(); moveFrom(std::move(o)); }
+        return *this;
+    }
+    ~QueryColumns() { releaseOwned(); }
+
+    size_t       rows()                   const { return rows_; }
+    MTL::Buffer* buffer(int col)          const { auto it = buffers_.find(col); return it==buffers_.end()?nullptr:it->second; }
+    const int*   ints  (int col)          const { auto it = intPtrs_.find(col);   return it==intPtrs_.end()?nullptr:it->second; }
+    const float* floats(int col)          const { auto it = floatPtrs_.find(col); return it==floatPtrs_.end()?nullptr:it->second; }
+    const char*  chars (int col)          const { auto it = charPtrs_.find(col);  return it==charPtrs_.end()?nullptr:it->second; }
+    bool         zeroCopy()               const { return mapped_.valid(); }
+
+    void _adoptMapped(MappedColumns&& mc, const std::vector<ColSpec>& specs);
+    void _adoptCopied(MTL::Device* dev, LoadedColumns&& lc, const std::vector<ColSpec>& specs);
+
+private:
+    MappedColumns                              mapped_;
+    LoadedColumns                              copied_;
+    std::unordered_map<int, MTL::Buffer*>      buffers_;
+    std::unordered_map<int, const int*>        intPtrs_;
+    std::unordered_map<int, const float*>      floatPtrs_;
+    std::unordered_map<int, const char*>       charPtrs_;
+    std::vector<MTL::Buffer*>                  ownedBuffers_;
+    size_t                                     rows_ = 0;
+
+    void releaseOwned() {
+        for (auto* b : ownedBuffers_) if (b) b->release();
+        ownedBuffers_.clear();
+        buffers_.clear(); intPtrs_.clear(); floatPtrs_.clear(); charPtrs_.clear();
+        rows_ = 0;
+    }
+    void moveFrom(QueryColumns&& o) {
+        mapped_       = std::move(o.mapped_);
+        copied_       = std::move(o.copied_);
+        buffers_      = std::move(o.buffers_);
+        intPtrs_      = std::move(o.intPtrs_);
+        floatPtrs_    = std::move(o.floatPtrs_);
+        charPtrs_     = std::move(o.charPtrs_);
+        ownedBuffers_ = std::move(o.ownedBuffers_);
+        rows_         = o.rows_;
+        o.rows_ = 0;
+    }
+};
+
+inline void QueryColumns::_adoptMapped(MappedColumns&& mc, const std::vector<ColSpec>& specs) {
+    rows_ = mc.nRows;
+    for (const auto& s : specs) {
+        MTL::Buffer* buf = mc.get(s.columnIndex);
+        if (!buf) continue;
+        buffers_[s.columnIndex] = buf;
+        const char* base = (const char*)buf->contents();
+        switch (s.type) {
+            case ColType::INT:
+            case ColType::DATE:       intPtrs_  [s.columnIndex] = (const int*)base;   break;
+            case ColType::FLOAT:      floatPtrs_[s.columnIndex] = (const float*)base; break;
+            case ColType::CHAR1:
+            case ColType::CHAR_FIXED: charPtrs_ [s.columnIndex] = (const char*)base;  break;
+        }
+    }
+    mapped_ = std::move(mc);
+}
+
+inline void QueryColumns::_adoptCopied(MTL::Device* dev, LoadedColumns&& lc, const std::vector<ColSpec>& specs) {
+    copied_ = std::move(lc);
+    if (!specs.empty()) {
+        const auto& s0 = specs.front();
+        switch (s0.type) {
+            case ColType::INT:
+            case ColType::DATE:       rows_ = copied_.ints(s0.columnIndex).size(); break;
+            case ColType::FLOAT:      rows_ = copied_.floats(s0.columnIndex).size(); break;
+            case ColType::CHAR1:      rows_ = copied_.chars(s0.columnIndex).size(); break;
+            case ColType::CHAR_FIXED: rows_ = s0.fixedWidth > 0
+                                              ? copied_.chars(s0.columnIndex).size() / (size_t)s0.fixedWidth
+                                              : copied_.chars(s0.columnIndex).size();
+                                      break;
+        }
+    }
+    for (const auto& s : specs) {
+        size_t bytes = 0;
+        const void* src = nullptr;
+        switch (s.type) {
+            case ColType::INT:
+            case ColType::DATE: {
+                const auto& v = copied_.ints(s.columnIndex);
+                bytes = v.size() * sizeof(int); src = v.data();
+                intPtrs_[s.columnIndex] = v.data();
+                break;
+            }
+            case ColType::FLOAT: {
+                const auto& v = copied_.floats(s.columnIndex);
+                bytes = v.size() * sizeof(float); src = v.data();
+                floatPtrs_[s.columnIndex] = v.data();
+                break;
+            }
+            case ColType::CHAR1:
+            case ColType::CHAR_FIXED: {
+                const auto& v = copied_.chars(s.columnIndex);
+                bytes = v.size(); src = v.data();
+                charPtrs_[s.columnIndex] = v.data();
+                break;
+            }
+        }
+        MTL::Buffer* buf = dev->newBuffer(src, bytes, MTL::ResourceStorageModeShared);
+        buffers_[s.columnIndex] = buf;
+        ownedBuffers_.push_back(buf);
+    }
+}
+
+inline QueryColumns loadQueryColumns(MTL::Device* device,
+                                      const std::string& tblPath,
+                                      const std::vector<ColSpec>& specs) {
+    QueryColumns qc;
+    if (zeroCopyEnabled()) {
+        MappedColumns mc = colbin::loadColumnsAsBuffers(device, tblPath, specs);
+        if (mc.valid()) {
+            size_t bytes = 0;
+            for (auto& [k, b] : mc.buffers) if (b) bytes += b->length();
+            loadStats().recordBinary(bytes);
+            qc._adoptMapped(std::move(mc), specs);
+            return qc;
+        }
+    }
+    LoadedColumns lc = loadColumnsMultiAuto(tblPath, specs);
+    qc._adoptCopied(device, std::move(lc), specs);
+    return qc;
+}
+
 
 inline LoadedColumns loadColumnsMultiAuto(const std::string& filePath,
                                            const std::vector<ColSpec>& specs) {
