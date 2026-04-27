@@ -1553,9 +1553,11 @@ int main(int argc, const char* argv[]) {
         std::string arg(argv[i]);
         if (arg == "help" || arg == "--help" || arg == "-h") {
             printf("GPU Database Codegen\n");
-            printf("Usage: GPUDBCodegen [flags] [sf1|sf10|sf50|sf100] q<N>\n");
+            printf("Usage: GPUDBCodegen [flags] [sf1|sf10|sf50|sf100] q<N>|mb<N>\n");
             printf("  q1..q22       - Run TPC-H query via codegen pipeline\n");
             printf("  all           - Run all 22 queries\n");
+            printf("  mb1..mb7      - Run microbenchmark (sql/mb<N>.sql)\n");
+            printf("  mball         - Run all microbenchmarks\n");
             printf("Flags:\n");
             printf("  --no-zerocopy - Disable zero-copy mmap path (force buffer copies)\n");
             printf("  --no-binary   - Disable .colbin binary loader (force .tbl parser)\n");
@@ -1600,8 +1602,32 @@ int main(int argc, const char* argv[]) {
         runCodegenQuery(device, cmdQueue, sql, name);
     };
 
+    auto runMicrobench = [&](int mbNum) {
+        std::string path = "sql/mb" + std::to_string(mbNum) + ".sql";
+        std::ifstream f(path);
+        if (!f.is_open()) {
+            std::cerr << "Cannot open SQL file: " << path << std::endl;
+            return;
+        }
+        std::stringstream ss;
+        ss << f.rdbuf();
+        std::string sql = ss.str();
+        std::string name = "MB" + std::to_string(mbNum);
+        runCodegenQuery(device, cmdQueue, sql, name);
+    };
+
     if (query == "all") {
         for (int q = 1; q <= 22; q++) runQuery(q);
+    } else if (query == "mball") {
+        for (int m = 1; m <= 7; m++) runMicrobench(m);
+    } else if (query.size() >= 3 && query[0] == 'm' && query[1] == 'b') {
+        int mbNum = std::stoi(query.substr(2));
+        if (mbNum >= 1 && mbNum <= 99) {
+            runMicrobench(mbNum);
+        } else {
+            std::cerr << "Unknown microbench: " << query << std::endl;
+            return 1;
+        }
     } else if (query.size() >= 2 && query[0] == 'q') {
         int qNum = std::stoi(query.substr(1));
         if (qNum >= 1 && qNum <= 22) {
