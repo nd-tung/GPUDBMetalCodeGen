@@ -139,6 +139,10 @@ public:
     };
     const std::vector<PhaseInfo>& getPhases() const;
 
+    // Mutable phase access (used by --autotune-tg to change TG size between
+    // dispatches without recompiling the kernels).
+    std::vector<PhaseInfo>& getPhasesMutable();
+
     // Access all bindings across all phases (for buffer allocation)
     std::vector<MetalParamBinding> getAllBindings() const;
 
