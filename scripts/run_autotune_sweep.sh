@@ -49,8 +49,9 @@ run_one() {  # $1=config_tag $2=sf $3=q $4...=extra flags
 
 for sf in "${SFS[@]}"; do
   for q in "${QUERIES[@]}"; do
-    run_one baseline    "$sf" "$q"
-    run_one autotune_tg "$sf" "$q" --autotune-tg
+    run_one baseline             "$sf" "$q"
+    run_one autotune_tg          "$sf" "$q" --autotune-tg
+    run_one autotune_tg_perphase "$sf" "$q" --autotune-tg-per-phase
   done
 done
 
