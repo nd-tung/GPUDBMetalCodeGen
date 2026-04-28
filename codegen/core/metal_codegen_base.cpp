@@ -439,6 +439,10 @@ const std::vector<MetalCodegen::PhaseInfo>& MetalCodegen::getPhases() const {
     return phases_;
 }
 
+std::vector<MetalCodegen::PhaseInfo>& MetalCodegen::getPhasesMutable() {
+    return phases_;
+}
+
 std::vector<MetalParamBinding> MetalCodegen::getAllBindings() const {
     std::vector<MetalParamBinding> all;
     std::unordered_set<std::string> seen;

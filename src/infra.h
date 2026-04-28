@@ -1405,6 +1405,13 @@ struct DetailedTiming {
     size_t loadBytes     = 0;
     double ingestMs      = 0.0;  // one-time .tbl->column ingest (excluded from e2e)
     std::vector<std::pair<std::string, double>> phaseKernelMs; // per-kernel GPU time
+    // C1: per-trial GPU-time distribution (set when --repeat N>1).
+    // Reported as p10/p50/p90 + MAD (median absolute deviation).
+    // gpuTotalMs is the p50 (median) for back-compat.
+    int    gpuTrialsN  = 0;
+    double gpuMsP10    = 0.0;
+    double gpuMsP90    = 0.0;
+    double gpuMsMad    = 0.0;
 };
 
 inline void printDetailedTimingSummary(const DetailedTiming& t, bool quiet = false) {
@@ -1498,6 +1505,14 @@ inline void printDetailedTimingSummary(const DetailedTiming& t, bool quiet = fal
             rowMs(label, ms);
         }
         rowMs("GPU Compute",    gpuComputeMs);
+        if (t.gpuTrialsN > 1) {
+            char buf[64];
+            snprintf(buf, sizeof(buf),
+                     "p10=%.2f p50=%.2f p90=%.2f mad=%.2f (n=%d)",
+                     t.gpuMsP10, gpuComputeMs, t.gpuMsP90, t.gpuMsMad,
+                     t.gpuTrialsN);
+            rowStr("  GPU dist", buf);
+        }
         rowMs("CPU Compute",    cpuComputeMs);
         rowMsHi("Query Compute",     queryComputeMs);
         bar();
@@ -1526,13 +1541,15 @@ inline void printDetailedTimingSummary(const DetailedTiming& t, bool quiet = fal
         : 0.0;
     const double cpuTotalLegacy = compileOverheadMs + t.dataLoadMs +
                                   t.bufferAllocMs + cpuComputeMs;
-    printf("TIMING_CSV,%s,%s,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%s,%zu,%.3f,%.3f,%.3f\n",
+    printf("TIMING_CSV,%s,%s,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%s,%zu,%.3f,%.3f,%.3f,%d,%.3f,%.3f,%.3f\n",
            t.scaleFactor.c_str(), t.queryName.c_str(),
            t.analyzeMs, t.planMs, t.codegenMs, t.compileMs, t.psoMs,
            t.dataLoadMs, t.bufferAllocMs, gpuComputeMs, cpuComputeMs,
            compileOverheadMs, cpuTotalLegacy, end2end,
            t.loadSource.empty() ? "none" : t.loadSource.c_str(),
-           t.loadBytes, loadMibps, t.ingestMs, queryComputeMs);
+           t.loadBytes, loadMibps, t.ingestMs, queryComputeMs,
+           // C1: per-trial GPU-time distribution (zeros if --repeat 1)
+           t.gpuTrialsN, t.gpuMsP10, t.gpuMsP90, t.gpuMsMad);
 }
 
 // --- Bitmap Buffer Creation ---

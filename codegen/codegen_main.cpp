@@ -14,6 +14,7 @@
 #include <sstream>
 #include <cmath>
 #include <cstdlib>
+#include <limits>
 #include <sys/stat.h>
 #include <set>
 #include <map>
@@ -28,6 +29,7 @@ static int  g_warmup            = 3;     // --warmup N
 static int  g_repeat            = 1;     // --repeat N
 static bool g_csv               = false; // --csv  (suppress human-readable breakdown)
 static int  g_tgSizeOverride    = 0;     // --threadgroup-size N (0 = use plan default)
+static bool g_autotuneTg        = false; // --autotune-tg  (per-query global TG sweep)
 static bool g_noPipelineCache   = false; // --no-pipeline-cache
 static bool g_noFastMath        = false; // --no-fastmath
 static bool g_printPlan         = false; // --print-plan
@@ -1053,6 +1055,54 @@ static void runCodegenQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
         timing.loadSource = loadStats().source();
         timing.loadBytes  = loadStats().bytes;
 
+        // ----- B1: --autotune-tg ---------------------------------------
+        // Per-query global TG sweep over a fixed candidate set. For each
+        // candidate, override every phase's threadgroupSize, run a quick
+        // calibration (1 untimed + 3 timed iters), and record the median
+        // GPU time. Finally apply the best candidate and continue with
+        // the regular --warmup/--repeat measurement loop. The PSO is
+        // shared across candidates: tg_size is a kernel parameter
+        // ([[threads_per_threadgroup]]), so changing dispatch TG does
+        // NOT require recompiling.
+        if (g_autotuneTg) {
+            const std::vector<int> candidates = {32, 64, 128, 256, 512, 1024};
+            // Snapshot original (plan-default) TG sizes so we can restore
+            // any per-phase preferences (e.g. 256 for hash builds).
+            auto& phs = cg.getPhasesMutable();
+            std::vector<int> originalTg(phs.size());
+            for (size_t i = 0; i < phs.size(); i++)
+                originalTg[i] = phs[i].threadgroupSize;
+
+            int bestTg = 0;
+            double bestP50 = std::numeric_limits<double>::infinity();
+            for (int candTg : candidates) {
+                for (auto& p : phs) p.threadgroupSize = candTg;
+                // 1 untimed warmup
+                (void) executor.execute(compiled, cg, 0, 1);
+                std::vector<double> samples;
+                samples.reserve(3);
+                for (int t = 0; t < 3; t++) {
+                    auto rr = executor.execute(compiled, cg, 0, 1);
+                    samples.push_back((double)rr.totalKernelTimeMs);
+                }
+                std::sort(samples.begin(), samples.end());
+                double p50 = samples[samples.size() / 2];
+                if (g_csv) {
+                    printf("AUTOTUNE_CSV,%s,%s,%d,%.3f,%.3f,%.3f\n",
+                           timing.scaleFactor.c_str(),
+                           timing.queryName.c_str(),
+                           candTg, samples[0], p50, samples.back());
+                }
+                if (p50 < bestP50) { bestP50 = p50; bestTg = candTg; }
+            }
+            // Apply the winner uniformly. (Per-phase autotune left for B1+.)
+            for (auto& p : phs) p.threadgroupSize = bestTg;
+            if (!g_csv) {
+                printf("[autotune-tg] best TG = %d (p50 GPU = %.3f ms across %zu candidates)\n",
+                       bestTg, bestP50, candidates.size());
+            }
+        }
+
         // External warmup loop (untimed). Replaces the executor's internal
         // warmup so we control the iteration count via --warmup N.
         for (int w = 0; w < g_warmup; w++) {
@@ -1121,9 +1171,32 @@ static void runCodegenQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
             return v[v.size() / 2];
         };
 
+        // C1: percentile + MAD on the GPU-time trial distribution.
+        auto pct = [](std::vector<double> v, double p) -> double {
+            if (v.empty()) return 0.0;
+            std::sort(v.begin(), v.end());
+            // Nearest-rank percentile: ceil(p * N) - 1, clamped.
+            double idx = p * (double)v.size();
+            size_t i = (size_t)std::min<double>(std::max<double>(idx - 1, 0),
+                                                (double)(v.size() - 1));
+            return v[i];
+        };
+        auto mad = [&median](std::vector<double> v) -> double {
+            if (v.size() < 2) return 0.0;
+            double m = median(v);
+            std::vector<double> dev;
+            dev.reserve(v.size());
+            for (double x : v) dev.push_back(std::fabs(x - m));
+            return median(std::move(dev));
+        };
+
         result.parseTimeMs = static_cast<float>(parseMs);
         timing.bufferAllocMs = result.bufferAllocTimeMs;
         timing.gpuTotalMs    = median(gpuTrials);
+        timing.gpuTrialsN    = (int)gpuTrials.size();
+        timing.gpuMsP10      = pct(gpuTrials, 0.10);
+        timing.gpuMsP90      = pct(gpuTrials, 0.90);
+        timing.gpuMsMad      = mad(gpuTrials);
         if (g_noPipelineCache) {
             // Override the single-shot compile time with the per-trial median
             // so the headline number reflects the cost we're studying.
@@ -1798,6 +1871,8 @@ int main(int argc, const char* argv[]) {
             printf("  --repeat N           Run N timed iterations, report median (default 1)\n");
             printf("  --csv                Suppress text breakdown; emit one TIMING_CSV per trial\n");
             printf("  --threadgroup-size N Override default threadgroup size (default = plan-specified)\n");
+            printf("  --autotune-tg        Per-query global TG sweep over {32,64,128,256,512,1024};\n");
+            printf("                       picks the size with min p50 GPU time (logs AUTOTUNE_CSV)\n");
             printf("  --no-pipeline-cache  Recompile Metal source on every measured iteration\n");
             printf("  --no-fastmath        Disable Metal -ffast-math (numerics study)\n");
             printf("  --print-plan         Print the MetalQueryPlan structure before codegen\n");
@@ -1827,6 +1902,7 @@ int main(int argc, const char* argv[]) {
         if (arg == "--threadgroup-size" && i + 1 < argc) {
             g_tgSizeOverride = std::max(0, std::atoi(argv[++i])); continue;
         }
+        if (arg == "--autotune-tg")       { g_autotuneTg = true; continue; }
         if (arg == "sf1")  { g_dataset_path = "data/SF-1/"; continue; }
         if (arg == "sf10") { g_dataset_path = "data/SF-10/"; continue; }
         if (arg == "sf50") { g_dataset_path = "data/SF-50/"; continue; }
