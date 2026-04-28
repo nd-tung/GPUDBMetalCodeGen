@@ -15,8 +15,8 @@ echo "Output dir: $OUT"
 WARM=3
 REP=5
 
-# TIMING_CSV columns produced by the binary:
-HEADER='sf,query,analyze_ms,plan_ms,codegen_ms,compile_ms,pso_ms,dataload_ms,bufalloc_ms,gpu_ms,cpu_ms,compile_overhead_ms,cpu_total_ms,e2e_ms,load_source,load_bytes,load_mibps,ingest_ms,query_compute_ms'
+# TIMING_CSV columns produced by the binary (23 fields; last 4 added by C1).
+HEADER='sf,query,analyze_ms,plan_ms,codegen_ms,compile_ms,pso_ms,dataload_ms,bufalloc_ms,gpu_ms,cpu_ms,compile_overhead_ms,cpu_total_ms,e2e_ms,load_source,load_bytes,load_mibps,ingest_ms,query_compute_ms,gpu_trials_n,gpu_p10_ms,gpu_p90_ms,gpu_mad_ms'
 
 run_one() {  # $1=tag $2=sf $3=qn $4..=extra flags
   local tag=$1 sf=$2 q=$3; shift 3
