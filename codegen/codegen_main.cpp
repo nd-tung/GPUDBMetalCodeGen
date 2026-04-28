@@ -30,6 +30,7 @@ static int  g_repeat            = 1;     // --repeat N
 static bool g_csv               = false; // --csv  (suppress human-readable breakdown)
 static int  g_tgSizeOverride    = 0;     // --threadgroup-size N (0 = use plan default)
 static bool g_autotuneTg        = false; // --autotune-tg  (per-query global TG sweep)
+static bool g_autotuneTgPerPhase= false; // --autotune-tg-per-phase (per-kernel TG)
 static bool g_noPipelineCache   = false; // --no-pipeline-cache
 static bool g_noFastMath        = false; // --no-fastmath
 static bool g_printPlan         = false; // --print-plan
@@ -1055,53 +1056,107 @@ static void runCodegenQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
         timing.loadSource = loadStats().source();
         timing.loadBytes  = loadStats().bytes;
 
-        // ----- B1: --autotune-tg ---------------------------------------
-        // Per-query global TG sweep over a fixed candidate set. For each
+        // ----- B1: --autotune-tg [--autotune-tg-per-phase] --------------
+        // Per-query TG sweep over a fixed candidate set. For each
         // candidate, override every phase's threadgroupSize, run a quick
-        // calibration (1 untimed + 5 timed iters, drop max as outlier),
-        // and record the median GPU time. Finally apply the best
-        // candidate and continue with the regular --warmup/--repeat
+        // calibration (1 untimed + 5 timed iters, drop max), and record
+        // the median GPU time -- both totals (for global autotune) and
+        // per-phase timings (for per-phase autotune). Finally apply the
+        // best candidate(s) and continue with the regular --warmup/--repeat
         // measurement loop. The PSO is shared across candidates: tg_size
         // is a kernel parameter ([[threads_per_threadgroup]]), so
         // changing dispatch TG does NOT require recompiling.
-        if (g_autotuneTg) {
+        if (g_autotuneTg || g_autotuneTgPerPhase) {
             const std::vector<int> candidates = {32, 64, 128, 256, 512, 1024};
-            // Snapshot original (plan-default) TG sizes so we can restore
-            // any per-phase preferences (e.g. 256 for hash builds).
             auto& phs = cg.getPhasesMutable();
-            std::vector<int> originalTg(phs.size());
-            for (size_t i = 0; i < phs.size(); i++)
-                originalTg[i] = phs[i].threadgroupSize;
+            const size_t nPhases = phs.size();
 
-            int bestTg = 0;
-            double bestP50 = std::numeric_limits<double>::infinity();
-            for (int candTg : candidates) {
+            // perPhaseP50[c][i] = median (of 4) GPU time of phase i when
+            // every phase is dispatched at candidates[c].
+            std::vector<std::vector<double>> perPhaseP50(
+                candidates.size(), std::vector<double>(nPhases, 0.0));
+            std::vector<double> totalP50(candidates.size(), 0.0);
+
+            for (size_t c = 0; c < candidates.size(); c++) {
+                int candTg = candidates[c];
                 for (auto& p : phs) p.threadgroupSize = candTg;
                 // 1 untimed warmup
                 (void) executor.execute(compiled, cg, 0, 1);
-                // 5 timed trials; drop the slowest as outlier, p50 of remaining 4.
-                std::vector<double> samples;
-                samples.reserve(5);
+                // 5 timed trials; drop slowest as outlier.
+                std::vector<double> totals; totals.reserve(5);
+                std::vector<std::vector<double>> phaseSamples(nPhases);
+                for (auto& v : phaseSamples) v.reserve(5);
                 for (int t = 0; t < 5; t++) {
                     auto rr = executor.execute(compiled, cg, 0, 1);
-                    samples.push_back((double)rr.totalKernelTimeMs);
+                    totals.push_back((double)rr.totalKernelTimeMs);
+                    for (size_t i = 0; i < nPhases && i < rr.phaseTimesMs.size(); i++) {
+                        phaseSamples[i].push_back((double)rr.phaseTimesMs[i]);
+                    }
                 }
-                std::sort(samples.begin(), samples.end());
-                samples.pop_back();   // drop slowest
-                double p50 = samples[samples.size() / 2];
+                auto p50DropMax = [](std::vector<double> v) -> double {
+                    if (v.empty()) return 0.0;
+                    std::sort(v.begin(), v.end());
+                    if (v.size() > 1) v.pop_back();
+                    return v[v.size() / 2];
+                };
+                totalP50[c] = p50DropMax(totals);
+                for (size_t i = 0; i < nPhases; i++) {
+                    perPhaseP50[c][i] = p50DropMax(phaseSamples[i]);
+                }
                 if (g_csv) {
+                    std::sort(totals.begin(), totals.end());
                     printf("AUTOTUNE_CSV,%s,%s,%d,%.3f,%.3f,%.3f\n",
                            timing.scaleFactor.c_str(),
                            timing.queryName.c_str(),
-                           candTg, samples.front(), p50, samples.back());
+                           candTg, totals.front(), totalP50[c], totals.back());
+                    for (size_t i = 0; i < nPhases; i++) {
+                        printf("AUTOTUNE_PHASE_CSV,%s,%s,%s,%d,%.3f\n",
+                               timing.scaleFactor.c_str(),
+                               timing.queryName.c_str(),
+                               phs[i].name.c_str(), candTg, perPhaseP50[c][i]);
+                    }
                 }
-                if (p50 < bestP50) { bestP50 = p50; bestTg = candTg; }
             }
-            // Apply the winner uniformly. (Per-phase autotune left for B1+.)
-            for (auto& p : phs) p.threadgroupSize = bestTg;
-            if (!g_csv) {
-                printf("[autotune-tg] best TG = %d (p50 GPU = %.3f ms across %zu candidates)\n",
-                       bestTg, bestP50, candidates.size());
+
+            if (g_autotuneTgPerPhase) {
+                // Pick best TG per phase by minimum p50 phase time.
+                std::vector<int> chosen(nPhases, candidates.back());
+                double sumChosenMs = 0.0;
+                for (size_t i = 0; i < nPhases; i++) {
+                    double bestMs = std::numeric_limits<double>::infinity();
+                    int bestC = candidates.back();
+                    for (size_t c = 0; c < candidates.size(); c++) {
+                        if (perPhaseP50[c][i] < bestMs) {
+                            bestMs = perPhaseP50[c][i];
+                            bestC = candidates[c];
+                        }
+                    }
+                    chosen[i] = bestC;
+                    sumChosenMs += bestMs;
+                    phs[i].threadgroupSize = bestC;
+                }
+                if (!g_csv) {
+                    printf("[autotune-tg-per-phase] picks:");
+                    for (size_t i = 0; i < nPhases; i++) {
+                        printf(" %s=%d", phs[i].name.c_str(), chosen[i]);
+                    }
+                    printf("  (sum p50 = %.3f ms)\n", sumChosenMs);
+                }
+            } else {
+                // Global: pick TG that minimises total GPU time.
+                int bestTg = candidates.back();
+                double bestP50 = std::numeric_limits<double>::infinity();
+                for (size_t c = 0; c < candidates.size(); c++) {
+                    if (totalP50[c] < bestP50) {
+                        bestP50 = totalP50[c];
+                        bestTg = candidates[c];
+                    }
+                }
+                for (auto& p : phs) p.threadgroupSize = bestTg;
+                if (!g_csv) {
+                    printf("[autotune-tg] best TG = %d (p50 GPU = %.3f ms across %zu candidates)\n",
+                           bestTg, bestP50, candidates.size());
+                }
             }
         }
 
@@ -1875,6 +1930,8 @@ int main(int argc, const char* argv[]) {
             printf("  --threadgroup-size N Override default threadgroup size (default = plan-specified)\n");
             printf("  --autotune-tg        Per-query global TG sweep over {32,64,128,256,512,1024};\n");
             printf("                       picks the size with min p50 GPU time (logs AUTOTUNE_CSV)\n");
+            printf("  --autotune-tg-per-phase  Per-phase TG sweep; picks min-p50 TG independently\n");
+            printf("                       for each kernel (logs AUTOTUNE_PHASE_CSV)\n");
             printf("  --no-pipeline-cache  Recompile Metal source on every measured iteration\n");
             printf("  --no-fastmath        Disable Metal -ffast-math (numerics study)\n");
             printf("  --print-plan         Print the MetalQueryPlan structure before codegen\n");
@@ -1905,6 +1962,7 @@ int main(int argc, const char* argv[]) {
             g_tgSizeOverride = std::max(0, std::atoi(argv[++i])); continue;
         }
         if (arg == "--autotune-tg")       { g_autotuneTg = true; continue; }
+        if (arg == "--autotune-tg-per-phase") { g_autotuneTgPerPhase = true; continue; }
         if (arg == "sf1")  { g_dataset_path = "data/SF-1/"; continue; }
         if (arg == "sf10") { g_dataset_path = "data/SF-10/"; continue; }
         if (arg == "sf50") { g_dataset_path = "data/SF-50/"; continue; }
