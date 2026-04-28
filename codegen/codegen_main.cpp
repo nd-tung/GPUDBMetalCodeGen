@@ -1218,6 +1218,20 @@ static void runCodegenQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
                        (double)result.totalKernelTimeMs,
                        trialCompileMs,
                        e2eTrialMs);
+                // C2: per-phase GPU breakdown for this trial. Emitting one
+                // row per phase per trial lets analysis spot per-kernel
+                // variance and bottlenecks without parsing the text report.
+                for (size_t pi = 0; pi < result.phaseTimesMs.size(); pi++) {
+                    const std::string& nm = (pi < result.phaseNames.size())
+                        ? result.phaseNames[pi] : "phase";
+                    int tgUsed = (pi < cg.getPhases().size())
+                        ? cg.getPhases()[pi].threadgroupSize : 0;
+                    printf("PHASE_CSV,%s,%s,%d,%s,%d,%.3f\n",
+                           timing.queryName.c_str(),
+                           timing.scaleFactor.c_str(),
+                           r, nm.c_str(), tgUsed,
+                           (double)result.phaseTimesMs[pi]);
+                }
             }
         }
 
