@@ -1058,12 +1058,12 @@ static void runCodegenQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
         // ----- B1: --autotune-tg ---------------------------------------
         // Per-query global TG sweep over a fixed candidate set. For each
         // candidate, override every phase's threadgroupSize, run a quick
-        // calibration (1 untimed + 3 timed iters), and record the median
-        // GPU time. Finally apply the best candidate and continue with
-        // the regular --warmup/--repeat measurement loop. The PSO is
-        // shared across candidates: tg_size is a kernel parameter
-        // ([[threads_per_threadgroup]]), so changing dispatch TG does
-        // NOT require recompiling.
+        // calibration (1 untimed + 5 timed iters, drop max as outlier),
+        // and record the median GPU time. Finally apply the best
+        // candidate and continue with the regular --warmup/--repeat
+        // measurement loop. The PSO is shared across candidates: tg_size
+        // is a kernel parameter ([[threads_per_threadgroup]]), so
+        // changing dispatch TG does NOT require recompiling.
         if (g_autotuneTg) {
             const std::vector<int> candidates = {32, 64, 128, 256, 512, 1024};
             // Snapshot original (plan-default) TG sizes so we can restore
@@ -1079,19 +1079,21 @@ static void runCodegenQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
                 for (auto& p : phs) p.threadgroupSize = candTg;
                 // 1 untimed warmup
                 (void) executor.execute(compiled, cg, 0, 1);
+                // 5 timed trials; drop the slowest as outlier, p50 of remaining 4.
                 std::vector<double> samples;
-                samples.reserve(3);
-                for (int t = 0; t < 3; t++) {
+                samples.reserve(5);
+                for (int t = 0; t < 5; t++) {
                     auto rr = executor.execute(compiled, cg, 0, 1);
                     samples.push_back((double)rr.totalKernelTimeMs);
                 }
                 std::sort(samples.begin(), samples.end());
+                samples.pop_back();   // drop slowest
                 double p50 = samples[samples.size() / 2];
                 if (g_csv) {
                     printf("AUTOTUNE_CSV,%s,%s,%d,%.3f,%.3f,%.3f\n",
                            timing.scaleFactor.c_str(),
                            timing.queryName.c_str(),
-                           candTg, samples[0], p50, samples.back());
+                           candTg, samples.front(), p50, samples.back());
                 }
                 if (p50 < bestP50) { bestP50 = p50; bestTg = candTg; }
             }
