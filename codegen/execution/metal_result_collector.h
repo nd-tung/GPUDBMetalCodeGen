@@ -28,6 +28,11 @@ struct GenericResult {
     std::vector<Row> rows;
 
     void print(int limit = -1) const;
+    // Stable text serialization for golden-result comparison.
+    // Format: header row "col1,col2,...\n", then one CSV row per result row.
+    // Floats use %.4f; int64 use %lld; strings are emitted as-is.
+    // Row order is preserved (caller is responsible for any sort).
+    std::string toCanonical() const;
     bool empty() const { return rows.empty(); }
     size_t numRows() const { return rows.size(); }
 };

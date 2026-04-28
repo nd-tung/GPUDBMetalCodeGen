@@ -23,6 +23,10 @@ public:
     // Number of cached pipelines
     size_t cacheSize() const { return pipelineCache_.size(); }
 
+    // Toggle Metal -ffast-math for subsequent compile() calls (default true).
+    static void setFastMathEnabled(bool on) { sFastMath_ = on; }
+    static bool fastMathEnabled() { return sFastMath_; }
+
     // Compiled query: library + pipeline states for each phase
     struct CompiledQuery {
         MTL::Library* library = nullptr;
@@ -33,6 +37,7 @@ public:
 private:
     MTL::Device* device_;
     std::unordered_map<std::string, MTL::ComputePipelineState*> pipelineCache_;
+    static bool sFastMath_;
 };
 
 } // namespace codegen
