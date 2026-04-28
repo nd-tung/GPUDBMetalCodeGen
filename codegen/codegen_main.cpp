@@ -12,9 +12,97 @@
 #include "tpch_schema.h"
 #include <fstream>
 #include <sstream>
+#include <cmath>
+#include <cstdlib>
+#include <sys/stat.h>
 #include <set>
 #include <map>
 #include <unordered_map>
+#include <algorithm>
+#include <memory>
+
+// ===================================================================
+// Experiment flags (set in main, read by runCodegenQuery)
+// ===================================================================
+static int  g_warmup            = 3;     // --warmup N
+static int  g_repeat            = 1;     // --repeat N
+static bool g_csv               = false; // --csv  (suppress human-readable breakdown)
+static int  g_tgSizeOverride    = 0;     // --threadgroup-size N (0 = use plan default)
+static bool g_noPipelineCache   = false; // --no-pipeline-cache
+static bool g_noFastMath        = false; // --no-fastmath
+static bool g_printPlan         = false; // --print-plan
+static std::string g_dumpMslDir;         // --dump-msl PATH (directory or file template)
+static std::string g_checkDir;           // --check DIR  (compare result vs DIR/<query>_<sf>.csv)
+static std::string g_saveGoldenDir;      // --save-golden DIR
+static double g_checkAbsTol = 1e-2;      // --check-abs-tol N
+static double g_checkRelTol = 1e-4;      // --check-rel-tol N
+static int    g_checkExitCode = 0;       // accumulated: nonzero if any --check failed
+
+// Compare two canonical CSV blobs with float tolerance.
+// Returns empty string on match; otherwise a short human-readable diff message.
+static std::string compareCanonical(const std::string& got, const std::string& expected,
+                                    double absTol, double relTol) {
+    auto split = [](const std::string& s) {
+        std::vector<std::string> lines;
+        std::istringstream is(s);
+        std::string ln;
+        while (std::getline(is, ln)) lines.push_back(ln);
+        return lines;
+    };
+    auto splitCsv = [](const std::string& ln) {
+        std::vector<std::string> out;
+        std::string cur;
+        for (char c : ln) {
+            if (c == ',') { out.push_back(cur); cur.clear(); }
+            else cur.push_back(c);
+        }
+        out.push_back(cur);
+        return out;
+    };
+    auto isNumber = [](const std::string& s, double& out) {
+        if (s.empty()) return false;
+        char* end = nullptr;
+        out = std::strtod(s.c_str(), &end);
+        return end != s.c_str() && *end == '\0';
+    };
+
+    auto a = split(got), b = split(expected);
+    if (a.size() != b.size()) {
+        char buf[128];
+        snprintf(buf, sizeof(buf), "row count mismatch: got=%zu expected=%zu",
+                 a.size(), b.size());
+        return buf;
+    }
+    for (size_t i = 0; i < a.size(); i++) {
+        if (a[i] == b[i]) continue;
+        auto ca = splitCsv(a[i]);
+        auto cb = splitCsv(b[i]);
+        if (ca.size() != cb.size()) {
+            char buf[256];
+            snprintf(buf, sizeof(buf), "line %zu: column count mismatch (%zu vs %zu)",
+                     i, ca.size(), cb.size());
+            return buf;
+        }
+        for (size_t c = 0; c < ca.size(); c++) {
+            if (ca[c] == cb[c]) continue;
+            double va, vb;
+            if (isNumber(ca[c], va) && isNumber(cb[c], vb)) {
+                double diff = std::fabs(va - vb);
+                double tol = absTol + relTol * std::max(std::fabs(va), std::fabs(vb));
+                if (diff <= tol) continue;
+                char buf[256];
+                snprintf(buf, sizeof(buf), "line %zu col %zu: %s vs %s (diff=%.6g tol=%.6g)",
+                         i, c, ca[c].c_str(), cb[c].c_str(), diff, tol);
+                return buf;
+            }
+            char buf[256];
+            snprintf(buf, sizeof(buf), "line %zu col %zu: '%s' vs '%s'",
+                     i, c, ca[c].c_str(), cb[c].c_str());
+            return buf;
+        }
+    }
+    return "";
+}
 
 // ===================================================================
 // Shared post-processing data structs
@@ -77,7 +165,7 @@ static Q18PostData g_q18Post;
 
 static void runCodegenQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
                             const std::string& sql, const std::string& queryName) {
-    printf("\n=== Codegen: %s ===\n", queryName.c_str());
+    if (!g_csv) printf("\n=== Codegen: %s ===\n", queryName.c_str());
     try {
         using clk = std::chrono::high_resolution_clock;
         auto elapsedMs = [](clk::time_point a, clk::time_point b) {
@@ -118,20 +206,48 @@ static void runCodegenQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
         plan.name = queryName;
         timing.planMs = elapsedMs(tPlan0, clk::now());
 
+        // Experiment override: --threadgroup-size N replaces every phase's TG size.
+        if (g_tgSizeOverride > 0) {
+            for (auto& ph : plan.phases) ph.threadgroupSize = g_tgSizeOverride;
+        }
+
+        // Experiment introspection: --print-plan dumps phase summary.
+        if (g_printPlan) {
+            printf("\n--- MetalQueryPlan: %s ---\n", plan.name.c_str());
+            printf("  helpers           : %zu\n", plan.helpers.size());
+            printf("  phases            : %zu\n", plan.phases.size());
+            for (size_t i = 0; i < plan.phases.size(); i++) {
+                const auto& ph = plan.phases[i];
+                printf("    [%zu] kernel=%s  tg=%d  singleThread=%s  bitmapReads=%zu  scalarParams=%zu  extraBuffers=%zu\n",
+                       i, ph.name.c_str(), ph.threadgroupSize,
+                       ph.singleThread ? "true" : "false",
+                       ph.bitmapReads.size(), ph.scalarParams.size(), ph.extraBuffers.size());
+            }
+            if (plan.cpuSort) {
+                printf("  cpuSort.keys      : %zu  limit=%d\n",
+                       plan.cpuSort->keys.size(), plan.cpuSort->limit);
+            }
+            printf("---\n");
+        }
+
         // 3. Generate Metal source via producer-consumer operators
         auto tCodegen0 = clk::now();
         auto cg = codegen::generateFromPlan(plan);
         std::string metalSource = cg.print();
         timing.codegenMs = elapsedMs(tCodegen0, clk::now());
 
-        printf("Generated Metal source (%zu bytes, %d phase(s))\n",
-               metalSource.size(), cg.phaseCount());
+        if (!g_csv) {
+            printf("Generated Metal source (%zu bytes, %d phase(s))\n",
+                   metalSource.size(), cg.phaseCount());
+        }
 
         // Debug: dump generated source to file
         {
-            std::ofstream dbg("debug/codegen_debug_" + queryName + ".metal");
+            std::string dumpDir = g_dumpMslDir.empty() ? "debug" : g_dumpMslDir;
+            std::string path = dumpDir + "/codegen_debug_" + queryName + ".metal";
+            std::ofstream dbg(path);
             dbg << metalSource;
-            printf("  (written to debug/codegen_debug_%s.metal)\n", queryName.c_str());
+            if (!g_csv) printf("  (written to %s)\n", path.c_str());
         }
 
         // 4. Compile Metal source → MTLLibrary
@@ -925,7 +1041,7 @@ static void runCodegenQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
             g_q21Post.maxSuppkey = maxSk;
         }
 
-        // 6. Execute
+        // 6. Execute (with experiment harness: warmup + repeat + optional pipeline-cache bypass)
         auto parseEnd = std::chrono::high_resolution_clock::now();
         double parseMs = std::chrono::duration<double, std::milli>(parseEnd - parseStart).count();
         // One-time .tbl->column ingest (only when .colbin is missing) is
@@ -937,10 +1053,82 @@ static void runCodegenQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
         timing.loadSource = loadStats().source();
         timing.loadBytes  = loadStats().bytes;
 
-        auto result = executor.execute(compiled, cg, 2, 1);
+        // External warmup loop (untimed). Replaces the executor's internal
+        // warmup so we control the iteration count via --warmup N.
+        for (int w = 0; w < g_warmup; w++) {
+            (void) executor.execute(compiled, cg, 0, 1);
+        }
+
+        // Measured loop. Each trial captures GPU time + (optionally) JIT compile time.
+        std::vector<double> gpuTrials;     gpuTrials.reserve(g_repeat);
+        std::vector<double> compileTrials; compileTrials.reserve(g_repeat);
+        std::vector<double> e2eTrials;     e2eTrials.reserve(g_repeat);
+        codegen::MetalExecutionResult result;
+
+        for (int r = 0; r < g_repeat; r++) {
+            // --no-pipeline-cache: rebuild library + PSOs every measured trial
+            // to expose the JIT cost amortization curve. The compiler must
+            // outlive execute() because ~RuntimeCompiler releases the PSOs.
+            codegen::RuntimeCompiler::CompiledQuery compiledTrial = compiled;
+            std::unique_ptr<codegen::RuntimeCompiler> compilerR;
+            double trialCompileMs = 0.0;
+            if (g_noPipelineCache) {
+                auto tcr0 = clk::now();
+                compilerR = std::make_unique<codegen::RuntimeCompiler>(device);
+                auto* libR = compilerR->compile(metalSource);
+                if (!libR) {
+                    std::cerr << "Codegen: Metal recompile failed in --no-pipeline-cache trial\n";
+                    return;
+                }
+                codegen::RuntimeCompiler::CompiledQuery cR;
+                cR.library = libR;
+                for (const auto& phase : cg.getPhases()) {
+                    auto* pso = compilerR->getPipeline(libR, phase.name);
+                    if (!pso) {
+                        std::cerr << "Codegen: PSO recreation failed for " << phase.name << "\n";
+                        return;
+                    }
+                    cR.pipelines.push_back(pso);
+                    cR.kernelNames.push_back(phase.name);
+                }
+                compiledTrial = cR;
+                trialCompileMs = elapsedMs(tcr0, clk::now());
+            }
+
+            auto tr0 = clk::now();
+            result = executor.execute(compiledTrial, cg, 0, 1);
+            double e2eTrialMs = elapsedMs(tr0, clk::now());
+
+            gpuTrials.push_back((double)result.totalKernelTimeMs);
+            compileTrials.push_back(trialCompileMs);
+            e2eTrials.push_back(e2eTrialMs);
+
+            if (g_csv && g_repeat > 1) {
+                printf("TRIAL_CSV,%s,%s,%d,%.3f,%.3f,%.3f\n",
+                       timing.queryName.c_str(),
+                       timing.scaleFactor.c_str(),
+                       r,
+                       (double)result.totalKernelTimeMs,
+                       trialCompileMs,
+                       e2eTrialMs);
+            }
+        }
+
+        // Median across measured trials (lower-median for even N).
+        auto median = [](std::vector<double> v) -> double {
+            if (v.empty()) return 0.0;
+            std::sort(v.begin(), v.end());
+            return v[v.size() / 2];
+        };
+
         result.parseTimeMs = static_cast<float>(parseMs);
         timing.bufferAllocMs = result.bufferAllocTimeMs;
-        timing.gpuTotalMs    = result.totalKernelTimeMs;
+        timing.gpuTotalMs    = median(gpuTrials);
+        if (g_noPipelineCache) {
+            // Override the single-shot compile time with the per-trial median
+            // so the headline number reflects the cost we're studying.
+            timing.compileMs = median(compileTrials);
+        }
         timing.phaseKernelMs.clear();
         for (size_t i = 0; i < result.phaseTimesMs.size(); i++) {
             const std::string name = (i < result.phaseNames.size())
@@ -950,9 +1138,53 @@ static void runCodegenQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
 
         auto postStart = std::chrono::high_resolution_clock::now();
 
-        // 7. Print results
-        printf("\n%s Results:\n", queryName.c_str());
-        result.result.print();
+        // 7. Print results (suppressed under --csv to keep stdout machine-readable)
+        if (!g_csv) {
+            printf("\n%s Results:\n", queryName.c_str());
+            result.result.print();
+        }
+
+        // 7b. Correctness oracle (golden-result compare).
+        // Operates on the GPU result struct only (pre-CPU-postprocess), so
+        // queries that rely on CPU sort/format (Q2, Q16, Q21) are validated
+        // up to GPU output; the post-processed output is not (yet) checked.
+        if (!g_saveGoldenDir.empty() || !g_checkDir.empty()) {
+            std::string canonical = result.result.toCanonical();
+            std::string fname = queryName + "_" + timing.scaleFactor + ".csv";
+
+            if (!g_saveGoldenDir.empty()) {
+                ::mkdir(g_saveGoldenDir.c_str(), 0755); // ok if exists
+                std::string path = g_saveGoldenDir + "/" + fname;
+                std::ofstream of(path);
+                of << canonical;
+                if (!g_csv) printf("[GOLDEN] saved %s (%zu rows)\n",
+                                   path.c_str(), result.result.numRows());
+            }
+            if (!g_checkDir.empty()) {
+                std::string path = g_checkDir + "/" + fname;
+                std::ifstream ifs(path);
+                if (!ifs) {
+                    fprintf(stderr, "[CHECK] %s: golden file missing: %s\n",
+                            queryName.c_str(), path.c_str());
+                    g_checkExitCode = 2;
+                } else {
+                    std::ostringstream buf;
+                    buf << ifs.rdbuf();
+                    std::string diff = compareCanonical(canonical, buf.str(),
+                                                        g_checkAbsTol, g_checkRelTol);
+                    if (diff.empty()) {
+                        printf("[CHECK] %s @ %s: OK (%zu rows)\n",
+                               queryName.c_str(), timing.scaleFactor.c_str(),
+                               result.result.numRows());
+                    } else {
+                        fprintf(stderr, "[CHECK] %s @ %s: FAIL — %s\n",
+                                queryName.c_str(), timing.scaleFactor.c_str(),
+                                diff.c_str());
+                        g_checkExitCode = 1;
+                    }
+                }
+            }
+        }
 
         // ---------------------------------------------------------------
         // Per-query post-processing
@@ -1535,7 +1767,7 @@ static void runCodegenQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
         double postMs = std::chrono::duration<double, std::milli>(postEnd - postStart).count();
         timing.postMs = postMs;
 
-        printDetailedTimingSummary(timing);
+        printDetailedTimingSummary(timing, g_csv);
 
         executor.releaseAllocatedBuffers();
     } catch (const std::exception& e) {
@@ -1558,13 +1790,43 @@ int main(int argc, const char* argv[]) {
             printf("  all           - Run all 22 queries\n");
             printf("  mb1..mb7      - Run microbenchmark (sql/mb<N>.sql)\n");
             printf("  mball         - Run all microbenchmarks\n");
-            printf("Flags:\n");
-            printf("  --no-zerocopy - Disable zero-copy mmap path (force buffer copies)\n");
-            printf("  --no-binary   - Disable .colbin binary loader (force .tbl parser)\n");
+            printf("Loader flags:\n");
+            printf("  --no-zerocopy        Disable zero-copy mmap path (force buffer copies)\n");
+            printf("  --no-binary          Disable .colbin binary loader (force .tbl parser)\n");
+            printf("Experiment flags:\n");
+            printf("  --warmup N           Run N untimed warmup iterations (default 3)\n");
+            printf("  --repeat N           Run N timed iterations, report median (default 1)\n");
+            printf("  --csv                Suppress text breakdown; emit one TIMING_CSV per trial\n");
+            printf("  --threadgroup-size N Override default threadgroup size (default = plan-specified)\n");
+            printf("  --no-pipeline-cache  Recompile Metal source on every measured iteration\n");
+            printf("  --no-fastmath        Disable Metal -ffast-math (numerics study)\n");
+            printf("  --print-plan         Print the MetalQueryPlan structure before codegen\n");
+            printf("  --dump-msl DIR       Write generated MSL to DIR/<query>.metal (default: debug/)\n");
+            printf("  --check DIR          Compare GPU result against DIR/<query>_<sf>.csv (golden)\n");
+            printf("  --save-golden DIR    Write current GPU result to DIR/<query>_<sf>.csv (overwrites)\n");
+            printf("  --check-abs-tol N    Absolute float tolerance (default 1e-2)\n");
+            printf("  --check-rel-tol N    Relative float tolerance (default 1e-4)\n");
+            printf("  --scalar-atomic      Reduction ablation: every thread issues a global atomic\n");
+            printf("                       (disables SIMD+TG reduce; for B2 ablation)\n");
             return 0;
         }
-        if (arg == "--no-zerocopy") { ::setenv("GPUDB_NO_ZEROCOPY", "1", 1); continue; }
-        if (arg == "--no-binary")   { ::setenv("GPUDB_NO_BINARY",   "1", 1); continue; }
+        if (arg == "--no-zerocopy")       { ::setenv("GPUDB_NO_ZEROCOPY", "1", 1); continue; }
+        if (arg == "--no-binary")         { ::setenv("GPUDB_NO_BINARY",   "1", 1); continue; }
+        if (arg == "--scalar-atomic")     { ::setenv("GPUDB_SCALAR_ATOMIC", "1", 1); continue; }
+        if (arg == "--csv")               { g_csv = true; continue; }
+        if (arg == "--no-pipeline-cache") { g_noPipelineCache = true; continue; }
+        if (arg == "--no-fastmath")       { g_noFastMath = true; continue; }
+        if (arg == "--print-plan")        { g_printPlan = true; continue; }
+        if (arg == "--dump-msl" && i + 1 < argc) { g_dumpMslDir = argv[++i]; continue; }
+        if (arg == "--check" && i + 1 < argc) { g_checkDir = argv[++i]; continue; }
+        if (arg == "--save-golden" && i + 1 < argc) { g_saveGoldenDir = argv[++i]; continue; }
+        if (arg == "--check-abs-tol" && i + 1 < argc) { g_checkAbsTol = std::atof(argv[++i]); continue; }
+        if (arg == "--check-rel-tol" && i + 1 < argc) { g_checkRelTol = std::atof(argv[++i]); continue; }
+        if (arg == "--warmup" && i + 1 < argc) { g_warmup = std::max(0, std::atoi(argv[++i])); continue; }
+        if (arg == "--repeat" && i + 1 < argc) { g_repeat = std::max(1, std::atoi(argv[++i])); continue; }
+        if (arg == "--threadgroup-size" && i + 1 < argc) {
+            g_tgSizeOverride = std::max(0, std::atoi(argv[++i])); continue;
+        }
         if (arg == "sf1")  { g_dataset_path = "data/SF-1/"; continue; }
         if (arg == "sf10") { g_dataset_path = "data/SF-10/"; continue; }
         if (arg == "sf50") { g_dataset_path = "data/SF-50/"; continue; }
@@ -1576,6 +1838,9 @@ int main(int argc, const char* argv[]) {
         std::cerr << "Usage: GPUDBCodegen [sf1|sf10|sf100] q<N>" << std::endl;
         return 1;
     }
+
+    // Apply --no-fastmath globally before any compile() runs.
+    if (g_noFastMath) codegen::RuntimeCompiler::setFastMathEnabled(false);
 
     NS::AutoreleasePool* pool = NS::AutoreleasePool::alloc()->init();
     MTL::Device* device = MTL::CreateSystemDefaultDevice();
@@ -1642,5 +1907,5 @@ int main(int argc, const char* argv[]) {
     }
 
     pool->release();
-    return 0;
+    return g_checkExitCode;
 }

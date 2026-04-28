@@ -5,6 +5,8 @@
 
 namespace codegen {
 
+bool RuntimeCompiler::sFastMath_ = true;
+
 RuntimeCompiler::~RuntimeCompiler() {
     clearCache();
 }
@@ -19,7 +21,7 @@ MTL::Library* RuntimeCompiler::compile(const std::string& source) {
     NS::Error* error = nullptr;
     auto* sourceStr = NS::String::string(source.c_str(), NS::UTF8StringEncoding);
     auto* opts = MTL::CompileOptions::alloc()->init();
-    opts->setFastMathEnabled(true);
+    opts->setFastMathEnabled(sFastMath_);
     auto* library = device_->newLibrary(sourceStr, opts, &error);
     opts->release();
 

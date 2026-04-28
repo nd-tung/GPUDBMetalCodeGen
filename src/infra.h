@@ -1407,7 +1407,7 @@ struct DetailedTiming {
     std::vector<std::pair<std::string, double>> phaseKernelMs; // per-kernel GPU time
 };
 
-inline void printDetailedTimingSummary(const DetailedTiming& t) {
+inline void printDetailedTimingSummary(const DetailedTiming& t, bool quiet = false) {
     // Terminology (used in the table and the CSV):
     //   Compile Overhead = SQL analyze + plan + metal codegen/compile + PSO
     //                      (one-time per query; independent of input size)
@@ -1425,93 +1425,95 @@ inline void printDetailedTimingSummary(const DetailedTiming& t) {
     const double end2end           = compileOverheadMs + t.dataLoadMs +
                                      t.bufferAllocMs + queryComputeMs;
 
-    auto bar = []() {
-        printf("  +------------------------+-----------------+\n");
-    };
-    auto head = [](const char* title) {
-        printf("  | %-38s |\n", title);
-    };
-    auto rowMs = [](const char* label, double ms) {
-        printf("  | %-22s | %12.3f ms |\n", label, ms);
-    };
-    auto rowMsHi = [](const char* label, double ms) {
-        // Trailing "<<" marker draws the eye to the headline metric.
-        printf("  | %-22s | %12.3f ms | <<\n", label, ms);
-    };
-    auto rowStr = [](const char* label, const char* value) {
-        printf("  | %-22s | %15s |\n", label, value);
-    };
+    if (!quiet) {
+        auto bar = []() {
+            printf("  +------------------------+-----------------+\n");
+        };
+        auto head = [](const char* title) {
+            printf("  | %-38s |\n", title);
+        };
+        auto rowMs = [](const char* label, double ms) {
+            printf("  | %-22s | %12.3f ms |\n", label, ms);
+        };
+        auto rowMsHi = [](const char* label, double ms) {
+            // Trailing "<<" marker draws the eye to the headline metric.
+            printf("  | %-22s | %12.3f ms | <<\n", label, ms);
+        };
+        auto rowStr = [](const char* label, const char* value) {
+            printf("  | %-22s | %15s |\n", label, value);
+        };
 
-    printf("\n  Timing Breakdown");
-    if (!t.queryName.empty()) printf(" — %s", t.queryName.c_str());
-    if (!t.scaleFactor.empty()) printf(" @ %s", t.scaleFactor.c_str());
-    printf("\n");
+        printf("\n  Timing Breakdown");
+        if (!t.queryName.empty()) printf(" — %s", t.queryName.c_str());
+        if (!t.scaleFactor.empty()) printf(" @ %s", t.scaleFactor.c_str());
+        printf("\n");
 
-    // --- 1. Compile Overhead (one-time per query) -----------------------
-    bar();
-    head("Compile Overhead  (one-time)");
-    bar();
-    rowMs("SQL Analyze",    t.analyzeMs);
-    rowMs("Plan Build",     t.planMs);
-    rowMs("Metal Codegen",  t.codegenMs);
-    rowMs("Metal Compile",  t.compileMs);
-    rowMs("PSO Creation",   t.psoMs);
-    rowMs("  subtotal",     compileOverheadMs);
-    bar();
+        // --- 1. Compile Overhead (one-time per query) -------------------
+        bar();
+        head("Compile Overhead  (one-time)");
+        bar();
+        rowMs("SQL Analyze",    t.analyzeMs);
+        rowMs("Plan Build",     t.planMs);
+        rowMs("Metal Codegen",  t.codegenMs);
+        rowMs("Metal Compile",  t.compileMs);
+        rowMs("PSO Creation",   t.psoMs);
+        rowMs("  subtotal",     compileOverheadMs);
+        bar();
 
-    // --- 2. Data Load (host I/O) ----------------------------------------
-    {
-        char title[64];
-        const char* src = t.loadSource.empty() ? "colbin" : t.loadSource.c_str();
-        snprintf(title, sizeof(title), "Data Load  (I/O, %s)", src);
-        head(title);
-    }
-    bar();
-    rowMs("Load Time", t.dataLoadMs);
-    if (t.loadBytes > 0) {
-        char buf[32];
-        snprintf(buf, sizeof(buf), "%.1f MiB", (double)t.loadBytes / (1024.0 * 1024.0));
-        rowStr("Bytes", buf);
-    }
-    if (t.loadBytes > 0 && t.dataLoadMs > 0.0) {
-        const double mibps = ((double)t.loadBytes / (1024.0 * 1024.0)) / (t.dataLoadMs / 1000.0);
-        char buf[32];
-        snprintf(buf, sizeof(buf), "%.1f MiB/s", mibps);
-        rowStr("Throughput", buf);
-    }
-    if (t.ingestMs > 0.0) {
-        const char* show = ::getenv("GPUDB_SHOW_INGEST");
-        if (show && show[0] == '1') {
-            rowMs("tbl->col ingest (1x)", t.ingestMs);
+        // --- 2. Data Load (host I/O) ------------------------------------
+        {
+            char title[64];
+            const char* src = t.loadSource.empty() ? "colbin" : t.loadSource.c_str();
+            snprintf(title, sizeof(title), "Data Load  (I/O, %s)", src);
+            head(title);
         }
+        bar();
+        rowMs("Load Time", t.dataLoadMs);
+        if (t.loadBytes > 0) {
+            char buf[32];
+            snprintf(buf, sizeof(buf), "%.1f MiB", (double)t.loadBytes / (1024.0 * 1024.0));
+            rowStr("Bytes", buf);
+        }
+        if (t.loadBytes > 0 && t.dataLoadMs > 0.0) {
+            const double mibps = ((double)t.loadBytes / (1024.0 * 1024.0)) / (t.dataLoadMs / 1000.0);
+            char buf[32];
+            snprintf(buf, sizeof(buf), "%.1f MiB/s", mibps);
+            rowStr("Throughput", buf);
+        }
+        if (t.ingestMs > 0.0) {
+            const char* show = ::getenv("GPUDB_SHOW_INGEST");
+            if (show && show[0] == '1') {
+                rowMs("tbl->col ingest (1x)", t.ingestMs);
+            }
+        }
+        bar();
+
+        // --- 3. Query Execution (the actual compute) --------------------
+        head("Query Execution  (actual compute)");
+        bar();
+        rowMs("Buffer Setup",   t.bufferAllocMs);
+        for (const auto& [name, ms] : t.phaseKernelMs) {
+            char label[64];
+            snprintf(label, sizeof(label), "  GPU kernel %s", name.c_str());
+            rowMs(label, ms);
+        }
+        rowMs("GPU Compute",    gpuComputeMs);
+        rowMs("CPU Compute",    cpuComputeMs);
+        rowMsHi("Query Compute",     queryComputeMs);
+        bar();
+
+        // --- 4. Totals --------------------------------------------------
+        head("Totals");
+        bar();
+        rowMs("Compile Overhead",  compileOverheadMs);
+        rowMs("Data Load",         t.dataLoadMs);
+        rowMs("Buffer Setup",      t.bufferAllocMs);
+        rowMs("Query Compute",     queryComputeMs);
+        rowMsHi("End-to-End",      end2end);
+        bar();
     }
-    bar();
 
-    // --- 3. Query Execution (the actual compute) ------------------------
-    head("Query Execution  (actual compute)");
-    bar();
-    rowMs("Buffer Setup",   t.bufferAllocMs);
-    for (const auto& [name, ms] : t.phaseKernelMs) {
-        char label[64];
-        snprintf(label, sizeof(label), "  GPU kernel %s", name.c_str());
-        rowMs(label, ms);
-    }
-    rowMs("GPU Compute",    gpuComputeMs);
-    rowMs("CPU Compute",    cpuComputeMs);
-    rowMsHi("Query Compute",     queryComputeMs);
-    bar();
-
-    // --- 4. Totals ------------------------------------------------------
-    head("Totals");
-    bar();
-    rowMs("Compile Overhead",  compileOverheadMs);
-    rowMs("Data Load",         t.dataLoadMs);
-    rowMs("Buffer Setup",      t.bufferAllocMs);
-    rowMs("Query Compute",     queryComputeMs);
-    rowMsHi("End-to-End",      end2end);
-    bar();
-
-    // Machine-readable single line for CSV harvesting.
+    // Machine-readable single line for CSV harvesting (always emitted).
     // Kept back-compatible with prior field order. Renamed fields (same slot):
     //   gpu_ms      -> gpu_compute_ms
     //   post_ms     -> cpu_compute_ms

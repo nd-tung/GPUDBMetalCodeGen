@@ -1,7 +1,18 @@
 #include "metal_operators.h"
 #include <sstream>
+#include <cstdlib>
 
 namespace codegen {
+
+// Ablation: when GPUDB_SCALAR_ATOMIC=1, MetalTGReduce skips the
+// SIMD+threadgroup reduction and has every thread issue a global atomic.
+// This isolates the value of the existing reduction strategy.
+static std::string tableSizeName(const std::string& t) { return "n_" + t; }
+
+static bool scalarAtomicMode() {
+    const char* e = std::getenv("GPUDB_SCALAR_ATOMIC");
+    return e && e[0] && e[0] != '0';
+}
 
 // ===================================================================
 // MetalGridStrideScan
@@ -19,46 +30,28 @@ void MetalGridStrideScan::addColumn(const std::string& paramName, const std::str
 void MetalGridStrideScan::produce(MetalCodegen& cg, ConsumerFn consume) {
     cg.setPhaseScannedTable(tableName_);
 
-    if (!columns_.empty()) {
-        // Columnar mode: register each column as a separate buffer
-        for (const auto& col : columns_) {
-            cg.addColumnParam(col.paramName, col.metalType, tableName_);
-        }
-        cg.addTableSizeParam(tableName_);
-    } else {
-        // AoS mode: single struct pointer + size
-        cg.addTableParam(tableName_, "/* struct set by planner */");
+    // All TPC-H scans are columnar (addColumn() called by the planner before
+    // produce()). The legacy AoS struct path was removed — no current query
+    // exercises it.
+    if (columns_.empty()) {
+        throw std::runtime_error(
+            "MetalGridStrideScan(" + tableName_ +
+            "): no columns registered. Call addColumn() before produce().");
     }
+    for (const auto& col : columns_) {
+        cg.addColumnParam(col.paramName, col.metalType, tableName_);
+    }
+    cg.addTableSizeParam(tableName_);
 
     // Emit grid-stride loop
-    cg.addBlock("for (uint " + idxVar_ + " = tid; " + idxVar_ + " < n_" + tableName_ +
-                "; " + idxVar_ + " += tpg)", [&]() {
+    cg.addBlock("for (uint " + idxVar_ + " = tid; " + idxVar_ + " < " +
+                tableSizeName(tableName_) + "; " + idxVar_ + " += tpg)", [&]() {
         consume();
     });
 }
 
 std::string MetalGridStrideScan::describe() const {
     return "GridStrideScan(" + tableName_ + ")";
-}
-
-// ===================================================================
-// MetalSimpleScan
-// ===================================================================
-
-MetalSimpleScan::MetalSimpleScan(const std::string& table,
-                                 const std::string& rowVar)
-    : tableName_(table), rowVar_(rowVar) {}
-
-void MetalSimpleScan::produce(MetalCodegen& cg, ConsumerFn consume) {
-    cg.setPhaseScannedTable(tableName_);
-    cg.addTableParam(tableName_, "/* struct set by planner */");
-    cg.addIf("tid < n_" + tableName_, [&]() {
-        consume();
-    });
-}
-
-std::string MetalSimpleScan::describe() const {
-    return "SimpleScan(" + tableName_ + ")";
 }
 
 // ===================================================================
@@ -299,6 +292,8 @@ void MetalTGReduce::setResultAlias(const std::string& displayName, int scaleDown
 }
 
 void MetalTGReduce::produce(MetalCodegen& cg, ConsumerFn consume) {
+    const bool scalar = scalarAtomicMode();
+
     // Register output buffers
     for (const auto& acc : accumulators_) {
         if (acc.type == "float") {
@@ -311,48 +306,67 @@ void MetalTGReduce::produce(MetalCodegen& cg, ConsumerFn consume) {
         }
     }
 
-    // Declare local accumulators
-    for (const auto& acc : accumulators_) {
-        if (acc.type == "float") {
-            cg.addLine("float local_" + acc.name + " = 0.0f;");
-        } else {
-            cg.addLine("long local_" + acc.name + " = 0;");
-        }
-    }
-
-    // Child produces rows; inside the loop we accumulate
-    child_->produce(cg, [&]() {
+    if (scalar) {
+        // ===== SCALAR-ATOMIC ABLATION =====
+        // Each thread issues a global atomic per row consumed. No local
+        // accumulation, no SIMD/TG reduction, no shared memory.
+        cg.addComment("--- Scalar-atomic mode: per-row global atomic ---");
+        child_->produce(cg, [&]() {
+            for (const auto& acc : accumulators_) {
+                if (acc.type == "float") {
+                    cg.addLine("atomic_add_float(" + acc.loBuffer + ", (float)("
+                               + acc.valueExpr + "));");
+                } else {
+                    cg.addLine("atomic_add_long_pair(" + acc.loBuffer + ", "
+                               + acc.hiBuffer + ", (long)(" + acc.valueExpr + "));");
+                }
+            }
+            consume();
+        });
+    } else {
+        // Declare local accumulators
         for (const auto& acc : accumulators_) {
             if (acc.type == "float") {
-                cg.addLine("local_" + acc.name + " += (float)(" + acc.valueExpr + ");");
+                cg.addLine("float local_" + acc.name + " = 0.0f;");
             } else {
-                cg.addLine("local_" + acc.name + " += (long)(" + acc.valueExpr + ");");
+                cg.addLine("long local_" + acc.name + " = 0;");
             }
         }
-        consume();
-    });
 
-    // After the loop: SIMD + threadgroup reduction → atomic write
-    cg.addComment("--- Threadgroup reduction ---");
-    for (const auto& acc : accumulators_) {
-        std::string localVar = "local_" + acc.name;
-        std::string tgVar = "tg_" + acc.name;
+        // Child produces rows; inside the loop we accumulate
+        child_->produce(cg, [&]() {
+            for (const auto& acc : accumulators_) {
+                if (acc.type == "float") {
+                    cg.addLine("local_" + acc.name + " += (float)(" + acc.valueExpr + ");");
+                } else {
+                    cg.addLine("local_" + acc.name + " += (long)(" + acc.valueExpr + ");");
+                }
+            }
+            consume();
+        });
 
-        if (acc.type == "float") {
-            cg.addLine("threadgroup float tg_shared_" + acc.name + "[32];");
-            cg.addLine("float " + tgVar + " = tg_reduce_float(" + localVar +
-                       ", lid, tg_size, tg_shared_" + acc.name + ");");
-            cg.addIf("lid == 0", [&]() {
-                cg.addLine("atomic_add_float(" + acc.loBuffer + ", " + tgVar + ");");
-            });
-        } else {
-            cg.addLine("threadgroup long tg_shared_" + acc.name + "[32];");
-            cg.addLine("long " + tgVar + " = tg_reduce_long(" + localVar +
-                       ", lid, tg_size, tg_shared_" + acc.name + ");");
-            cg.addIf("lid == 0", [&]() {
-                cg.addLine("atomic_add_long_pair(" + acc.loBuffer + ", " +
-                           acc.hiBuffer + ", " + tgVar + ");");
-            });
+        // After the loop: SIMD + threadgroup reduction → atomic write
+        cg.addComment("--- Threadgroup reduction ---");
+        for (const auto& acc : accumulators_) {
+            std::string localVar = "local_" + acc.name;
+            std::string tgVar = "tg_" + acc.name;
+
+            if (acc.type == "float") {
+                cg.addLine("threadgroup float tg_shared_" + acc.name + "[32];");
+                cg.addLine("float " + tgVar + " = tg_reduce_float(" + localVar +
+                           ", lid, tg_size, tg_shared_" + acc.name + ");");
+                cg.addIf("lid == 0", [&]() {
+                    cg.addLine("atomic_add_float(" + acc.loBuffer + ", " + tgVar + ");");
+                });
+            } else {
+                cg.addLine("threadgroup long tg_shared_" + acc.name + "[32];");
+                cg.addLine("long " + tgVar + " = tg_reduce_long(" + localVar +
+                           ", lid, tg_size, tg_shared_" + acc.name + ");");
+                cg.addIf("lid == 0", [&]() {
+                    cg.addLine("atomic_add_long_pair(" + acc.loBuffer + ", " +
+                               acc.hiBuffer + ", " + tgVar + ");");
+                });
+            }
         }
     }
 
@@ -415,7 +429,16 @@ void MetalKeyedAgg::produce(MetalCodegen& cg, ConsumerFn consume) {
     // Only use TG reduction when there are enough aggregates per row to justify
     // the reduction overhead. With few aggs (e.g. 1 count), the barrier cost
     // exceeds the atomic savings, especially for low-selectivity joins.
-    if (allAdds && numBuckets_ <= 64 && aggregates_.size() >= 3) {
+    //
+    // Tuning knobs (empirical, see /memories/repo/metal_codegen_optimizations.md):
+    //   - kMaxBucketsForTGReduce: per-thread accumulator array length cap.
+    //     Above this, register pressure and TG-shared memory dominate.
+    //   - kMinAggsForTGReduce: minimum aggs per row to amortise the two-level
+    //     reduction barrier cost.
+    constexpr int kMaxBucketsForTGReduce = 64;
+    constexpr int kMinAggsForTGReduce    = 3;
+    if (allAdds && numBuckets_ <= kMaxBucketsForTGReduce &&
+        (int)aggregates_.size() >= kMinAggsForTGReduce) {
         // === OPTIMIZED PATH: thread-local + TG reduction ===
         cg.setPhaseMaxThreadgroups(1024);
 
@@ -851,7 +874,7 @@ void MetalHistogram::produce(MetalCodegen& cg, ConsumerFn consume) {
     cg.addBufferParam(inputCountArray_, "uint", inputSize_, false);
     cg.addAtomicBufferParam(outputHistArray_, "atomic_uint",
                             histSizeExpr_.empty() ? std::to_string(maxBuckets_ + 1) : histSizeExpr_);
-    cg.addScalarParam("n_" + inputCountArray_, "uint");
+    cg.addScalarParam(tableSizeName(inputCountArray_), "uint");
 
     // Use threadgroup-local histogram to reduce global atomic contention
     int tgHistSize = maxBuckets_ + 1;

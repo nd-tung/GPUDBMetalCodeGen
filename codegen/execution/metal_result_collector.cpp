@@ -1,6 +1,7 @@
 #include "metal_result_collector.h"
 #include <iostream>
 #include <iomanip>
+#include <sstream>
 #include <cstring>
 #include <algorithm>
 #include <cstdint>
@@ -75,6 +76,38 @@ void GenericResult::print(int limit) const {
 
     if (limit > 0 && (size_t)limit < rows.size())
         std::cout << "... (" << rows.size() - limit << " more rows)\n";
+}
+
+// ===================================================================
+// GenericResult::toCanonical
+// ===================================================================
+
+std::string GenericResult::toCanonical() const {
+    std::ostringstream os;
+    for (size_t c = 0; c < columns.size(); c++) {
+        if (c) os << ",";
+        os << columns[c].name;
+    }
+    os << "\n";
+    for (const auto& row : rows) {
+        for (size_t c = 0; c < row.size(); c++) {
+            if (c) os << ",";
+            std::visit([&](auto&& v) {
+                using T = std::decay_t<decltype(v)>;
+                if constexpr (std::is_same_v<T, int64_t>) {
+                    os << v;
+                } else if constexpr (std::is_same_v<T, double>) {
+                    char buf[64];
+                    snprintf(buf, sizeof(buf), "%.4f", v);
+                    os << buf;
+                } else {
+                    os << v;
+                }
+            }, row[c]);
+        }
+        os << "\n";
+    }
+    return os.str();
 }
 
 // ===================================================================
@@ -164,8 +197,8 @@ GenericResult MetalResultCollector::collectKeyedAgg(const MetalResultSchema& sch
     if (it == buffers.end()) return result;
 
     const auto* data = static_cast<const uint32_t*>(it->second->contents());
-    int nb = schema.keyedAgg.numBuckets;
-    int vpb = schema.keyedAgg.valuesPerBucket;
+    const int numBuckets       = schema.keyedAgg.numBuckets;
+    const int valuesPerBucket  = schema.keyedAgg.valuesPerBucket;
     const auto& slots = schema.keyedAgg.slots;
 
     // Build column headers
@@ -175,34 +208,37 @@ GenericResult MetalResultCollector::collectKeyedAgg(const MetalResultSchema& sch
             result.columns.push_back({slot.name, slot.isLongPair ? "long" : "uint"});
         }
     } else {
-        for (int v = 0; v < vpb; v++) {
+        for (int v = 0; v < valuesPerBucket; v++) {
             result.columns.push_back({"val_" + std::to_string(v), "uint"});
         }
     }
 
-    for (int b = 0; b < nb; b++) {
-        // Check if bucket has data
+    for (int bucket = 0; bucket < numBuckets; bucket++) {
+        const int rowBase = bucket * valuesPerBucket;
+        // Skip empty buckets (all slots zero)
         bool hasData = false;
-        for (int v = 0; v < vpb; v++) {
-            if (data[b * vpb + v] != 0) { hasData = true; break; }
+        for (int v = 0; v < valuesPerBucket; v++) {
+            if (data[rowBase + v] != 0) { hasData = true; break; }
         }
         if (!hasData) continue;
 
         GenericResult::Row row;
-        row.push_back((int64_t)b);  // bucket key
+        row.push_back((int64_t)bucket);  // bucket key
 
         if (!slots.empty()) {
             for (const auto& slot : slots) {
                 if (slot.isLongPair) {
-                    uint32_t lo = data[b * vpb + slot.offset];
-                    uint32_t hi = data[b * vpb + slot.offset + 1];
+                    // 64-bit aggregate stored as two adjacent uint32 slots
+                    // (lo at offset, hi at offset+1) — see metal_common_header.h
+                    uint32_t lo = data[rowBase + slot.offset];
+                    uint32_t hi = data[rowBase + slot.offset + 1];
                     int64_t val = ((int64_t)hi << 32) | (int64_t)lo;
                     if (slot.scaleDown > 0)
                         row.push_back((double)val / slot.scaleDown);
                     else
                         row.push_back(val);
                 } else {
-                    int64_t val = (int64_t)data[b * vpb + slot.offset];
+                    int64_t val = (int64_t)data[rowBase + slot.offset];
                     if (slot.scaleDown > 0)
                         row.push_back((double)val / slot.scaleDown);
                     else
@@ -210,8 +246,8 @@ GenericResult MetalResultCollector::collectKeyedAgg(const MetalResultSchema& sch
                 }
             }
         } else {
-            for (int v = 0; v < vpb; v++) {
-                row.push_back((int64_t)data[b * vpb + v]);
+            for (int v = 0; v < valuesPerBucket; v++) {
+                row.push_back((int64_t)data[rowBase + v]);
             }
         }
         result.rows.push_back(std::move(row));
