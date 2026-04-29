@@ -7,8 +7,7 @@
 // into a MetalCodegen instance. Operators form trees where each
 // calls its child's produce() and wraps the consumer callback.
 //
-// Modeled on the CUDACodeGeneral operator framework, but emitting
-// Metal Shading Language with Apple GPU-specific optimizations
+// Emits Metal Shading Language with Apple GPU-specific optimizations
 // (SIMD group reductions, Metal atomics, [[buffer(N)]] attributes).
 // ===================================================================
 
@@ -84,21 +83,6 @@ private:
     std::string rowVar_;
     std::string idxVar_;
     std::vector<ColumnDesc> columns_;
-};
-
-// Simple scan without grid-stride (for single-threadgroup or index-based).
-// Emits:
-//   if (tid < n_{table}) { ... }
-class MetalSimpleScan : public MetalOperator {
-public:
-    MetalSimpleScan(const std::string& table,
-                    const std::string& rowVar = "row");
-    void produce(MetalCodegen& cg, ConsumerFn consume) override;
-    std::string describe() const override;
-
-private:
-    std::string tableName_;
-    std::string rowVar_;
 };
 
 // ===================================================================
@@ -291,6 +275,9 @@ public:
         std::string valueExpr;
         std::string atomicOp;   // "add", "min", "max"
         bool isLongPair = false; // true → uses lo/hi atomic_uint pair at offset/offset+1
+        // scaleDown is applied during result COLLECTION only (post-process),
+        // see MetalResultCollector::collectKeyedAgg. The GPU kernel always
+        // accumulates the raw fixed-point value; this divisor is for display.
         int scaleDown = 0;      // result divisor (e.g. 100 for cents→dollars, 0=none)
     };
 
