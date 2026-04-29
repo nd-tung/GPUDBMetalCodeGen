@@ -166,7 +166,7 @@ static Q18PostData g_q18Post;
 // Run a query through the codegen pipeline
 // ===================================================================
 
-static void runCodegenQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
+static bool runCodegenQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
                             const std::string& sql, const std::string& queryName) {
     if (!g_csv) printf("\n=== Codegen: %s ===\n", queryName.c_str());
     try {
@@ -203,7 +203,7 @@ static void runCodegenQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
         auto maybePlan = codegen::buildMetalPlan(analyzed, queryName);
         if (!maybePlan) {
             std::cerr << "Codegen: query pattern not yet supported for " << queryName << std::endl;
-            return;
+            return false;
         }
         auto& plan = *maybePlan;
         plan.name = queryName;
@@ -260,7 +260,7 @@ static void runCodegenQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
         timing.compileMs = elapsedMs(tCompile0, clk::now());
         if (!library) {
             std::cerr << "Codegen: Metal compilation failed" << std::endl;
-            return;
+            return false;
         }
 
         // Build CompiledQuery with PSOs for each phase
@@ -271,7 +271,7 @@ static void runCodegenQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
             auto* pso = compiler.getPipeline(library, phase.name);
             if (!pso) {
                 std::cerr << "Codegen: PSO creation failed for " << phase.name << std::endl;
-                return;
+                return false;
             }
             compiled.pipelines.push_back(pso);
             compiled.kernelNames.push_back(phase.name);
@@ -333,6 +333,23 @@ static void runCodegenQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
             loadedTables.emplace_back(tableName, std::move(cols));
         }
 
+        auto loadPreprocessColumns = [&](const std::string& tableName,
+                                         const std::vector<ColSpec>& specs) {
+            return loadQueryColumns(device, g_dataset_path + tableName + ".tbl", specs);
+        };
+        auto copyIntColumn = [](const QueryColumns& columns, int columnIndex) {
+            const int* values = columns.ints(columnIndex);
+            return values ? std::vector<int>(values, values + columns.rows()) : std::vector<int>{};
+        };
+        auto copyFloatColumn = [](const QueryColumns& columns, int columnIndex) {
+            const float* values = columns.floats(columnIndex);
+            return values ? std::vector<float>(values, values + columns.rows()) : std::vector<float>{};
+        };
+        auto copyCharColumn = [](const QueryColumns& columns, int columnIndex, size_t byteCount) {
+            const char* values = columns.chars(columnIndex);
+            return values ? std::vector<char>(values, values + byteCount) : std::vector<char>{};
+        };
+
         // ---------------------------------------------------------------
         // Compute max key values for dynamic buffer sizing
         // ---------------------------------------------------------------
@@ -374,7 +391,7 @@ static void runCodegenQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
             int germany_nk = findNationKey(nat, "GERMANY");
             if (france_nk == -1 || germany_nk == -1) {
                 std::cerr << "Error: FRANCE/GERMANY not found in nation table" << std::endl;
-                return;
+                return false;
             }
             executor.registerScalarInt("france_nk", france_nk);
             executor.registerScalarInt("germany_nk", germany_nk);
@@ -387,7 +404,7 @@ static void runCodegenQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
                                         RegionData::NAME_WIDTH, "ASIA");
             if (asia_rk == -1) {
                 std::cerr << "Error: ASIA region not found" << std::endl;
-                return;
+                return false;
             }
             executor.registerScalarInt("asia_rk", asia_rk);
         }
@@ -401,7 +418,7 @@ static void runCodegenQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
             int brazil_nk = findNationKey(nat, "BRAZIL");
             if (america_rk == -1 || brazil_nk == -1) {
                 std::cerr << "Error: AMERICA/BRAZIL not found" << std::endl;
-                return;
+                return false;
             }
             executor.registerScalarInt("america_rk", america_rk);
             executor.registerScalarInt("brazil_nk", brazil_nk);
@@ -439,18 +456,18 @@ static void runCodegenQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
             int germany_nk = findNationKey(nat, "GERMANY");
             if (germany_nk == -1) {
                 std::cerr << "Error: GERMANY not found in nation table" << std::endl;
-                return;
+                return false;
             }
             executor.registerScalarInt("germany_nk", germany_nk);
         }
 
         // Q17: build per-partkey threshold from loaded data
         if (plan.name == "Q17") {
-            auto pCols = loadColumnsMultiAuto(g_dataset_path + "part.tbl",
+            auto pCols = loadPreprocessColumns("part",
                 {{0, ColType::INT}, {3, ColType::CHAR_FIXED, 10}, {6, ColType::CHAR_FIXED, 10}});
-            auto& p_partkey = pCols.ints(0);
-            auto& p_brand = pCols.chars(3);
-            auto& p_container = pCols.chars(6);
+            auto p_partkey = copyIntColumn(pCols, 0);
+            auto p_brand = copyCharColumn(pCols, 3, pCols.rows() * 10);
+            auto p_container = copyCharColumn(pCols, 6, pCols.rows() * 10);
             size_t partRows = p_partkey.size();
 
             const int*   pl_partkey = nullptr;
@@ -511,31 +528,31 @@ static void runCodegenQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
 
         // Q9: build green-parts bitmap, lookup arrays, and partsupp HT
         if (plan.name == "Q9") {
-            auto pCols = loadColumnsMultiAuto(g_dataset_path + "part.tbl",
+            auto pCols = loadPreprocessColumns("part",
                 {{0, ColType::INT}, {1, ColType::CHAR_FIXED, 55}});
-            auto& p_partkey = pCols.ints(0);
-            auto& p_name = pCols.chars(1);
+            auto p_partkey = copyIntColumn(pCols, 0);
+            auto p_name = copyCharColumn(pCols, 1, pCols.rows() * 55);
 
-            auto sCols = loadColumnsMultiAuto(g_dataset_path + "supplier.tbl",
+            auto sCols = loadPreprocessColumns("supplier",
                 {{0, ColType::INT}, {3, ColType::INT}});
-            auto& s_suppkey = sCols.ints(0);
-            auto& s_nationkey = sCols.ints(3);
+            auto s_suppkey = copyIntColumn(sCols, 0);
+            auto s_nationkey = copyIntColumn(sCols, 3);
 
-            auto oCols = loadColumnsMultiAuto(g_dataset_path + "orders.tbl",
+            auto oCols = loadPreprocessColumns("orders",
                 {{0, ColType::INT}, {4, ColType::DATE}});
-            auto& o_orderkey = oCols.ints(0);
-            auto& o_orderdate = oCols.ints(4);
+            auto o_orderkey = copyIntColumn(oCols, 0);
+            auto o_orderdate = copyIntColumn(oCols, 4);
 
-            auto psCols = loadColumnsMultiAuto(g_dataset_path + "partsupp.tbl",
+            auto psCols = loadPreprocessColumns("partsupp",
                 {{0, ColType::INT}, {1, ColType::INT}, {3, ColType::FLOAT}});
-            auto& ps_partkey = psCols.ints(0);
-            auto& ps_suppkey = psCols.ints(1);
-            auto& ps_supplycost = psCols.floats(3);
+            auto ps_partkey = copyIntColumn(psCols, 0);
+            auto ps_suppkey = copyIntColumn(psCols, 1);
+            auto ps_supplycost = copyFloatColumn(psCols, 3);
 
-            auto nCols = loadColumnsMultiAuto(g_dataset_path + "nation.tbl",
+            auto nCols = loadPreprocessColumns("nation",
                 {{0, ColType::INT}, {1, ColType::CHAR_FIXED, 25}});
-            auto& n_nationkey = nCols.ints(0);
-            auto& n_name = nCols.chars(1);
+            auto n_nationkey = copyIntColumn(nCols, 0);
+            auto n_name = copyCharColumn(nCols, 1, nCols.rows() * 25);
 
             std::vector<std::string> nationNames(25);
             for (size_t i = 0; i < n_nationkey.size(); i++) {
@@ -630,28 +647,28 @@ static void runCodegenQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
 
         // Q20: build forest% bitmap, partsupp HT, CANADA filter
         if (plan.name == "Q20") {
-            auto pCols = loadColumnsMultiAuto(g_dataset_path + "part.tbl",
+            auto pCols = loadPreprocessColumns("part",
                 {{0, ColType::INT}, {1, ColType::CHAR_FIXED, 55}});
-            auto& p_partkey = pCols.ints(0);
-            auto& p_name = pCols.chars(1);
+            auto p_partkey = copyIntColumn(pCols, 0);
+            auto p_name = copyCharColumn(pCols, 1, pCols.rows() * 55);
 
-            auto psCols = loadColumnsMultiAuto(g_dataset_path + "partsupp.tbl",
+            auto psCols = loadPreprocessColumns("partsupp",
                 {{0, ColType::INT}, {1, ColType::INT}, {2, ColType::INT}});
-            auto& ps_partkey = psCols.ints(0);
-            auto& ps_suppkey = psCols.ints(1);
-            auto& ps_availqty = psCols.ints(2);
+            auto ps_partkey = copyIntColumn(psCols, 0);
+            auto ps_suppkey = copyIntColumn(psCols, 1);
+            auto ps_availqty = copyIntColumn(psCols, 2);
 
-            auto sCols = loadColumnsMultiAuto(g_dataset_path + "supplier.tbl",
+            auto sCols = loadPreprocessColumns("supplier",
                 {{0, ColType::INT}, {1, ColType::CHAR_FIXED, 25}, {2, ColType::CHAR_FIXED, 40}, {3, ColType::INT}});
-            auto& s_suppkey = sCols.ints(0);
-            auto& s_name = sCols.chars(1);
-            auto& s_address = sCols.chars(2);
-            auto& s_nationkey = sCols.ints(3);
+            auto s_suppkey = copyIntColumn(sCols, 0);
+            auto s_name = copyCharColumn(sCols, 1, sCols.rows() * 25);
+            auto s_address = copyCharColumn(sCols, 2, sCols.rows() * 40);
+            auto s_nationkey = copyIntColumn(sCols, 3);
 
-            auto nCols = loadColumnsMultiAuto(g_dataset_path + "nation.tbl",
+            auto nCols = loadPreprocessColumns("nation",
                 {{0, ColType::INT}, {1, ColType::CHAR_FIXED, 25}});
-            auto& n_nationkey = nCols.ints(0);
-            auto& n_name = nCols.chars(1);
+            auto n_nationkey = copyIntColumn(nCols, 0);
+            auto n_name = copyCharColumn(nCols, 1, nCols.rows() * 25);
 
             int canada_nk = -1;
             for (size_t i = 0; i < n_nationkey.size(); i++) {
@@ -736,40 +753,40 @@ static void runCodegenQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
 
         // Q2: build EUROPE supplier bitmap, allocate part bitmap (filled by GPU Phase 1)
         if (plan.name == "Q2") {
-            auto pCols = loadColumnsMultiAuto(g_dataset_path + "part.tbl",
+            auto pCols = loadPreprocessColumns("part",
                 {{0, ColType::INT}, {2, ColType::CHAR_FIXED, 25}});
-            auto& p_partkey = pCols.ints(0);
-            auto& p_mfgr = pCols.chars(2);
+            auto p_partkey = copyIntColumn(pCols, 0);
+            auto p_mfgr = copyCharColumn(pCols, 2, pCols.rows() * 25);
 
-            auto sCols = loadColumnsMultiAuto(g_dataset_path + "supplier.tbl", {
+            auto sCols = loadPreprocessColumns("supplier", {
                 {0, ColType::INT}, {1, ColType::CHAR_FIXED, 25}, {2, ColType::CHAR_FIXED, 40},
                 {3, ColType::INT}, {4, ColType::CHAR_FIXED, 15}, {5, ColType::FLOAT},
                 {6, ColType::CHAR_FIXED, 101}
             });
-            auto& s_suppkey = sCols.ints(0);
-            auto& s_name = sCols.chars(1);
-            auto& s_address = sCols.chars(2);
-            auto& s_nationkey = sCols.ints(3);
-            auto& s_phone = sCols.chars(4);
-            auto& s_acctbal = sCols.floats(5);
-            auto& s_comment = sCols.chars(6);
+            auto s_suppkey = copyIntColumn(sCols, 0);
+            auto s_name = copyCharColumn(sCols, 1, sCols.rows() * 25);
+            auto s_address = copyCharColumn(sCols, 2, sCols.rows() * 40);
+            auto s_nationkey = copyIntColumn(sCols, 3);
+            auto s_phone = copyCharColumn(sCols, 4, sCols.rows() * 15);
+            auto s_acctbal = copyFloatColumn(sCols, 5);
+            auto s_comment = copyCharColumn(sCols, 6, sCols.rows() * 101);
 
-            auto psCols = loadColumnsMultiAuto(g_dataset_path + "partsupp.tbl",
+            auto psCols = loadPreprocessColumns("partsupp",
                 {{0, ColType::INT}, {1, ColType::INT}, {3, ColType::FLOAT}});
-            auto& ps_partkey = psCols.ints(0);
-            auto& ps_suppkey = psCols.ints(1);
-            auto& ps_supplycost = psCols.floats(3);
+            auto ps_partkey = copyIntColumn(psCols, 0);
+            auto ps_suppkey = copyIntColumn(psCols, 1);
+            auto ps_supplycost = copyFloatColumn(psCols, 3);
 
-            auto nCols = loadColumnsMultiAuto(g_dataset_path + "nation.tbl",
+            auto nCols = loadPreprocessColumns("nation",
                 {{0, ColType::INT}, {1, ColType::CHAR_FIXED, 25}, {2, ColType::INT}});
-            auto& n_nationkey = nCols.ints(0);
-            auto& n_name = nCols.chars(1);
-            auto& n_regionkey = nCols.ints(2);
+            auto n_nationkey = copyIntColumn(nCols, 0);
+            auto n_name = copyCharColumn(nCols, 1, nCols.rows() * 25);
+            auto n_regionkey = copyIntColumn(nCols, 2);
 
-            auto rCols = loadColumnsMultiAuto(g_dataset_path + "region.tbl",
+            auto rCols = loadPreprocessColumns("region",
                 {{0, ColType::INT}, {1, ColType::CHAR_FIXED, 25}});
-            auto& r_regionkey = rCols.ints(0);
-            auto& r_name = rCols.chars(1);
+            auto r_regionkey = copyIntColumn(rCols, 0);
+            auto r_name = copyCharColumn(rCols, 1, rCols.rows() * 25);
 
             int europe_rk = -1;
             for (size_t i = 0; i < r_regionkey.size(); i++) {
@@ -845,12 +862,12 @@ static void runCodegenQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
 
         // Q16: build part_group_map, allocate complaint bitmap (filled by GPU Phase 1)
         if (plan.name == "Q16") {
-            auto pCols = loadColumnsMultiAuto(g_dataset_path + "part.tbl",
+            auto pCols = loadPreprocessColumns("part",
                 {{0, ColType::INT}, {3, ColType::CHAR_FIXED, 10}, {4, ColType::CHAR_FIXED, 25}, {5, ColType::INT}});
-            auto& p_partkey = pCols.ints(0);
-            auto& p_brand = pCols.chars(3);
-            auto& p_type = pCols.chars(4);
-            auto& p_size = pCols.ints(5);
+            auto p_partkey = copyIntColumn(pCols, 0);
+            auto p_brand = copyCharColumn(pCols, 3, pCols.rows() * 10);
+            auto p_type = copyCharColumn(pCols, 4, pCols.rows() * 25);
+            auto p_size = copyIntColumn(pCols, 5);
 
             // Get maxSk from loaded supplier data (standard mechanism loads it for Phase 1)
             int maxSk = 0;
@@ -940,12 +957,12 @@ static void runCodegenQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
 
         // Q18: preload orders.tbl for post-processing (avoids reloading during post)
         if (plan.name == "Q18") {
-            auto oCols = loadColumnsMultiAuto(g_dataset_path + "orders.tbl",
+            auto oCols = loadPreprocessColumns("orders",
                 {{0, ColType::INT}, {1, ColType::INT}, {3, ColType::FLOAT}, {4, ColType::DATE}});
-            auto& okeys = oCols.ints(0);
-            g_q18Post.o_custkey = std::move(oCols.ints(1));
-            g_q18Post.o_totalprice = std::move(oCols.floats(3));
-            g_q18Post.o_orderdate = std::move(oCols.ints(4));
+            auto okeys = copyIntColumn(oCols, 0);
+            g_q18Post.o_custkey = copyIntColumn(oCols, 1);
+            g_q18Post.o_totalprice = copyFloatColumn(oCols, 3);
+            g_q18Post.o_orderdate = copyIntColumn(oCols, 4);
             // Build direct-mapped orderkey -> row index
             int maxOk = 0;
             for (int k : okeys) if (k > maxOk) maxOk = k;
@@ -957,16 +974,16 @@ static void runCodegenQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
         // Q21: allocate GPU buffers for phases, build SA-supp bitmap (tiny)
         if (plan.name == "Q21") {
             // Load supplier/nation for SA bitmap + post-processing (small tables)
-            auto sCols = loadColumnsMultiAuto(g_dataset_path + "supplier.tbl",
+            auto sCols = loadPreprocessColumns("supplier",
                 {{0, ColType::INT}, {1, ColType::CHAR_FIXED, 25}, {3, ColType::INT}});
-            auto& s_suppkey = sCols.ints(0);
-            auto& s_name = sCols.chars(1);
-            auto& s_nationkey = sCols.ints(3);
+            auto s_suppkey = copyIntColumn(sCols, 0);
+            auto s_name = copyCharColumn(sCols, 1, sCols.rows() * 25);
+            auto s_nationkey = copyIntColumn(sCols, 3);
 
-            auto nCols = loadColumnsMultiAuto(g_dataset_path + "nation.tbl",
+            auto nCols = loadPreprocessColumns("nation",
                 {{0, ColType::INT}, {1, ColType::CHAR_FIXED, 25}});
-            auto& n_nationkey = nCols.ints(0);
-            auto& n_name = nCols.chars(1);
+            auto n_nationkey = copyIntColumn(nCols, 0);
+            auto n_name = copyCharColumn(nCols, 1, nCols.rows() * 25);
 
             int sa_nk = -1;
             for (size_t i = 0; i < n_nationkey.size(); i++) {
@@ -1185,7 +1202,7 @@ static void runCodegenQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
                 auto* libR = compilerR->compile(metalSource);
                 if (!libR) {
                     std::cerr << "Codegen: Metal recompile failed in --no-pipeline-cache trial\n";
-                    return;
+                    return false;
                 }
                 codegen::RuntimeCompiler::CompiledQuery cR;
                 cR.library = libR;
@@ -1193,7 +1210,7 @@ static void runCodegenQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
                     auto* pso = compilerR->getPipeline(libR, phase.name);
                     if (!pso) {
                         std::cerr << "Codegen: PSO recreation failed for " << phase.name << "\n";
-                        return;
+                        return false;
                     }
                     cR.pipelines.push_back(pso);
                     cR.kernelNames.push_back(phase.name);
@@ -1627,10 +1644,10 @@ static void runCodegenQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
             auto* profitBuf = executor.getAllocatedBuffer("d_q9_profit");
             if (profitBuf) {
                 const float* profits = (const float*)profitBuf->contents();
-                auto nCols = loadColumnsMultiAuto(g_dataset_path + "nation.tbl",
+                auto nCols = loadPreprocessColumns("nation",
                     {{0, ColType::INT}, {1, ColType::CHAR_FIXED, 25}});
-                auto& n_nk = nCols.ints(0);
-                auto& n_nm = nCols.chars(1);
+                auto n_nk = copyIntColumn(nCols, 0);
+                auto n_nm = copyCharColumn(nCols, 1, nCols.rows() * 25);
                 std::vector<std::string> nationNames(25);
                 for (size_t i = 0; i < n_nk.size(); i++) {
                     std::string nm;
@@ -1914,8 +1931,10 @@ static void runCodegenQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
         printDetailedTimingSummary(timing, g_csv);
 
         executor.releaseAllocatedBuffers();
+        return true;
     } catch (const std::exception& e) {
         std::cerr << "Codegen error (" << queryName << "): " << e.what() << std::endl;
+        return false;
     }
 }
 
@@ -1965,14 +1984,36 @@ int main(int argc, const char* argv[]) {
         if (arg == "--no-pipeline-cache") { g_noPipelineCache = true; continue; }
         if (arg == "--no-fastmath")       { g_noFastMath = true; continue; }
         if (arg == "--print-plan")        { g_printPlan = true; continue; }
-        if (arg == "--dump-msl" && i + 1 < argc) { g_dumpMslDir = argv[++i]; continue; }
-        if (arg == "--check" && i + 1 < argc) { g_checkDir = argv[++i]; continue; }
-        if (arg == "--save-golden" && i + 1 < argc) { g_saveGoldenDir = argv[++i]; continue; }
-        if (arg == "--check-abs-tol" && i + 1 < argc) { g_checkAbsTol = std::atof(argv[++i]); continue; }
-        if (arg == "--check-rel-tol" && i + 1 < argc) { g_checkRelTol = std::atof(argv[++i]); continue; }
-        if (arg == "--warmup" && i + 1 < argc) { g_warmup = std::max(0, std::atoi(argv[++i])); continue; }
-        if (arg == "--repeat" && i + 1 < argc) { g_repeat = std::max(1, std::atoi(argv[++i])); continue; }
-        if (arg == "--threadgroup-size" && i + 1 < argc) {
+        if (arg == "--dump-msl") {
+            if (i + 1 >= argc) { std::cerr << "Missing value for --dump-msl\n"; return 1; }
+            g_dumpMslDir = argv[++i]; continue;
+        }
+        if (arg == "--check") {
+            if (i + 1 >= argc) { std::cerr << "Missing value for --check\n"; return 1; }
+            g_checkDir = argv[++i]; continue;
+        }
+        if (arg == "--save-golden") {
+            if (i + 1 >= argc) { std::cerr << "Missing value for --save-golden\n"; return 1; }
+            g_saveGoldenDir = argv[++i]; continue;
+        }
+        if (arg == "--check-abs-tol") {
+            if (i + 1 >= argc) { std::cerr << "Missing value for --check-abs-tol\n"; return 1; }
+            g_checkAbsTol = std::atof(argv[++i]); continue;
+        }
+        if (arg == "--check-rel-tol") {
+            if (i + 1 >= argc) { std::cerr << "Missing value for --check-rel-tol\n"; return 1; }
+            g_checkRelTol = std::atof(argv[++i]); continue;
+        }
+        if (arg == "--warmup") {
+            if (i + 1 >= argc) { std::cerr << "Missing value for --warmup\n"; return 1; }
+            g_warmup = std::max(0, std::atoi(argv[++i])); continue;
+        }
+        if (arg == "--repeat") {
+            if (i + 1 >= argc) { std::cerr << "Missing value for --repeat\n"; return 1; }
+            g_repeat = std::max(1, std::atoi(argv[++i])); continue;
+        }
+        if (arg == "--threadgroup-size") {
+            if (i + 1 >= argc) { std::cerr << "Missing value for --threadgroup-size\n"; return 1; }
             g_tgSizeOverride = std::max(0, std::atoi(argv[++i])); continue;
         }
         if (arg == "--autotune-tg")       { g_autotuneTg = true; continue; }
@@ -1981,6 +2022,14 @@ int main(int argc, const char* argv[]) {
         if (arg == "sf10") { g_dataset_path = "data/SF-10/"; continue; }
         if (arg == "sf50") { g_dataset_path = "data/SF-50/"; continue; }
         if (arg == "sf100") { g_dataset_path = "data/SF-100/"; continue; }
+        if (!arg.empty() && arg[0] == '-') {
+            std::cerr << "Unknown flag: " << arg << std::endl;
+            return 1;
+        }
+        if (!query.empty()) {
+            std::cerr << "Unexpected extra query argument: " << arg << std::endl;
+            return 1;
+        }
         query = arg;
     }
 
@@ -2003,42 +2052,43 @@ int main(int argc, const char* argv[]) {
 
     printSystemInfo(getSystemInfo(device));
 
-    auto runQuery = [&](int qNum) {
+    auto runQuery = [&](int qNum) -> bool {
         std::string path = "sql/q" + std::to_string(qNum) + ".sql";
         std::ifstream f(path);
         if (!f.is_open()) {
             std::cerr << "Cannot open SQL file: " << path << std::endl;
-            return;
+            return false;
         }
         std::stringstream ss;
         ss << f.rdbuf();
         std::string sql = ss.str();
         std::string name = "Q" + std::to_string(qNum);
-        runCodegenQuery(device, cmdQueue, sql, name);
+        return runCodegenQuery(device, cmdQueue, sql, name);
     };
 
-    auto runMicrobench = [&](int mbNum) {
+    auto runMicrobench = [&](int mbNum) -> bool {
         std::string path = "sql/mb" + std::to_string(mbNum) + ".sql";
         std::ifstream f(path);
         if (!f.is_open()) {
             std::cerr << "Cannot open SQL file: " << path << std::endl;
-            return;
+            return false;
         }
         std::stringstream ss;
         ss << f.rdbuf();
         std::string sql = ss.str();
         std::string name = "MB" + std::to_string(mbNum);
-        runCodegenQuery(device, cmdQueue, sql, name);
+        return runCodegenQuery(device, cmdQueue, sql, name);
     };
 
+    bool ok = true;
     if (query == "all") {
-        for (int q = 1; q <= 22; q++) runQuery(q);
+        for (int q = 1; q <= 22; q++) ok = runQuery(q) && ok;
     } else if (query == "mball") {
-        for (int m = 1; m <= 7; m++) runMicrobench(m);
+        for (int m = 1; m <= 7; m++) ok = runMicrobench(m) && ok;
     } else if (query.size() >= 3 && query[0] == 'm' && query[1] == 'b') {
         int mbNum = std::stoi(query.substr(2));
         if (mbNum >= 1 && mbNum <= 99) {
-            runMicrobench(mbNum);
+            ok = runMicrobench(mbNum);
         } else {
             std::cerr << "Unknown microbench: " << query << std::endl;
             return 1;
@@ -2046,7 +2096,7 @@ int main(int argc, const char* argv[]) {
     } else if (query.size() >= 2 && query[0] == 'q') {
         int qNum = std::stoi(query.substr(1));
         if (qNum >= 1 && qNum <= 22) {
-            runQuery(qNum);
+            ok = runQuery(qNum);
         } else {
             std::cerr << "Unknown query: " << query << std::endl;
             return 1;
@@ -2057,5 +2107,6 @@ int main(int argc, const char* argv[]) {
     }
 
     pool->release();
+    if (!ok && g_checkExitCode == 0) return 1;
     return g_checkExitCode;
 }

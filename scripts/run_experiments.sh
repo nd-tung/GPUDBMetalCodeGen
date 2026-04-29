@@ -21,6 +21,17 @@ QUERIES="q1 q6 q13 q17"
 CHUNK_SIZES="5 10 25 50 100 200"
 REPS=3
 
+if [[ ! -x "$BIN" ]]; then
+  echo "Building project..."
+  make -j"$(sysctl -n hw.ncpu 2>/dev/null || echo 8)"
+fi
+
+if ! "$BIN" --help 2>/dev/null | grep -q -- '--chunk'; then
+  echo "ERROR: $BIN does not expose --chunk/--no-db streaming flags." >&2
+  echo "This SF100 streaming experiment script is stale until chunked mode is wired into GPUDBCodegen." >&2
+  exit 1
+fi
+
 mkdir -p "$LOGDIR"
 
 # CSV header

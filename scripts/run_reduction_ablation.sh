@@ -13,7 +13,7 @@ TS=$(date +%Y%m%d_%H%M%S)
 OUT=build/exp_reduction_${TS}
 mkdir -p "$OUT"
 CSV=$OUT/reduction.csv
-echo "strategy,sf,query,gpu_ms,e2e_ms,kernel_ms,load_mibps" > "$CSV"
+echo "strategy,sf,query,gpu_ms,e2e_ms,pso_ms,load_mibps" > "$CSV"
 
 QUERIES=(mb1 mb2 mb3 mb4 mb5 mb6 mb7 q1 q6 q14)
 SFS=(sf1 sf10)
@@ -27,12 +27,12 @@ run() {  # $1=strategy_label $2=extra_args $3=sf $4=q
         printf "  %-15s %s %-4s FAIL\n" "$label" "$sf" "$q"
         return
     fi
-    local gpu kernel e2e bw
+    local gpu pso e2e bw
     gpu=$(awk -F, '{print $10}' <<<"$line")
-    kernel=$(awk -F, '{print $7}' <<<"$line")    # pso_ms (kernel exec)
+    pso=$(awk -F, '{print $7}' <<<"$line")
     e2e=$(awk -F, '{print $14}' <<<"$line")
     bw=$(awk -F, '{print $17}' <<<"$line")
-    echo "$label,$sf,$q,$gpu,$e2e,$kernel,$bw" >> "$CSV"
+    echo "$label,$sf,$q,$gpu,$e2e,$pso,$bw" >> "$CSV"
     printf "  %-15s %s %-4s  gpu=%6.2fms  e2e=%7.2fms  bw=%9.1f MiB/s\n" \
         "$label" "$sf" "$q" "$gpu" "$e2e" "$bw"
 }
