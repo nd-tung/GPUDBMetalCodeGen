@@ -266,7 +266,7 @@ static std::optional<MetalQueryPlan> buildQ6Plan(const AnalyzedQuery& aq) {
         filtered = std::move(scan);
     }
 
-    auto reduce = std::make_unique<MetalTGReduce>(std::move(filtered), "d_" + alias);
+    auto reduce = std::make_unique<MetalTGReduce>(std::move(filtered), tableDataName(alias));
     // For Q6, use long (fixed-point 100x) accumulation for precision
     reduce->addAccumulator(alias, "(long)(" + aggExpr + " * 100.0f)", "long");
 

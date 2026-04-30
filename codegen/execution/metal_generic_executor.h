@@ -36,7 +36,9 @@ struct MetalExecutionResult {
     float dataLoadTimeMs   = 0.0f;  // .tbl parse + host buffer fill + per-query setup
     float bufferAllocTimeMs = 0.0f; // GPU buffer allocation / upload inside execute()
 
-    // Legacy aggregate (== dataLoadTimeMs), kept for backwards compatibility
+    // Same value as dataLoadTimeMs; kept under this name because the
+    // TIMING_CSV output schema and downstream analysis scripts already
+    // reference `parseTimeMs`.
     float parseTimeMs      = 0.0f;
     float postTimeMs       = 0.0f;
 };
@@ -45,20 +47,21 @@ class MetalGenericExecutor {
 public:
     MetalGenericExecutor(MTL::Device* device, MTL::CommandQueue* cmdQueue);
 
-    // Register table data from host memory
-    void registerTable(const std::string& name, const void* data,
-                       size_t rowCount, size_t bytesPerRow);
+    // RAII safety net: any owned GPU buffers still held when the executor goes
+    // out of scope are released. The normal lifecycle still calls
+    // releaseAllocatedBuffers() explicitly after results are consumed.
+    ~MetalGenericExecutor();
 
-    // Register a single column buffer from host memory
-    void registerColumn(const std::string& paramName, const void* data,
-                        size_t rowCount, size_t bytesPerElem);
+    MetalGenericExecutor(const MetalGenericExecutor&) = delete;
+    MetalGenericExecutor& operator=(const MetalGenericExecutor&) = delete;
+
+    // Register a pre-allocated Metal buffer (zero-copy column or pre-built
+    // dimension table). The executor does NOT take ownership.
+    void registerTableBuffer(const std::string& name, MTL::Buffer* buffer,
+                             size_t rowCount);
 
     // Register row count for a table (so n_tableName can be resolved)
     void registerTableRowCount(const std::string& tableName, size_t rowCount);
-
-    // Register a pre-allocated Metal buffer
-    void registerTableBuffer(const std::string& name, MTL::Buffer* buffer,
-                             size_t rowCount);
 
     // Register a pre-allocated buffer into the cross-phase buffer map
     // (used for pre-computed data like bitmaps or lookup arrays)
