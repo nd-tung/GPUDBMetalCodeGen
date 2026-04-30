@@ -158,6 +158,7 @@ BufferMap MetalGenericExecutor::allocatePhaseBuffers(
 
 void MetalGenericExecutor::zeroInitBuffers(const MetalCodegen::PhaseInfo& phase,
                                             const BufferMap& buffers) {
+    if (skipZeroInit_) return;  // frozen mode: output buffers accumulate across chunks
     for (const auto& b : phase.bindings) {
         if (b.zeroInit && b.kind == MetalParamKind::DeviceBuffer) {
             auto it = buffers.find(b.name);
@@ -166,6 +167,14 @@ void MetalGenericExecutor::zeroInitBuffers(const MetalCodegen::PhaseInfo& phase,
             }
         }
     }
+}
+
+// ===================================================================
+// Collect result from current allocatedBuffers_ (used after chunk loop)
+// ===================================================================
+
+GenericResult MetalGenericExecutor::collectResult(const MetalCodegen& codegen) const {
+    return MetalResultCollector::collect(codegen.getResultSchema(), allocatedBuffers_);
 }
 
 // ===================================================================
@@ -226,20 +235,33 @@ MetalExecutionResult MetalGenericExecutor::execute(
     const MetalCodegen& codegen,
     int warmupRuns,
     int measuredRuns) {
+    return execute(compiled, codegen, warmupRuns, measuredRuns, 0, -1);
+}
+
+MetalExecutionResult MetalGenericExecutor::execute(
+    const RuntimeCompiler::CompiledQuery& compiled,
+    const MetalCodegen& codegen,
+    int warmupRuns,
+    int measuredRuns,
+    int firstPhase,
+    int lastPhase) {
 
     MetalExecutionResult execResult;
-    const auto& phases = codegen.getPhases();
+    const auto& allPhases = codegen.getPhases();
 
-    if (phases.empty()) {
+    if (allPhases.empty()) {
         std::cerr << "MetalGenericExecutor: no phases to execute\n";
         return execResult;
     }
+    if (lastPhase < 0) lastPhase = (int)allPhases.size();
+    if (firstPhase >= lastPhase) return execResult;
 
     // Pre-allocate all buffers across all phases (timed)
     auto allocStart = std::chrono::high_resolution_clock::now();
     BufferMap allBuffers;
-    for (const auto& phase : phases) {
-        auto phaseBuffers = allocatePhaseBuffers(phase);
+        for (int _pi = firstPhase; _pi < lastPhase; _pi++) {
+            const auto& phase = allPhases[_pi];
+            auto phaseBuffers = allocatePhaseBuffers(phase);
         for (auto& [k, v] : phaseBuffers) {
             if (!allBuffers.count(k))
                 allBuffers[k] = v;
@@ -253,7 +275,8 @@ MetalExecutionResult MetalGenericExecutor::execute(
 
     for (int iter = 0; iter < totalRuns; iter++) {
         // Zero-init output buffers each iteration
-        for (const auto& phase : phases) {
+        for (int _pi = firstPhase; _pi < lastPhase; _pi++) {
+            const auto& phase = allPhases[_pi];
             zeroInitBuffers(phase, allBuffers);
         }
 
@@ -264,8 +287,8 @@ MetalExecutionResult MetalGenericExecutor::execute(
             auto* cmdBuf = cmdQueue_->commandBuffer();
             auto* encoder = cmdBuf->computeCommandEncoder();
 
-            for (size_t pi = 0; pi < phases.size(); pi++) {
-                const auto& phase = phases[pi];
+            for (size_t pi = (size_t)firstPhase; pi < (size_t)lastPhase; pi++) {
+                const auto& phase = allPhases[pi];
                 auto* pso = findPSO(compiled, phase.name);
                 if (!pso) {
                     std::cerr << "MetalGenericExecutor: PSO not found for '"
@@ -305,7 +328,7 @@ MetalExecutionResult MetalGenericExecutor::execute(
                                                   MTL::Size::Make(tgSize, 1, 1));
                 }
 
-                if (pi + 1 < phases.size()) {
+                if ((int)pi + 1 < lastPhase) {
                     encoder->memoryBarrier(MTL::BarrierScopeBuffers);
                 }
             }
@@ -320,11 +343,11 @@ MetalExecutionResult MetalGenericExecutor::execute(
         double totalGpuSec = 0.0;
         execResult.phaseTimesMs.clear();
         execResult.phaseNames.clear();
-        execResult.phaseTimesMs.reserve(phases.size());
-        execResult.phaseNames.reserve(phases.size());
+        execResult.phaseTimesMs.reserve((size_t)(lastPhase - firstPhase));
+        execResult.phaseNames.reserve((size_t)(lastPhase - firstPhase));
 
-        for (size_t pi = 0; pi < phases.size(); pi++) {
-            const auto& phase = phases[pi];
+        for (size_t pi = (size_t)firstPhase; pi < (size_t)lastPhase; pi++) {
+            const auto& phase = allPhases[pi];
             auto* pso = findPSO(compiled, phase.name);
             if (!pso) {
                 std::cerr << "MetalGenericExecutor: PSO not found for '"
