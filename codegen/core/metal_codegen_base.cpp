@@ -127,7 +127,7 @@ void MetalCodegen::addTableParam(const std::string& table, const std::string& me
     {
         MetalParamBinding b;
         b.name = "d_" + table;
-        b.metalDecl = "device const " + metalType + "*";
+        b.metalTypeDecl = "device const " + metalType + "*";
         b.kind = MetalParamKind::TableData;
         b.tableName = table;
         b.elementType = metalType;
@@ -138,7 +138,7 @@ void MetalCodegen::addTableParam(const std::string& table, const std::string& me
     {
         MetalParamBinding b;
         b.name = "n_" + table;
-        b.metalDecl = "constant uint&";
+        b.metalTypeDecl = "constant uint&";
         b.kind = MetalParamKind::TableSize;
         b.tableName = table;
         b.elementType = "uint";
@@ -154,7 +154,7 @@ void MetalCodegen::addColumnParam(const std::string& paramName, const std::strin
         throw std::runtime_error("addColumnParam: no active phase");
     MetalParamBinding b;
     b.name = paramName;
-    b.metalDecl = "device const " + metalType + "*";
+    b.metalTypeDecl = "device const " + metalType + "*";
     b.kind = MetalParamKind::TableData;
     b.tableName = tableName.empty() ? paramName : tableName;
     b.elementType = metalType;
@@ -167,7 +167,7 @@ void MetalCodegen::addTableSizeParam(const std::string& table) {
         throw std::runtime_error("addTableSizeParam: no active phase");
     MetalParamBinding b;
     b.name = "n_" + table;
-    b.metalDecl = "constant uint&";
+    b.metalTypeDecl = "constant uint&";
     b.kind = MetalParamKind::TableSize;
     b.tableName = table;
     b.elementType = "uint";
@@ -183,7 +183,7 @@ void MetalCodegen::addBufferParam(const std::string& name, const std::string& el
         if (existing.name == name) return;
     MetalParamBinding b;
     b.name = name;
-    b.metalDecl = "device " + elemType + "*";
+    b.metalTypeDecl = "device " + elemType + "*";
     b.kind = MetalParamKind::DeviceBuffer;
     b.elementType = elemType;
     b.sizeExpr = sizeExpr;
@@ -205,7 +205,7 @@ void MetalCodegen::addAtomicBufferParam(const std::string& name,
         if (existing.name == name) return;
     MetalParamBinding b;
     b.name = name;
-    b.metalDecl = "device " + atomicType + "*";
+    b.metalTypeDecl = "device " + atomicType + "*";
     b.kind = MetalParamKind::DeviceBuffer;
     b.elementType = atomicType;
     b.sizeExpr = sizeExpr;
@@ -223,7 +223,7 @@ void MetalCodegen::addScalarParam(const std::string& name, const std::string& ty
         if (existing.name == name) return;
     MetalParamBinding b;
     b.name = name;
-    b.metalDecl = "constant " + type + "&";
+    b.metalTypeDecl = "constant " + type + "&";
     b.kind = MetalParamKind::ConstantScalar;
     b.elementType = type;
     currentPhase_->bindings.push_back(b);
@@ -235,7 +235,7 @@ void MetalCodegen::addConstantDataParam(const std::string& name, const std::stri
         throw std::runtime_error("addConstantDataParam: no active phase");
     MetalParamBinding b;
     b.name = name;
-    b.metalDecl = "constant " + type + "*";
+    b.metalTypeDecl = "constant " + type + "*";
     b.kind = MetalParamKind::ConstantData;
     b.elementType = type;
     b.hostCopyBytes = bytes;
@@ -247,7 +247,7 @@ void MetalCodegen::addBitmapReadParam(const std::string& name, const std::string
         throw std::runtime_error("addBitmapReadParam: no active phase");
     MetalParamBinding b;
     b.name = name;
-    b.metalDecl = "device const uint*";
+    b.metalTypeDecl = "device const uint*";
     b.kind = MetalParamKind::DeviceBuffer;
     b.elementType = "uint";
     b.sizeExpr = sizeExpr;
@@ -377,7 +377,7 @@ std::string MetalCodegen::generateSignature(const PhaseInfo& phase) const {
 
     for (size_t i = 0; i < phase.bindings.size(); i++) {
         const auto& b = phase.bindings[i];
-        sig << "    " << b.metalDecl << " " << b.name
+        sig << "    " << b.metalTypeDecl << " " << b.name
             << " [[buffer(" << b.bufferIndex << ")]]";
         if (i + 1 < phase.bindings.size() || needsThreadPos)
             sig << ",";

@@ -82,6 +82,30 @@ public:
         int measuredRuns = 1
     );
 
+        // Execute only a subset of phases [firstPhase, lastPhase).
+        // lastPhase = -1 means execute all phases from firstPhase onward.
+        // Useful for chunked execution: run stream-table phases per chunk,
+        // then run post-stream phases once after all chunks.
+        MetalExecutionResult execute(
+            const RuntimeCompiler::CompiledQuery& compiled,
+            const MetalCodegen& codegen,
+            int warmupRuns,
+            int measuredRuns,
+            int firstPhase,
+            int lastPhase
+        );
+
+    // When true, zeroInitBuffers() becomes a no-op so GPU output buffers
+    // accumulate atomically across successive execute() calls.
+    // Use for chunked execution: clear before first chunk, set true before
+    // subsequent chunks, clear again after the last chunk.
+    void setSkipZeroInit(bool skip) { skipZeroInit_ = skip; }
+
+    // Collect results from the current allocatedBuffers_ state without
+    // re-running the GPU.  Used after a chunked execution loop to read
+    // the accumulated result that the GPU built up across all chunks.
+    GenericResult collectResult(const MetalCodegen& codegen) const;
+
     // Clean up allocated buffers (call after execute, results consumed)
     void releaseAllocatedBuffers();
 
@@ -95,6 +119,7 @@ private:
     MTL::Device* device_;
     MTL::CommandQueue* cmdQueue_;
     MetalSizeResolver sizeResolver_;
+    bool skipZeroInit_ = false;  // when true, zeroInitBuffers() is a no-op
 
     // Registered tables: name → {buffer, rowCount}
     struct TableInfo {
