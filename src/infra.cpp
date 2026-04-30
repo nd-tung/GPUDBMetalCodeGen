@@ -7,6 +7,3 @@
 
 // Global dataset configuration — definitions
 std::string g_dataset_path = "data/SF-1/"; // Default to SF-1
-bool g_sf100_mode = false; // true when running SF100 chunked execution
-size_t g_chunk_rows_override = 0;  // 0 = use adaptive
-bool g_double_buffer = true;       // default: double-buffer

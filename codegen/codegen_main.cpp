@@ -10,10 +10,12 @@
 #include "metal_plan_builder.h"
 #include "metal_generic_executor.h"
 #include "query_preprocessing.h"
+#include "chunked_colbin_loader.h"
 #include "tpch_schema.h"
 #include <fstream>
 #include <sstream>
 #include <cmath>
+#include <cerrno>
 #include <cstdlib>
 #include <limits>
 #include <sys/stat.h>
@@ -41,6 +43,8 @@ static std::string g_saveGoldenDir;      // --save-golden DIR
 static double g_checkAbsTol = 1e-2;      // --check-abs-tol N
 static double g_checkRelTol = 1e-4;      // --check-rel-tol N
 static int    g_checkExitCode = 0;       // accumulated: nonzero if any --check failed
+static size_t g_chunkRows = 0;           // --chunk N[K|M|G], 0 = full-table mode
+static bool   g_chunkDoubleBuffer = true;// --no-db uses one reusable chunk slot
 
 // Compare two canonical CSV blobs with float tolerance.
 // Returns empty string on match; otherwise a short human-readable diff message.
@@ -113,6 +117,382 @@ using codegen::g_q16Post;
 using codegen::g_q18Post;
 using codegen::g_q20Post;
 using codegen::g_q21Post;
+
+static ColSpec colSpecFor(const codegen::ColumnDef& cdef) {
+    ColType type = ColType::INT;
+    switch (cdef.type) {
+        case codegen::DataType::INT:        type = ColType::INT; break;
+        case codegen::DataType::FLOAT:      type = ColType::FLOAT; break;
+        case codegen::DataType::DATE:       type = ColType::DATE; break;
+        case codegen::DataType::CHAR1:      type = ColType::CHAR1; break;
+        case codegen::DataType::CHAR_FIXED: type = ColType::CHAR_FIXED; break;
+    }
+    return ColSpec(cdef.index, type, cdef.fixedWidth);
+}
+
+static double resultValueAsDouble(const codegen::GenericResult::Value& value, bool& wasDouble) {
+    if (auto v = std::get_if<double>(&value)) {
+        wasDouble = true;
+        return *v;
+    }
+    if (auto v = std::get_if<int64_t>(&value)) {
+        return (double)*v;
+    }
+    wasDouble = true;
+    return 0.0;
+}
+
+struct ChunkResultAccumulator {
+    codegen::MetalResultSchema::Kind kind = codegen::MetalResultSchema::NONE;
+    std::vector<codegen::GenericResult::Column> columns;
+    std::vector<double> scalarSums;
+    std::vector<bool> scalarIsDouble;
+    std::map<int64_t, std::vector<double>> keyedSums;
+    std::vector<bool> keyedIsDouble;
+
+    void add(const codegen::GenericResult& chunk, codegen::MetalResultSchema::Kind schemaKind) {
+        if (chunk.columns.empty()) return;
+        if (columns.empty()) columns = chunk.columns;
+        kind = schemaKind;
+
+        if (schemaKind == codegen::MetalResultSchema::SCALAR_AGG) {
+            if (chunk.rows.empty()) return;
+            if (scalarSums.empty()) {
+                scalarSums.assign(chunk.rows[0].size(), 0.0);
+                scalarIsDouble.assign(chunk.rows[0].size(), false);
+            }
+            for (size_t i = 0; i < chunk.rows[0].size(); ++i) {
+                bool wasDouble = false;
+                scalarSums[i] += resultValueAsDouble(chunk.rows[0][i], wasDouble);
+                scalarIsDouble[i] = scalarIsDouble[i] || wasDouble;
+            }
+            return;
+        }
+
+        if (schemaKind == codegen::MetalResultSchema::KEYED_AGG) {
+            if (keyedIsDouble.empty() && chunk.columns.size() > 1) {
+                keyedIsDouble.assign(chunk.columns.size() - 1, false);
+            }
+            for (const auto& row : chunk.rows) {
+                if (row.empty()) continue;
+                int64_t bucket = 0;
+                if (auto b = std::get_if<int64_t>(&row[0])) bucket = *b;
+                else if (auto b = std::get_if<double>(&row[0])) bucket = (int64_t)*b;
+                auto& sums = keyedSums[bucket];
+                if (sums.empty()) sums.assign(row.size() - 1, 0.0);
+                for (size_t i = 1; i < row.size(); ++i) {
+                    bool wasDouble = false;
+                    sums[i - 1] += resultValueAsDouble(row[i], wasDouble);
+                    keyedIsDouble[i - 1] = keyedIsDouble[i - 1] || wasDouble;
+                }
+            }
+        }
+    }
+
+    codegen::GenericResult finish() const {
+        codegen::GenericResult out;
+        out.columns = columns;
+        if (kind == codegen::MetalResultSchema::SCALAR_AGG) {
+            codegen::GenericResult::Row row;
+            for (size_t i = 0; i < scalarSums.size(); ++i) {
+                if (i < scalarIsDouble.size() && scalarIsDouble[i]) row.push_back(scalarSums[i]);
+                else row.push_back((int64_t)std::llround(scalarSums[i]));
+            }
+            if (!row.empty()) out.rows.push_back(std::move(row));
+            return out;
+        }
+        if (kind == codegen::MetalResultSchema::KEYED_AGG) {
+            for (const auto& [bucket, sums] : keyedSums) {
+                codegen::GenericResult::Row row;
+                row.push_back(bucket);
+                for (size_t i = 0; i < sums.size(); ++i) {
+                    if (i < keyedIsDouble.size() && keyedIsDouble[i]) row.push_back(sums[i]);
+                    else row.push_back((int64_t)std::llround(sums[i]));
+                }
+                out.rows.push_back(std::move(row));
+            }
+        }
+        return out;
+    }
+};
+
+static bool chunkedQuerySupported(const std::string& queryName, std::string& reason) {
+    if (queryName == "Q1" || queryName == "Q6" || queryName == "Q14" || queryName == "Q19") {
+        return true;
+    }
+    reason = "--chunk currently supports Q1, Q6, Q14, and Q19. Other queries need query-specific state merging.";
+    return false;
+}
+
+static bool parseRowCountWithSuffix(const std::string& text, size_t& out) {
+    if (text.empty()) return false;
+    char suffix = text.back();
+    size_t multiplier = 1;
+    std::string digits = text;
+    if (suffix == 'k' || suffix == 'K' || suffix == 'm' || suffix == 'M' ||
+        suffix == 'g' || suffix == 'G') {
+        digits.pop_back();
+        if (suffix == 'k' || suffix == 'K') multiplier = 1000ULL;
+        if (suffix == 'm' || suffix == 'M') multiplier = 1000ULL * 1000ULL;
+        if (suffix == 'g' || suffix == 'G') multiplier = 1000ULL * 1000ULL * 1000ULL;
+    }
+    if (digits.empty()) return false;
+    char* end = nullptr;
+    errno = 0;
+    unsigned long long value = std::strtoull(digits.c_str(), &end, 10);
+    if (errno != 0 || end == digits.c_str() || *end != '\0' || value == 0) return false;
+    out = (size_t)value * multiplier;
+    return out > 0;
+}
+
+static std::string chooseStreamTable(const std::map<std::string, std::set<std::string>>& tableCols) {
+    if (tableCols.count("lineitem")) return "lineitem";
+    if (tableCols.count("orders")) return "orders";
+    return tableCols.empty() ? std::string{} : tableCols.begin()->first;
+}
+
+static void registerMaxKeySymbols(
+    codegen::MetalGenericExecutor& executor,
+    const std::vector<codegen::LoadedQueryTable>& loadedTables,
+    const std::map<std::string, std::set<std::string>>& tableCols,
+    const codegen::TPCHSchema& schema) {
+    int maxCk = 0, maxSk = 0, maxOk = 0, maxPk = 0;
+    for (auto& [tblName, cols] : loadedTables) {
+        const auto tableIt = tableCols.find(tblName);
+        if (tableIt == tableCols.end()) continue;
+        const auto& tdef = schema.table(tblName);
+        size_t nRows = cols.rows();
+        for (const auto& colName : tableIt->second) {
+            auto& cdef = tdef.col(colName);
+            if (cdef.type != codegen::DataType::INT && cdef.type != codegen::DataType::DATE)
+                continue;
+            const int* data = cols.ints(cdef.index);
+            if (!data) continue;
+            if (colName == "c_custkey" || colName == "o_custkey")
+                for (size_t i = 0; i < nRows; ++i) maxCk = std::max(maxCk, data[i]);
+            else if (colName == "s_suppkey" || colName == "l_suppkey" || colName == "ps_suppkey")
+                for (size_t i = 0; i < nRows; ++i) maxSk = std::max(maxSk, data[i]);
+            else if (colName == "o_orderkey" || colName == "l_orderkey")
+                for (size_t i = 0; i < nRows; ++i) maxOk = std::max(maxOk, data[i]);
+            else if (colName == "p_partkey" || colName == "l_partkey" || colName == "ps_partkey")
+                for (size_t i = 0; i < nRows; ++i) maxPk = std::max(maxPk, data[i]);
+        }
+    }
+    executor.registerSymbol("maxCustkey", maxCk + 1);
+    executor.registerSymbol("maxSuppkey", maxSk + 1);
+    executor.registerSymbol("maxOrderkey", maxOk + 1);
+    executor.registerSymbol("maxPartkey", maxPk + 1);
+}
+
+static bool handleGoldenResult(const std::string& queryName,
+                               const std::string& scaleFactor,
+                               const codegen::GenericResult& result) {
+    if (g_saveGoldenDir.empty() && g_checkDir.empty()) return true;
+
+    std::string canonical = result.toCanonical();
+    std::string fname = queryName + "_" + scaleFactor + ".csv";
+
+    if (!g_saveGoldenDir.empty()) {
+        ::mkdir(g_saveGoldenDir.c_str(), 0755);
+        std::string path = g_saveGoldenDir + "/" + fname;
+        std::ofstream of(path);
+        of << canonical;
+        if (!g_csv) printf("[GOLDEN] saved %s (%zu rows)\n", path.c_str(), result.numRows());
+    }
+    if (!g_checkDir.empty()) {
+        std::string path = g_checkDir + "/" + fname;
+        std::ifstream ifs(path);
+        if (!ifs) {
+            fprintf(stderr, "[CHECK] %s: golden file missing: %s\n", queryName.c_str(), path.c_str());
+            g_checkExitCode = 2;
+            return false;
+        }
+        std::ostringstream buf;
+        buf << ifs.rdbuf();
+        std::string diff = compareCanonical(canonical, buf.str(), g_checkAbsTol, g_checkRelTol);
+        if (diff.empty()) {
+            printf("[CHECK] %s @ %s: OK (%zu rows)\n",
+                   queryName.c_str(), scaleFactor.c_str(), result.numRows());
+        } else {
+            fprintf(stderr, "[CHECK] %s @ %s: FAIL - %s\n",
+                    queryName.c_str(), scaleFactor.c_str(), diff.c_str());
+            g_checkExitCode = 1;
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool runChunkedCodegenQuery(
+    MTL::Device* device,
+    MTL::CommandQueue* cmdQueue,
+    const codegen::RuntimeCompiler::CompiledQuery& compiled,
+    const codegen::MetalCodegen& cg,
+    const codegen::MetalQueryPlan& plan,
+    const std::map<std::string, std::set<std::string>>& tableCols,
+    const codegen::TPCHSchema& schema,
+    DetailedTiming& timing) {
+
+    std::string reason;
+    if (!chunkedQuerySupported(plan.name, reason)) {
+        std::cerr << "Codegen: " << reason << std::endl;
+        return false;
+    }
+    if (cg.getResultSchema().kind != codegen::MetalResultSchema::SCALAR_AGG &&
+        cg.getResultSchema().kind != codegen::MetalResultSchema::KEYED_AGG) {
+        std::cerr << "Codegen: --chunk only supports scalar/keyed aggregate result schemas" << std::endl;
+        return false;
+    }
+
+    using clk = std::chrono::high_resolution_clock;
+    auto elapsedMs = [](clk::time_point a, clk::time_point b) {
+        return std::chrono::duration<double, std::milli>(b - a).count();
+    };
+
+    const std::string streamTable = chooseStreamTable(tableCols);
+    if (streamTable.empty()) {
+        std::cerr << "Codegen: --chunk could not identify a streamed table" << std::endl;
+        return false;
+    }
+
+    std::map<std::string, std::vector<ColSpec>> tableSpecs;
+    for (const auto& [tableName, colNames] : tableCols) {
+        const auto& tdef = schema.table(tableName);
+        auto& specs = tableSpecs[tableName];
+        for (const auto& colName : colNames) {
+            specs.push_back(colSpecFor(tdef.col(colName)));
+        }
+    }
+
+    const int streamSlots = g_chunkDoubleBuffer ? 2 : 1;
+    auto loadStart = clk::now();
+
+    codegen::ChunkedColbinTable stream;
+    std::string streamError;
+    if (!stream.open(device, g_dataset_path + streamTable + ".tbl",
+                     tableSpecs[streamTable], g_chunkRows, streamSlots, streamError)) {
+        std::cerr << "Codegen: --chunk failed for " << streamTable << ": "
+                  << streamError << std::endl;
+        return false;
+    }
+
+    codegen::MetalGenericExecutor executor(device, cmdQueue);
+    std::vector<codegen::LoadedQueryTable> loadedTables;
+    for (const auto& [tableName, specs] : tableSpecs) {
+        if (tableName == streamTable) continue;
+        auto cols = loadQueryColumns(device, g_dataset_path + tableName + ".tbl", specs);
+        size_t rowCount = cols.rows();
+        const auto& tdef = schema.table(tableName);
+        for (const auto& colName : tableCols.at(tableName)) {
+            const auto& cdef = tdef.col(colName);
+            if (MTL::Buffer* buf = cols.buffer(cdef.index)) {
+                executor.registerTableBuffer(colName, buf, rowCount);
+            }
+        }
+        executor.registerTableRowCount(tableName, rowCount);
+        loadedTables.emplace_back(tableName, std::move(cols));
+    }
+
+    registerMaxKeySymbols(executor, loadedTables, tableCols, schema);
+    if (!codegen::prepareQueryPreprocessing(plan.name, device, executor, loadedTables)) {
+        return false;
+    }
+
+    double loadSetupMs = elapsedMs(loadStart, clk::now());
+    double chunkCopyMs = 0.0;
+    double bufferAllocMs = 0.0;
+    double gpuMs = 0.0;
+    double mergeMs = 0.0;
+    std::map<std::string, double> phaseSums;
+    ChunkResultAccumulator merged;
+
+    const auto& streamTdef = schema.table(streamTable);
+    const size_t totalRows = stream.rows();
+    const size_t chunkRows = stream.chunkRows();
+    size_t chunkCount = 0;
+
+    for (size_t startRow = 0; startRow < totalRows; startRow += chunkRows) {
+        const size_t rowsThisChunk = std::min(chunkRows, totalRows - startRow);
+        const int slot = (int)(chunkCount % (size_t)streamSlots);
+
+        auto chunkLoadStart = clk::now();
+        if (!stream.loadChunk(slot, startRow, rowsThisChunk, streamError)) {
+            std::cerr << "Codegen: chunk load failed: " << streamError << std::endl;
+            return false;
+        }
+        chunkCopyMs += elapsedMs(chunkLoadStart, clk::now());
+
+        for (const auto& colName : tableCols.at(streamTable)) {
+            const auto& cdef = streamTdef.col(colName);
+            MTL::Buffer* buf = stream.buffer(slot, cdef.index);
+            if (!buf) {
+                std::cerr << "Codegen: missing chunk buffer for " << streamTable
+                          << "." << colName << std::endl;
+                return false;
+            }
+            executor.registerTableBuffer(colName, buf, rowsThisChunk);
+        }
+        executor.registerTableRowCount(streamTable, rowsThisChunk);
+
+        auto result = executor.execute(compiled, cg, 0, 1);
+        bufferAllocMs += result.bufferAllocTimeMs;
+        gpuMs += result.totalKernelTimeMs;
+        for (size_t i = 0; i < result.phaseTimesMs.size(); ++i) {
+            const std::string name = (i < result.phaseNames.size())
+                ? result.phaseNames[i] : ("phase" + std::to_string(i));
+            phaseSums[name] += result.phaseTimesMs[i];
+        }
+
+        auto mergeStart = clk::now();
+        merged.add(result.result, cg.getResultSchema().kind);
+        mergeMs += elapsedMs(mergeStart, clk::now());
+        chunkCount++;
+    }
+
+    codegen::GenericResult finalResult = merged.finish();
+    timing.dataLoadMs = loadSetupMs + chunkCopyMs;
+    timing.ingestMs = 0.0;
+    timing.loadSource = "chunked-colbin";
+    timing.loadBytes = loadStats().bytes + stream.bytesLoaded();
+    timing.bufferAllocMs = bufferAllocMs;
+    timing.gpuTotalMs = gpuMs;
+    timing.gpuTrialsN = 1;
+    timing.gpuMsP10 = gpuMs;
+    timing.gpuMsP90 = gpuMs;
+    timing.gpuMsMad = 0.0;
+    timing.postMs = mergeMs;
+    timing.phaseKernelMs.clear();
+    for (const auto& [name, ms] : phaseSums) {
+        timing.phaseKernelMs.emplace_back(name, ms);
+    }
+
+    if (!g_csv) {
+        printf("\n%s Results:\n", plan.name.c_str());
+        finalResult.print();
+    }
+
+    handleGoldenResult(plan.name, timing.scaleFactor, finalResult);
+
+    if (plan.name == "Q14" && finalResult.numRows() == 1 && finalResult.columns.size() == 2) {
+        double promo = std::get<double>(finalResult.rows[0][0]);
+        double total = std::get<double>(finalResult.rows[0][1]);
+        if (total > 0 && !g_csv) {
+            printf("  -> promo_revenue = %.2f%%\n", 100.0 * promo / total);
+        }
+    }
+
+    printf("SF100 streaming: %zu chunks, parse=%.3fms, GPU=%.3fms, post=%.3fms, chunk_rows=%zu, slots=%d\n",
+           chunkCount, timing.dataLoadMs, timing.gpuTotalMs, timing.postMs,
+           chunkRows, streamSlots);
+    printf("STREAMING_CSV,%s,%s,%s,%zu,%zu,%d,%.3f,%.3f,%.3f,%zu\n",
+           timing.scaleFactor.c_str(), timing.queryName.c_str(), streamTable.c_str(),
+           chunkRows, chunkCount, streamSlots, timing.dataLoadMs,
+           timing.gpuTotalMs, timing.postMs, timing.loadBytes);
+
+    printDetailedTimingSummary(timing, g_csv);
+    executor.releaseAllocatedBuffers();
+    return true;
+}
 
 // ===================================================================
 // Run a query through the codegen pipeline
@@ -230,13 +610,7 @@ static bool runCodegenQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
         }
         timing.psoMs = elapsedMs(tPso0, clk::now());
 
-        // 5. Load data — determine which columns to load from bindings
-        auto parseStart = std::chrono::high_resolution_clock::now();
-        loadStats().reset();  // track per-query load source + byte count
-
-        codegen::MetalGenericExecutor executor(device, cmdQueue);
         const auto& schema = codegen::TPCHSchema::instance();
-
         // Collect columns needed per table from all phases
         std::map<std::string, std::set<std::string>> tableCols;
         for (const auto& phase : cg.getPhases()) {
@@ -247,22 +621,23 @@ static bool runCodegenQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
             }
         }
 
+        // 5. Load data: full-table zero-copy/copy or bounded chunked colbin.
+        loadStats().reset();  // track per-query load source + byte count
+        if (g_chunkRows > 0) {
+            return runChunkedCodegenQuery(device, cmdQueue, compiled, cg, plan,
+                                          tableCols, schema, timing);
+        }
+
+        auto parseStart = std::chrono::high_resolution_clock::now();
+        codegen::MetalGenericExecutor executor(device, cmdQueue);
+
         // Load each table's columns and register with executor (zero-copy via QueryColumns).
         std::vector<std::pair<std::string, QueryColumns>> loadedTables;
         for (auto& [tableName, colNames] : tableCols) {
             const auto& tdef = schema.table(tableName);
             std::vector<ColSpec> specs;
             for (const auto& colName : colNames) {
-                auto& cdef = tdef.col(colName);
-                ColType ct = ColType::INT;
-                switch (cdef.type) {
-                    case codegen::DataType::INT:    ct = ColType::INT; break;
-                    case codegen::DataType::FLOAT:  ct = ColType::FLOAT; break;
-                    case codegen::DataType::DATE:   ct = ColType::DATE; break;
-                    case codegen::DataType::CHAR1:  ct = ColType::CHAR1; break;
-                    case codegen::DataType::CHAR_FIXED: ct = ColType::CHAR_FIXED; break;
-                }
-                specs.emplace_back(cdef.index, ct, cdef.fixedWidth);
+                specs.push_back(colSpecFor(tdef.col(colName)));
             }
 
             auto cols = loadQueryColumns(device, g_dataset_path + tableName + ".tbl", specs);
@@ -288,32 +663,7 @@ static bool runCodegenQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
         // ---------------------------------------------------------------
         // Compute max key values for dynamic buffer sizing
         // ---------------------------------------------------------------
-        {
-            int maxCk = 0, maxSk = 0, maxOk = 0, maxPk = 0;
-            for (auto& [tblName, cols] : loadedTables) {
-                const auto& tdef = schema.table(tblName);
-                size_t nRows = cols.rows();
-                for (const auto& colName : tableCols[tblName]) {
-                    auto& cdef = tdef.col(colName);
-                    if (cdef.type != codegen::DataType::INT && cdef.type != codegen::DataType::DATE)
-                        continue;
-                    const int* data = cols.ints(cdef.index);
-                    if (!data) continue;
-                    if (colName == "c_custkey" || colName == "o_custkey")
-                        for (size_t i = 0; i < nRows; ++i) maxCk = std::max(maxCk, data[i]);
-                    else if (colName == "s_suppkey" || colName == "l_suppkey" || colName == "ps_suppkey")
-                        for (size_t i = 0; i < nRows; ++i) maxSk = std::max(maxSk, data[i]);
-                    else if (colName == "o_orderkey" || colName == "l_orderkey")
-                        for (size_t i = 0; i < nRows; ++i) maxOk = std::max(maxOk, data[i]);
-                    else if (colName == "p_partkey" || colName == "l_partkey" || colName == "ps_partkey")
-                        for (size_t i = 0; i < nRows; ++i) maxPk = std::max(maxPk, data[i]);
-                }
-            }
-            executor.registerSymbol("maxCustkey", maxCk + 1);
-            executor.registerSymbol("maxSuppkey", maxSk + 1);
-            executor.registerSymbol("maxOrderkey", maxOk + 1);
-            executor.registerSymbol("maxPartkey", maxPk + 1);
-        }
+        registerMaxKeySymbols(executor, loadedTables, tableCols, schema);
 
         // ---------------------------------------------------------------
         // Per-query pre-processing: resolve small lookup tables/scalars
@@ -1217,6 +1567,8 @@ int main(int argc, const char* argv[]) {
             printf("Loader flags:\n");
             printf("  --no-zerocopy        Disable zero-copy mmap path (force buffer copies)\n");
             printf("  --no-binary          Disable .colbin binary loader (force .tbl parser)\n");
+            printf("  --chunk N[K|M|G]     Stream supported queries from .colbin in N-row chunks\n");
+            printf("  --no-db              With --chunk, use one reusable chunk slot instead of two\n");
             printf("Experiment flags:\n");
             printf("  --warmup N           Run N untimed warmup iterations (default 3)\n");
             printf("  --repeat N           Run N timed iterations, report median (default 1)\n");
@@ -1240,6 +1592,23 @@ int main(int argc, const char* argv[]) {
         }
         if (arg == "--no-zerocopy")       { ::setenv("GPUDB_NO_ZEROCOPY", "1", 1); continue; }
         if (arg == "--no-binary")         { ::setenv("GPUDB_NO_BINARY",   "1", 1); continue; }
+        if (arg == "--no-db")             { g_chunkDoubleBuffer = false; continue; }
+        if (arg.rfind("--chunk=", 0) == 0) {
+            if (!parseRowCountWithSuffix(arg.substr(8), g_chunkRows)) {
+                std::cerr << "Invalid value for --chunk: " << arg.substr(8) << "\n";
+                return 1;
+            }
+            continue;
+        }
+        if (arg == "--chunk") {
+            if (i + 1 >= argc) { std::cerr << "Missing value for --chunk\n"; return 1; }
+            std::string value = argv[++i];
+            if (!parseRowCountWithSuffix(value, g_chunkRows)) {
+                std::cerr << "Invalid value for --chunk: " << value << "\n";
+                return 1;
+            }
+            continue;
+        }
         if (arg == "--scalar-atomic")     { ::setenv("GPUDB_SCALAR_ATOMIC", "1", 1); continue; }
         if (arg == "--csv")               { g_csv = true; continue; }
         if (arg == "--no-pipeline-cache") { g_noPipelineCache = true; continue; }

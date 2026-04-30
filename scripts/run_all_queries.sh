@@ -99,7 +99,11 @@ run_one() {
     echo "  -> $sf $q"
 
     local rc=0
-    "$BIN" "${CHECK_ARGS[@]}" "$sf" "$q" > "$log" 2>&1 || rc=$?
+    if [[ -n "$CHECK_DIR" ]]; then
+        "$BIN" --check "$CHECK_DIR" "$sf" "$q" > "$log" 2>&1 || rc=$?
+    else
+        "$BIN" "$sf" "$q" > "$log" 2>&1 || rc=$?
+    fi
 
     # Capture GPU info from first SYSINFO_CSV line we see.
     if [[ -z "$GPU_NAME" ]]; then
