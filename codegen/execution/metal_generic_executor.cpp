@@ -13,30 +13,19 @@ namespace codegen {
 MetalGenericExecutor::MetalGenericExecutor(MTL::Device* device, MTL::CommandQueue* cmdQueue)
     : device_(device), cmdQueue_(cmdQueue) {}
 
+MetalGenericExecutor::~MetalGenericExecutor() {
+    // Safety net: callers should normally invoke releaseAllocatedBuffers()
+    // explicitly, but on early returns / exceptions this guarantees we don't
+    // leak GPU buffers we own.
+    releaseAllocatedBuffers();
+}
+
 // ===================================================================
 // Table registration
 // ===================================================================
 
-void MetalGenericExecutor::registerTable(const std::string& name, const void* data,
-                                          size_t rowCount, size_t bytesPerRow) {
-    size_t totalBytes = rowCount * bytesPerRow;
-    auto* buf = device_->newBuffer(data, totalBytes, MTL::ResourceStorageModeShared);
-    tables_[name] = {buf, rowCount, true};
-
-    // Register size symbol: n_{table} and num{Table}
-    sizeResolver_.registerSymbol("n_" + name, rowCount);
-    sizeResolver_.registerSymbol("num" + name, rowCount);
-}
-
-void MetalGenericExecutor::registerColumn(const std::string& paramName, const void* data,
-                                           size_t rowCount, size_t bytesPerElem) {
-    size_t totalBytes = rowCount * bytesPerElem;
-    auto* buf = device_->newBuffer(data, totalBytes, MTL::ResourceStorageModeShared);
-    tables_[paramName] = {buf, rowCount, true};
-}
-
 void MetalGenericExecutor::registerTableRowCount(const std::string& tableName, size_t rowCount) {
-    sizeResolver_.registerSymbol("n_" + tableName, rowCount);
+    sizeResolver_.registerSymbol(tableSizeName(tableName), rowCount);
     sizeResolver_.registerSymbol("num" + tableName, rowCount);
 }
 
@@ -44,7 +33,7 @@ void MetalGenericExecutor::registerTableBuffer(const std::string& name,
                                                 MTL::Buffer* buffer,
                                                 size_t rowCount) {
     tables_[name] = {buffer, rowCount, false};
-    sizeResolver_.registerSymbol("n_" + name, rowCount);
+    sizeResolver_.registerSymbol(tableSizeName(name), rowCount);
     sizeResolver_.registerSymbol("num" + name, rowCount);
 }
 
@@ -92,8 +81,11 @@ BufferMap MetalGenericExecutor::allocatePhaseBuffers(
                 if (tIt != tables_.end()) {
                     buffers[b.name] = tIt->second.buffer;
                 } else {
-                    std::cerr << "Warning: table/column '" << b.name
-                              << "' not registered\n";
+                    // Fail loudly here instead of letting Metal surface this as
+                    // an opaque dispatch-time crash.
+                    throw std::runtime_error(
+                        "MetalGenericExecutor: required table/column '" + b.name +
+                        "' (table='" + b.tableName + "') is not registered");
                 }
                 break;
             }
@@ -108,7 +100,7 @@ BufferMap MetalGenericExecutor::allocatePhaseBuffers(
                     rowCount = tIt->second.rowCount;
                 } else {
                     // Try size resolver
-                    std::string symName = "n_" + b.tableName;
+                    std::string symName = tableSizeName(b.tableName);
                     if (sizeResolver_.hasSymbol(symName)) {
                         rowCount = sizeResolver_.getSymbol(symName);
                     }
@@ -291,14 +283,18 @@ MetalExecutionResult MetalGenericExecutor::execute(
                     encoder->dispatchThreadgroups(MTL::Size::Make(1, 1, 1),
                                                   MTL::Size::Make(1, 1, 1));
                 } else {
-                    NS::UInteger numTG = 1024;
+                    // Floor of kMinThreadgroups ensures GPU occupancy for small
+                    // tables; cap at kMaxThreadgroups (Metal grid-Y limit margin).
+                    constexpr NS::UInteger kMinThreadgroups = 1024;
+                    constexpr NS::UInteger kMaxThreadgroups = 65535;
+                    NS::UInteger numTG = kMinThreadgroups;
                     if (!phase.scannedTable.empty()) {
-                        std::string sym = "n_" + phase.scannedTable;
+                        std::string sym = tableSizeName(phase.scannedTable);
                         if (sizeResolver_.hasSymbol(sym)) {
                             size_t rowCount = sizeResolver_.getSymbol(sym);
                             NS::UInteger computed = (rowCount + tgSize - 1) / tgSize;
-                            if (computed > 1024) numTG = computed;
-                            if (numTG > 65535) numTG = 65535;
+                            if (computed > kMinThreadgroups) numTG = computed;
+                            if (numTG > kMaxThreadgroups) numTG = kMaxThreadgroups;
                         }
                     }
                     if (phase.maxThreadgroups > 0 &&
@@ -352,14 +348,16 @@ MetalExecutionResult MetalGenericExecutor::execute(
                 encoder->dispatchThreadgroups(MTL::Size::Make(1, 1, 1),
                                               MTL::Size::Make(1, 1, 1));
             } else {
-                NS::UInteger numTG = 1024;
+                constexpr NS::UInteger kMinThreadgroups = 1024;
+                constexpr NS::UInteger kMaxThreadgroups = 65535;
+                NS::UInteger numTG = kMinThreadgroups;
                 if (!phase.scannedTable.empty()) {
-                    std::string sym = "n_" + phase.scannedTable;
+                    std::string sym = tableSizeName(phase.scannedTable);
                     if (sizeResolver_.hasSymbol(sym)) {
                         size_t rowCount = sizeResolver_.getSymbol(sym);
                         NS::UInteger computed = (rowCount + tgSize - 1) / tgSize;
-                        if (computed > 1024) numTG = computed;
-                        if (numTG > 65535) numTG = 65535;
+                        if (computed > kMinThreadgroups) numTG = computed;
+                        if (numTG > kMaxThreadgroups) numTG = kMaxThreadgroups;
                     }
                 }
                 if (phase.maxThreadgroups > 0 &&

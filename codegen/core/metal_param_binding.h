@@ -25,9 +25,19 @@ enum class MetalParamKind {
     ConstantData,     // constant T*     — host data copied via setBytes()
 };
 
+// Naming convention for buffer-name strings produced by codegen and resolved by the executor:
+//
+//   tableDataName(t)  ==  "d_" + t   — device-side data pointer for table `t`
+//   tableSizeName(t)  ==  "n_" + t   — row-count scalar (constant uint&) for table `t`
+//
+// Use these helpers instead of bare "d_"/"n_" string concatenations.
+inline std::string tableDataName(const std::string& table) { return "d_" + table; }
+inline std::string tableSizeName(const std::string& table) { return "n_" + table; }
+
 struct MetalParamBinding {
     std::string name;            // e.g. "d_lineitem_shipdate", "data_size"
-    std::string metalDecl;       // e.g. "device const int*", "constant uint&"
+    std::string metalTypeDecl;   // full Metal parameter declaration without the name,
+                                 // e.g. "device const int*", "constant uint&"
     MetalParamKind kind;
     std::string tableName;       // for TableData/TableSize: which table
     std::string elementType;     // e.g. "float", "uint", "atomic_uint"
