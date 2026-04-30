@@ -8,7 +8,7 @@
 # Experiment matrix:
 #   Chunk sizes: 5M, 10M, 25M, 50M, 100M, 200M rows
 #   Buffering:   double-buffer (2 slots) vs single-buffer (1 slot)
-#   Queries:     Q1 (GPU-heavy), Q6 (scan), Q13 (orders), Q17 (complex)
+#   Queries:     Q1 (keyed agg), Q6 (scan), Q14/Q19 (lineitem + part)
 #   Repetitions: 3 per config
 # =============================================================================
 
@@ -17,7 +17,7 @@ set -e
 BIN="./build/bin/GPUDBCodegen"
 LOGDIR="/tmp/sf100_experiments"
 RESULT_FILE="/tmp/sf100_experiment_results.csv"
-QUERIES="q1 q6 q13 q17"
+QUERIES="q1 q6 q14 q19"
 CHUNK_SIZES="5 10 25 50 100 200"
 REPS=3
 
@@ -28,7 +28,12 @@ fi
 
 if ! "$BIN" --help 2>/dev/null | grep -q -- '--chunk'; then
   echo "ERROR: $BIN does not expose --chunk/--no-db streaming flags." >&2
-  echo "This SF100 streaming experiment script is stale until chunked mode is wired into GPUDBCodegen." >&2
+  exit 1
+fi
+
+if [[ ! -s data/SF-100/lineitem.colbin ]]; then
+  echo "ERROR: data/SF-100/lineitem.colbin is missing or empty." >&2
+  echo "Build SF100 .colbin files before running chunked experiments." >&2
   exit 1
 fi
 

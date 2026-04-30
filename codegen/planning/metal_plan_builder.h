@@ -6,9 +6,7 @@
 // Produces MetalQueryPlan containing per-phase operator trees that
 // can be fed to MetalCodegen for Metal shader generation.
 //
-// This sits alongside the existing query_planner.h (which produces
-// flat PlanOp vectors). Once all queries are migrated, the old
-// planner can be retired.
+// This is the active planning path used by the codegen binary.
 // ===================================================================
 
 #include "metal_operators.h"
