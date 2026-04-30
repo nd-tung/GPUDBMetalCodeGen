@@ -101,7 +101,19 @@ std::string GenericResult::toCanonical() const {
                     snprintf(buf, sizeof(buf), "%.4f", v);
                     os << buf;
                 } else {
-                    os << v;
+                    // Quote string fields that contain commas, quotes, or newlines
+                    const std::string& sv = v;
+                    bool needsQuote = sv.find_first_of(",\"\n\r") != std::string::npos;
+                    if (needsQuote) {
+                        os << '"';
+                        for (char ch : sv) {
+                            if (ch == '"') os << '"'; // escape embedded quote
+                            os << ch;
+                        }
+                        os << '"';
+                    } else {
+                        os << sv;
+                    }
                 }
             }, row[c]);
         }

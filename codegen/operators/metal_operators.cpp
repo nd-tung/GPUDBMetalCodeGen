@@ -7,8 +7,6 @@ namespace codegen {
 // Ablation: when GPUDB_SCALAR_ATOMIC=1, MetalTGReduce skips the
 // SIMD+threadgroup reduction and has every thread issue a global atomic.
 // This isolates the value of the existing reduction strategy.
-static std::string tableSizeName(const std::string& t) { return "n_" + t; }
-
 static bool scalarAtomicMode() {
     const char* e = std::getenv("GPUDB_SCALAR_ATOMIC");
     return e && e[0] && e[0] != '0';
