@@ -43,6 +43,21 @@ struct MetalQueryPlan {
     // Helper device functions emitted before all kernels
     std::vector<std::string> helpers;
 
+    // Data-larger-than-memory (DLM) opt-in. When true, the driver may run
+    // this plan under the chunked-streaming path: the largest scanned
+    // .colbin table is split into row-chunks, stream phases run per chunk
+    // with GPU output zero-init suppressed across chunks, and pre/post
+    // phases run once around the loop. A plan is only safe to mark
+    // chunkable when:
+    //   - exactly one table appears as the "stream" scan (largest table),
+    //   - every output buffer written by a stream phase uses an
+    //     associative atomic op (atomic_fetch_add/_or), so partial
+    //     results combine correctly across chunks,
+    //   - any pre/post phases are bounded in size and read-only against
+    //     the streamed table.
+    // The default (false) is the safe choice — see DOCUMENTATION.md §9.4.
+    bool chunkable = false;
+
     // CPU-side post-processing
     struct CpuSort {
         struct SortKey { std::string column; bool descending; };

@@ -47,6 +47,11 @@ static double g_checkAbsTol = 1e-2;      // --check-abs-tol N
 static double g_checkRelTol = 1e-4;      // --check-rel-tol N
 static int    g_checkExitCode = 0;       // accumulated: nonzero if any --check failed
 static size_t g_chunkRows = 0;           // --chunk N[K|M|G], 0 = full-table mode
+static size_t g_chunkRowsExplicit = 0;    // user-set --chunk value (0 = unset);
+                                          // g_chunkRows above is the *effective*
+                                          // value, possibly raised by the per-query
+                                          // auto-chunk trigger and reset between
+                                          // queries to g_chunkRowsExplicit.
 static bool   g_chunkDoubleBuffer = true;// --no-db uses one reusable chunk slot
 
 // Compare two canonical CSV blobs with float tolerance.
@@ -322,6 +327,10 @@ static std::string autoDetectStreamTable(
 static bool runCodegenQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
                             const std::string& sql, const std::string& queryName) {
     if (!g_csv) printf("\n=== Codegen: %s ===\n", queryName.c_str());
+    // Reset effective chunk size to whatever the user explicitly asked for.
+    // Without this, an earlier query's auto-chunk decision would leak into
+    // the next query when the binary is invoked with `all` or `mball`.
+    g_chunkRows = g_chunkRowsExplicit;
     try {
         using clk = std::chrono::high_resolution_clock;
         auto elapsedMs = [](clk::time_point a, clk::time_point b) {
@@ -361,6 +370,26 @@ static bool runCodegenQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
         auto& plan = *maybePlan;
         plan.name = queryName;
         timing.planMs = elapsedMs(tPlan0, clk::now());
+
+        // ----------------------------------------------------------------
+        // Data-larger-than-memory (DLM) safety gate.
+        //   * Hard error if the user explicitly passed --chunk for a query
+        //     whose plan is not yet certified chunkable (see DOCUMENTATION
+        //     §9.4 — only Q1/Q4/Q6/Q12/Q13/Q14/Q19 + microbenchmarks today).
+        //   * Otherwise force g_chunkRows back to 0 so the auto-chunk
+        //     trigger below cannot silently engage and produce wrong
+        //     output for joins / sorts / non-associative aggregates.
+        // ----------------------------------------------------------------
+        if (!plan.chunkable) {
+            if (g_chunkRowsExplicit > 0) {
+                std::cerr << "Codegen: " << queryName
+                          << " does not support chunked execution yet "
+                             "(--chunk is unsafe for this query — see "
+                             "DOCUMENTATION.md §9.4).\n";
+                return false;
+            }
+            g_chunkRows = 0;  // suppress auto-chunk below
+        }
 
         // Experiment override: --threadgroup-size N replaces every phase's TG size.
         if (g_tgSizeOverride > 0) {
@@ -445,7 +474,10 @@ static bool runCodegenQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
         // 5. Load data: full-table zero-copy/copy or bounded chunked colbin.
         loadStats().reset();  // track per-query load source + byte count
         // Auto-enable chunked execution when dataset exceeds available RAM.
-        if (g_chunkRows == 0) {
+        // Skip entirely for non-chunkable plans (see DLM gate above) so we
+        // never auto-engage chunking on a query that would produce wrong
+        // results.
+        if (g_chunkRows == 0 && plan.chunkable) {
             const std::string autoStreamTable = autoDetectStreamTable(tableCols);
             if (!autoStreamTable.empty()) {
                 uint64_t physMemBytes = 0;
@@ -1644,7 +1676,7 @@ int main(int argc, const char* argv[]) {
         if (arg == "--no-binary")         { ::setenv("GPUDB_NO_BINARY",   "1", 1); continue; }
         if (arg == "--no-db")             { g_chunkDoubleBuffer = false; continue; }
         if (arg.rfind("--chunk=", 0) == 0) {
-            if (!parseRowCountWithSuffix(arg.substr(8), g_chunkRows)) {
+            if (!parseRowCountWithSuffix(arg.substr(8), g_chunkRowsExplicit)) {
                 std::cerr << "Invalid value for --chunk: " << arg.substr(8) << "\n";
                 return 1;
             }
@@ -1653,7 +1685,7 @@ int main(int argc, const char* argv[]) {
         if (arg == "--chunk") {
             if (i + 1 >= argc) { std::cerr << "Missing value for --chunk\n"; return 1; }
             std::string value = argv[++i];
-            if (!parseRowCountWithSuffix(value, g_chunkRows)) {
+            if (!parseRowCountWithSuffix(value, g_chunkRowsExplicit)) {
                 std::cerr << "Invalid value for --chunk: " << value << "\n";
                 return 1;
             }

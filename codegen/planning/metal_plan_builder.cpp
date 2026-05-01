@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <iostream>
 #include <set>
+#include <unordered_set>
 
 namespace codegen {
 
@@ -2299,6 +2300,12 @@ static std::optional<MetalQueryPlan> buildQ21Plan_byName();
 
 std::optional<MetalQueryPlan> buildMetalPlan(const AnalyzedQuery& aq,
                                               const std::string& queryName) {
+    // ----------------------------------------------------------------
+    // Inner dispatch — returns the raw plan for a given (aq, queryName).
+    // The outer wrapper below stamps the chunkable flag based on a
+    // tested allowlist (DLM Tier-A / Tier-A′ — see DOCUMENTATION §9.4).
+    // ----------------------------------------------------------------
+    auto dispatch = [&]() -> std::optional<MetalQueryPlan> {
     // Name-based dispatch first for queries that clash with analysis-based detectors
     if (queryName == "Q19") return buildQ19Plan_byName();
     if (queryName == "Q13") return buildQ13Plan_byName();
@@ -2329,6 +2336,30 @@ std::optional<MetalQueryPlan> buildMetalPlan(const AnalyzedQuery& aq,
     if (queryName == "Q3") return buildQ3Plan_byName();
 
     return std::nullopt;
+    };
+
+    auto plan = dispatch();
+    if (!plan) return plan;
+
+    // ----------------------------------------------------------------
+    // DLM allowlist. A query is chunkable iff every stream-phase output
+    // is updated via an associative atomic op (atomic_fetch_add / _or)
+    // and no per-chunk row materialization happens. The set below has
+    // been validated against golden CSVs — extend only after adding the
+    // matching golden / --check coverage.
+    //   Tier A  (single-table additive aggregates):  Q1, Q6, Q12, Q14, Q19
+    //   Tier A′ (bitmap or per-key counter outputs): Q4, Q13
+    // Microbenchmarks reuse Q6's plan and are therefore implicitly chunkable.
+    // ----------------------------------------------------------------
+    static const std::unordered_set<std::string> kChunkableNames = {
+        "Q1", "Q6", "Q12", "Q14", "Q19",   // Tier A
+        "Q4", "Q13",                          // Tier A′
+    };
+    const bool isMicrobench = queryName.rfind("MB", 0) == 0;
+    if (kChunkableNames.count(queryName) || isMicrobench) {
+        plan->chunkable = true;
+    }
+    return plan;
 }
 
 // ===================================================================
