@@ -13,8 +13,17 @@
 #include <unordered_map>
 #include <stdexcept>
 #include <cstddef>
+#include <cstdint>
 
 namespace codegen {
+
+// Knuth multiplicative hash constant (golden-ratio reciprocal × 2^32).
+// Used by the open-addressing hash tables in query_preprocessing.cpp
+// (host-side build) and by the matching Metal probes emitted from
+// metal_plan_builder.cpp (`q9_ht_probe`, `q20_ht_add`). Host and device
+// MUST use the same constant or probes will miss; if you change this
+// value, update both sides.
+inline constexpr uint32_t kKnuthHashMul = 2654435769u;
 
 // What kind of parameter is it?
 enum class MetalParamKind {

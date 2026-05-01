@@ -100,6 +100,26 @@ int findFixedNameKey(const QueryColumns& columns, int keyColumn, int nameColumn,
     return -1;
 }
 
+// Resolve a fixed-width NAME -> id from a small lookup table (e.g. nation/region
+// where col 0 = id, col 1 = CHAR(25) name) and register it as a scalar int param.
+// Returns false (and logs to stderr) if the name is missing.
+bool registerNameKey(MTL::Device* device,
+                     MetalGenericExecutor& executor,
+                     const std::vector<LoadedQueryTable>& loadedTables,
+                     const std::string& tableName,
+                     const std::string& target,
+                     const std::string& paramName) {
+    auto view = resolvePreprocessColumns(device, tableName,
+        {{0, ColType::INT}, {1, ColType::CHAR_FIXED, 25}}, loadedTables);
+    int key = findFixedNameKey(view.get(), 0, 1, 25, target);
+    if (key == -1) {
+        std::cerr << "Error: " << target << " not found in " << tableName << " table\n";
+        return false;
+    }
+    executor.registerScalarInt(paramName, key);
+    return true;
+}
+
 } // namespace
 
 bool prepareQueryPreprocessing(const std::string& queryName,
@@ -108,45 +128,19 @@ bool prepareQueryPreprocessing(const std::string& queryName,
                                const std::vector<LoadedQueryTable>& loadedTables) {
     // Q7: resolve nation keys
     if (queryName == "Q7") {
-        auto natView = resolvePreprocessColumns(device, "nation",
-            {{0, ColType::INT}, {1, ColType::CHAR_FIXED, 25}}, loadedTables);
-        const auto& nat = natView.get();
-        int france_nk = findFixedNameKey(nat, 0, 1, 25, "FRANCE");
-        int germany_nk = findFixedNameKey(nat, 0, 1, 25, "GERMANY");
-        if (france_nk == -1 || germany_nk == -1) {
-            std::cerr << "Error: FRANCE/GERMANY not found in nation table" << std::endl;
-            return false;
-        }
-        executor.registerScalarInt("france_nk", france_nk);
-        executor.registerScalarInt("germany_nk", germany_nk);
+        if (!registerNameKey(device, executor, loadedTables, "nation", "FRANCE",  "france_nk"))  return false;
+        if (!registerNameKey(device, executor, loadedTables, "nation", "GERMANY", "germany_nk")) return false;
     }
 
     // Q5: resolve ASIA regionkey
     if (queryName == "Q5") {
-        auto regView = resolvePreprocessColumns(device, "region",
-            {{0, ColType::INT}, {1, ColType::CHAR_FIXED, 25}}, loadedTables);
-        int asia_rk = findFixedNameKey(regView.get(), 0, 1, 25, "ASIA");
-        if (asia_rk == -1) {
-            std::cerr << "Error: ASIA region not found" << std::endl;
-            return false;
-        }
-        executor.registerScalarInt("asia_rk", asia_rk);
+        if (!registerNameKey(device, executor, loadedTables, "region", "ASIA", "asia_rk")) return false;
     }
 
     // Q8: resolve AMERICA regionkey and BRAZIL nationkey
     if (queryName == "Q8") {
-        auto regView = resolvePreprocessColumns(device, "region",
-            {{0, ColType::INT}, {1, ColType::CHAR_FIXED, 25}}, loadedTables);
-        auto natView = resolvePreprocessColumns(device, "nation",
-            {{0, ColType::INT}, {1, ColType::CHAR_FIXED, 25}}, loadedTables);
-        int america_rk = findFixedNameKey(regView.get(), 0, 1, 25, "AMERICA");
-        int brazil_nk = findFixedNameKey(natView.get(), 0, 1, 25, "BRAZIL");
-        if (america_rk == -1 || brazil_nk == -1) {
-            std::cerr << "Error: AMERICA/BRAZIL not found" << std::endl;
-            return false;
-        }
-        executor.registerScalarInt("america_rk", america_rk);
-        executor.registerScalarInt("brazil_nk", brazil_nk);
+        if (!registerNameKey(device, executor, loadedTables, "region", "AMERICA", "america_rk")) return false;
+        if (!registerNameKey(device, executor, loadedTables, "nation", "BRAZIL",  "brazil_nk"))  return false;
     }
 
     // Q22: compute avg balance for valid-prefix customers
@@ -177,14 +171,7 @@ bool prepareQueryPreprocessing(const std::string& queryName,
 
     // Q11: resolve GERMANY nationkey
     if (queryName == "Q11") {
-        auto natView = resolvePreprocessColumns(device, "nation",
-            {{0, ColType::INT}, {1, ColType::CHAR_FIXED, 25}}, loadedTables);
-        int germany_nk = findFixedNameKey(natView.get(), 0, 1, 25, "GERMANY");
-        if (germany_nk == -1) {
-            std::cerr << "Error: GERMANY not found in nation table" << std::endl;
-            return false;
-        }
-        executor.registerScalarInt("germany_nk", germany_nk);
+        if (!registerNameKey(device, executor, loadedTables, "nation", "GERMANY", "germany_nk")) return false;
     }
 
     // Q17: build per-partkey threshold from loaded data
@@ -350,7 +337,7 @@ bool prepareQueryPreprocessing(const std::string& queryName,
             if (pk < 0 || (size_t)pk / 32 >= bmpInts || !((partBitmap[pk / 32] >> (pk % 32)) & 1))
                 continue;
             uint32_t key = (uint32_t)pk * suppMul + (uint32_t)ps_suppkey[i];
-            uint32_t h = (key * 2654435769u) & htMask;
+            uint32_t h = (key * kKnuthHashMul) & htMask;
             for (uint32_t s = 0; s <= htMask; s++) {
                 uint32_t slot = (h + s) & htMask;
                 if (htKeys[slot] == 0xFFFFFFFFu) {
@@ -456,7 +443,7 @@ bool prepareQueryPreprocessing(const std::string& queryName,
             if (pk < 0 || (size_t)pk / 32 >= bmpInts || !((partBitmap[pk / 32] >> (pk % 32)) & 1))
                 continue;
             uint64_t key = (uint64_t)pk * (uint64_t)suppMul + (uint64_t)ps_suppkey[i];
-            uint32_t h = ((uint32_t)(key ^ (key >> 32)) * 2654435769u) & htMask;
+            uint32_t h = ((uint32_t)(key ^ (key >> 32)) * kKnuthHashMul) & htMask;
             for (uint32_t s = 0; s <= htMask; s++) {
                 uint32_t slot = (h + s) & htMask;
                 if (htKeys[slot] == ~uint64_t(0)) {
