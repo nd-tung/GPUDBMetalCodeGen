@@ -2349,11 +2349,18 @@ std::optional<MetalQueryPlan> buildMetalPlan(const AnalyzedQuery& aq,
     // matching golden / --check coverage.
     //   Tier A  (single-table additive aggregates):  Q1, Q6, Q12, Q14, Q19
     //   Tier A′ (bitmap or per-key counter outputs): Q4, Q13
+    //   Tier B  (joins + atomic_fetch_add aggregate): Q3, Q5, Q7, Q8, Q9, Q10
+    //   Tier B′ (needs stream-colbin pre-scan):       Q15, Q17, Q18
+    //                  Q15/Q18: max-key scan via extendMaxKeysFromStreamColbin
+    //                  Q17:     pre-stream l_partkey/l_quantity load via
+    //                           resolvePreprocessColumns disk fallback
     // Microbenchmarks reuse Q6's plan and are therefore implicitly chunkable.
     // ----------------------------------------------------------------
     static const std::unordered_set<std::string> kChunkableNames = {
         "Q1", "Q6", "Q12", "Q14", "Q19",   // Tier A
         "Q4", "Q13",                          // Tier A′
+        "Q3", "Q5", "Q7", "Q8", "Q9", "Q10",  // Tier B
+        "Q15", "Q17", "Q18",                  // Tier B′
     };
     const bool isMicrobench = queryName.rfind("MB", 0) == 0;
     if (kChunkableNames.count(queryName) || isMicrobench) {

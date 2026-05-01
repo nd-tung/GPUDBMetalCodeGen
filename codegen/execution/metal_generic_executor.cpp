@@ -44,6 +44,11 @@ void MetalGenericExecutor::registerAllocatedBuffer(const std::string& name, MTL:
 void MetalGenericExecutor::registerSymbol(const std::string& name, size_t value) {
     sizeResolver_.registerSymbol(name, value);
 }
+bool MetalGenericExecutor::tryGetSymbol(const std::string& name, size_t& out) const {
+    if (!sizeResolver_.hasSymbol(name)) return false;
+    out = sizeResolver_.getSymbol(name);
+    return true;
+}
 void MetalGenericExecutor::registerScalarInt(const std::string& name, int value) {
     scalarInts_[name] = value;
 }

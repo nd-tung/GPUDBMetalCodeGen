@@ -44,7 +44,7 @@ TBL2COLBIN     = $(BIN_DIR)/tbl_to_colbin
 # ---------------------------------------------------------------------------
 # Build
 # ---------------------------------------------------------------------------
-.PHONY: all rebuild clean run tools colbin-sf1 colbin-sf10 colbin-sf50 colbin-sf100 clean-colbin
+.PHONY: all rebuild clean run tools colbin-sf1 colbin-sf10 colbin-sf20 colbin-sf50 colbin-sf100 clean-colbin
 
 all: $(TARGET)
 tools: $(TBL2COLBIN)
@@ -115,6 +115,9 @@ colbin-sf1: $(TBL2COLBIN)
 
 colbin-sf10: $(TBL2COLBIN)
 	./$(TBL2COLBIN) data/SF-10
+
+colbin-sf20: $(TBL2COLBIN)
+	./$(TBL2COLBIN) data/SF-20
 
 colbin-sf50: $(TBL2COLBIN)
 	./$(TBL2COLBIN) data/SF-50

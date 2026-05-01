@@ -277,6 +277,80 @@ static void registerMaxKeySymbols(
     executor.registerSymbol("maxPartkey", maxPk + 1);
 }
 
+// In chunked execution mode the stream table is intentionally absent from
+// `loadedTables`, so its key columns never contribute to the max-key scan
+// performed by registerMaxKeySymbols(). Without this extension Q15/Q18
+// (single-table aggregates keyed by l_suppkey / l_orderkey) collapse to
+// maxSuppkey == 1 / maxOrderkey == 1 and write OOB. We perform a one-time
+// in-memory load of just the int key columns of the stream table from its
+// .colbin and merge the per-column max into the already-registered symbols.
+static void extendMaxKeysFromStreamColbin(
+    codegen::MetalGenericExecutor& executor,
+    const std::string& streamTblPath,
+    const std::set<std::string>& streamCols,
+    const codegen::TPCHSchema& schema,
+    const std::string& streamTable) {
+    if (streamTable.empty()) return;
+    const auto& tdef = schema.table(streamTable);
+    std::vector<std::pair<std::string, ColSpec>> intSpecs;
+    for (const auto& colName : streamCols) {
+        const auto& cdef = tdef.col(colName);
+        if (cdef.type != codegen::DataType::INT && cdef.type != codegen::DataType::DATE)
+            continue;
+        if (colName != "c_custkey" && colName != "o_custkey" &&
+            colName != "s_suppkey" && colName != "l_suppkey" && colName != "ps_suppkey" &&
+            colName != "o_orderkey" && colName != "l_orderkey" &&
+            colName != "p_partkey"  && colName != "l_partkey"  && colName != "ps_partkey")
+            continue;
+        intSpecs.emplace_back(colName, colSpecFor(cdef));
+    }
+    if (intSpecs.empty()) return;
+
+    std::vector<ColSpec> specs;
+    specs.reserve(intSpecs.size());
+    for (const auto& [_, s] : intSpecs) specs.push_back(s);
+
+    LoadedColumns parsed;
+    if (!colbin::loadColumnsFromBinary(streamTblPath, specs, parsed)) {
+        std::cerr << "extendMaxKeysFromStreamColbin: failed to read colbin for "
+                  << streamTable << " at " << streamTblPath
+                  << " (max-key symbols may be wrong)\n";
+        return;
+    }
+
+    int maxCk = 0, maxSk = 0, maxOk = 0, maxPk = 0;
+    for (const auto& [colName, spec] : intSpecs) {
+        const auto& v = parsed.ints(spec.columnIndex);
+        if (v.empty()) continue;
+        int colMax = 0;
+        for (int x : v) if (x > colMax) colMax = x;
+        if (colName == "c_custkey" || colName == "o_custkey") maxCk = std::max(maxCk, colMax);
+        else if (colName == "s_suppkey" || colName == "l_suppkey" || colName == "ps_suppkey")
+            maxSk = std::max(maxSk, colMax);
+        else if (colName == "o_orderkey" || colName == "l_orderkey")
+            maxOk = std::max(maxOk, colMax);
+        else if (colName == "p_partkey" || colName == "l_partkey" || colName == "ps_partkey")
+            maxPk = std::max(maxPk, colMax);
+    }
+
+    // sizeResolver_::registerSymbol overwrites; query each previously-registered
+    // value and re-register the max with our stream-table contribution.
+    auto bump = [&](const char* name, int streamMax) {
+        if (streamMax <= 0) return;
+        size_t cur = 0;
+        if (executor.tryGetSymbol(name, cur)) {
+            executor.registerSymbol(name, std::max(cur, (size_t)streamMax + 1));
+        } else {
+            executor.registerSymbol(name, (size_t)streamMax + 1);
+        }
+    };
+    bump("maxCustkey",  maxCk);
+    bump("maxSuppkey",  maxSk);
+    bump("maxOrderkey", maxOk);
+    bump("maxPartkey",  maxPk);
+}
+
+
 // ===================================================================
 // Peek at a .colbin file header to read row count + file size without
 // mapping the full file.  Returns false if file is absent / invalid.
@@ -558,6 +632,14 @@ static bool runCodegenQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
         }
 
         registerMaxKeySymbols(executor, loadedTables, tableCols, schema);
+        if (!streamTable.empty() && tableCols.count(streamTable)) {
+            extendMaxKeysFromStreamColbin(
+                executor,
+                g_dataset_path + streamTable + ".tbl",
+                tableCols.at(streamTable),
+                schema,
+                streamTable);
+        }
         if (!codegen::prepareQueryPreprocessing(plan.name, device, executor, loadedTables)) {
             return false;
         }
@@ -1732,6 +1814,7 @@ int main(int argc, const char* argv[]) {
         if (arg == "--autotune-tg-per-phase") { g_autotuneTgPerPhase = true; continue; }
         if (arg == "sf1")  { g_dataset_path = "data/SF-1/"; continue; }
         if (arg == "sf10") { g_dataset_path = "data/SF-10/"; continue; }
+        if (arg == "sf20") { g_dataset_path = "data/SF-20/"; continue; }
         if (arg == "sf50") { g_dataset_path = "data/SF-50/"; continue; }
         if (arg == "sf100") { g_dataset_path = "data/SF-100/"; continue; }
         if (!arg.empty() && arg[0] == '-') {

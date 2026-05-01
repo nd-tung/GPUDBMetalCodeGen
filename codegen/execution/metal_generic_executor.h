@@ -70,6 +70,9 @@ public:
     // Register a symbolic size (e.g. "maxCustkey" → 150000)
     void registerSymbol(const std::string& name, size_t value);
 
+    // Look up a previously-registered symbolic size; returns false if absent.
+    bool tryGetSymbol(const std::string& name, size_t& out) const;
+
     // Register a scalar constant (for constant T& params set via setBytes)
     void registerScalarInt(const std::string& name, int value);
     void registerScalarFloat(const std::string& name, float value);

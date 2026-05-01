@@ -198,60 +198,66 @@ bool prepareQueryPreprocessing(const std::string& queryName,
         auto p_container = copyCharColumn(pCols, 6, pCols.rows() * 10);
         size_t partRows = p_partkey.size();
 
-        const int*   pl_partkey = nullptr;
-        const float* pl_quantity = nullptr;
-        size_t liRows = 0;
+        // lineitem may be the stream table in chunked mode and therefore
+        // absent from loadedTables. resolvePreprocessColumns falls back to
+        // a one-time disk load (l_partkey + l_quantity = ~960 MB at SF20)
+        // which is freed when pView_li goes out of scope at end of block.
         const auto& tpchSchema = TPCHSchema::instance();
-        for (auto& [tblName, cols] : loadedTables) {
-            if (tblName == "lineitem") {
-                pl_partkey  = cols.ints  (tpchSchema.table("lineitem").col("l_partkey").index);
-                pl_quantity = cols.floats(tpchSchema.table("lineitem").col("l_quantity").index);
-                liRows = cols.rows();
+        const int liPartkeyIdx  = tpchSchema.table("lineitem").col("l_partkey").index;
+        const int liQuantityIdx = tpchSchema.table("lineitem").col("l_quantity").index;
+        auto liView = resolvePreprocessColumns(device, "lineitem",
+            {{liPartkeyIdx, ColType::INT}, {liQuantityIdx, ColType::FLOAT}},
+            loadedTables);
+        const auto& liCols = liView.get();
+        const int*   pl_partkey  = liCols.ints  (liPartkeyIdx);
+        const float* pl_quantity = liCols.floats(liQuantityIdx);
+        size_t liRows = liCols.rows();
+        if (!pl_partkey || !pl_quantity) {
+            std::cerr << "Q17 preprocessing: failed to obtain l_partkey/l_quantity\n";
+            return false;
+        }
+
+        int maxPk = 0;
+        for (int pk : p_partkey) maxPk = std::max(maxPk, pk);
+        size_t mapSize = (size_t)(maxPk + 1);
+
+        std::vector<uint32_t> bitmap((mapSize + 31) / 32, 0);
+        for (size_t i = 0; i < partRows; i++) {
+            const char* brand = p_brand.data() + i * 10;
+            const char* cont = p_container.data() + i * 10;
+            bool isBrand23 = (brand[0]=='B' && brand[5]=='#' && brand[6]=='2' && brand[7]=='3');
+            bool isMedBox = (cont[0]=='M' && cont[1]=='E' && cont[2]=='D' && cont[3]==' ' &&
+                             cont[4]=='B' && cont[5]=='O' && cont[6]=='X');
+            if (isBrand23 && isMedBox) {
+                int pk = p_partkey[i];
+                bitmap[pk / 32] |= (1u << (pk % 32));
             }
         }
-        if (pl_partkey) {
-            int maxPk = 0;
-            for (int pk : p_partkey) maxPk = std::max(maxPk, pk);
-            size_t mapSize = (size_t)(maxPk + 1);
 
-            std::vector<uint32_t> bitmap((mapSize + 31) / 32, 0);
-            for (size_t i = 0; i < partRows; i++) {
-                const char* brand = p_brand.data() + i * 10;
-                const char* cont = p_container.data() + i * 10;
-                bool isBrand23 = (brand[0]=='B' && brand[5]=='#' && brand[6]=='2' && brand[7]=='3');
-                bool isMedBox = (cont[0]=='M' && cont[1]=='E' && cont[2]=='D' && cont[3]==' ' &&
-                                 cont[4]=='B' && cont[5]=='O' && cont[6]=='X');
-                if (isBrand23 && isMedBox) {
-                    int pk = p_partkey[i];
-                    bitmap[pk / 32] |= (1u << (pk % 32));
-                }
+        std::vector<double> sumQty(mapSize, 0.0);
+        std::vector<int> cntQty(mapSize, 0);
+        for (size_t i = 0; i < liRows; i++) {
+            int pk = pl_partkey[i];
+            if (pk >= 0 && (size_t)pk < mapSize && (bitmap[pk / 32] >> (pk % 32)) & 1) {
+                sumQty[pk] += pl_quantity[i];
+                cntQty[pk]++;
             }
-
-            std::vector<double> sumQty(mapSize, 0.0);
-            std::vector<int> cntQty(mapSize, 0);
-            for (size_t i = 0; i < liRows; i++) {
-                int pk = pl_partkey[i];
-                if (pk >= 0 && (size_t)pk < mapSize && (bitmap[pk / 32] >> (pk % 32)) & 1) {
-                    sumQty[pk] += pl_quantity[i];
-                    cntQty[pk]++;
-                }
-            }
-
-            std::vector<float> threshold(mapSize, 0.0f);
-            for (size_t pk = 0; pk < mapSize; pk++) {
-                if (cntQty[pk] > 0) {
-                    threshold[pk] = (float)(0.2 * sumQty[pk] / cntQty[pk]);
-                }
-            }
-
-            auto* threshBuf = device->newBuffer(threshold.data(), mapSize * sizeof(float),
-                                                 MTL::ResourceStorageModeShared);
-            executor.registerAllocatedBuffer("d_q17_threshold", threshBuf);
-
-            auto* bitmapBuf = device->newBuffer(bitmap.data(), bitmap.size() * sizeof(uint32_t),
-                                                 MTL::ResourceStorageModeShared);
-            executor.registerAllocatedBuffer("d_q17_bitmap", bitmapBuf);
         }
+
+        std::vector<float> threshold(mapSize, 0.0f);
+        for (size_t pk = 0; pk < mapSize; pk++) {
+            if (cntQty[pk] > 0) {
+                threshold[pk] = (float)(0.2 * sumQty[pk] / cntQty[pk]);
+            }
+        }
+
+        auto* threshBuf = device->newBuffer(threshold.data(), mapSize * sizeof(float),
+                                             MTL::ResourceStorageModeShared);
+        executor.registerAllocatedBuffer("d_q17_threshold", threshBuf);
+
+        auto* bitmapBuf = device->newBuffer(bitmap.data(), bitmap.size() * sizeof(uint32_t),
+                                             MTL::ResourceStorageModeShared);
+        executor.registerAllocatedBuffer("d_q17_bitmap", bitmapBuf);
     }
 
     // Q9: build green-parts bitmap, lookup arrays, and partsupp HT
