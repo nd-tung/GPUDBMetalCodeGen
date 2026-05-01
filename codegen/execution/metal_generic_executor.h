@@ -154,6 +154,13 @@ private:
     // Find PSO by kernel name
     MTL::ComputePipelineState* findPSO(const RuntimeCompiler::CompiledQuery& cq,
                                         const std::string& name);
+
+    // Encode one phase: set PSO, bind buffers, compute threadgroup config,
+    // dispatch. Used by both warmup and measured loops in execute().
+    void encodePhase(MTL::ComputeCommandEncoder* encoder,
+                     MTL::ComputePipelineState* pso,
+                     const MetalCodegen::PhaseInfo& phase,
+                     const BufferMap& buffers);
 };
 
 } // namespace codegen

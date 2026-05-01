@@ -119,10 +119,23 @@ void MetalCodegen::setPhaseMaxThreadgroups(int max) {
 // Parameter registration
 // ===================================================================
 
-void MetalCodegen::addTableParam(const std::string& table, const std::string& metalType) {
+void MetalCodegen::pushBinding(const char* op, MetalParamBinding b, bool dedup) {
     if (!currentPhase_)
-        throw std::runtime_error("addTableParam: no active phase");
+        throw std::runtime_error(std::string(op) + ": no active phase");
+    if (dedup) {
+        for (const auto& existing : currentPhase_->bindings)
+            if (existing.name == b.name) return;
+    }
+    // Only register sizes for buffers we actually allocate (writeable
+    // DeviceBuffers). Read-only views describe a buffer registered (and
+    // sized) elsewhere; recording their sizeExpr here could clobber the
+    // authoritative entry.
+    if (!b.sizeExpr.empty() && b.kind == MetalParamKind::DeviceBuffer && !b.readOnly)
+        globalBufferSizes_[b.name] = b.sizeExpr;
+    currentPhase_->bindings.push_back(std::move(b));
+}
 
+void MetalCodegen::addTableParam(const std::string& table, const std::string& metalType) {
     // Data pointer
     {
         MetalParamBinding b;
@@ -132,7 +145,7 @@ void MetalCodegen::addTableParam(const std::string& table, const std::string& me
         b.tableName = table;
         b.elementType = metalType;
         b.readOnly = true;
-        currentPhase_->bindings.push_back(b);
+        pushBinding("addTableParam", std::move(b), /*dedup=*/false);
     }
     // Size
     {
@@ -142,7 +155,7 @@ void MetalCodegen::addTableParam(const std::string& table, const std::string& me
         b.kind = MetalParamKind::TableSize;
         b.tableName = table;
         b.elementType = "uint";
-        currentPhase_->bindings.push_back(b);
+        pushBinding("addTableParam", std::move(b), /*dedup=*/false);
     }
 
     registeredTables_.insert(table);
@@ -150,8 +163,6 @@ void MetalCodegen::addTableParam(const std::string& table, const std::string& me
 
 void MetalCodegen::addColumnParam(const std::string& paramName, const std::string& metalType,
                                    const std::string& tableName) {
-    if (!currentPhase_)
-        throw std::runtime_error("addColumnParam: no active phase");
     MetalParamBinding b;
     b.name = paramName;
     b.metalTypeDecl = "device const " + metalType + "*";
@@ -159,28 +170,21 @@ void MetalCodegen::addColumnParam(const std::string& paramName, const std::strin
     b.tableName = tableName.empty() ? paramName : tableName;
     b.elementType = metalType;
     b.readOnly = true;
-    currentPhase_->bindings.push_back(b);
+    pushBinding("addColumnParam", std::move(b), /*dedup=*/false);
 }
 
 void MetalCodegen::addTableSizeParam(const std::string& table) {
-    if (!currentPhase_)
-        throw std::runtime_error("addTableSizeParam: no active phase");
     MetalParamBinding b;
     b.name = "n_" + table;
     b.metalTypeDecl = "constant uint&";
     b.kind = MetalParamKind::TableSize;
     b.tableName = table;
     b.elementType = "uint";
-    currentPhase_->bindings.push_back(b);
+    pushBinding("addTableSizeParam", std::move(b), /*dedup=*/false);
 }
 
 void MetalCodegen::addBufferParam(const std::string& name, const std::string& elemType,
                                    const std::string& sizeExpr, bool zeroInit, int fillByte) {
-    if (!currentPhase_)
-        throw std::runtime_error("addBufferParam: no active phase");
-    // Skip if already registered in this phase
-    for (const auto& existing : currentPhase_->bindings)
-        if (existing.name == name) return;
     MetalParamBinding b;
     b.name = name;
     b.metalTypeDecl = "device " + elemType + "*";
@@ -189,20 +193,12 @@ void MetalCodegen::addBufferParam(const std::string& name, const std::string& el
     b.sizeExpr = sizeExpr;
     b.zeroInit = zeroInit;
     b.fillByte = fillByte;
-    currentPhase_->bindings.push_back(b);
-
-    if (!sizeExpr.empty())
-        globalBufferSizes_[name] = sizeExpr;
+    pushBinding("addBufferParam", std::move(b), /*dedup=*/true);
 }
 
 void MetalCodegen::addAtomicBufferParam(const std::string& name,
                                          const std::string& atomicType,
                                          const std::string& sizeExpr) {
-    if (!currentPhase_)
-        throw std::runtime_error("addAtomicBufferParam: no active phase");
-    // Skip if already registered in this phase
-    for (const auto& existing : currentPhase_->bindings)
-        if (existing.name == name) return;
     MetalParamBinding b;
     b.name = name;
     b.metalTypeDecl = "device " + atomicType + "*";
@@ -210,41 +206,30 @@ void MetalCodegen::addAtomicBufferParam(const std::string& name,
     b.elementType = atomicType;
     b.sizeExpr = sizeExpr;
     b.zeroInit = true;
-    currentPhase_->bindings.push_back(b);
-
-    if (!sizeExpr.empty())
-        globalBufferSizes_[name] = sizeExpr;
+    pushBinding("addAtomicBufferParam", std::move(b), /*dedup=*/true);
 }
 
 void MetalCodegen::addScalarParam(const std::string& name, const std::string& type) {
-    if (!currentPhase_)
-        throw std::runtime_error("addScalarParam: no active phase");
-    for (const auto& existing : currentPhase_->bindings)
-        if (existing.name == name) return;
     MetalParamBinding b;
     b.name = name;
     b.metalTypeDecl = "constant " + type + "&";
     b.kind = MetalParamKind::ConstantScalar;
     b.elementType = type;
-    currentPhase_->bindings.push_back(b);
+    pushBinding("addScalarParam", std::move(b), /*dedup=*/true);
 }
 
 void MetalCodegen::addConstantDataParam(const std::string& name, const std::string& type,
                                          size_t bytes) {
-    if (!currentPhase_)
-        throw std::runtime_error("addConstantDataParam: no active phase");
     MetalParamBinding b;
     b.name = name;
     b.metalTypeDecl = "constant " + type + "*";
     b.kind = MetalParamKind::ConstantData;
     b.elementType = type;
     b.hostCopyBytes = bytes;
-    currentPhase_->bindings.push_back(b);
+    pushBinding("addConstantDataParam", std::move(b), /*dedup=*/false);
 }
 
 void MetalCodegen::addBitmapReadParam(const std::string& name, const std::string& sizeExpr) {
-    if (!currentPhase_)
-        throw std::runtime_error("addBitmapReadParam: no active phase");
     MetalParamBinding b;
     b.name = name;
     b.metalTypeDecl = "device const uint*";
@@ -252,7 +237,7 @@ void MetalCodegen::addBitmapReadParam(const std::string& name, const std::string
     b.elementType = "uint";
     b.sizeExpr = sizeExpr;
     b.readOnly = true;
-    currentPhase_->bindings.push_back(b);
+    pushBinding("addBitmapReadParam", std::move(b), /*dedup=*/false);
 }
 
 void MetalCodegen::addBitmapWriteParam(const std::string& name, const std::string& sizeExpr) {
