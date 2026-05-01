@@ -617,7 +617,10 @@ inline bool loadColumnsFromBinary(const std::string& tblPath,
 {
     const std::string cp = binaryPath(tblPath);
     size_t tblSize = 0; int64_t tblMtime = 0;
-    if (!statFile(tblPath, tblSize, tblMtime)) return false;
+    const bool tblPresent = statFile(tblPath, tblSize, tblMtime);
+    // .tbl is optional: if missing, trust the .colbin's internal header and
+    // skip source-size/mtime cross-check (tbl files may be deleted to save
+    // disk once .colbin has been generated).
 
     MappedFile mf;
     if (!mf.open(cp)) return false;
@@ -628,8 +631,10 @@ inline bool loadColumnsFromBinary(const std::string& tblPath,
     memcpy(&hdr, base, sizeof(hdr));
     if (memcmp(hdr.magic, MAGIC, 8) != 0) return false;
     if (hdr.version != VERSION) return false;
-    if (hdr.source_size != tblSize) return false;
-    if (hdr.source_mtime_ns != tblMtime) return false;
+    if (tblPresent) {
+        if (hdr.source_size != tblSize) return false;
+        if (hdr.source_mtime_ns != tblMtime) return false;
+    }
     if (sizeof(FileHeader) + hdr.n_cols * sizeof(ColDesc) > mf.size) return false;
 
     const ColDesc* descs = (const ColDesc*)(base + sizeof(FileHeader));
@@ -865,7 +870,8 @@ inline MappedColumns loadColumnsAsBuffers(MTL::Device* device,
 
     const std::string cp = binaryPath(tblPath);
     size_t tblSize = 0; int64_t tblMtime = 0;
-    if (!statFile(tblPath, tblSize, tblMtime)) return out;
+    const bool tblPresent = statFile(tblPath, tblSize, tblMtime);
+    // .tbl is optional once .colbin has been generated.
 
     int fd = ::open(cp.c_str(), O_RDONLY);
     if (fd < 0) return out;
@@ -883,8 +889,8 @@ inline MappedColumns loadColumnsAsBuffers(MTL::Device* device,
     memcpy(&hdr, base, sizeof(hdr));
     if (memcmp(hdr.magic, MAGIC, 8) != 0 ||
         hdr.version != VERSION ||
-        hdr.source_size != tblSize ||
-        hdr.source_mtime_ns != tblMtime) {
+        (tblPresent && (hdr.source_size != tblSize ||
+                        hdr.source_mtime_ns != tblMtime))) {
         ::munmap(base, fileSize);
         return out;
     }
@@ -1187,7 +1193,7 @@ inline NationData loadNation(const std::string& sf_path, bool with_regionkey = f
     NationData d;
     std::vector<ColSpec> specs = {{0, ColType::INT}, {1, ColType::CHAR_FIXED, NationData::NAME_WIDTH}};
     if (with_regionkey) specs.push_back({2, ColType::INT});
-    auto cols = loadColumnsMulti(sf_path + "nation.tbl", specs);
+    auto cols = loadColumnsMultiAuto(sf_path + "nation.tbl", specs);
     d.nationkey = std::move(cols.ints(0));
     d.name      = std::move(cols.chars(1));
     if (with_regionkey) d.regionkey = std::move(cols.ints(2));
@@ -1203,7 +1209,7 @@ struct RegionData {
 
 inline RegionData loadRegion(const std::string& sf_path) {
     RegionData d;
-    auto cols = loadColumnsMulti(sf_path + "region.tbl", {{0, ColType::INT}, {1, ColType::CHAR_FIXED, RegionData::NAME_WIDTH}});
+    auto cols = loadColumnsMultiAuto(sf_path + "region.tbl", {{0, ColType::INT}, {1, ColType::CHAR_FIXED, RegionData::NAME_WIDTH}});
     d.regionkey = std::move(cols.ints(0));
     d.name      = std::move(cols.chars(1));
     return d;
@@ -1217,7 +1223,7 @@ struct SupplierBasic {
 
 inline SupplierBasic loadSupplierBasic(const std::string& sf_path) {
     SupplierBasic d;
-    auto cols = loadColumnsMulti(sf_path + "supplier.tbl", {{0, ColType::INT}, {3, ColType::INT}});
+    auto cols = loadColumnsMultiAuto(sf_path + "supplier.tbl", {{0, ColType::INT}, {3, ColType::INT}});
     d.suppkey   = std::move(cols.ints(0));
     d.nationkey = std::move(cols.ints(3));
     return d;

@@ -12,7 +12,7 @@ BIN_DIR      = $(BUILD_DIR)/bin
 OBJ_DIR      = $(BUILD_DIR)/obj
 
 CXX      = clang++
-CXXFLAGS = -std=c++20 -Wall -Wextra -O3
+CXXFLAGS = -std=c++20 -Wall -Wextra -O3 -MMD -MP
 INCLUDES = -Ithird_party/metal-cpp -Ithird_party/libpg_query \
            -Icodegen -Icodegen/core -Icodegen/operators -Icodegen/execution -Icodegen/planning \
            -Isrc
@@ -91,6 +91,9 @@ $(TBL2COLBIN): $(TBL2COLBIN_OBJ) $(INFRA_OBJ) | $(BIN_DIR)
 
 $(BIN_DIR) $(OBJ_DIR) $(BUILD_DIR):
 	@mkdir -p $@
+
+# Auto-generated header dependencies (-MMD -MP)
+-include $(OBJ_DIR)/*.d
 
 clean:
 	@echo "Cleaning build artifacts..."
