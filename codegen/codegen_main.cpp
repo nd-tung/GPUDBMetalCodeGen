@@ -211,18 +211,6 @@ static ColSpec colSpecFor(const codegen::ColumnDef& cdef) {
     return ColSpec(cdef.index, type, cdef.fixedWidth);
 }
 
-static double resultValueAsDouble(const codegen::GenericResult::Value& value, bool& wasDouble) {
-    if (auto v = std::get_if<double>(&value)) {
-        wasDouble = true;
-        return *v;
-    }
-    if (auto v = std::get_if<int64_t>(&value)) {
-        return (double)*v;
-    }
-    wasDouble = true;
-    return 0.0;
-}
-
 static bool parseRowCountWithSuffix(const std::string& text, size_t& out) {
     if (text.empty()) return false;
     char suffix = text.back();
