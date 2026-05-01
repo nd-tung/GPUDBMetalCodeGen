@@ -173,6 +173,13 @@ private:
     std::string indent() const;
     std::string generateSignature(const PhaseInfo& phase) const;
     static std::string commonHeader();
+
+    // Centralised binding push: validates an active phase, optionally skips
+    // duplicates, appends to currentPhase_->bindings, and (if sizeExpr is
+    // populated) records the size in globalBufferSizes_. Replaces the
+    // open-coded "if (!currentPhase_) throw … push_back" pattern that was
+    // repeated in every addXxxParam method.
+    void pushBinding(const char* op, MetalParamBinding b, bool dedup);
     void assignBufferIndices(PhaseInfo& phase);
 };
 
