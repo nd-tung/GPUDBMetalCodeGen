@@ -126,6 +126,16 @@ bool prepareQueryPreprocessing(const std::string& queryName,
                                MTL::Device* device,
                                MetalGenericExecutor& executor,
                                const std::vector<LoadedQueryTable>& loadedTables) {
+    // Reset all per-query post-processing globals so a second in-process
+    // call (e.g. a sweep) does not see stale vectors / GPU buffer pointers
+    // from a previous query. The buffers themselves are owned by the
+    // executor's allocatedBuffers_ and freed on its destruction.
+    g_q2Post  = {};
+    g_q16Post = {};
+    g_q18Post = {};
+    g_q20Post = {};
+    g_q21Post = {};
+
     // Q7: resolve nation keys
     if (queryName == "Q7") {
         if (!registerNameKey(device, executor, loadedTables, "nation", "FRANCE",  "france_nk"))  return false;
