@@ -447,18 +447,19 @@ bool prepareQueryPreprocessing(const std::string& queryName,
         int maxSk = 0;
         for (int sk : ps_suppkey) maxSk = std::max(maxSk, sk);
         uint32_t suppMul = (uint32_t)(maxSk + 1);
-        std::vector<uint32_t> htKeys(htSlots, 0xFFFFFFFFu);
+        // 64-bit packed key: at SF20 maxPk*suppMul ~ 8e11 overflows uint32.
+        std::vector<uint64_t> htKeys(htSlots, ~uint64_t(0));
         std::vector<float> htVals(htSlots, 0.0f);
         std::vector<int> htPsIdx(htSlots, -1);
         for (size_t i = 0; i < ps_partkey.size(); i++) {
             int pk = ps_partkey[i];
             if (pk < 0 || (size_t)pk / 32 >= bmpInts || !((partBitmap[pk / 32] >> (pk % 32)) & 1))
                 continue;
-            uint32_t key = (uint32_t)pk * suppMul + (uint32_t)ps_suppkey[i];
-            uint32_t h = (key * 2654435769u) & htMask;
+            uint64_t key = (uint64_t)pk * (uint64_t)suppMul + (uint64_t)ps_suppkey[i];
+            uint32_t h = ((uint32_t)(key ^ (key >> 32)) * 2654435769u) & htMask;
             for (uint32_t s = 0; s <= htMask; s++) {
                 uint32_t slot = (h + s) & htMask;
-                if (htKeys[slot] == 0xFFFFFFFFu) {
+                if (htKeys[slot] == ~uint64_t(0)) {
                     htKeys[slot] = key;
                     htPsIdx[slot] = (int)i;
                     break;
@@ -468,7 +469,7 @@ bool prepareQueryPreprocessing(const std::string& queryName,
 
         auto* bmpBuf = device->newBuffer(partBitmap.data(), bmpInts * sizeof(uint32_t),
                                           MTL::ResourceStorageModeShared);
-        auto* htKeysBuf = device->newBuffer(htKeys.data(), htSlots * sizeof(uint32_t),
+        auto* htKeysBuf = device->newBuffer(htKeys.data(), htSlots * sizeof(uint64_t),
                                              MTL::ResourceStorageModeShared);
         auto* htValsBuf = device->newBuffer(htSlots * sizeof(float),
                                              MTL::ResourceStorageModeShared);

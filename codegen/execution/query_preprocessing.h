@@ -15,7 +15,7 @@ using LoadedQueryTable = std::pair<std::string, QueryColumns>;
 
 struct Q20PostData {
     std::vector<int> ps_partkey, ps_suppkey, ps_availqty;
-    std::vector<uint32_t> htKeys;
+    std::vector<uint64_t> htKeys;
     std::vector<int> htPsIdx;
     uint32_t htMask = 0, htSlots = 0;
     std::vector<int> s_suppkey, s_nationkey;

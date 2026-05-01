@@ -2227,17 +2227,17 @@ static std::optional<MetalQueryPlan> buildQ20Plan_byName() {
 
     // Helper: hash probe + atomic add
     plan.helpers.push_back(R"(
-static void q20_ht_add(const device uint* ht_keys, device atomic_float* ht_vals,
-                        uint ht_mask, uint key, float qty) {
-    uint h = (key * 2654435769u) & ht_mask;
+static void q20_ht_add(const device ulong* ht_keys, device atomic_float* ht_vals,
+                        uint ht_mask, ulong key, float qty) {
+    uint h = ((uint)(key ^ (key >> 32)) * 2654435769u) & ht_mask;
     for (uint step = 0; step < 64; step++) {
         uint slot = (h + step) & ht_mask;
-        uint k = ht_keys[slot];
+        ulong k = ht_keys[slot];
         if (k == key) {
             atomic_fetch_add_explicit(&ht_vals[slot], qty, memory_order_relaxed);
             return;
         }
-        if (k == 0xFFFFFFFFu) return; // not in HT = not qualifying partsupp
+        if (k == 0xFFFFFFFFFFFFFFFFul) return; // not in HT = not qualifying partsupp
     }
 }
 )");
@@ -2262,7 +2262,7 @@ static void q20_ht_add(const device uint* ht_keys, device atomic_float* ht_vals,
         auto hashAgg = std::make_unique<MetalComputeExpr>(
             std::move(bmpProbe), "_unused", "int",
             "(q20_ht_add(d_q20_ht_keys, d_q20_ht_vals, d_q20_ht_mask, "
-            "(uint)l_partkey[" + idx + "] * supp_mul + (uint)l_suppkey[" + idx + "], "
+            "(ulong)l_partkey[" + idx + "] * (ulong)supp_mul + (ulong)l_suppkey[" + idx + "], "
             "l_quantity[" + idx + "]), 0)");
 
         MetalQueryPlan::Phase phase;
@@ -2270,8 +2270,8 @@ static void q20_ht_add(const device uint* ht_keys, device atomic_float* ht_vals,
         phase.root = std::move(hashAgg);
         phase.threadgroupSize = 1024;
         // Extra buffers
-        phase.extraBuffers.push_back({"d_q20_ht_keys", "uint", true});
-        phase.extraBuffers.push_back({"d_q20_ht_vals", "atomic_float", false});
+        phase.extraBuffers.push_back({"d_q20_ht_keys", "ulong", true, false});
+        phase.extraBuffers.push_back({"d_q20_ht_vals", "atomic_float", false, true});
         phase.scalarParams.push_back({"d_q20_ht_mask", "uint"});
         phase.scalarParams.push_back({"supp_mul", "uint"});
         plan.phases.push_back(std::move(phase));
@@ -2406,7 +2406,7 @@ MetalCodegen generateFromPlan(const MetalQueryPlan& plan) {
             if (eb.readOnly)
                 cg.addBufferParam(eb.name, "const " + eb.type, "", false);
             else
-                cg.addBufferParam(eb.name, eb.type, "", false);
+                cg.addBufferParam(eb.name, eb.type, "", eb.zeroInit);
         }
 
         if (phase.root) {

@@ -1537,7 +1537,7 @@ static bool runCodegenQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
                 const float* htVals = (const float*)pd.htValsBuf->contents();
                 std::set<int> qualSuppkeys;
                 for (uint32_t slot = 0; slot < pd.htSlots; slot++) {
-                    if (pd.htKeys[slot] == 0xFFFFFFFFu) continue;
+                    if (pd.htKeys[slot] == ~uint64_t(0)) continue;
                     int psIdx = pd.htPsIdx[slot];
                     if (psIdx < 0) continue;
                     float sumQty = htVals[slot];
