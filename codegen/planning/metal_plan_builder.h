@@ -35,7 +35,7 @@ struct MetalQueryPlan {
         // Scalar constant params (name, type) — registered before operator production
         std::vector<std::pair<std::string, std::string>> scalarParams;
         // Extra buffer params not added by operators (e.g., pre-built hash tables)
-        struct ExtraBuffer { std::string name; std::string type; bool readOnly = true; };
+        struct ExtraBuffer { std::string name; std::string type; bool readOnly = true; bool zeroInit = false; };
         std::vector<ExtraBuffer> extraBuffers;
     };
     std::vector<Phase> phases;
