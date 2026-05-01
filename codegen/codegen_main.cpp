@@ -547,13 +547,26 @@ static bool runCodegenQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
 
         // 5. Load data: full-table zero-copy/copy or bounded chunked colbin.
         loadStats().reset();  // track per-query load source + byte count
-        // Auto-enable chunked execution when dataset exceeds available RAM.
-        // Skip entirely for non-chunkable plans (see DLM gate above) so we
-        // never auto-engage chunking on a query that would produce wrong
-        // results.
+        // Auto-enable chunked execution when dataset exceeds available RAM
+        // or the GPU working-set budget. Skip entirely for non-chunkable
+        // plans (see DLM gate above) so we never auto-engage chunking on a
+        // query that would produce wrong results.
+        //
+        // Adaptive sizing strategy:
+        //   * streamBytesPerRow = sum(elemBytes) for *projected* columns of
+        //     the stream table only — narrower projections yield wider
+        //     chunks and amortise launch overhead better.
+        //   * residentBytes     = sum(nrows * sum(elemBytes(projected)))
+        //     across non-stream tables that stay fully resident in shared
+        //     buffers + GPU side hash maps.
+        //   * budget            = min(availRAM, gpuWorkingSet) * fraction
+        //                         - residentBytes
+        //   * chunkRows         = floor(budget / (streamBytesPerRow * slots))
+        //   * Clamped to [256K, totalStreamRows].
         if (g_chunkRows == 0 && plan.chunkable) {
             const std::string autoStreamTable = autoDetectStreamTable(tableCols);
             if (!autoStreamTable.empty()) {
+                // --- Memory budgets ---------------------------------------
                 uint64_t physMemBytes = 0;
                 {
                     size_t len = sizeof(physMemBytes);
@@ -573,29 +586,101 @@ static bool runCodegenQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
                         availMemBytes = std::min(reclaimable, physMemBytes);
                     }
                 }
+                uint64_t gpuBudgetBytes = (uint64_t)device->recommendedMaxWorkingSetSize();
+                if (gpuBudgetBytes == 0) gpuBudgetBytes = physMemBytes;
+                uint64_t totalBudget = std::min(availMemBytes, gpuBudgetBytes);
+
+                // --- Per-column elem-byte helper --------------------------
+                auto elemBytes = [&](const codegen::ColumnDef& c) -> uint64_t {
+                    switch (c.type) {
+                        case codegen::DataType::INT:
+                        case codegen::DataType::DATE:
+                        case codegen::DataType::FLOAT:      return 4;
+                        case codegen::DataType::CHAR1:      return 1;
+                        case codegen::DataType::CHAR_FIXED: return (uint64_t)c.fixedWidth;
+                    }
+                    return 0;
+                };
+                auto projectedBytesPerRow = [&](const std::string& tName,
+                                                 const std::set<std::string>& cols) {
+                    uint64_t bpr = 0;
+                    const auto& tdef = schema.table(tName);
+                    for (const auto& cn : cols) bpr += elemBytes(tdef.col(cn));
+                    return bpr;
+                };
+
+                // --- Total dataset size (full file sizes for trigger) -----
                 uint64_t totalDataBytes = 0;
-                for (auto& [tName, _cols] : tableCols) {
+                for (const auto& [tName, _cols] : tableCols) {
                     uint64_t nr = 0, fsz = 0;
                     if (peekColbinHeader(g_dataset_path + tName + ".colbin", nr, fsz))
                         totalDataBytes += fsz;
                 }
-                constexpr double kThreshold = 0.75, kChunkFraction = 0.20;
-                if (availMemBytes > 0 &&
-                    totalDataBytes > (uint64_t)(availMemBytes * kThreshold)) {
-                    uint64_t streamRows = 0, streamSize = 0;
+
+                // --- Resident bytes (non-stream tables, projected only) ---
+                uint64_t residentBytes = 0;
+                for (const auto& [tName, cols] : tableCols) {
+                    if (tName == autoStreamTable) continue;
+                    uint64_t nr = 0, fsz = 0;
+                    if (!peekColbinHeader(g_dataset_path + tName + ".colbin", nr, fsz))
+                        continue;
+                    residentBytes += nr * projectedBytesPerRow(tName, cols);
+                }
+
+                // --- Trigger: chunk only when dataset would dominate budget
+                constexpr double kThreshold    = 0.75;
+                constexpr double kBudgetFraction = 0.50; // headroom for hash maps, output, kernels
+                if (totalBudget > 0 &&
+                    totalDataBytes > (uint64_t)(totalBudget * kThreshold)) {
+                    uint64_t streamRows = 0, streamFsz = 0;
                     if (peekColbinHeader(g_dataset_path + autoStreamTable + ".colbin",
-                                        streamRows, streamSize) && streamRows > 0) {
-                        double bytesPerRow   = (double)streamSize / (double)streamRows;
-                        double targetBytes   = (double)availMemBytes * kChunkFraction;
-                        size_t autoChunkRows = std::max<size_t>(
-                            65536, (size_t)(targetBytes / bytesPerRow));
+                                        streamRows, streamFsz) && streamRows > 0) {
+                        const std::set<std::string>& streamCols = tableCols.at(autoStreamTable);
+                        uint64_t streamBytesPerRow =
+                            projectedBytesPerRow(autoStreamTable, streamCols);
+                        if (streamBytesPerRow == 0) streamBytesPerRow = 1;
+                        const int slots = g_chunkDoubleBuffer ? 2 : 1;
+
+                        // Budget left for the streaming buffers after the
+                        // resident tables claim their share. Reserve at
+                        // least 1/8 of total budget for chunks even when
+                        // residents are large (probe maps are typically
+                        // much smaller than full-resident sizes).
+                        int64_t streamBudget =
+                            (int64_t)((double)totalBudget * kBudgetFraction)
+                            - (int64_t)residentBytes;
+                        int64_t minStreamBudget =
+                            (int64_t)(totalBudget / 8);
+                        if (streamBudget < minStreamBudget)
+                            streamBudget = minStreamBudget;
+                        if (streamBudget < (int64_t)(64ull << 20))  // 64 MiB floor
+                            streamBudget = (int64_t)(64ull << 20);
+
+                        size_t autoChunkRows = (size_t)
+                            ((uint64_t)streamBudget /
+                             (streamBytesPerRow * (uint64_t)slots));
+                        // Clamp: floor at 256K rows (launch-overhead amortise),
+                        // ceiling at total stream rows (no need to chunk).
+                        autoChunkRows = std::max<size_t>(autoChunkRows, 256u * 1024);
+                        if (autoChunkRows > streamRows)
+                            autoChunkRows = (size_t)streamRows;
                         g_chunkRows = autoChunkRows;
-                        if (!g_csv)
-                            printf("[auto-chunk] Dataset ~%.1f GiB > %.0f%% avail RAM"
-                                   " (%.1f GiB avail / %.1f GiB phys)"
-                                   " — enabling chunk=%zu rows\n",
-                                   totalDataBytes / 1e9, kThreshold * 100,
-                                   availMemBytes / 1e9, physMemBytes / 1e9, g_chunkRows);
+                        if (!g_csv) {
+                            printf("[auto-chunk] %s: dataset=%.1f GiB resident=%.1f GiB"
+                                   " budget=%.1f GiB (RAM=%.1f phys=%.1f GPU=%.1f)"
+                                   " stream=%s bytes/row=%llu slots=%d"
+                                   " — chunk=%zu rows (%.0f MiB/slot)\n",
+                                   plan.name.c_str(),
+                                   totalDataBytes / 1e9,
+                                   residentBytes / 1e9,
+                                   totalBudget * kBudgetFraction / 1e9,
+                                   availMemBytes / 1e9, physMemBytes / 1e9,
+                                   gpuBudgetBytes / 1e9,
+                                   autoStreamTable.c_str(),
+                                   (unsigned long long)streamBytesPerRow,
+                                   slots, g_chunkRows,
+                                   (double)(g_chunkRows * streamBytesPerRow) / (1ull << 20));
+                        }
                     }
                 }
             }
@@ -1024,6 +1109,29 @@ static bool runCodegenQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
             double ratio = (total > 0) ? (100.0 * promo / total) : 0.0;
             result.result.columns = {{"promo_revenue", "float"}};
             result.result.rows[0] = {ratio};
+        }
+
+        // Q12: GPU emits 4 buckets [(MAIL,high), (MAIL,low), (SHIP,high),
+        // (SHIP,low)]; pivot to two output rows with columns matching
+        // golden CSV (l_shipmode, high_line_count, low_line_count).
+        if (plan.name == "Q12" && result.result.numRows() == 4 &&
+            result.result.columns.size() == 2) {
+            auto getCount = [&](size_t r) -> int64_t {
+                const auto& v = result.result.rows[r][1];
+                if (std::holds_alternative<int64_t>(v)) return std::get<int64_t>(v);
+                if (std::holds_alternative<double>(v))  return (int64_t)std::get<double>(v);
+                return 0;
+            };
+            int64_t mailHigh = getCount(0), mailLow = getCount(1);
+            int64_t shipHigh = getCount(2), shipLow = getCount(3);
+            result.result.columns = {
+                {"l_shipmode", "string"},
+                {"high_line_count", "int"},
+                {"low_line_count",  "int"}
+            };
+            result.result.rows.clear();
+            result.result.rows.push_back({std::string("MAIL"), mailHigh, mailLow});
+            result.result.rows.push_back({std::string("SHIP"), shipHigh, shipLow});
         }
 
         // 7. Print generic results.

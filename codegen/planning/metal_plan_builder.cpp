@@ -2354,6 +2354,10 @@ std::optional<MetalQueryPlan> buildMetalPlan(const AnalyzedQuery& aq,
     //                  Q15/Q18: max-key scan via extendMaxKeysFromStreamColbin
     //                  Q17:     pre-stream l_partkey/l_quantity load via
     //                           resolvePreprocessColumns disk fallback
+    //   Tier C  (alternate stream tables — partsupp/orders):
+    //                  Q11: stream=partsupp; pre-stream supplier-bitmap
+    //                  Q22: stream=orders; bitmap_or per chunk, customer
+    //                       post-stream filter+count+sum (associative atomics)
     // Microbenchmarks reuse Q6's plan and are therefore implicitly chunkable.
     // ----------------------------------------------------------------
     static const std::unordered_set<std::string> kChunkableNames = {
@@ -2361,6 +2365,7 @@ std::optional<MetalQueryPlan> buildMetalPlan(const AnalyzedQuery& aq,
         "Q4", "Q13",                          // Tier A′
         "Q3", "Q5", "Q7", "Q8", "Q9", "Q10",  // Tier B
         "Q15", "Q17", "Q18",                  // Tier B′
+        "Q11", "Q22",                         // Tier C
     };
     const bool isMicrobench = queryName.rfind("MB", 0) == 0;
     if (kChunkableNames.count(queryName) || isMicrobench) {
