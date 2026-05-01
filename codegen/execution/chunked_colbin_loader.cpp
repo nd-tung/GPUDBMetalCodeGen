@@ -71,10 +71,9 @@ bool ChunkedColbinTable::open(MTL::Device* device,
 
     size_t tblSize = 0;
     int64_t tblMtime = 0;
-    if (!colbin::statFile(tblPath, tblSize, tblMtime)) {
-        error = "cannot stat source table " + errnoMessage(tblPath);
-        return false;
-    }
+    const bool tblPresent = colbin::statFile(tblPath, tblSize, tblMtime);
+    // .tbl is optional once .colbin has been generated; if absent we skip
+    // the source-size/mtime cross-check and trust the .colbin header.
 
     const std::string colbinPath = colbin::binaryPath(tblPath);
     int fd = ::open(colbinPath.c_str(), O_RDONLY);
@@ -108,8 +107,8 @@ bool ChunkedColbinTable::open(MTL::Device* device,
     std::memcpy(&header, base, sizeof(header));
     if (std::memcmp(header.magic, colbin::MAGIC, 8) != 0 ||
         header.version != colbin::VERSION ||
-        header.source_size != tblSize ||
-        header.source_mtime_ns != tblMtime ||
+        (tblPresent && (header.source_size != tblSize ||
+                        header.source_mtime_ns != tblMtime)) ||
         sizeof(colbin::FileHeader) + header.n_cols * sizeof(colbin::ColDesc) > fileSize) {
         ::munmap(base, fileSize);
         error = "stale or invalid .colbin for " + tblPath + " (run make colbin-sfN)";
