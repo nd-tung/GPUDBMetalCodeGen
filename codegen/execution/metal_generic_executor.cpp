@@ -232,6 +232,49 @@ void MetalGenericExecutor::bindPhaseBuffers(MTL::ComputeCommandEncoder* encoder,
 }
 
 // ===================================================================
+// Encode a single phase (PSO bind, buffer bind, dispatch)
+// ===================================================================
+
+void MetalGenericExecutor::encodePhase(MTL::ComputeCommandEncoder* encoder,
+                                       MTL::ComputePipelineState* pso,
+                                       const MetalCodegen::PhaseInfo& phase,
+                                       const BufferMap& buffers) {
+    encoder->setComputePipelineState(pso);
+    bindPhaseBuffers(encoder, phase, buffers);
+
+    NS::UInteger tgSize = pso->maxTotalThreadsPerThreadgroup();
+    if (tgSize > (NS::UInteger)phase.threadgroupSize)
+        tgSize = phase.threadgroupSize;
+
+    if (phase.isSingleThread) {
+        encoder->dispatchThreadgroups(MTL::Size::Make(1, 1, 1),
+                                      MTL::Size::Make(1, 1, 1));
+        return;
+    }
+
+    // Floor of kMinThreadgroups ensures GPU occupancy for small tables;
+    // cap at kMaxThreadgroups (Metal grid-Y limit margin).
+    constexpr NS::UInteger kMinThreadgroups = 1024;
+    constexpr NS::UInteger kMaxThreadgroups = 65535;
+    NS::UInteger numTG = kMinThreadgroups;
+    if (!phase.scannedTable.empty()) {
+        std::string sym = tableSizeName(phase.scannedTable);
+        if (sizeResolver_.hasSymbol(sym)) {
+            size_t rowCount = sizeResolver_.getSymbol(sym);
+            NS::UInteger computed = (rowCount + tgSize - 1) / tgSize;
+            if (computed > kMinThreadgroups) numTG = computed;
+            if (numTG > kMaxThreadgroups) numTG = kMaxThreadgroups;
+        }
+    }
+    if (phase.maxThreadgroups > 0 &&
+        numTG > (NS::UInteger)phase.maxThreadgroups) {
+        numTG = phase.maxThreadgroups;
+    }
+    encoder->dispatchThreadgroups(MTL::Size::Make(numTG, 1, 1),
+                                  MTL::Size::Make(tgSize, 1, 1));
+}
+
+// ===================================================================
 // Execute
 // ===================================================================
 
@@ -300,38 +343,7 @@ MetalExecutionResult MetalGenericExecutor::execute(
                               << phase.name << "'\n";
                     continue;
                 }
-                encoder->setComputePipelineState(pso);
-                bindPhaseBuffers(encoder, phase, allBuffers);
-
-                NS::UInteger tgSize = pso->maxTotalThreadsPerThreadgroup();
-                if (tgSize > (NS::UInteger)phase.threadgroupSize)
-                    tgSize = phase.threadgroupSize;
-
-                if (phase.isSingleThread) {
-                    encoder->dispatchThreadgroups(MTL::Size::Make(1, 1, 1),
-                                                  MTL::Size::Make(1, 1, 1));
-                } else {
-                    // Floor of kMinThreadgroups ensures GPU occupancy for small
-                    // tables; cap at kMaxThreadgroups (Metal grid-Y limit margin).
-                    constexpr NS::UInteger kMinThreadgroups = 1024;
-                    constexpr NS::UInteger kMaxThreadgroups = 65535;
-                    NS::UInteger numTG = kMinThreadgroups;
-                    if (!phase.scannedTable.empty()) {
-                        std::string sym = tableSizeName(phase.scannedTable);
-                        if (sizeResolver_.hasSymbol(sym)) {
-                            size_t rowCount = sizeResolver_.getSymbol(sym);
-                            NS::UInteger computed = (rowCount + tgSize - 1) / tgSize;
-                            if (computed > kMinThreadgroups) numTG = computed;
-                            if (numTG > kMaxThreadgroups) numTG = kMaxThreadgroups;
-                        }
-                    }
-                    if (phase.maxThreadgroups > 0 &&
-                        numTG > (NS::UInteger)phase.maxThreadgroups) {
-                        numTG = phase.maxThreadgroups;
-                    }
-                    encoder->dispatchThreadgroups(MTL::Size::Make(numTG, 1, 1),
-                                                  MTL::Size::Make(tgSize, 1, 1));
-                }
+                encodePhase(encoder, pso, phase, allBuffers);
 
                 if ((int)pi + 1 < lastPhase) {
                     encoder->memoryBarrier(MTL::BarrierScopeBuffers);
@@ -365,36 +377,7 @@ MetalExecutionResult MetalGenericExecutor::execute(
             auto* cmdBuf = cmdQueue_->commandBuffer();
             auto* encoder = cmdBuf->computeCommandEncoder();
 
-            encoder->setComputePipelineState(pso);
-            bindPhaseBuffers(encoder, phase, allBuffers);
-
-            NS::UInteger tgSize = pso->maxTotalThreadsPerThreadgroup();
-            if (tgSize > (NS::UInteger)phase.threadgroupSize)
-                tgSize = phase.threadgroupSize;
-
-            if (phase.isSingleThread) {
-                encoder->dispatchThreadgroups(MTL::Size::Make(1, 1, 1),
-                                              MTL::Size::Make(1, 1, 1));
-            } else {
-                constexpr NS::UInteger kMinThreadgroups = 1024;
-                constexpr NS::UInteger kMaxThreadgroups = 65535;
-                NS::UInteger numTG = kMinThreadgroups;
-                if (!phase.scannedTable.empty()) {
-                    std::string sym = tableSizeName(phase.scannedTable);
-                    if (sizeResolver_.hasSymbol(sym)) {
-                        size_t rowCount = sizeResolver_.getSymbol(sym);
-                        NS::UInteger computed = (rowCount + tgSize - 1) / tgSize;
-                        if (computed > kMinThreadgroups) numTG = computed;
-                        if (numTG > kMaxThreadgroups) numTG = kMaxThreadgroups;
-                    }
-                }
-                if (phase.maxThreadgroups > 0 &&
-                    numTG > (NS::UInteger)phase.maxThreadgroups) {
-                    numTG = phase.maxThreadgroups;
-                }
-                encoder->dispatchThreadgroups(MTL::Size::Make(numTG, 1, 1),
-                                              MTL::Size::Make(tgSize, 1, 1));
-            }
+            encodePhase(encoder, pso, phase, allBuffers);
 
             encoder->endEncoding();
             cmdBuf->commit();
