@@ -41,7 +41,7 @@ static int  g_tgSizeOverride    = 0;     // --threadgroup-size N (0 = use plan d
 static bool g_autotuneTg        = false; // --autotune-tg  (per-query global TG sweep)
 static bool g_autotuneTgPerPhase= false; // --autotune-tg-per-phase (per-kernel TG)
 static bool g_noPipelineCache   = false; // --no-pipeline-cache
-static bool g_noFastMath        = false; // --no-fastmath
+static bool g_fastMath          = false; // --fastmath
 static bool g_printPlan         = false; // --print-plan
 static std::string g_dumpMslDir;         // --dump-msl PATH (directory or file template)
 static std::string g_checkDir;           // --check DIR  (compare result vs DIR/<query>_<sf>.csv)
@@ -723,11 +723,28 @@ static bool runCodegenQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
         //   * residentBytes     = sum(nrows * sum(elemBytes(projected)))
         //     across non-stream tables that stay fully resident in shared
         //     buffers + GPU side hash maps.
-        //   * budget            = min(availRAM, gpuWorkingSet) * fraction
+        //   * budget            = min(physRAM, gpuWorkingSet) * fraction
         //                         - residentBytes
         //   * chunkRows         = floor(budget / (streamBytesPerRow * slots))
         //   * Clamped to [256K, totalStreamRows].
-        if (g_chunkRows == 0 && plan.chunkable) {
+        //
+        // Note: the trigger uses physMemBytes (not vm_statistics64's
+        // free+inactive+speculative). On Apple Silicon the GPU shares
+        // system RAM and the kernel evicts file-backed/cached pages on
+        // demand, so reclaimable-only accounting is far too pessimistic
+        // (e.g. reports ~5 GiB on a 16 GiB Mac with normal browser/IDE
+        // usage). Likewise, the working-set estimate compares *projected*
+        // bytes (residentBytes + streamRows * streamBytesPerRow), not
+        // full .colbin file sizes, since unprojected columns are never
+        // loaded into GPU buffers.
+        // Enter the budget block whenever the plan is chunkable. We use
+        // the computed working-set both to *engage* chunking when it does
+        // not fit (auto path, g_chunkRows starts at 0) and to *downgrade*
+        // an explicit `--chunk N` request to direct load when it clearly
+        // does fit (explicit path, g_chunkRows starts > 0). The downgrade
+        // can be disabled by setting GPUDB_FORCE_CHUNK=1 — useful for
+        // benchmarking the chunked path on small datasets.
+        if (plan.chunkable) {
             const std::string autoStreamTable = autoDetectStreamTable(tableCols);
             if (!autoStreamTable.empty()) {
                 // --- Memory budgets ---------------------------------------
@@ -752,7 +769,11 @@ static bool runCodegenQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
                 }
                 uint64_t gpuBudgetBytes = (uint64_t)device->recommendedMaxWorkingSetSize();
                 if (gpuBudgetBytes == 0) gpuBudgetBytes = physMemBytes;
-                uint64_t totalBudget = std::min(availMemBytes, gpuBudgetBytes);
+                // Use physMemBytes (not availMemBytes) for the trigger:
+                // on UMA, file-backed pages are evicted on demand, so the
+                // VM "free+inactive+speculative" estimate is too tight.
+                // availMemBytes is kept only for the diagnostic printout.
+                uint64_t totalBudget = std::min(physMemBytes, gpuBudgetBytes);
 
                 // --- Per-column elem-byte helper --------------------------
                 auto elemBytes = [&](const codegen::ColumnDef& c) -> uint64_t {
@@ -773,7 +794,7 @@ static bool runCodegenQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
                     return bpr;
                 };
 
-                // --- Total dataset size (full file sizes for trigger) -----
+                // --- Total dataset size (full file sizes, diagnostic) ----
                 uint64_t totalDataBytes = 0;
                 for (const auto& [tName, _cols] : tableCols) {
                     uint64_t nr = 0, fsz = 0;
@@ -791,11 +812,54 @@ static bool runCodegenQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
                     residentBytes += nr * projectedBytesPerRow(tName, cols);
                 }
 
-                // --- Trigger: chunk only when dataset would dominate budget
+                // --- Projected stream bytes (stream table, projected only)
+                uint64_t streamProjectedBytes = 0;
+                {
+                    uint64_t nr = 0, fsz = 0;
+                    if (peekColbinHeader(g_dataset_path + autoStreamTable + ".colbin",
+                                         nr, fsz)) {
+                        streamProjectedBytes =
+                            nr * projectedBytesPerRow(autoStreamTable,
+                                                      tableCols.at(autoStreamTable));
+                    }
+                }
+                // Working-set we'd allocate if we loaded the whole stream
+                // resident — this is what actually competes with the GPU
+                // budget, not the on-disk file footprint.
+                uint64_t projectedWorkingSet = residentBytes + streamProjectedBytes;
+
+                // --- Trigger: chunk only when projected working-set would
+                //              dominate the budget.
                 constexpr double kThreshold    = 0.75;
                 constexpr double kBudgetFraction = 0.50; // headroom for hash maps, output, kernels
-                if (totalBudget > 0 &&
-                    totalDataBytes > (uint64_t)(totalBudget * kThreshold)) {
+                const bool fitsInBudget =
+                    (totalBudget > 0) &&
+                    (projectedWorkingSet <= (uint64_t)(totalBudget * kThreshold));
+
+                // --- Explicit-chunk downgrade ----------------------------
+                // If the user passed --chunk N but the projected working
+                // set fits comfortably, chunking would only add the
+                // O(N) host-copy tax with no memory benefit. Downgrade
+                // to direct load unless GPUDB_FORCE_CHUNK=1.
+                if (g_chunkRows > 0 && fitsInBudget) {
+                    const char* force = std::getenv("GPUDB_FORCE_CHUNK");
+                    bool forceChunk = (force && force[0] && force[0] != '0');
+                    if (!forceChunk) {
+                        if (!g_csv) {
+                            printf("[auto-chunk] %s: --chunk %zu downgraded to "
+                                   "direct load (working-set=%.2f GiB fits in "
+                                   "budget=%.2f GiB; set GPUDB_FORCE_CHUNK=1 "
+                                   "to override)\n",
+                                   plan.name.c_str(),
+                                   g_chunkRows,
+                                   projectedWorkingSet / 1e9,
+                                   totalBudget * kThreshold / 1e9);
+                        }
+                        g_chunkRows = 0;
+                    }
+                }
+
+                if (g_chunkRows == 0 && !fitsInBudget) {
                     uint64_t streamRows = 0, streamFsz = 0;
                     if (peekColbinHeader(g_dataset_path + autoStreamTable + ".colbin",
                                         streamRows, streamFsz) && streamRows > 0) {
@@ -830,13 +894,16 @@ static bool runCodegenQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
                             autoChunkRows = (size_t)streamRows;
                         g_chunkRows = autoChunkRows;
                         if (!g_csv) {
-                            printf("[auto-chunk] %s: dataset=%.1f GiB resident=%.1f GiB"
-                                   " budget=%.1f GiB (RAM=%.1f phys=%.1f GPU=%.1f)"
+                            printf("[auto-chunk] %s: disk=%.1f GiB working-set=%.1f GiB"
+                                   " (resident=%.1f + stream=%.1f)"
+                                   " budget=%.1f GiB (avail=%.1f phys=%.1f GPU=%.1f)"
                                    " stream=%s bytes/row=%llu slots=%d"
                                    " — chunk=%zu rows (%.0f MiB/slot)\n",
                                    plan.name.c_str(),
                                    totalDataBytes / 1e9,
+                                   projectedWorkingSet / 1e9,
                                    residentBytes / 1e9,
+                                   streamProjectedBytes / 1e9,
                                    totalBudget * kBudgetFraction / 1e9,
                                    availMemBytes / 1e9, physMemBytes / 1e9,
                                    gpuBudgetBytes / 1e9,
@@ -861,6 +928,10 @@ static bool runCodegenQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
 
         // Load each table's columns. In chunked mode, skip the stream table
         // here — it is loaded per-chunk below.
+        // Track pure I/O (file read/mmap into host buffers) separately
+        // from CPU preprocessing (max-key scans, per-query prep).
+        double ioMs = 0.0;
+        double preprocessMs = 0.0;
         std::vector<std::pair<std::string, QueryColumns>> loadedTables;
         for (auto& [tableName, colNames] : tableCols) {
             if (!streamTable.empty() && tableName == streamTable) continue;
@@ -868,7 +939,9 @@ static bool runCodegenQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
             std::vector<ColSpec> specs;
             for (const auto& colName : colNames)
                 specs.push_back(colSpecFor(tdef.col(colName)));
+            auto _ioStart = clk::now();
             auto cols = loadQueryColumns(device, g_dataset_path + tableName + ".tbl", specs);
+            ioMs += elapsedMs(_ioStart, clk::now());
             size_t rowCount = cols.rows();
             for (const auto& colName : colNames) {
                 auto& cdef = tdef.col(colName);
@@ -880,17 +953,21 @@ static bool runCodegenQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
             loadedTables.emplace_back(tableName, std::move(cols));
         }
 
-        registerMaxKeySymbols(executor, loadedTables, tableCols, schema);
-        if (!streamTable.empty() && tableCols.count(streamTable)) {
-            extendMaxKeysFromStreamColbin(
-                executor,
-                g_dataset_path + streamTable + ".tbl",
-                tableCols.at(streamTable),
-                schema,
-                streamTable);
-        }
-        if (!codegen::prepareQueryPreprocessing(plan.name, device, executor, loadedTables)) {
-            return false;
+        {
+            auto _ppStart = clk::now();
+            registerMaxKeySymbols(executor, loadedTables, tableCols, schema);
+            if (!streamTable.empty() && tableCols.count(streamTable)) {
+                extendMaxKeysFromStreamColbin(
+                    executor,
+                    g_dataset_path + streamTable + ".tbl",
+                    tableCols.at(streamTable),
+                    schema,
+                    streamTable);
+            }
+            if (!codegen::prepareQueryPreprocessing(plan.name, device, executor, loadedTables)) {
+                return false;
+            }
+            preprocessMs += elapsedMs(_ppStart, clk::now());
         }
 
         codegen::MetalExecutionResult result;
@@ -1001,6 +1078,9 @@ static bool runCodegenQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
             timing.loadSource    = "chunked-colbin";
             timing.loadBytes     = loadStats().bytes + stream.bytesLoaded();
             timing.bufferAllocMs = bufAllocMs;
+            // Chunked I/O: pre-stream load(ioMs) + per-chunk loadChunk(chunkCopyMs).
+            timing.ioMs          = ioMs + chunkCopyMs;
+            timing.preprocessMs  = preprocessMs;
             timing.gpuTotalMs    = gpuMs;
             timing.gpuTrialsN    = 1;
             timing.gpuMsP10      = gpuMs;
@@ -1032,6 +1112,11 @@ static bool runCodegenQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
         timing.ingestMs   = ingestMs;
         timing.loadSource = loadStats().source();
         timing.loadBytes  = loadStats().bytes;
+        // Split data-load window into pure I/O vs CPU preprocess. Anything
+        // unaccounted for in the window is attributed to preprocess.
+        timing.ioMs         = ioMs;
+        timing.preprocessMs = (timing.dataLoadMs > ioMs)
+                              ? (timing.dataLoadMs - ioMs) : preprocessMs;
 
         // ----- B1: --autotune-tg [--autotune-tg-per-phase] --------------
         // Per-query TG sweep over a fixed candidate set. For each
@@ -2015,7 +2100,8 @@ int main(int argc, const char* argv[]) {
             printf("  --autotune-tg-per-phase  Per-phase TG sweep; picks min-p50 TG independently\n");
             printf("                       for each kernel (logs AUTOTUNE_PHASE_CSV)\n");
             printf("  --no-pipeline-cache  Recompile Metal source on every measured iteration\n");
-            printf("  --no-fastmath        Disable Metal -ffast-math (numerics study)\n");
+            printf("  --fastmath           Enable Metal -ffast-math (default: off)\n");
+            printf("  --no-fastmath        Disable Metal -ffast-math (default behavior)\n");
             printf("  --print-plan         Print the MetalQueryPlan structure before codegen\n");
             printf("  --dump-msl DIR       Write generated MSL to DIR/<query>.metal (default: debug/)\n");
             printf("  --check DIR          Compare GPU result against DIR/<query>_<sf>.csv (golden)\n");
@@ -2048,7 +2134,8 @@ int main(int argc, const char* argv[]) {
         if (arg == "--scalar-atomic")     { ::setenv("GPUDB_SCALAR_ATOMIC", "1", 1); continue; }
         if (arg == "--csv")               { g_csv = true; continue; }
         if (arg == "--no-pipeline-cache") { g_noPipelineCache = true; continue; }
-        if (arg == "--no-fastmath")       { g_noFastMath = true; continue; }
+        if (arg == "--fastmath")          { g_fastMath = true; continue; }
+        if (arg == "--no-fastmath")       { g_fastMath = false; continue; }
         if (arg == "--print-plan")        { g_printPlan = true; continue; }
         if (arg == "--dump-msl") {
             if (i + 1 >= argc) { std::cerr << "Missing value for --dump-msl\n"; return 1; }
@@ -2105,8 +2192,8 @@ int main(int argc, const char* argv[]) {
         return 1;
     }
 
-    // Apply --no-fastmath globally before any compile() runs.
-    if (g_noFastMath) codegen::RuntimeCompiler::setFastMathEnabled(false);
+    // Apply explicit fast-math selection globally before any compile() runs.
+    codegen::RuntimeCompiler::setFastMathEnabled(g_fastMath);
 
     NS::AutoreleasePool* pool = NS::AutoreleasePool::alloc()->init();
     MTL::Device* device = MTL::CreateSystemDefaultDevice();
