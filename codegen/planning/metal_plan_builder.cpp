@@ -209,6 +209,41 @@ std::string colMetalType(const std::string& table, const std::string& colName) {
     return "int";
 }
 
+using ColumnList = std::initializer_list<std::pair<const char*, const char*>>;
+
+std::unique_ptr<MetalGridStrideScan> makeScan(const std::string& table,
+                                              const std::string& idxVar,
+                                              ColumnList columns) {
+    auto scan = std::make_unique<MetalGridStrideScan>(table, "row", idxVar);
+    for (const auto& [name, type] : columns) scan->addColumn(name, type);
+    return scan;
+}
+
+std::unique_ptr<MetalGridStrideScan> makeScanForCols(const std::string& table,
+                                                     const std::string& idxVar,
+                                                     const std::set<std::string>& cols) {
+    auto scan = std::make_unique<MetalGridStrideScan>(table, "row", idxVar);
+    for (const auto& colName : cols) scan->addColumn(colName, colMetalType(table, colName));
+    return scan;
+}
+
+std::unique_ptr<MetalOperator> maybeSelect(std::unique_ptr<MetalOperator> input,
+                                           const std::string& filterCond) {
+    if (filterCond.empty()) return input;
+    return std::make_unique<MetalSelection>(std::move(input), filterCond);
+}
+
+MetalQueryPlan::Phase& appendPhase(MetalQueryPlan& plan, const std::string& name,
+                                   std::unique_ptr<MetalOperator> root,
+                                   int threadgroupSize = 1024) {
+    MetalQueryPlan::Phase phase;
+    phase.name = name;
+    phase.root = std::move(root);
+    phase.threadgroupSize = threadgroupSize;
+    plan.phases.push_back(std::move(phase));
+    return plan.phases.back();
+}
+
 } // anonymous namespace
 
 // ===================================================================
@@ -253,19 +288,7 @@ static std::optional<MetalQueryPlan> buildQ6Plan(const AnalyzedQuery& aq) {
     // Build filter predicate using columnar indexing
     std::string filterCond = combineFilters(aq.filters, idxVar);
 
-    // Build operator tree: TGReduce ← Selection ← GridStrideScan
-    auto scan = std::make_unique<MetalGridStrideScan>("lineitem", "row", idxVar);
-    // Register needed columns
-    for (const auto& colName : usedCols) {
-        scan->addColumn(colName, colMetalType("lineitem", colName));
-    }
-
-    std::unique_ptr<MetalOperator> filtered;
-    if (!filterCond.empty()) {
-        filtered = std::make_unique<MetalSelection>(std::move(scan), filterCond);
-    } else {
-        filtered = std::move(scan);
-    }
+    auto filtered = maybeSelect(makeScanForCols("lineitem", idxVar, usedCols), filterCond);
 
     auto reduce = std::make_unique<MetalTGReduce>(std::move(filtered), tableDataName(alias));
     // For Q6, use long (fixed-point 100x) accumulation for precision
@@ -274,11 +297,7 @@ static std::optional<MetalQueryPlan> buildQ6Plan(const AnalyzedQuery& aq) {
     // Register result schema: scalar aggregate, 1 column, scale down by 100
     reduce->setResultAlias(alias, 100);
 
-    MetalQueryPlan::Phase phase;
-    phase.name = "Q6_reduce";
-    phase.root = std::move(reduce);
-    phase.threadgroupSize = 1024;
-    plan.phases.push_back(std::move(phase));
+    appendPhase(plan, "Q6_reduce", std::move(reduce));
 
     return plan;
 }
@@ -310,17 +329,7 @@ static std::optional<MetalQueryPlan> buildQ1Plan(const AnalyzedQuery& aq) {
         if (t.agg && t.agg->innerExpr) collectColumns(t.agg->innerExpr, usedCols);
     }
 
-    auto scan = std::make_unique<MetalGridStrideScan>("lineitem", "row", idxVar);
-    for (const auto& colName : usedCols) {
-        scan->addColumn(colName, colMetalType("lineitem", colName));
-    }
-
-    std::unique_ptr<MetalOperator> filtered;
-    if (!filterCond.empty()) {
-        filtered = std::make_unique<MetalSelection>(std::move(scan), filterCond);
-    } else {
-        filtered = std::move(scan);
-    }
+    auto filtered = maybeSelect(makeScanForCols("lineitem", idxVar, usedCols), filterCond);
 
     // Q1 uses 6-bin keyed aggregation with columnar access
     std::string bucketExpr = "((l_returnflag[" + idxVar + "] == 'A' ? 0 : (l_returnflag[" + idxVar + "] == 'N' ? 2 : 4)) + (l_linestatus[" + idxVar + "] == 'F' ? 0 : 1))";
@@ -339,11 +348,7 @@ static std::optional<MetalQueryPlan> buildQ1Plan(const AnalyzedQuery& aq) {
     agg->addAggregate("sum_disc", 8, "(uint)(l_discount[" + idxVar + "] * 10000.0f)", "add", false, 0);
     agg->addAggregate("count_order", 9, "1u", "add", false, 0);
 
-    MetalQueryPlan::Phase phase;
-    phase.name = "Q1_reduce";
-    phase.root = std::move(agg);
-    phase.threadgroupSize = 1024;
-    plan.phases.push_back(std::move(phase));
+    appendPhase(plan, "Q1_reduce", std::move(agg));
 
     return plan;
 }
@@ -381,9 +386,7 @@ static std::optional<MetalQueryPlan> buildQ14Plan(const AnalyzedQuery& aq) {
 
     // Phase 1: Build promo bitmap from part table
     {
-        auto scan = std::make_unique<MetalGridStrideScan>("part", "row", idxVar);
-        scan->addColumn("p_partkey", "int");
-        scan->addColumn("p_type", "char");
+        auto scan = makeScan("part", idxVar, {{"p_partkey", "int"}, {"p_type", "char"}});
 
         // Filter: p_type starts with "PROMO" → check first 5 chars
         // p_type is CHAR_FIXED(25), accessed as p_type[i * 25 + offset]
@@ -401,20 +404,15 @@ static std::optional<MetalQueryPlan> buildQ14Plan(const AnalyzedQuery& aq) {
             std::move(filter), "d_promo_bitmap",
             "p_partkey[" + idxVar + "]", "(maxPartkey + 31) / 32 + 1");
 
-        MetalQueryPlan::Phase phase;
-        phase.name = "Q14_build_bitmap";
-        phase.root = std::move(bitmapBuild);
-        phase.threadgroupSize = 1024;
-        plan.phases.push_back(std::move(phase));
+        appendPhase(plan, "Q14_build_bitmap", std::move(bitmapBuild));
     }
 
     // Phase 2: Scan lineitem, filter by date, reduce with promo/total
     {
-        auto scan = std::make_unique<MetalGridStrideScan>("lineitem", "row", idxVar);
-        scan->addColumn("l_partkey", "int");
-        scan->addColumn("l_shipdate", "int");
-        scan->addColumn("l_extendedprice", "float");
-        scan->addColumn("l_discount", "float");
+        auto scan = makeScan("lineitem", idxVar, {
+            {"l_partkey", "int"}, {"l_shipdate", "int"},
+            {"l_extendedprice", "float"}, {"l_discount", "float"}
+        });
 
         // Filter: date range from analyzed query (l_shipdate predicates)
         // Extract date filters that reference l_shipdate
@@ -430,13 +428,7 @@ static std::optional<MetalQueryPlan> buildQ14Plan(const AnalyzedQuery& aq) {
             }
         }
 
-        std::string filterCond = combineFilters(dateFilters, idxVar);
-        std::unique_ptr<MetalOperator> filtered;
-        if (!filterCond.empty()) {
-            filtered = std::make_unique<MetalSelection>(std::move(scan), filterCond);
-        } else {
-            filtered = std::move(scan);
-        }
+        auto filtered = maybeSelect(std::move(scan), combineFilters(dateFilters, idxVar));
 
         // TGReduce with 2 accumulators:
         // total_sum: l_extendedprice * (1 - l_discount) for all qualifying rows
@@ -449,12 +441,8 @@ static std::optional<MetalQueryPlan> buildQ14Plan(const AnalyzedQuery& aq) {
         reduce->setResultAlias("promo_revenue", 0);
         reduce->setResultAlias("total_revenue", 0);
 
-        MetalQueryPlan::Phase phase;
-        phase.name = "Q14_reduce";
-        phase.root = std::move(reduce);
-        phase.threadgroupSize = 1024;
+        auto& phase = appendPhase(plan, "Q14_reduce", std::move(reduce));
         phase.bitmapReads.push_back({"d_promo_bitmap", ""});
-        plan.phases.push_back(std::move(phase));
     }
 
     return plan;
@@ -503,10 +491,9 @@ static std::optional<MetalQueryPlan> buildQ4Plan(const AnalyzedQuery& aq) {
     // Phase 1: Build late-delivery bitmap from lineitem
     // Set bit for l_orderkey where l_commitdate < l_receiptdate
     {
-        auto scan = std::make_unique<MetalGridStrideScan>("lineitem", "row", idxVar);
-        scan->addColumn("l_orderkey", "int");
-        scan->addColumn("l_commitdate", "int");
-        scan->addColumn("l_receiptdate", "int");
+        auto scan = makeScan("lineitem", idxVar, {
+            {"l_orderkey", "int"}, {"l_commitdate", "int"}, {"l_receiptdate", "int"}
+        });
 
         auto filter = std::make_unique<MetalSelection>(std::move(scan),
             "l_commitdate[" + idxVar + "] < l_receiptdate[" + idxVar + "]");
@@ -515,19 +502,14 @@ static std::optional<MetalQueryPlan> buildQ4Plan(const AnalyzedQuery& aq) {
             std::move(filter), "d_late_bitmap",
             "l_orderkey[" + idxVar + "]", "(maxOrderkey + 31) / 32 + 1");
 
-        MetalQueryPlan::Phase phase;
-        phase.name = "Q4_build_bitmap";
-        phase.root = std::move(bitmapBuild);
-        phase.threadgroupSize = 1024;
-        plan.phases.push_back(std::move(phase));
+        appendPhase(plan, "Q4_build_bitmap", std::move(bitmapBuild));
     }
 
     // Phase 2: Scan orders, filter by date + bitmap probe, count by priority
     {
-        auto scan = std::make_unique<MetalGridStrideScan>("orders", "row", idxVar);
-        scan->addColumn("o_orderkey", "int");
-        scan->addColumn("o_orderdate", "int");
-        scan->addColumn("o_orderpriority", "char");
+        auto scan = makeScan("orders", idxVar, {
+            {"o_orderkey", "int"}, {"o_orderdate", "int"}, {"o_orderpriority", "char"}
+        });
 
         // Extract date filter from the analyzed query
         std::vector<PredPtr> dateFilters;
@@ -538,12 +520,7 @@ static std::optional<MetalQueryPlan> buildQ4Plan(const AnalyzedQuery& aq) {
         }
         std::string filterCond = combineFilters(dateFilters, idxVar);
 
-        std::unique_ptr<MetalOperator> filtered;
-        if (!filterCond.empty()) {
-            filtered = std::make_unique<MetalSelection>(std::move(scan), filterCond);
-        } else {
-            filtered = std::move(scan);
-        }
+        auto filtered = maybeSelect(std::move(scan), filterCond);
 
         // Bitmap probe: only orders with late lineitem deliveries
         auto probed = std::make_unique<MetalBitmapProbe>(
@@ -558,11 +535,7 @@ static std::optional<MetalQueryPlan> buildQ4Plan(const AnalyzedQuery& aq) {
             /*numBuckets=*/5, /*valuesPerBucket=*/1, "5");
         agg->addAggregate("order_count", 0, "1u", "add", false, 0);
 
-        MetalQueryPlan::Phase phase;
-        phase.name = "Q4_count";
-        phase.root = std::move(agg);
-        phase.threadgroupSize = 1024;
-        plan.phases.push_back(std::move(phase));
+        appendPhase(plan, "Q4_count", std::move(agg));
     }
 
     return plan;
@@ -603,9 +576,7 @@ static std::optional<MetalQueryPlan> buildQ12Plan(const AnalyzedQuery& aq) {
     // Phase 1: Build priority bitmap from orders
     // Set bit for o_orderkey where o_orderpriority is '1-URGENT' or '2-HIGH'
     {
-        auto scan = std::make_unique<MetalGridStrideScan>("orders", "row", idxVar);
-        scan->addColumn("o_orderkey", "int");
-        scan->addColumn("o_orderpriority", "char");
+        auto scan = makeScan("orders", idxVar, {{"o_orderkey", "int"}, {"o_orderpriority", "char"}});
 
         // o_orderpriority CHAR1, first char: '1' or '2' → high priority
         auto filter = std::make_unique<MetalSelection>(std::move(scan),
@@ -615,21 +586,15 @@ static std::optional<MetalQueryPlan> buildQ12Plan(const AnalyzedQuery& aq) {
             std::move(filter), "d_priority_bitmap",
             "o_orderkey[" + idxVar + "]", "(maxOrderkey + 31) / 32 + 1");
 
-        MetalQueryPlan::Phase phase;
-        phase.name = "Q12_build_bitmap";
-        phase.root = std::move(bitmapBuild);
-        phase.threadgroupSize = 1024;
-        plan.phases.push_back(std::move(phase));
+        appendPhase(plan, "Q12_build_bitmap", std::move(bitmapBuild));
     }
 
     // Phase 2: Scan lineitem, filter by shipmode + date constraints, probe bitmap, 4-bin count
     {
-        auto scan = std::make_unique<MetalGridStrideScan>("lineitem", "row", idxVar);
-        scan->addColumn("l_orderkey", "int");
-        scan->addColumn("l_shipmode", "char");
-        scan->addColumn("l_shipdate", "int");
-        scan->addColumn("l_commitdate", "int");
-        scan->addColumn("l_receiptdate", "int");
+        auto scan = makeScan("lineitem", idxVar, {
+            {"l_orderkey", "int"}, {"l_shipmode", "char"}, {"l_shipdate", "int"},
+            {"l_commitdate", "int"}, {"l_receiptdate", "int"}
+        });
 
         // Lineitem filters:
         // 1. l_shipmode IN ('MAIL', 'SHIP') → first char 'M' or 'S'
@@ -668,12 +633,8 @@ static std::optional<MetalQueryPlan> buildQ12Plan(const AnalyzedQuery& aq) {
             /*numBuckets=*/4, /*valuesPerBucket=*/1, "4");
         agg->addAggregate("count", 0, "1u", "add", false, 0);
 
-        MetalQueryPlan::Phase phase;
-        phase.name = "Q12_count";
-        phase.root = std::move(agg);
-        phase.threadgroupSize = 1024;
+        auto& phase = appendPhase(plan, "Q12_count", std::move(agg));
         phase.bitmapReads.push_back({"d_priority_bitmap", ""});
-        plan.phases.push_back(std::move(phase));
     }
 
     return plan;
@@ -724,10 +685,9 @@ static std::optional<MetalQueryPlan> buildQ10Plan(const AnalyzedQuery& aq) {
     // Phase 1: Build orders direct-address map
     // orders_map[orderkey] = custkey (filtered by date)
     {
-        auto scan = std::make_unique<MetalGridStrideScan>("orders", "row", idxVar);
-        scan->addColumn("o_orderkey", "int");
-        scan->addColumn("o_custkey", "int");
-        scan->addColumn("o_orderdate", "int");
+        auto scan = makeScan("orders", idxVar, {
+            {"o_orderkey", "int"}, {"o_custkey", "int"}, {"o_orderdate", "int"}
+        });
 
         // Extract date filters from analyzed query
         std::vector<PredPtr> dateFilters;
@@ -738,12 +698,7 @@ static std::optional<MetalQueryPlan> buildQ10Plan(const AnalyzedQuery& aq) {
         }
         std::string filterCond = combineFilters(dateFilters, idxVar);
 
-        std::unique_ptr<MetalOperator> filtered;
-        if (!filterCond.empty()) {
-            filtered = std::make_unique<MetalSelection>(std::move(scan), filterCond);
-        } else {
-            filtered = std::move(scan);
-        }
+        auto filtered = maybeSelect(std::move(scan), filterCond);
 
         // ArrayStore: orders_map[orderkey] = custkey
         auto store = std::make_unique<MetalArrayStore>(
@@ -752,20 +707,15 @@ static std::optional<MetalQueryPlan> buildQ10Plan(const AnalyzedQuery& aq) {
             "o_custkey[" + idxVar + "]",
             "int", "maxOrderkey");
 
-        MetalQueryPlan::Phase phase;
-        phase.name = "Q10_build_orders_map";
-        phase.root = std::move(store);
-        phase.threadgroupSize = 1024;
-        plan.phases.push_back(std::move(phase));
+        appendPhase(plan, "Q10_build_orders_map", std::move(store));
     }
 
     // Phase 2: Probe lineitem, aggregate revenue per custkey
     {
-        auto scan = std::make_unique<MetalGridStrideScan>("lineitem", "row", idxVar);
-        scan->addColumn("l_orderkey", "int");
-        scan->addColumn("l_returnflag", "char");
-        scan->addColumn("l_extendedprice", "float");
-        scan->addColumn("l_discount", "float");
+        auto scan = makeScan("lineitem", idxVar, {
+            {"l_orderkey", "int"}, {"l_returnflag", "char"},
+            {"l_extendedprice", "float"}, {"l_discount", "float"}
+        });
 
         // Filter: l_returnflag = 'R'
         auto filtered = std::make_unique<MetalSelection>(std::move(scan),
@@ -784,11 +734,7 @@ static std::optional<MetalQueryPlan> buildQ10Plan(const AnalyzedQuery& aq) {
             "_custkey", revenue, "maxCustkey",
             "atomic_float", "float");
 
-        MetalQueryPlan::Phase phase;
-        phase.name = "Q10_probe_aggregate";
-        phase.root = std::move(agg);
-        phase.threadgroupSize = 1024;
-        plan.phases.push_back(std::move(phase));
+        appendPhase(plan, "Q10_probe_aggregate", std::move(agg));
     }
 
     return plan;
@@ -837,9 +783,7 @@ static std::optional<MetalQueryPlan> buildQ7Plan_byName() {
 
     // Phase 1: Build supplier nation map
     {
-        auto scan = std::make_unique<MetalGridStrideScan>("supplier", "row", idx);
-        scan->addColumn("s_suppkey", "int");
-        scan->addColumn("s_nationkey", "int");
+        auto scan = makeScan("supplier", idx, {{"s_suppkey", "int"}, {"s_nationkey", "int"}});
 
         auto filtered = std::make_unique<MetalSelection>(std::move(scan),
             "s_nationkey[" + idx + "] == france_nk || s_nationkey[" + idx + "] == germany_nk");
@@ -850,19 +794,13 @@ static std::optional<MetalQueryPlan> buildQ7Plan_byName() {
             "s_suppkey[" + idx + "]", "s_nationkey[" + idx + "]",
             "int", "maxSuppkey");
 
-        MetalQueryPlan::Phase phase;
-        phase.name = "Q7_build_supp_map";
-        phase.root = std::move(store);
-        phase.threadgroupSize = 256;
+        auto& phase = appendPhase(plan, "Q7_build_supp_map", std::move(store), 256);
         phase.scalarParams = {{"france_nk", "int"}, {"germany_nk", "int"}};
-        plan.phases.push_back(std::move(phase));
     }
 
     // Phase 2: Build customer nation map
     {
-        auto scan = std::make_unique<MetalGridStrideScan>("customer", "row", idx);
-        scan->addColumn("c_custkey", "int");
-        scan->addColumn("c_nationkey", "int");
+        auto scan = makeScan("customer", idx, {{"c_custkey", "int"}, {"c_nationkey", "int"}});
 
         auto filtered = std::make_unique<MetalSelection>(std::move(scan),
             "c_nationkey[" + idx + "] == france_nk || c_nationkey[" + idx + "] == germany_nk");
@@ -873,19 +811,13 @@ static std::optional<MetalQueryPlan> buildQ7Plan_byName() {
             "c_custkey[" + idx + "]", "c_nationkey[" + idx + "]",
             "int", "maxCustkey");
 
-        MetalQueryPlan::Phase phase;
-        phase.name = "Q7_build_cust_map";
-        phase.root = std::move(store);
-        phase.threadgroupSize = 256;
+        auto& phase = appendPhase(plan, "Q7_build_cust_map", std::move(store), 256);
         phase.scalarParams = {{"france_nk", "int"}, {"germany_nk", "int"}};
-        plan.phases.push_back(std::move(phase));
     }
 
     // Phase 3: Build orders map (orderkey → custkey)
     {
-        auto scan = std::make_unique<MetalGridStrideScan>("orders", "row", idx);
-        scan->addColumn("o_orderkey", "int");
-        scan->addColumn("o_custkey", "int");
+        auto scan = makeScan("orders", idx, {{"o_orderkey", "int"}, {"o_custkey", "int"}});
 
         // ArrayStore: orders_map[orderkey] = custkey
         auto store = std::make_unique<MetalArrayStore>(
@@ -893,21 +825,15 @@ static std::optional<MetalQueryPlan> buildQ7Plan_byName() {
             "o_orderkey[" + idx + "]", "o_custkey[" + idx + "]",
             "int", "maxOrderkey");
 
-        MetalQueryPlan::Phase phase;
-        phase.name = "Q7_build_orders_map";
-        phase.root = std::move(store);
-        phase.threadgroupSize = 256;
-        plan.phases.push_back(std::move(phase));
+        appendPhase(plan, "Q7_build_orders_map", std::move(store), 256);
     }
 
     // Phase 4: Probe lineitem → cascaded lookups → aggregate into 4 bins
     {
-        auto scan = std::make_unique<MetalGridStrideScan>("lineitem", "row", idx);
-        scan->addColumn("l_orderkey", "int");
-        scan->addColumn("l_suppkey", "int");
-        scan->addColumn("l_shipdate", "int");
-        scan->addColumn("l_extendedprice", "float");
-        scan->addColumn("l_discount", "float");
+        auto scan = makeScan("lineitem", idx, {
+            {"l_orderkey", "int"}, {"l_suppkey", "int"}, {"l_shipdate", "int"},
+            {"l_extendedprice", "float"}, {"l_discount", "float"}
+        });
 
         // Date filter: 1995-01-01 to 1996-12-31
         auto dateFiltered = std::make_unique<MetalSelection>(std::move(scan),
@@ -947,12 +873,8 @@ static std::optional<MetalQueryPlan> buildQ7Plan_byName() {
             bucketExpr, valueExpr, "4",
             "atomic_float", "float");
 
-        MetalQueryPlan::Phase phase;
-        phase.name = "Q7_probe_aggregate";
-        phase.root = std::move(agg);
-        phase.threadgroupSize = 1024;
+        auto& phase = appendPhase(plan, "Q7_probe_aggregate", std::move(agg));
         phase.scalarParams = {{"france_nk", "int"}, {"germany_nk", "int"}};
-        plan.phases.push_back(std::move(phase));
     }
 
     return plan;
@@ -975,9 +897,7 @@ static std::optional<MetalQueryPlan> buildQ5Plan_byName() {
 
     // Phase 0: Build nation bitmap (ASIA nations only)
     {
-        auto scan = std::make_unique<MetalGridStrideScan>("nation", "row", idx);
-        scan->addColumn("n_nationkey", "int");
-        scan->addColumn("n_regionkey", "int");
+        auto scan = makeScan("nation", idx, {{"n_nationkey", "int"}, {"n_regionkey", "int"}});
 
         auto filtered = std::make_unique<MetalSelection>(std::move(scan),
             "n_regionkey[" + idx + "] == asia_rk");
@@ -986,19 +906,13 @@ static std::optional<MetalQueryPlan> buildQ5Plan_byName() {
             std::move(filtered), "d_nation_bitmap",
             "n_nationkey[" + idx + "]", "(25 + 31) / 32");
 
-        MetalQueryPlan::Phase phase;
-        phase.name = "Q5_build_nation_bitmap";
-        phase.root = std::move(bitmap);
-        phase.threadgroupSize = 32;  // only 25 rows
+        auto& phase = appendPhase(plan, "Q5_build_nation_bitmap", std::move(bitmap), 32);
         phase.scalarParams = {{"asia_rk", "int"}};
-        plan.phases.push_back(std::move(phase));
     }
 
     // Phase 1: Build customer nation map (ASIA customers only)
     {
-        auto scan = std::make_unique<MetalGridStrideScan>("customer", "row", idx);
-        scan->addColumn("c_custkey", "int");
-        scan->addColumn("c_nationkey", "int");
+        auto scan = makeScan("customer", idx, {{"c_custkey", "int"}, {"c_nationkey", "int"}});
 
         auto probed = std::make_unique<MetalBitmapProbe>(std::move(scan),
             "d_nation_bitmap", "c_nationkey[" + idx + "]");
@@ -1008,18 +922,12 @@ static std::optional<MetalQueryPlan> buildQ5Plan_byName() {
             "c_custkey[" + idx + "]", "c_nationkey[" + idx + "]",
             "int", "maxCustkey");
 
-        MetalQueryPlan::Phase phase;
-        phase.name = "Q5_build_cust_map";
-        phase.root = std::move(store);
-        phase.threadgroupSize = 256;
-        plan.phases.push_back(std::move(phase));
+        appendPhase(plan, "Q5_build_cust_map", std::move(store), 256);
     }
 
     // Phase 2: Build supplier nation map (ASIA suppliers only)
     {
-        auto scan = std::make_unique<MetalGridStrideScan>("supplier", "row", idx);
-        scan->addColumn("s_suppkey", "int");
-        scan->addColumn("s_nationkey", "int");
+        auto scan = makeScan("supplier", idx, {{"s_suppkey", "int"}, {"s_nationkey", "int"}});
 
         auto probed = std::make_unique<MetalBitmapProbe>(std::move(scan),
             "d_nation_bitmap", "s_nationkey[" + idx + "]");
@@ -1029,19 +937,14 @@ static std::optional<MetalQueryPlan> buildQ5Plan_byName() {
             "s_suppkey[" + idx + "]", "s_nationkey[" + idx + "]",
             "int", "maxSuppkey");
 
-        MetalQueryPlan::Phase phase;
-        phase.name = "Q5_build_supp_map";
-        phase.root = std::move(store);
-        phase.threadgroupSize = 256;
-        plan.phases.push_back(std::move(phase));
+        appendPhase(plan, "Q5_build_supp_map", std::move(store), 256);
     }
 
     // Phase 3: Build orders nation map (date-filtered, customer-in-ASIA)
     {
-        auto scan = std::make_unique<MetalGridStrideScan>("orders", "row", idx);
-        scan->addColumn("o_orderkey", "int");
-        scan->addColumn("o_custkey", "int");
-        scan->addColumn("o_orderdate", "int");
+        auto scan = makeScan("orders", idx, {
+            {"o_orderkey", "int"}, {"o_custkey", "int"}, {"o_orderdate", "int"}
+        });
 
         // Date filter: 1994-01-01 to 1994-12-31
         auto dateFiltered = std::make_unique<MetalSelection>(std::move(scan),
@@ -1059,20 +962,15 @@ static std::optional<MetalQueryPlan> buildQ5Plan_byName() {
             "o_orderkey[" + idx + "]", "_cust_nk",
             "int", "maxOrderkey");
 
-        MetalQueryPlan::Phase phase;
-        phase.name = "Q5_build_orders_map";
-        phase.root = std::move(store);
-        phase.threadgroupSize = 1024;
-        plan.phases.push_back(std::move(phase));
+        appendPhase(plan, "Q5_build_orders_map", std::move(store));
     }
 
     // Phase 4: Probe lineitem → same-nation check → aggregate
     {
-        auto scan = std::make_unique<MetalGridStrideScan>("lineitem", "row", idx);
-        scan->addColumn("l_orderkey", "int");
-        scan->addColumn("l_suppkey", "int");
-        scan->addColumn("l_extendedprice", "float");
-        scan->addColumn("l_discount", "float");
+        auto scan = makeScan("lineitem", idx, {
+            {"l_orderkey", "int"}, {"l_suppkey", "int"},
+            {"l_extendedprice", "float"}, {"l_discount", "float"}
+        });
 
         // Lookup: cust_nk = orders_nation_map[l_orderkey]
         auto lookupOrders = std::make_unique<MetalArrayLookup>(
@@ -1097,11 +995,7 @@ static std::optional<MetalQueryPlan> buildQ5Plan_byName() {
             "_cust_nk", valueExpr, "25",
             "atomic_float", "float");
 
-        MetalQueryPlan::Phase phase;
-        phase.name = "Q5_probe_aggregate";
-        phase.root = std::move(agg);
-        phase.threadgroupSize = 1024;
-        plan.phases.push_back(std::move(phase));
+        appendPhase(plan, "Q5_probe_aggregate", std::move(agg));
     }
 
     return plan;
@@ -1125,9 +1019,7 @@ static std::optional<MetalQueryPlan> buildQ8Plan_byName() {
 
     // Phase 0: Build nation bitmap for AMERICA region
     {
-        auto scan = std::make_unique<MetalGridStrideScan>("nation", "row", idx);
-        scan->addColumn("n_nationkey", "int");
-        scan->addColumn("n_regionkey", "int");
+        auto scan = makeScan("nation", idx, {{"n_nationkey", "int"}, {"n_regionkey", "int"}});
 
         auto filtered = std::make_unique<MetalSelection>(std::move(scan),
             "n_regionkey[" + idx + "] == america_rk");
@@ -1136,19 +1028,13 @@ static std::optional<MetalQueryPlan> buildQ8Plan_byName() {
             std::move(filtered), "d_america_bitmap",
             "n_nationkey[" + idx + "]", "(25 + 31) / 32");
 
-        MetalQueryPlan::Phase phase;
-        phase.name = "Q8_build_nation_bitmap";
-        phase.root = std::move(bitmap);
-        phase.threadgroupSize = 32;
+        auto& phase = appendPhase(plan, "Q8_build_nation_bitmap", std::move(bitmap), 32);
         phase.scalarParams = {{"america_rk", "int"}};
-        plan.phases.push_back(std::move(phase));
     }
 
     // Phase 1: Build part bitmap for 'ECONOMY ANODIZED STEEL'
     {
-        auto scan = std::make_unique<MetalGridStrideScan>("part", "row", idx);
-        scan->addColumn("p_partkey", "int");
-        scan->addColumn("p_type", "char");
+        auto scan = makeScan("part", idx, {{"p_partkey", "int"}, {"p_type", "char"}});
 
         // Compare 22 chars of p_type (CHAR_FIXED stride 25)
         std::string cond =
@@ -1181,18 +1067,12 @@ static std::optional<MetalQueryPlan> buildQ8Plan_byName() {
             std::move(filtered), "d_part_bitmap",
             "p_partkey[" + idx + "]", "(maxPartkey + 31) / 32");
 
-        MetalQueryPlan::Phase phase;
-        phase.name = "Q8_build_part_bitmap";
-        phase.root = std::move(bitmap);
-        phase.threadgroupSize = 256;
-        plan.phases.push_back(std::move(phase));
+        appendPhase(plan, "Q8_build_part_bitmap", std::move(bitmap), 256);
     }
 
     // Phase 2: Build customer nation map (only AMERICA customers)
     {
-        auto scan = std::make_unique<MetalGridStrideScan>("customer", "row", idx);
-        scan->addColumn("c_custkey", "int");
-        scan->addColumn("c_nationkey", "int");
+        auto scan = makeScan("customer", idx, {{"c_custkey", "int"}, {"c_nationkey", "int"}});
 
         auto probed = std::make_unique<MetalBitmapProbe>(std::move(scan),
             "d_america_bitmap", "c_nationkey[" + idx + "]");
@@ -1202,37 +1082,26 @@ static std::optional<MetalQueryPlan> buildQ8Plan_byName() {
             "c_custkey[" + idx + "]", "c_nationkey[" + idx + "]",
             "int", "maxCustkey");
 
-        MetalQueryPlan::Phase phase;
-        phase.name = "Q8_build_cust_map";
-        phase.root = std::move(store);
-        phase.threadgroupSize = 256;
-        plan.phases.push_back(std::move(phase));
+        appendPhase(plan, "Q8_build_cust_map", std::move(store), 256);
     }
 
     // Phase 3: Build supplier nation map (all suppliers)
     {
-        auto scan = std::make_unique<MetalGridStrideScan>("supplier", "row", idx);
-        scan->addColumn("s_suppkey", "int");
-        scan->addColumn("s_nationkey", "int");
+        auto scan = makeScan("supplier", idx, {{"s_suppkey", "int"}, {"s_nationkey", "int"}});
 
         auto store = std::make_unique<MetalArrayStore>(
             std::move(scan), "d_supp_nation_map",
             "s_suppkey[" + idx + "]", "s_nationkey[" + idx + "]",
             "int", "maxSuppkey");
 
-        MetalQueryPlan::Phase phase;
-        phase.name = "Q8_build_supp_map";
-        phase.root = std::move(store);
-        phase.threadgroupSize = 256;
-        plan.phases.push_back(std::move(phase));
+        appendPhase(plan, "Q8_build_supp_map", std::move(store), 256);
     }
 
     // Phase 4: Build orders year map (date-filtered, AMERICA customer)
     {
-        auto scan = std::make_unique<MetalGridStrideScan>("orders", "row", idx);
-        scan->addColumn("o_orderkey", "int");
-        scan->addColumn("o_custkey", "int");
-        scan->addColumn("o_orderdate", "int");
+        auto scan = makeScan("orders", idx, {
+            {"o_orderkey", "int"}, {"o_custkey", "int"}, {"o_orderdate", "int"}
+        });
 
         auto dateFiltered = std::make_unique<MetalSelection>(std::move(scan),
             "o_orderdate[" + idx + "] >= 19950101 && o_orderdate[" + idx + "] <= 19961231");
@@ -1247,22 +1116,16 @@ static std::optional<MetalQueryPlan> buildQ8Plan_byName() {
             "o_orderkey[" + idx + "]", "o_orderdate[" + idx + "] / 10000",
             "int", "maxOrderkey");
 
-        MetalQueryPlan::Phase phase;
-        phase.name = "Q8_build_orders_map";
-        phase.root = std::move(store);
-        phase.threadgroupSize = 1024;
-        plan.phases.push_back(std::move(phase));
+        appendPhase(plan, "Q8_build_orders_map", std::move(store));
     }
 
     // Phase 5: Probe lineitem — dual aggregation into result_bins
     // [0]=brazil_95, [1]=brazil_96, [2]=total_95, [3]=total_96
     {
-        auto scan = std::make_unique<MetalGridStrideScan>("lineitem", "row", idx);
-        scan->addColumn("l_orderkey", "int");
-        scan->addColumn("l_partkey", "int");
-        scan->addColumn("l_suppkey", "int");
-        scan->addColumn("l_extendedprice", "float");
-        scan->addColumn("l_discount", "float");
+        auto scan = makeScan("lineitem", idx, {
+            {"l_orderkey", "int"}, {"l_partkey", "int"}, {"l_suppkey", "int"},
+            {"l_extendedprice", "float"}, {"l_discount", "float"}
+        });
 
         auto partProbed = std::make_unique<MetalBitmapProbe>(std::move(scan),
             "d_part_bitmap", "l_partkey[" + idx + "]");
@@ -1294,12 +1157,8 @@ static std::optional<MetalQueryPlan> buildQ8Plan_byName() {
             "_year - 1995", revenue, "4",
             "atomic_float", "float");
 
-        MetalQueryPlan::Phase phase;
-        phase.name = "Q8_probe_aggregate";
-        phase.root = std::move(brazilAgg);
-        phase.threadgroupSize = 1024;
+        auto& phase = appendPhase(plan, "Q8_probe_aggregate", std::move(brazilAgg));
         phase.scalarParams = {{"brazil_nk", "int"}};
-        plan.phases.push_back(std::move(phase));
     }
 
     return plan;
@@ -1314,9 +1173,7 @@ static std::optional<MetalQueryPlan> buildQ3Plan_byName() {
 
     // Phase 1: Build customer bitmap (BUILDING segment)
     {
-        auto scan = std::make_unique<MetalGridStrideScan>("customer", "row", idx);
-        scan->addColumn("c_custkey", "int");
-        scan->addColumn("c_mktsegment", "char");
+        auto scan = makeScan("customer", idx, {{"c_custkey", "int"}, {"c_mktsegment", "char"}});
 
         auto filtered = std::make_unique<MetalSelection>(std::move(scan),
             "c_mktsegment[" + idx + "] == 'B'");
@@ -1325,20 +1182,15 @@ static std::optional<MetalQueryPlan> buildQ3Plan_byName() {
             std::move(filtered), "d_cust_bitmap",
             "c_custkey[" + idx + "]", "(maxCustkey + 31) / 32");
 
-        MetalQueryPlan::Phase phase;
-        phase.name = "Q3_build_cust_bitmap";
-        phase.root = std::move(bitmap);
-        phase.threadgroupSize = 256;
-        plan.phases.push_back(std::move(phase));
+        appendPhase(plan, "Q3_build_cust_bitmap", std::move(bitmap), 256);
     }
 
     // Phase 2: Build orders maps (date + priority, dual ArrayStore)
     {
-        auto scan = std::make_unique<MetalGridStrideScan>("orders", "row", idx);
-        scan->addColumn("o_orderkey", "int");
-        scan->addColumn("o_custkey", "int");
-        scan->addColumn("o_orderdate", "int");
-        scan->addColumn("o_shippriority", "int");
+        auto scan = makeScan("orders", idx, {
+            {"o_orderkey", "int"}, {"o_custkey", "int"},
+            {"o_orderdate", "int"}, {"o_shippriority", "int"}
+        });
 
         auto dateFiltered = std::make_unique<MetalSelection>(std::move(scan),
             "o_orderdate[" + idx + "] < 19950315");
@@ -1356,20 +1208,15 @@ static std::optional<MetalQueryPlan> buildQ3Plan_byName() {
             "o_orderkey[" + idx + "]", "o_shippriority[" + idx + "]",
             "int", "maxOrderkey");
 
-        MetalQueryPlan::Phase phase;
-        phase.name = "Q3_build_orders_maps";
-        phase.root = std::move(storePrio);
-        phase.threadgroupSize = 256;
-        plan.phases.push_back(std::move(phase));
+        appendPhase(plan, "Q3_build_orders_maps", std::move(storePrio), 256);
     }
 
     // Phase 3: Probe lineitem → aggregate revenue per orderkey
     {
-        auto scan = std::make_unique<MetalGridStrideScan>("lineitem", "row", idx);
-        scan->addColumn("l_orderkey", "int");
-        scan->addColumn("l_shipdate", "int");
-        scan->addColumn("l_extendedprice", "float");
-        scan->addColumn("l_discount", "float");
+        auto scan = makeScan("lineitem", idx, {
+            {"l_orderkey", "int"}, {"l_shipdate", "int"},
+            {"l_extendedprice", "float"}, {"l_discount", "float"}
+        });
 
         auto dateFiltered = std::make_unique<MetalSelection>(std::move(scan),
             "l_shipdate[" + idx + "] > 19950315");
@@ -1385,11 +1232,7 @@ static std::optional<MetalQueryPlan> buildQ3Plan_byName() {
             "l_orderkey[" + idx + "]", revenue, "maxOrderkey",
             "atomic_float", "float");
 
-        MetalQueryPlan::Phase phase;
-        phase.name = "Q3_probe_aggregate";
-        phase.root = std::move(agg);
-        phase.threadgroupSize = 1024;
-        plan.phases.push_back(std::move(phase));
+        appendPhase(plan, "Q3_probe_aggregate", std::move(agg));
     }
 
     return plan;
@@ -1424,9 +1267,7 @@ static bool q13_comment_match(const device char* comment, uint idx) {
 
     // Phase 1: Scan orders, filter NOT LIKE, count per custkey
     {
-        auto scan = std::make_unique<MetalGridStrideScan>("orders", "row", idx);
-        scan->addColumn("o_custkey", "int");
-        scan->addColumn("o_comment", "char");
+        auto scan = makeScan("orders", idx, {{"o_custkey", "int"}, {"o_comment", "char"}});
 
         auto filtered = std::make_unique<MetalSelection>(std::move(scan),
             "!q13_comment_match(o_comment, " + idx + ")");
@@ -1435,17 +1276,12 @@ static bool q13_comment_match(const device char* comment, uint idx) {
             std::move(filtered), "d_order_counts",
             "o_custkey[" + idx + "]", "maxCustkey");
 
-        MetalQueryPlan::Phase phase;
-        phase.name = "Q13_count_orders";
-        phase.root = std::move(count);
-        phase.threadgroupSize = 1024;
-        plan.phases.push_back(std::move(phase));
+        appendPhase(plan, "Q13_count_orders", std::move(count));
     }
 
     // Phase 2: Scan customers, read order count, build histogram
     {
-        auto scan = std::make_unique<MetalGridStrideScan>("customer", "row", idx);
-        scan->addColumn("c_custkey", "int");
+        auto scan = makeScan("customer", idx, {{"c_custkey", "int"}});
 
         auto lookup = std::make_unique<MetalArrayLookup>(
             std::move(scan), "d_order_counts",
@@ -1456,11 +1292,7 @@ static bool q13_comment_match(const device char* comment, uint idx) {
             std::move(lookup), "d_histogram",
             "_cnt", "256");
 
-        MetalQueryPlan::Phase phase;
-        phase.name = "Q13_build_histogram";
-        phase.root = std::move(hist);
-        phase.threadgroupSize = 256;
-        plan.phases.push_back(std::move(phase));
+        appendPhase(plan, "Q13_build_histogram", std::move(hist), 256);
     }
 
     return plan;
@@ -1475,26 +1307,20 @@ static std::optional<MetalQueryPlan> buildQ22Plan_byName() {
 
     // Phase 1: Build orders bitmap
     {
-        auto scan = std::make_unique<MetalGridStrideScan>("orders", "row", idx);
-        scan->addColumn("o_custkey", "int");
+        auto scan = makeScan("orders", idx, {{"o_custkey", "int"}});
 
         auto bitmap = std::make_unique<MetalBitmapBuild>(
             std::move(scan), "d_cust_order_bitmap",
             "o_custkey[" + idx + "]", "(maxCustkey + 31) / 32");
 
-        MetalQueryPlan::Phase phase;
-        phase.name = "Q22_build_bitmap";
-        phase.root = std::move(bitmap);
-        phase.threadgroupSize = 1024;
-        plan.phases.push_back(std::move(phase));
+        appendPhase(plan, "Q22_build_bitmap", std::move(bitmap));
     }
 
     // Phase 2: Scan customer, filter, anti-bitmap, dual aggregate
     {
-        auto scan = std::make_unique<MetalGridStrideScan>("customer", "row", idx);
-        scan->addColumn("c_custkey", "int");
-        scan->addColumn("c_phone", "char");
-        scan->addColumn("c_acctbal", "float");
+        auto scan = makeScan("customer", idx, {
+            {"c_custkey", "int"}, {"c_phone", "char"}, {"c_acctbal", "float"}
+        });
 
         auto computePrefix = std::make_unique<MetalComputeExpr>(
             std::move(scan), "_prefix", "int",
@@ -1523,12 +1349,8 @@ static std::optional<MetalQueryPlan> buildQ22Plan_byName() {
             "_bin", "c_acctbal[" + idx + "]", "7",
             "atomic_float", "float");
 
-        MetalQueryPlan::Phase phase;
-        phase.name = "Q22_final_aggregate";
-        phase.root = std::move(sum);
-        phase.threadgroupSize = 256;
+        auto& phase = appendPhase(plan, "Q22_final_aggregate", std::move(sum), 256);
         phase.scalarParams = {{"avg_bal", "float"}};
-        plan.phases.push_back(std::move(phase));
     }
 
     return plan;
@@ -1543,9 +1365,7 @@ static std::optional<MetalQueryPlan> buildQ11Plan_byName() {
 
     // Phase 1: Build supplier bitmap for GERMANY
     {
-        auto scan = std::make_unique<MetalGridStrideScan>("supplier", "row", idx);
-        scan->addColumn("s_suppkey", "int");
-        scan->addColumn("s_nationkey", "int");
+        auto scan = makeScan("supplier", idx, {{"s_suppkey", "int"}, {"s_nationkey", "int"}});
 
         auto filtered = std::make_unique<MetalSelection>(std::move(scan),
             "s_nationkey[" + idx + "] == germany_nk");
@@ -1554,21 +1374,16 @@ static std::optional<MetalQueryPlan> buildQ11Plan_byName() {
             std::move(filtered), "d_supp_bitmap",
             "s_suppkey[" + idx + "]", "(maxSuppkey + 31) / 32");
 
-        MetalQueryPlan::Phase phase;
-        phase.name = "Q11_build_supp_bitmap";
-        phase.root = std::move(bitmap);
-        phase.threadgroupSize = 256;
+        auto& phase = appendPhase(plan, "Q11_build_supp_bitmap", std::move(bitmap), 256);
         phase.scalarParams = {{"germany_nk", "int"}};
-        plan.phases.push_back(std::move(phase));
     }
 
     // Phase 2: Scan partsupp → bitmap probe → per-part value aggregation
     {
-        auto scan = std::make_unique<MetalGridStrideScan>("partsupp", "row", idx);
-        scan->addColumn("ps_partkey", "int");
-        scan->addColumn("ps_suppkey", "int");
-        scan->addColumn("ps_supplycost", "float");
-        scan->addColumn("ps_availqty", "int");
+        auto scan = makeScan("partsupp", idx, {
+            {"ps_partkey", "int"}, {"ps_suppkey", "int"},
+            {"ps_supplycost", "float"}, {"ps_availqty", "int"}
+        });
 
         auto probed = std::make_unique<MetalBitmapProbe>(std::move(scan),
             "d_supp_bitmap", "ps_suppkey[" + idx + "]");
@@ -1579,11 +1394,7 @@ static std::optional<MetalQueryPlan> buildQ11Plan_byName() {
             "ps_partkey[" + idx + "]", valueExpr, "maxPartkey",
             "atomic_float", "float");
 
-        MetalQueryPlan::Phase phase;
-        phase.name = "Q11_aggregate";
-        phase.root = std::move(agg);
-        phase.threadgroupSize = 256;
-        plan.phases.push_back(std::move(phase));
+        appendPhase(plan, "Q11_aggregate", std::move(agg), 256);
     }
 
     return plan;
@@ -1627,11 +1438,10 @@ static int container_match(const device char* cont, uint idx) {
 
     // Phase 1: Build part condition bitmask map
     {
-        auto scan = std::make_unique<MetalGridStrideScan>("part", "row", idx);
-        scan->addColumn("p_partkey", "int");
-        scan->addColumn("p_brand", "char");
-        scan->addColumn("p_container", "char");
-        scan->addColumn("p_size", "int");
+        auto scan = makeScan("part", idx, {
+            {"p_partkey", "int"}, {"p_brand", "char"},
+            {"p_container", "char"}, {"p_size", "int"}
+        });
 
         auto computeCond = std::make_unique<MetalComputeExpr>(
             std::move(scan), "_cond", "int",
@@ -1648,22 +1458,16 @@ static int container_match(const device char* cont, uint idx) {
             std::move(filtered), "d_part_cond",
             "p_partkey[" + idx + "]", "_cond", "int", "maxPartkey");
 
-        MetalQueryPlan::Phase phase;
-        phase.name = "Q19_build_part_cond";
-        phase.root = std::move(store);
-        phase.threadgroupSize = 256;
-        plan.phases.push_back(std::move(phase));
+        appendPhase(plan, "Q19_build_part_cond", std::move(store), 256);
     }
 
     // Phase 2: Scan lineitem, lookup part condition, check quantity, reduce revenue
     {
-        auto scan = std::make_unique<MetalGridStrideScan>("lineitem", "row", idx);
-        scan->addColumn("l_partkey", "int");
-        scan->addColumn("l_quantity", "float");
-        scan->addColumn("l_extendedprice", "float");
-        scan->addColumn("l_discount", "float");
-        scan->addColumn("l_shipmode", "char");
-        scan->addColumn("l_shipinstruct", "char");
+        auto scan = makeScan("lineitem", idx, {
+            {"l_partkey", "int"}, {"l_quantity", "float"},
+            {"l_extendedprice", "float"}, {"l_discount", "float"},
+            {"l_shipmode", "char"}, {"l_shipinstruct", "char"}
+        });
 
         // l_shipmode IN ('AIR', 'REG AIR') — 'A..' or 'RE..'
         // l_shipinstruct = 'DELIVER IN PERSON' — first char 'D'
@@ -1685,11 +1489,7 @@ static int container_match(const device char* cont, uint idx) {
         reduce->addAccumulator("revenue", revenue, "long");
         reduce->setResultAlias("revenue", 100);
 
-        MetalQueryPlan::Phase phase;
-        phase.name = "Q19_reduce";
-        phase.root = std::move(reduce);
-        phase.threadgroupSize = 1024;
-        plan.phases.push_back(std::move(phase));
+        appendPhase(plan, "Q19_reduce", std::move(reduce));
     }
 
     return plan;
@@ -1703,11 +1503,10 @@ static std::optional<MetalQueryPlan> buildQ15Plan_byName() {
     MetalQueryPlan plan;
 
     {
-        auto scan = std::make_unique<MetalGridStrideScan>("lineitem", "row", idx);
-        scan->addColumn("l_suppkey", "int");
-        scan->addColumn("l_shipdate", "int");
-        scan->addColumn("l_extendedprice", "float");
-        scan->addColumn("l_discount", "float");
+        auto scan = makeScan("lineitem", idx, {
+            {"l_suppkey", "int"}, {"l_shipdate", "int"},
+            {"l_extendedprice", "float"}, {"l_discount", "float"}
+        });
 
         auto filtered = std::make_unique<MetalSelection>(std::move(scan),
             "l_shipdate[" + idx + "] >= 19960101 && l_shipdate[" + idx + "] < 19960401");
@@ -1718,11 +1517,7 @@ static std::optional<MetalQueryPlan> buildQ15Plan_byName() {
             "l_suppkey[" + idx + "]", revenue, "maxSuppkey",
             "atomic_float", "float");
 
-        MetalQueryPlan::Phase phase;
-        phase.name = "Q15_aggregate";
-        phase.root = std::move(agg);
-        phase.threadgroupSize = 1024;
-        plan.phases.push_back(std::move(phase));
+        appendPhase(plan, "Q15_aggregate", std::move(agg));
     }
 
     return plan;
@@ -1736,20 +1531,14 @@ static std::optional<MetalQueryPlan> buildQ18Plan_byName() {
     MetalQueryPlan plan;
 
     {
-        auto scan = std::make_unique<MetalGridStrideScan>("lineitem", "row", idx);
-        scan->addColumn("l_orderkey", "int");
-        scan->addColumn("l_quantity", "float");
+        auto scan = makeScan("lineitem", idx, {{"l_orderkey", "int"}, {"l_quantity", "float"}});
 
         auto agg = std::make_unique<MetalAtomicAgg>(
             std::move(scan), "d_order_qty",
             "l_orderkey[" + idx + "]", "l_quantity[" + idx + "]", "maxOrderkey",
             "atomic_float", "float");
 
-        MetalQueryPlan::Phase phase;
-        phase.name = "Q18_aggregate";
-        phase.root = std::move(agg);
-        phase.threadgroupSize = 1024;
-        plan.phases.push_back(std::move(phase));
+        appendPhase(plan, "Q18_aggregate", std::move(agg));
     }
 
     return plan;
@@ -1765,10 +1554,9 @@ static std::optional<MetalQueryPlan> buildQ17Plan_byName() {
     MetalQueryPlan plan;
 
     {
-        auto scan = std::make_unique<MetalGridStrideScan>("lineitem", "row", idx);
-        scan->addColumn("l_partkey", "int");
-        scan->addColumn("l_quantity", "float");
-        scan->addColumn("l_extendedprice", "float");
+        auto scan = makeScan("lineitem", idx, {
+            {"l_partkey", "int"}, {"l_quantity", "float"}, {"l_extendedprice", "float"}
+        });
 
         // First filter: bitmap test for qualifying parts (Brand#23 + MED BOX)
         auto bitmapFilter = std::make_unique<MetalSelection>(
@@ -1789,12 +1577,8 @@ static std::optional<MetalQueryPlan> buildQ17Plan_byName() {
         auto reduce = std::make_unique<MetalTGReduce>(std::move(filtered), "d_q17");
         reduce->addAccumulator("revenue", "l_extendedprice[" + idx + "]", "float");
 
-        MetalQueryPlan::Phase phase;
-        phase.name = "Q17_reduce";
-        phase.root = std::move(reduce);
-        phase.threadgroupSize = 1024;
+        auto& phase = appendPhase(plan, "Q17_reduce", std::move(reduce));
         phase.bitmapReads.push_back({"d_q17_bitmap", ""});
-        plan.phases.push_back(std::move(phase));
     }
 
     return plan;
@@ -1826,13 +1610,10 @@ static float q9_ht_probe(const device uint* ht_keys, const device float* ht_vals
 )");
 
     {
-        auto scan = std::make_unique<MetalGridStrideScan>("lineitem", "row", idx);
-        scan->addColumn("l_partkey", "int");
-        scan->addColumn("l_suppkey", "int");
-        scan->addColumn("l_orderkey", "int");
-        scan->addColumn("l_quantity", "float");
-        scan->addColumn("l_extendedprice", "float");
-        scan->addColumn("l_discount", "float");
+        auto scan = makeScan("lineitem", idx, {
+            {"l_partkey", "int"}, {"l_suppkey", "int"}, {"l_orderkey", "int"},
+            {"l_quantity", "float"}, {"l_extendedprice", "float"}, {"l_discount", "float"}
+        });
 
         // BitmapProbe: filter to green parts
         auto bmpProbe = std::make_unique<MetalBitmapProbe>(
@@ -1876,16 +1657,12 @@ static float q9_ht_probe(const device uint* ht_keys, const device float* ht_vals
             "_bin", "_profit", "200",
             "atomic_float", "float");
 
-        MetalQueryPlan::Phase phase;
-        phase.name = "Q9_profit_reduce";
-        phase.root = std::move(agg);
-        phase.threadgroupSize = 1024;
+        auto& phase = appendPhase(plan, "Q9_profit_reduce", std::move(agg));
         // Extra buffers: hash table keys, values, and mask scalar
         phase.extraBuffers.push_back({"d_ps_ht_keys", "uint", true});
         phase.extraBuffers.push_back({"d_ps_ht_vals", "float", true});
         phase.scalarParams.push_back({"d_ps_ht_mask", "uint"});
         phase.scalarParams.push_back({"supp_mul", "uint"});
-        plan.phases.push_back(std::move(phase));
     }
 
     return plan;
@@ -1936,9 +1713,7 @@ static void q16_bitmap_set(device atomic_uint* group_bitmaps, uint bv_ints,
 
     // Phase 1: Build complaint bitmap on GPU
     {
-        auto scan = std::make_unique<MetalGridStrideScan>("supplier", "row", idx);
-        scan->addColumn("s_suppkey", "int");
-        scan->addColumn("s_comment", "char");
+        auto scan = makeScan("supplier", idx, {{"s_suppkey", "int"}, {"s_comment", "char"}});
 
         auto filter = std::make_unique<MetalSelection>(
             std::move(scan),
@@ -1947,18 +1722,12 @@ static void q16_bitmap_set(device atomic_uint* group_bitmaps, uint bv_ints,
         auto bitmapBuild = std::make_unique<MetalBitmapBuild>(
             std::move(filter), "d_q16_complaint_bitmap", "s_suppkey[" + idx + "]", "");
 
-        MetalQueryPlan::Phase phase;
-        phase.name = "Q16_build_complaint";
-        phase.root = std::move(bitmapBuild);
-        phase.threadgroupSize = 1024;
-        plan.phases.push_back(std::move(phase));
+        appendPhase(plan, "Q16_build_complaint", std::move(bitmapBuild));
     }
 
     // Phase 2: partsupp scan with bitmap ops
     {
-        auto scan = std::make_unique<MetalGridStrideScan>("partsupp", "row", idx);
-        scan->addColumn("ps_partkey", "int");
-        scan->addColumn("ps_suppkey", "int");
+        auto scan = makeScan("partsupp", idx, {{"ps_partkey", "int"}, {"ps_suppkey", "int"}});
 
         // ArrayLookup: part_group_map[ps_partkey] → group_id
         auto groupLookup = std::make_unique<MetalArrayLookup>(
@@ -1979,13 +1748,9 @@ static void q16_bitmap_set(device atomic_uint* group_bitmaps, uint bv_ints,
             "(q16_bitmap_set(d_q16_group_bitmaps, d_q16_bv_ints, "
             "q16_group_id, ps_suppkey[" + idx + "]), 0)");
 
-        MetalQueryPlan::Phase phase;
-        phase.name = "Q16_scan_bitmap";
-        phase.root = std::move(bitmapSet);
-        phase.threadgroupSize = 1024;
+        auto& phase = appendPhase(plan, "Q16_scan_bitmap", std::move(bitmapSet));
         phase.extraBuffers.push_back({"d_q16_group_bitmaps", "atomic_uint", false});
         phase.scalarParams.push_back({"d_q16_bv_ints", "uint"});
-        plan.phases.push_back(std::move(phase));
     }
 
     return plan;
@@ -2031,9 +1796,7 @@ static void q21_track_supplier(device atomic_int* first_supp,
 
     // Phase 1: Build F-orders bitmap on GPU
     {
-        auto scan = std::make_unique<MetalGridStrideScan>("orders", "row", idx);
-        scan->addColumn("o_orderkey", "int");
-        scan->addColumn("o_orderstatus", "char");
+        auto scan = makeScan("orders", idx, {{"o_orderkey", "int"}, {"o_orderstatus", "char"}});
 
         auto filter = std::make_unique<MetalSelection>(
             std::move(scan), "o_orderstatus[" + idx + "] == 'F'");
@@ -2041,20 +1804,15 @@ static void q21_track_supplier(device atomic_int* first_supp,
         auto bitmapBuild = std::make_unique<MetalBitmapBuild>(
             std::move(filter), "d_q21_f_orders", "o_orderkey[" + idx + "]", "");
 
-        MetalQueryPlan::Phase phase;
-        phase.name = "Q21_build_f_orders";
-        phase.root = std::move(bitmapBuild);
-        phase.threadgroupSize = 1024;
-        plan.phases.push_back(std::move(phase));
+        appendPhase(plan, "Q21_build_f_orders", std::move(bitmapBuild));
     }
 
     // Phase 2: Build multi_supp and multi_late bitmaps on GPU
     {
-        auto scan = std::make_unique<MetalGridStrideScan>("lineitem", "row", idx);
-        scan->addColumn("l_orderkey", "int");
-        scan->addColumn("l_suppkey", "int");
-        scan->addColumn("l_receiptdate", "int");
-        scan->addColumn("l_commitdate", "int");
+        auto scan = makeScan("lineitem", idx, {
+            {"l_orderkey", "int"}, {"l_suppkey", "int"},
+            {"l_receiptdate", "int"}, {"l_commitdate", "int"}
+        });
 
         // BitmapProbe: only process F-orders
         auto fOrderProbe = std::make_unique<MetalBitmapProbe>(
@@ -2068,24 +1826,19 @@ static void q21_track_supplier(device atomic_int* first_supp,
             "l_orderkey[" + idx + "], l_suppkey[" + idx + "], "
             "l_receiptdate[" + idx + "] > l_commitdate[" + idx + "]), 0)");
 
-        MetalQueryPlan::Phase phase;
-        phase.name = "Q21_build_bitmaps";
-        phase.root = std::move(trackExpr);
-        phase.threadgroupSize = 1024;
+        auto& phase = appendPhase(plan, "Q21_build_bitmaps", std::move(trackExpr));
         phase.extraBuffers.push_back({"d_q21_first_supp", "atomic_int", false});
         phase.extraBuffers.push_back({"d_q21_first_late", "atomic_int", false});
         phase.extraBuffers.push_back({"d_q21_multi_supp", "atomic_uint", false});
         phase.extraBuffers.push_back({"d_q21_multi_late", "atomic_uint", false});
-        plan.phases.push_back(std::move(phase));
     }
 
     // Phase 3: Count qualifying suppliers
     {
-        auto scan = std::make_unique<MetalGridStrideScan>("lineitem", "row", idx);
-        scan->addColumn("l_orderkey", "int");
-        scan->addColumn("l_suppkey", "int");
-        scan->addColumn("l_receiptdate", "int");
-        scan->addColumn("l_commitdate", "int");
+        auto scan = makeScan("lineitem", idx, {
+            {"l_orderkey", "int"}, {"l_suppkey", "int"},
+            {"l_receiptdate", "int"}, {"l_commitdate", "int"}
+        });
 
         // BitmapProbe: F-order
         auto fOrderProbe = std::make_unique<MetalBitmapProbe>(
@@ -2113,11 +1866,7 @@ static void q21_track_supplier(device atomic_int* first_supp,
             std::move(antiLateProbe),
             "d_q21_supp_count", "l_suppkey[" + idx + "]");
 
-        MetalQueryPlan::Phase phase;
-        phase.name = "Q21_count_qualifying";
-        phase.root = std::move(countAgg);
-        phase.threadgroupSize = 1024;
-        plan.phases.push_back(std::move(phase));
+        appendPhase(plan, "Q21_count_qualifying", std::move(countAgg));
     }
 
     return plan;
@@ -2161,10 +1910,9 @@ static void q2_atomic_min(device atomic_uint* min_cost, uint partkey, float cost
 
     // Phase 1: Build part bitmap on GPU (size=15, type ends BRASS)
     {
-        auto scan = std::make_unique<MetalGridStrideScan>("part", "row", idx);
-        scan->addColumn("p_partkey", "int");
-        scan->addColumn("p_size", "int");
-        scan->addColumn("p_type", "char");
+        auto scan = makeScan("part", idx, {
+            {"p_partkey", "int"}, {"p_size", "int"}, {"p_type", "char"}
+        });
 
         auto sizeFilter = std::make_unique<MetalSelection>(
             std::move(scan), "p_size[" + idx + "] == 15");
@@ -2176,19 +1924,14 @@ static void q2_atomic_min(device atomic_uint* min_cost, uint partkey, float cost
         auto bitmapBuild = std::make_unique<MetalBitmapBuild>(
             std::move(typeFilter), "d_q2_part_bitmap", "p_partkey[" + idx + "]", "");
 
-        MetalQueryPlan::Phase phase;
-        phase.name = "Q2_build_part_bitmap";
-        phase.root = std::move(bitmapBuild);
-        phase.threadgroupSize = 1024;
-        plan.phases.push_back(std::move(phase));
+        appendPhase(plan, "Q2_build_part_bitmap", std::move(bitmapBuild));
     }
 
     // Phase 2: Find min cost (existing logic)
     {
-        auto scan = std::make_unique<MetalGridStrideScan>("partsupp", "row", idx);
-        scan->addColumn("ps_partkey", "int");
-        scan->addColumn("ps_suppkey", "int");
-        scan->addColumn("ps_supplycost", "float");
+        auto scan = makeScan("partsupp", idx, {
+            {"ps_partkey", "int"}, {"ps_suppkey", "int"}, {"ps_supplycost", "float"}
+        });
 
         // BitmapProbe: qualifying parts (size=15, type ends BRASS)
         auto partProbe = std::make_unique<MetalBitmapProbe>(
@@ -2204,12 +1947,8 @@ static void q2_atomic_min(device atomic_uint* min_cost, uint partkey, float cost
             "(q2_atomic_min(d_q2_min_cost, (uint)ps_partkey[" + idx + "], "
             "ps_supplycost[" + idx + "]), 0)");
 
-        MetalQueryPlan::Phase phase;
-        phase.name = "Q2_find_min_cost";
-        phase.root = std::move(atomicMin);
-        phase.threadgroupSize = 1024;
+        auto& phase = appendPhase(plan, "Q2_find_min_cost", std::move(atomicMin));
         phase.extraBuffers.push_back({"d_q2_min_cost", "atomic_uint", false});
-        plan.phases.push_back(std::move(phase));
     }
 
     return plan;
@@ -2243,11 +1982,10 @@ static void q20_ht_add(const device ulong* ht_keys, device atomic_float* ht_vals
 )");
 
     {
-        auto scan = std::make_unique<MetalGridStrideScan>("lineitem", "row", idx);
-        scan->addColumn("l_partkey", "int");
-        scan->addColumn("l_suppkey", "int");
-        scan->addColumn("l_quantity", "float");
-        scan->addColumn("l_shipdate", "int");
+        auto scan = makeScan("lineitem", idx, {
+            {"l_partkey", "int"}, {"l_suppkey", "int"},
+            {"l_quantity", "float"}, {"l_shipdate", "int"}
+        });
 
         // Date filter: 1994-01-01 to 1994-12-31
         auto dateFilter = std::make_unique<MetalSelection>(
@@ -2265,16 +2003,12 @@ static void q20_ht_add(const device ulong* ht_keys, device atomic_float* ht_vals
             "(ulong)l_partkey[" + idx + "] * (ulong)supp_mul + (ulong)l_suppkey[" + idx + "], "
             "l_quantity[" + idx + "]), 0)");
 
-        MetalQueryPlan::Phase phase;
-        phase.name = "Q20_lineitem_agg";
-        phase.root = std::move(hashAgg);
-        phase.threadgroupSize = 1024;
+        auto& phase = appendPhase(plan, "Q20_lineitem_agg", std::move(hashAgg));
         // Extra buffers
         phase.extraBuffers.push_back({"d_q20_ht_keys", "ulong", true, false});
         phase.extraBuffers.push_back({"d_q20_ht_vals", "atomic_float", false, true});
         phase.scalarParams.push_back({"d_q20_ht_mask", "uint"});
         phase.scalarParams.push_back({"supp_mul", "uint"});
-        plan.phases.push_back(std::move(phase));
     }
 
     return plan;

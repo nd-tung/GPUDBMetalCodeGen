@@ -42,7 +42,7 @@ done
 mkdir -p "$LOGDIR"
 
 # CSV header
-echo "query,chunk_M,double_buffer,rep,chunks,parse_ms,gpu_ms" > "$RESULT_FILE"
+echo "query,chunk_M,double_buffer,rep,chunks,load_ms,gpu_ms,copy_ms" > "$RESULT_FILE"
 
 echo "=========================================="
 echo "SF100 Chunk & Double-Buffer Experiment"
@@ -82,17 +82,19 @@ for chunk in $CHUNK_SIZES; do
         echo "[$run_idx/$total_runs] $q chunk=${chunk}M $db_label rep=$rep"
         $BIN sf100 --chunk=${chunk}M $db_flag $q > "$logfile" 2>&1
 
-        # Extract metrics from log: "SF100 streaming: N chunks, parse=Xms, GPU=Yms"
-        line=$(grep "SF100 streaming:" "$logfile" 2>/dev/null || echo "")
+        # Extract metrics from current chunk summary:
+        #   [chunk] table: N chunks, load=Xms, GPU=Yms, copy=Zms
+        line=$(grep -m1 "^\[chunk\].*: .* chunks, load=" "$logfile" 2>/dev/null || echo "")
         if [ -n "$line" ]; then
-          chunks=$(echo "$line" | sed 's/.*: \([0-9]*\) chunks.*/\1/')
-          parse=$(echo "$line" | sed 's/.*parse=\([0-9.]*\)ms.*/\1/')
+          chunks=$(echo "$line" | sed 's/.*: \([0-9][0-9]*\) chunks.*/\1/')
+          load=$(echo "$line" | sed 's/.*load=\([0-9.]*\)ms.*/\1/')
           gpu=$(echo "$line" | sed 's/.*GPU=\([0-9.]*\)ms.*/\1/')
-          echo "  -> chunks=$chunks parse=${parse}ms GPU=${gpu}ms"
-          echo "$q,$chunk,$db,$rep,$chunks,$parse,$gpu" >> "$RESULT_FILE"
+          copy=$(echo "$line" | sed 's/.*copy=\([0-9.]*\)ms.*/\1/')
+          echo "  -> chunks=$chunks load=${load}ms GPU=${gpu}ms copy=${copy}ms"
+          echo "$q,$chunk,$db,$rep,$chunks,$load,$gpu,$copy" >> "$RESULT_FILE"
         else
           echo "  -> ERROR (no streaming output found)"
-          echo "$q,$chunk,$db,$rep,ERR,ERR,ERR" >> "$RESULT_FILE"
+          echo "$q,$chunk,$db,$rep,ERR,ERR,ERR,ERR" >> "$RESULT_FILE"
         fi
       done
     done

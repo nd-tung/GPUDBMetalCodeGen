@@ -120,6 +120,30 @@ bool registerNameKey(MTL::Device* device,
     return true;
 }
 
+MTL::Buffer* registerFilledBuffer(MTL::Device* device,
+                                  MetalGenericExecutor& executor,
+                                  const std::string& name,
+                                  size_t bytes,
+                                  int fillByte = 0) {
+    size_t allocBytes = std::max(bytes, (size_t)4);
+    auto* buffer = device->newBuffer(allocBytes, MTL::ResourceStorageModeShared);
+    memset(buffer->contents(), fillByte, allocBytes);
+    executor.registerAllocatedBuffer(name, buffer);
+    return buffer;
+}
+
+template<typename T>
+MTL::Buffer* uploadAndRegister(MTL::Device* device,
+                               MetalGenericExecutor& executor,
+                               const std::string& name,
+                               const std::vector<T>& values) {
+    const size_t bytes = values.size() * sizeof(T);
+    if (bytes == 0) return registerFilledBuffer(device, executor, name, 0);
+    auto* buffer = device->newBuffer(values.data(), bytes, MTL::ResourceStorageModeShared);
+    executor.registerAllocatedBuffer(name, buffer);
+    return buffer;
+}
+
 } // namespace
 
 bool prepareQueryPreprocessing(const std::string& queryName,
@@ -248,13 +272,8 @@ bool prepareQueryPreprocessing(const std::string& queryName,
             }
         }
 
-        auto* threshBuf = device->newBuffer(threshold.data(), mapSize * sizeof(float),
-                                             MTL::ResourceStorageModeShared);
-        executor.registerAllocatedBuffer("d_q17_threshold", threshBuf);
-
-        auto* bitmapBuf = device->newBuffer(bitmap.data(), bitmap.size() * sizeof(uint32_t),
-                                             MTL::ResourceStorageModeShared);
-        executor.registerAllocatedBuffer("d_q17_bitmap", bitmapBuf);
+        uploadAndRegister(device, executor, "d_q17_threshold", threshold);
+        uploadAndRegister(device, executor, "d_q17_bitmap", bitmap);
     }
 
     // Q9: build green-parts bitmap, lookup arrays, and partsupp HT
@@ -358,22 +377,11 @@ bool prepareQueryPreprocessing(const std::string& queryName,
             }
         }
 
-        auto* bmpBuf = device->newBuffer(partBitmap.data(), bmpInts * sizeof(uint32_t),
-                                          MTL::ResourceStorageModeShared);
-        auto* natBuf = device->newBuffer(sNatArray.data(), sNatArray.size() * sizeof(int),
-                                          MTL::ResourceStorageModeShared);
-        auto* yrBuf = device->newBuffer(oYearArray.data(), oYearArray.size() * sizeof(int),
-                                         MTL::ResourceStorageModeShared);
-        auto* htKeysBuf = device->newBuffer(htKeys.data(), htSlots * sizeof(uint32_t),
-                                             MTL::ResourceStorageModeShared);
-        auto* htValsBuf = device->newBuffer(htVals.data(), htSlots * sizeof(float),
-                                             MTL::ResourceStorageModeShared);
-
-        executor.registerAllocatedBuffer("d_q9_part_bitmap", bmpBuf);
-        executor.registerAllocatedBuffer("d_q9_s_nationkey", natBuf);
-        executor.registerAllocatedBuffer("d_q9_o_year", yrBuf);
-        executor.registerAllocatedBuffer("d_ps_ht_keys", htKeysBuf);
-        executor.registerAllocatedBuffer("d_ps_ht_vals", htValsBuf);
+        uploadAndRegister(device, executor, "d_q9_part_bitmap", partBitmap);
+        uploadAndRegister(device, executor, "d_q9_s_nationkey", sNatArray);
+        uploadAndRegister(device, executor, "d_q9_o_year", oYearArray);
+        uploadAndRegister(device, executor, "d_ps_ht_keys", htKeys);
+        uploadAndRegister(device, executor, "d_ps_ht_vals", htVals);
         executor.registerScalarInt("d_ps_ht_mask", (int)htMask);
         executor.registerScalarInt("supp_mul", (int)suppMul);
 
@@ -446,7 +454,6 @@ bool prepareQueryPreprocessing(const std::string& queryName,
         uint32_t suppMul = (uint32_t)(maxSk + 1);
         // 64-bit packed key: at SF20 maxPk*suppMul ~ 8e11 overflows uint32.
         std::vector<uint64_t> htKeys(htSlots, ~uint64_t(0));
-        std::vector<float> htVals(htSlots, 0.0f);
         std::vector<int> htPsIdx(htSlots, -1);
         for (size_t i = 0; i < ps_partkey.size(); i++) {
             int pk = ps_partkey[i];
@@ -464,17 +471,10 @@ bool prepareQueryPreprocessing(const std::string& queryName,
             }
         }
 
-        auto* bmpBuf = device->newBuffer(partBitmap.data(), bmpInts * sizeof(uint32_t),
-                                          MTL::ResourceStorageModeShared);
-        auto* htKeysBuf = device->newBuffer(htKeys.data(), htSlots * sizeof(uint64_t),
-                                             MTL::ResourceStorageModeShared);
-        auto* htValsBuf = device->newBuffer(htSlots * sizeof(float),
-                                             MTL::ResourceStorageModeShared);
-        memset(htValsBuf->contents(), 0, htSlots * sizeof(float));
-
-        executor.registerAllocatedBuffer("d_q20_part_bitmap", bmpBuf);
-        executor.registerAllocatedBuffer("d_q20_ht_keys", htKeysBuf);
-        executor.registerAllocatedBuffer("d_q20_ht_vals", htValsBuf);
+        uploadAndRegister(device, executor, "d_q20_part_bitmap", partBitmap);
+        uploadAndRegister(device, executor, "d_q20_ht_keys", htKeys);
+        auto* htValsBuf = registerFilledBuffer(device, executor, "d_q20_ht_vals",
+                               htSlots * sizeof(float));
         executor.registerScalarInt("d_q20_ht_mask", (int)htMask);
         executor.registerScalarInt("supp_mul", (int)suppMul);
 
@@ -572,22 +572,13 @@ bool prepareQueryPreprocessing(const std::string& queryName,
         for (int pk : p_partkey) maxPk = std::max(maxPk, pk);
         size_t partBmpInts = ((size_t)maxPk + 32) / 32;
 
-        // Part bitmap is filled by GPU Phase 1
-        auto* partBmpBuf = device->newBuffer(partBmpInts * sizeof(uint32_t),
-                                              MTL::ResourceStorageModeShared);
-        memset(partBmpBuf->contents(), 0, partBmpInts * sizeof(uint32_t));
+        registerFilledBuffer(device, executor, "d_q2_part_bitmap",
+                     partBmpInts * sizeof(uint32_t));
 
         size_t minCostSize = (size_t)maxPk + 1;
-        auto* minCostBuf = device->newBuffer(minCostSize * sizeof(uint32_t),
-                                              MTL::ResourceStorageModeShared);
-        memset(minCostBuf->contents(), 0xFF, minCostSize * sizeof(uint32_t));
-
-        auto* suppBmpBuf = device->newBuffer(eurSuppBitmap.data(), suppBmpInts * sizeof(uint32_t),
-                                              MTL::ResourceStorageModeShared);
-
-        executor.registerAllocatedBuffer("d_q2_part_bitmap", partBmpBuf);
-        executor.registerAllocatedBuffer("d_q2_supp_bitmap", suppBmpBuf);
-        executor.registerAllocatedBuffer("d_q2_min_cost", minCostBuf);
+        auto* minCostBuf = registerFilledBuffer(device, executor, "d_q2_min_cost",
+                            minCostSize * sizeof(uint32_t), 0xFF);
+        uploadAndRegister(device, executor, "d_q2_supp_bitmap", eurSuppBitmap);
 
         g_q2Post.ps_partkey = std::move(ps_partkey);
         g_q2Post.ps_suppkey = std::move(ps_suppkey);
@@ -630,10 +621,8 @@ bool prepareQueryPreprocessing(const std::string& queryName,
         }
         size_t complaintBmpInts = ((size_t)maxSk + 32) / 32;
 
-        // Complaint bitmap is filled by GPU Phase 1
-        auto* cbmBuf = device->newBuffer(complaintBmpInts * sizeof(uint32_t),
-                                          MTL::ResourceStorageModeShared);
-        memset(cbmBuf->contents(), 0, complaintBmpInts * sizeof(uint32_t));
+        registerFilledBuffer(device, executor, "d_q16_complaint_bitmap",
+                     complaintBmpInts * sizeof(uint32_t));
 
         std::set<int> validSizes = {49, 14, 23, 45, 19, 3, 36, 9};
         struct GroupKey { std::string brand; std::string type; int size;
@@ -686,16 +675,9 @@ bool prepareQueryPreprocessing(const std::string& queryName,
         uint32_t numGroups = (uint32_t)groups.size();
         uint32_t bvInts = ((uint32_t)maxSk + 32) / 32;
 
-        auto* pgmBuf = device->newBuffer(partGroupMap.data(), partGroupMap.size() * sizeof(int),
-                                          MTL::ResourceStorageModeShared);
+        uploadAndRegister(device, executor, "d_q16_part_group_map", partGroupMap);
         size_t gbmBytes = (size_t)numGroups * bvInts * sizeof(uint32_t);
-        auto* gbmBuf = device->newBuffer(std::max(gbmBytes, (size_t)4),
-                                          MTL::ResourceStorageModeShared);
-        memset(gbmBuf->contents(), 0, gbmBytes);
-
-        executor.registerAllocatedBuffer("d_q16_part_group_map", pgmBuf);
-        executor.registerAllocatedBuffer("d_q16_complaint_bitmap", cbmBuf);
-        executor.registerAllocatedBuffer("d_q16_group_bitmaps", gbmBuf);
+        auto* gbmBuf = registerFilledBuffer(device, executor, "d_q16_group_bitmaps", gbmBytes);
         executor.registerScalarInt("d_q16_bv_ints", (int)bvInts);
 
         g_q16Post.groups = std::move(groups);
@@ -758,9 +740,7 @@ bool prepareQueryPreprocessing(const std::string& queryName,
             }
         }
 
-        auto* saBuf = device->newBuffer(saBitmap.data(), saBmpInts * sizeof(uint32_t),
-                                         MTL::ResourceStorageModeShared);
-        executor.registerAllocatedBuffer("d_q21_sa_supp", saBuf);
+        uploadAndRegister(device, executor, "d_q21_sa_supp", saBitmap);
 
         // Find max orderkey from loaded orders data for buffer sizing
         int maxOk = 0;
@@ -776,38 +756,15 @@ bool prepareQueryPreprocessing(const std::string& queryName,
         size_t fBmpInts = ((size_t)maxOk + 32) / 32;
         size_t okMapSize = (size_t)maxOk + 1;
 
-        // GPU buffers filled by Phase 1 (f_orders) and Phase 2 (multi_supp/multi_late)
-        auto* fBuf = device->newBuffer(fBmpInts * sizeof(uint32_t),
-                                        MTL::ResourceStorageModeShared);
-        memset(fBuf->contents(), 0, fBmpInts * sizeof(uint32_t));
-
-        auto* firstSuppBuf = device->newBuffer(okMapSize * sizeof(int),
-                                                MTL::ResourceStorageModeShared);
-        memset(firstSuppBuf->contents(), 0xFF, okMapSize * sizeof(int));
-
-        auto* firstLateBuf = device->newBuffer(okMapSize * sizeof(int),
-                                                MTL::ResourceStorageModeShared);
-        memset(firstLateBuf->contents(), 0xFF, okMapSize * sizeof(int));
-
-        auto* msBuf = device->newBuffer(fBmpInts * sizeof(uint32_t),
-                                         MTL::ResourceStorageModeShared);
-        memset(msBuf->contents(), 0, fBmpInts * sizeof(uint32_t));
-
-        auto* mlBuf = device->newBuffer(fBmpInts * sizeof(uint32_t),
-                                         MTL::ResourceStorageModeShared);
-        memset(mlBuf->contents(), 0, fBmpInts * sizeof(uint32_t));
-
-        executor.registerAllocatedBuffer("d_q21_f_orders", fBuf);
-        executor.registerAllocatedBuffer("d_q21_first_supp", firstSuppBuf);
-        executor.registerAllocatedBuffer("d_q21_first_late", firstLateBuf);
-        executor.registerAllocatedBuffer("d_q21_multi_supp", msBuf);
-        executor.registerAllocatedBuffer("d_q21_multi_late", mlBuf);
+        registerFilledBuffer(device, executor, "d_q21_f_orders", fBmpInts * sizeof(uint32_t));
+        registerFilledBuffer(device, executor, "d_q21_first_supp", okMapSize * sizeof(int), 0xFF);
+        registerFilledBuffer(device, executor, "d_q21_first_late", okMapSize * sizeof(int), 0xFF);
+        registerFilledBuffer(device, executor, "d_q21_multi_supp", fBmpInts * sizeof(uint32_t));
+        registerFilledBuffer(device, executor, "d_q21_multi_late", fBmpInts * sizeof(uint32_t));
 
         size_t suppCountSize = (size_t)maxSk + 1;
-        auto* suppCountBuf = device->newBuffer(suppCountSize * sizeof(uint32_t),
-                                                MTL::ResourceStorageModeShared);
-        memset(suppCountBuf->contents(), 0, suppCountSize * sizeof(uint32_t));
-        executor.registerAllocatedBuffer("d_q21_supp_count", suppCountBuf);
+        registerFilledBuffer(device, executor, "d_q21_supp_count",
+                     suppCountSize * sizeof(uint32_t));
 
         g_q21Post.s_suppkey = std::move(s_suppkey);
         g_q21Post.s_name = std::move(s_name);

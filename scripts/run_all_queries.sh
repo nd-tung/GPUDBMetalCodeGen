@@ -6,7 +6,7 @@
 # factors and writes a CSV report including chip/OS/GPU/memory information.
 #
 # Usage:
-#   scripts/run_all_queries.sh [sf1|sf10|sf100 ...] [-o results.csv] [-q "q1 q2"] [--check golden]
+#   scripts/run_all_queries.sh [sf1|sf10|sf20|sf50|sf100 ...] [-o results.csv] [-q "q1 q2"] [--check golden]
 #
 # Defaults: SF=sf1, all 22 queries, output = build/results_<timestamp>.csv
 # -----------------------------------------------------------------------------
@@ -19,7 +19,7 @@ QUERIES_OVERRIDE=""
 CHECK_DIR=""
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        sf1|sf10|sf50|sf100) SCALE_FACTORS+=("$1"); shift ;;
+        sf1|sf10|sf20|sf50|sf100) SCALE_FACTORS+=("$1"); shift ;;
         -o|--output)    OUTPUT="$2"; shift 2 ;;
         -q|--queries)   QUERIES_OVERRIDE="$2"; shift 2 ;;
         --check)
@@ -86,7 +86,7 @@ GIT_COMMIT="$(git rev-parse --short HEAD 2>/dev/null || echo none)"
     echo "# check_dir=${CHECK_DIR:-none}"
     echo "# timestamp=$TS"
     # NOTE: gpu/gpu_budget extracted from first SYSINFO_CSV line below
-    echo "scale_factor,query,status,analyze_ms,plan_ms,codegen_ms,compile_ms,pso_ms,dataload_ms,bufalloc_ms,gpu_compute_ms,cpu_compute_ms,compile_overhead_ms,cpu_total_ms,end2end_ms,load_source,load_bytes,load_mibps,ingest_ms,query_compute_ms,gpu_trials_n,gpu_p10_ms,gpu_p90_ms,gpu_mad_ms,gpu_name,gpu_budget_bytes"
+    echo "scale_factor,query,status,analyze_ms,plan_ms,codegen_ms,compile_ms,pso_ms,dataload_ms,bufalloc_ms,gpu_compute_ms,cpu_compute_ms,compile_overhead_ms,cpu_total_ms,end2end_ms,load_source,load_bytes,load_mibps,ingest_ms,query_compute_ms,gpu_trials_n,gpu_p10_ms,gpu_p90_ms,gpu_mad_ms,io_ms,preprocess_ms,query_execution_ms,gpu_name,gpu_budget_bytes"
 } > "$OUTPUT"
 
 GPU_NAME=""
@@ -120,7 +120,7 @@ run_one() {
     if [[ -z "$timing" ]]; then
         local status="NO_TIMING"
         [[ $rc -ne 0 ]] && status="FAIL"
-        echo "${sf},${q},${status}$(printf ',%.0s' {1..21}),${GPU_NAME},${GPU_BUDGET}" >> "$OUTPUT"
+        echo "${sf},${q},${status}$(printf ',%.0s' {1..24}),${GPU_NAME},${GPU_BUDGET}" >> "$OUTPUT"
         if [[ $rc -ne 0 ]]; then
             FAILURES=$((FAILURES + 1))
             echo "     FAILED (see $log)"
@@ -141,13 +141,13 @@ run_one() {
     # TIMING_CSV,sf,query,analyze,plan,codegen,compile,pso,dataload,bufalloc,
     #           gpu_compute,cpu_compute,compile_overhead,cpu_total,end2end,
     #           load_source,load_bytes,load_mibps,ingest_ms,query_compute,
-    #           gpu_trials_n,gpu_p10,gpu_p90,gpu_mad
+    #           gpu_trials_n,gpu_p10,gpu_p90,gpu_mad,io,preprocess,query_execution
     local body="${timing#TIMING_CSV,}"
     awk -v gpu="$GPU_NAME" -v bud="$GPU_BUDGET" -v status="$status" -F',' '
     {
-        # $1=sf, $2=query, $3..$23 are the current TIMING_CSV payload.
+        # $1=sf, $2=query, $3..$26 are the current TIMING_CSV payload.
         printf "%s,%s,%s", $1, $2, status;
-        for (i = 3; i <= 23; i++) printf ",%s", $i;
+        for (i = 3; i <= 26; i++) printf ",%s", $i;
         printf ",%s,%s\n", gpu, bud;
     }' <<< "$body" >> "$OUTPUT"
 }

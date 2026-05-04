@@ -23,7 +23,7 @@ public:
     // Number of cached pipelines
     size_t cacheSize() const { return pipelineCache_.size(); }
 
-    // Toggle Metal -ffast-math for subsequent compile() calls (default true).
+    // Toggle Metal -ffast-math for subsequent compile() calls (default false).
     static void setFastMathEnabled(bool on) { sFastMath_ = on; }
     static bool fastMathEnabled() { return sFastMath_; }
 

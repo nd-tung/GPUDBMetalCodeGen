@@ -5,7 +5,7 @@
 
 namespace codegen {
 
-bool RuntimeCompiler::sFastMath_ = true;
+bool RuntimeCompiler::sFastMath_ = false;
 
 RuntimeCompiler::~RuntimeCompiler() {
     clearCache();
