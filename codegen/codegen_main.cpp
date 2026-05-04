@@ -1,5 +1,5 @@
 // Codegen standalone entry point
-// Usage: GPUDBCodegen [sf1|sf10|sf100] q<N>
+// Usage: GPUDBCodegen [sf1|sf10|sf20|sf50|sf100] q<N>
 //
 // This binary performs SQL → AnalyzedQuery → MetalQueryPlan → operators → Metal → GPU
 // for all 22 TPC-H queries via runtime code generation.
@@ -9,6 +9,7 @@
 #include "runtime_compiler.h"
 #include "metal_plan_builder.h"
 #include "metal_generic_executor.h"
+#include "max_key_symbols.h"
 #include "query_preprocessing.h"
 #include "chunked_colbin_loader.h"
 #include "tpch_schema.h"
@@ -27,9 +28,6 @@
 #include <algorithm>
 #include <memory>
 #include <optional>
-#include <future>
-#include <thread>
-#include "../third_party/nlohmann/json.hpp"
 
 // ===================================================================
 // Experiment flags (set in main, read by runCodegenQuery)
@@ -202,18 +200,6 @@ using codegen::g_q18Post;
 using codegen::g_q20Post;
 using codegen::g_q21Post;
 
-static ColSpec colSpecFor(const codegen::ColumnDef& cdef) {
-    ColType type = ColType::INT;
-    switch (cdef.type) {
-        case codegen::DataType::INT:        type = ColType::INT; break;
-        case codegen::DataType::FLOAT:      type = ColType::FLOAT; break;
-        case codegen::DataType::DATE:       type = ColType::DATE; break;
-        case codegen::DataType::CHAR1:      type = ColType::CHAR1; break;
-        case codegen::DataType::CHAR_FIXED: type = ColType::CHAR_FIXED; break;
-    }
-    return ColSpec(cdef.index, type, cdef.fixedWidth);
-}
-
 static bool parseRowCountWithSuffix(const std::string& text, size_t& out) {
     if (text.empty()) return false;
     char suffix = text.back();
@@ -234,286 +220,6 @@ static bool parseRowCountWithSuffix(const std::string& text, size_t& out) {
     out = (size_t)value * multiplier;
     return out > 0;
 }
-
-// ===================================================================
-// Max-key scan strategies (experiment).
-//   GPUDB_MAXKEY_MODE = serial (default) | parallel | cache
-// ===================================================================
-enum class MaxKeyMode { Serial, Parallel, Cache };
-static MaxKeyMode currentMaxKeyMode() {
-    static MaxKeyMode m = []() {
-        const char* e = ::getenv("GPUDB_MAXKEY_MODE");
-        if (!e) return MaxKeyMode::Cache;  // default: cached parallel max
-        std::string v(e);
-        if (v == "serial")   return MaxKeyMode::Serial;
-        if (v == "parallel") return MaxKeyMode::Parallel;
-        if (v == "cache")    return MaxKeyMode::Cache;
-        return MaxKeyMode::Cache;
-    }();
-    return m;
-}
-
-// Approach B: parallel max via std::async. Splits the column into
-// nThreads ranges; each thread does a local std::max. Page-fault work
-// is parallelized across cores, which is the actual bottleneck on
-// cold-mapped colbins (zero-copy mmap means first-touch faults).
-static int parallelMaxInt(const int* data, size_t n) {
-    if (n == 0) return 0;
-    const unsigned hw = std::max(2u, std::thread::hardware_concurrency());
-    const size_t nThreads = std::min<size_t>(hw, std::max<size_t>(1, n / 65536));
-    if (nThreads <= 1) {
-        int m = 0;
-        for (size_t i = 0; i < n; i++) if (data[i] > m) m = data[i];
-        return m;
-    }
-    std::vector<std::future<int>> futs;
-    futs.reserve(nThreads);
-    const size_t chunk = (n + nThreads - 1) / nThreads;
-    for (size_t t = 0; t < nThreads; t++) {
-        const size_t lo = t * chunk;
-        const size_t hi = std::min(n, lo + chunk);
-        if (lo >= hi) break;
-        futs.push_back(std::async(std::launch::async, [data, lo, hi]() {
-            int m = 0;
-            for (size_t i = lo; i < hi; i++) if (data[i] > m) m = data[i];
-            return m;
-        }));
-    }
-    int m = 0;
-    for (auto& f : futs) m = std::max(m, f.get());
-    return m;
-}
-
-// Approach C: persistent on-disk cache of per-column max values.
-// Sidecar file: <dataset_path>/.maxkeys.json. Keyed by colbin file
-// (path basename, size, mtime) + column index. On hit we return the
-// cached max with zero scan; on miss we fall through to the parallel
-// scan and write the result back.
-struct MaxKeyCacheEntry {
-    std::string file;     // basename of .colbin
-    uint64_t size;
-    int64_t  mtime_ns;
-    int      columnIndex;
-    int      maxValue;
-};
-static std::string maxKeyCachePath() {
-    return g_dataset_path + ".maxkeys.json";
-}
-static bool loadMaxKeyCache(std::vector<MaxKeyCacheEntry>& out) {
-    out.clear();
-    std::ifstream f(maxKeyCachePath());
-    if (!f) return false;
-    try {
-        nlohmann::json j; f >> j;
-        if (!j.is_array()) return false;
-        for (const auto& e : j) {
-            MaxKeyCacheEntry x;
-            x.file        = e.at("file").get<std::string>();
-            x.size        = e.at("size").get<uint64_t>();
-            x.mtime_ns    = e.at("mtime_ns").get<int64_t>();
-            x.columnIndex = e.at("col").get<int>();
-            x.maxValue    = e.at("max").get<int>();
-            out.push_back(std::move(x));
-        }
-        return true;
-    } catch (...) { return false; }
-}
-static void saveMaxKeyCache(const std::vector<MaxKeyCacheEntry>& entries) {
-    nlohmann::json j = nlohmann::json::array();
-    for (const auto& e : entries) {
-        j.push_back({
-            {"file", e.file},
-            {"size", e.size},
-            {"mtime_ns", e.mtime_ns},
-            {"col", e.columnIndex},
-            {"max", e.maxValue},
-        });
-    }
-    std::ofstream f(maxKeyCachePath());
-    if (!f) return;
-    f << j.dump(2);
-}
-static bool cacheLookup(const std::vector<MaxKeyCacheEntry>& cache,
-                        const std::string& file, uint64_t size,
-                        int64_t mtime_ns, int columnIndex, int& out) {
-    for (const auto& e : cache) {
-        if (e.columnIndex == columnIndex && e.file == file &&
-            e.size == size && e.mtime_ns == mtime_ns) {
-            out = e.maxValue;
-            return true;
-        }
-    }
-    return false;
-}
-// Compute one column's max under the active mode. For Cache mode we
-// look up by colbin metadata; on miss we run the parallel scan and
-// queue an entry for write-back. The lookup metadata is the colbin
-// file (the source of truth for the underlying mmap'd bytes).
-static int computeColMax(const int* data, size_t n,
-                         const std::string& tblPath, int columnIndex,
-                         std::vector<MaxKeyCacheEntry>& cacheRead,
-                         std::vector<MaxKeyCacheEntry>& cacheWrite,
-                         bool& cacheDirty) {
-    const MaxKeyMode mode = currentMaxKeyMode();
-    if (mode == MaxKeyMode::Serial) {
-        int m = 0;
-        for (size_t i = 0; i < n; i++) if (data[i] > m) m = data[i];
-        return m;
-    }
-    if (mode == MaxKeyMode::Parallel) {
-        return parallelMaxInt(data, n);
-    }
-    // Cache mode: check sidecar by colbin file metadata.
-    const std::string cp = colbin::binaryPath(tblPath);
-    size_t fsz = 0; int64_t fmt = 0;
-    if (colbin::statFile(cp, fsz, fmt)) {
-        const std::string base = cp.substr(cp.find_last_of('/') + 1);
-        int hit = 0;
-        if (cacheLookup(cacheRead, base, (uint64_t)fsz, fmt, columnIndex, hit)) {
-            return hit;
-        }
-        int m = parallelMaxInt(data, n);
-        cacheWrite.push_back({base, (uint64_t)fsz, fmt, columnIndex, m});
-        cacheDirty = true;
-        return m;
-    }
-    return parallelMaxInt(data, n);
-}
-
-static void registerMaxKeySymbols(
-    codegen::MetalGenericExecutor& executor,
-    const std::vector<codegen::LoadedQueryTable>& loadedTables,
-    const std::map<std::string, std::set<std::string>>& tableCols,
-    const codegen::TPCHSchema& schema) {
-    int maxCk = 0, maxSk = 0, maxOk = 0, maxPk = 0;
-    std::vector<MaxKeyCacheEntry> cacheRead, cacheWrite;
-    bool cacheDirty = false;
-    if (currentMaxKeyMode() == MaxKeyMode::Cache) {
-        loadMaxKeyCache(cacheRead);
-    }
-    for (auto& [tblName, cols] : loadedTables) {
-        const auto tableIt = tableCols.find(tblName);
-        if (tableIt == tableCols.end()) continue;
-        const auto& tdef = schema.table(tblName);
-        size_t nRows = cols.rows();
-        for (const auto& colName : tableIt->second) {
-            auto& cdef = tdef.col(colName);
-            if (cdef.type != codegen::DataType::INT && cdef.type != codegen::DataType::DATE)
-                continue;
-            const int* data = cols.ints(cdef.index);
-            if (!data) continue;
-            const std::string tblPath = g_dataset_path + tblName + ".tbl";
-            int colMax = 0;
-            if (colName == "c_custkey" || colName == "o_custkey" ||
-                colName == "s_suppkey" || colName == "l_suppkey" || colName == "ps_suppkey" ||
-                colName == "o_orderkey" || colName == "l_orderkey" ||
-                colName == "p_partkey" || colName == "l_partkey" || colName == "ps_partkey") {
-                colMax = computeColMax(data, nRows, tblPath, cdef.index,
-                                       cacheRead, cacheWrite, cacheDirty);
-            }
-            if (colName == "c_custkey" || colName == "o_custkey")
-                maxCk = std::max(maxCk, colMax);
-            else if (colName == "s_suppkey" || colName == "l_suppkey" || colName == "ps_suppkey")
-                maxSk = std::max(maxSk, colMax);
-            else if (colName == "o_orderkey" || colName == "l_orderkey")
-                maxOk = std::max(maxOk, colMax);
-            else if (colName == "p_partkey" || colName == "l_partkey" || colName == "ps_partkey")
-                maxPk = std::max(maxPk, colMax);
-        }
-    }
-    if (cacheDirty) {
-        // Merge new entries with existing cache (so we don't lose other columns).
-        for (auto& e : cacheWrite) cacheRead.push_back(std::move(e));
-        saveMaxKeyCache(cacheRead);
-    }
-    executor.registerSymbol("maxCustkey", maxCk + 1);
-    executor.registerSymbol("maxSuppkey", maxSk + 1);
-    executor.registerSymbol("maxOrderkey", maxOk + 1);
-    executor.registerSymbol("maxPartkey", maxPk + 1);
-}
-
-// In chunked execution mode the stream table is intentionally absent from
-// `loadedTables`, so its key columns never contribute to the max-key scan
-// performed by registerMaxKeySymbols(). Without this extension Q15/Q18
-// (single-table aggregates keyed by l_suppkey / l_orderkey) collapse to
-// maxSuppkey == 1 / maxOrderkey == 1 and write OOB. We perform a one-time
-// in-memory load of just the int key columns of the stream table from its
-// .colbin and merge the per-column max into the already-registered symbols.
-static void extendMaxKeysFromStreamColbin(
-    codegen::MetalGenericExecutor& executor,
-    const std::string& streamTblPath,
-    const std::set<std::string>& streamCols,
-    const codegen::TPCHSchema& schema,
-    const std::string& streamTable) {
-    if (streamTable.empty()) return;
-    const auto& tdef = schema.table(streamTable);
-    std::vector<std::pair<std::string, ColSpec>> intSpecs;
-    for (const auto& colName : streamCols) {
-        const auto& cdef = tdef.col(colName);
-        if (cdef.type != codegen::DataType::INT && cdef.type != codegen::DataType::DATE)
-            continue;
-        if (colName != "c_custkey" && colName != "o_custkey" &&
-            colName != "s_suppkey" && colName != "l_suppkey" && colName != "ps_suppkey" &&
-            colName != "o_orderkey" && colName != "l_orderkey" &&
-            colName != "p_partkey"  && colName != "l_partkey"  && colName != "ps_partkey")
-            continue;
-        intSpecs.emplace_back(colName, colSpecFor(cdef));
-    }
-    if (intSpecs.empty()) return;
-
-    std::vector<ColSpec> specs;
-    specs.reserve(intSpecs.size());
-    for (const auto& [_, s] : intSpecs) specs.push_back(s);
-
-    LoadedColumns parsed;
-    if (!colbin::loadColumnsFromBinary(streamTblPath, specs, parsed)) {
-        std::cerr << "extendMaxKeysFromStreamColbin: failed to read colbin for "
-                  << streamTable << " at " << streamTblPath
-                  << " (max-key symbols may be wrong)\n";
-        return;
-    }
-
-    int maxCk = 0, maxSk = 0, maxOk = 0, maxPk = 0;
-    std::vector<MaxKeyCacheEntry> cacheRead, cacheWrite;
-    bool cacheDirty = false;
-    if (currentMaxKeyMode() == MaxKeyMode::Cache) {
-        loadMaxKeyCache(cacheRead);
-    }
-    for (const auto& [colName, spec] : intSpecs) {
-        const auto& v = parsed.ints(spec.columnIndex);
-        if (v.empty()) continue;
-        int colMax = computeColMax(v.data(), v.size(), streamTblPath, spec.columnIndex,
-                                   cacheRead, cacheWrite, cacheDirty);
-        if (colName == "c_custkey" || colName == "o_custkey") maxCk = std::max(maxCk, colMax);
-        else if (colName == "s_suppkey" || colName == "l_suppkey" || colName == "ps_suppkey")
-            maxSk = std::max(maxSk, colMax);
-        else if (colName == "o_orderkey" || colName == "l_orderkey")
-            maxOk = std::max(maxOk, colMax);
-        else if (colName == "p_partkey" || colName == "l_partkey" || colName == "ps_partkey")
-            maxPk = std::max(maxPk, colMax);
-    }
-    if (cacheDirty) {
-        for (auto& e : cacheWrite) cacheRead.push_back(std::move(e));
-        saveMaxKeyCache(cacheRead);
-    }
-
-    // sizeResolver_::registerSymbol overwrites; query each previously-registered
-    // value and re-register the max with our stream-table contribution.
-    auto bump = [&](const char* name, int streamMax) {
-        if (streamMax <= 0) return;
-        size_t cur = 0;
-        if (executor.tryGetSymbol(name, cur)) {
-            executor.registerSymbol(name, std::max(cur, (size_t)streamMax + 1));
-        } else {
-            executor.registerSymbol(name, (size_t)streamMax + 1);
-        }
-    };
-    bump("maxCustkey",  maxCk);
-    bump("maxSuppkey",  maxSk);
-    bump("maxOrderkey", maxOk);
-    bump("maxPartkey",  maxPk);
-}
-
 
 // ===================================================================
 // Peek at a .colbin file header to read row count + file size without
@@ -938,7 +644,7 @@ static bool runCodegenQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
             const auto& tdef = schema.table(tableName);
             std::vector<ColSpec> specs;
             for (const auto& colName : colNames)
-                specs.push_back(colSpecFor(tdef.col(colName)));
+                specs.push_back(codegen::colSpecFor(tdef.col(colName)));
             auto _ioStart = clk::now();
             auto cols = loadQueryColumns(device, g_dataset_path + tableName + ".tbl", specs);
             ioMs += elapsedMs(_ioStart, clk::now());
@@ -955,9 +661,9 @@ static bool runCodegenQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
 
         {
             auto _ppStart = clk::now();
-            registerMaxKeySymbols(executor, loadedTables, tableCols, schema);
+            codegen::registerMaxKeySymbols(executor, loadedTables, tableCols, schema);
             if (!streamTable.empty() && tableCols.count(streamTable)) {
-                extendMaxKeysFromStreamColbin(
+                codegen::extendMaxKeysFromStreamColbin(
                     executor,
                     g_dataset_path + streamTable + ".tbl",
                     tableCols.at(streamTable),
@@ -980,7 +686,7 @@ static bool runCodegenQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
         if (!streamTable.empty()) {
             std::vector<ColSpec> streamSpecs;
             for (const auto& colName : tableCols.at(streamTable))
-                streamSpecs.push_back(colSpecFor(schema.table(streamTable).col(colName)));
+                streamSpecs.push_back(codegen::colSpecFor(schema.table(streamTable).col(colName)));
             const int streamSlots = g_chunkDoubleBuffer ? 2 : 1;
             codegen::ChunkedColbinTable stream;
             std::string streamError;
@@ -2079,7 +1785,7 @@ int main(int argc, const char* argv[]) {
         std::string arg(argv[i]);
         if (arg == "help" || arg == "--help" || arg == "-h") {
             printf("GPU Database Codegen\n");
-            printf("Usage: GPUDBCodegen [flags] [sf1|sf10|sf50|sf100] q<N>|mb<N>\n");
+            printf("Usage: GPUDBCodegen [flags] [sf1|sf10|sf20|sf50|sf100] q<N>|mb<N>\n");
             printf("  q1..q22       - Run TPC-H query via codegen pipeline\n");
             printf("  all           - Run all 22 queries\n");
             printf("  mb1..mb7      - Run microbenchmark (sql/mb<N>.sql)\n");
@@ -2188,7 +1894,7 @@ int main(int argc, const char* argv[]) {
     }
 
     if (query.empty()) {
-        std::cerr << "Usage: GPUDBCodegen [sf1|sf10|sf100] q<N>" << std::endl;
+        std::cerr << "Usage: GPUDBCodegen [sf1|sf10|sf20|sf50|sf100] q<N>" << std::endl;
         return 1;
     }
 

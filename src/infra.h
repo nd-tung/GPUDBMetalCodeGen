@@ -118,20 +118,6 @@ struct MappedFile {
 // REUSABLE HELPERS
 // ===================================================================
 
-// --- Metal Pipeline Creation ---
-inline MTL::ComputePipelineState* createPipeline(MTL::Device* device, MTL::Library* library, const char* name) {
-    NS::Error* error = nullptr;
-    auto fn = library->newFunction(NS::String::string(name, NS::UTF8StringEncoding));
-    if (!fn) { std::cerr << "Kernel not found: " << name << std::endl; return nullptr; }
-    auto pso = device->newComputePipelineState(fn, &error);
-    fn->release();
-    if (!pso) { std::cerr << "Failed to create pipeline: " << name << std::endl; }
-    return pso;
-}
-
-// --- Variadic Release ---
-template<typename... Args> void releaseAll(Args*... args) { (args->release(), ...); }
-
 // --- String Trimming ---
 inline std::string trimFixed(const char* chars, size_t index, int width) {
     std::string s(chars + index * width, width);
@@ -140,36 +126,12 @@ inline std::string trimFixed(const char* chars, size_t index, int width) {
 }
 
 // --- Nation/Region Utilities ---
-inline int findRegionKey(const std::vector<int>& regionkeys, const char* name_chars,
-                         int width, const std::string& target) {
-    for (size_t i = 0; i < regionkeys.size(); i++) {
-        if (trimFixed(name_chars, i, width) == target) return regionkeys[i];
-    }
-    return -1;
-}
-
 inline std::map<int, std::string> buildNationNames(const std::vector<int>& nationkeys,
                                                     const char* name_chars, int width) {
     std::map<int, std::string> names;
     for (size_t i = 0; i < nationkeys.size(); i++)
         names[nationkeys[i]] = trimFixed(name_chars, i, width);
     return names;
-}
-
-inline std::vector<int> filterNationsByRegion(const std::vector<int>& nationkeys,
-                                               const std::vector<int>& regionkeys, int target_regionkey) {
-    std::vector<int> result;
-    for (size_t i = 0; i < nationkeys.size(); i++)
-        if (regionkeys[i] == target_regionkey) result.push_back(nationkeys[i]);
-    return result;
-}
-
-inline uint buildNationBitmap(const std::vector<int>& nationkeys,
-                               const std::vector<int>& regionkeys, int target_regionkey) {
-    uint bitmap = 0;
-    for (size_t i = 0; i < nationkeys.size(); i++)
-        if (regionkeys[i] == target_regionkey) bitmap |= (1u << nationkeys[i]);
-    return bitmap;
 }
 
 // ===================================================================
@@ -1140,54 +1102,6 @@ inline LoadedColumns loadColumnsMultiAuto(const std::string& filePath,
               << " ms (one-time, excluded from e2e)\n";
     return _out;
 }
-// --- Standard Column Loaders (file-based, for SF1/SF10) ---
-template<typename T, typename ParseFn>
-inline std::vector<T> loadColumn(const std::string& filePath, int columnIndex, ParseFn parse) {
-    std::vector<T> data;
-    std::ifstream file(filePath);
-    if (!file.is_open()) { std::cerr << "Error: Could not open file " << filePath << std::endl; return data; }
-    std::string line;
-    while (std::getline(file, line)) {
-        int currentCol = 0; size_t start = 0; size_t end = line.find('|');
-        while (end != std::string::npos) {
-            if (currentCol == columnIndex) { parse(data, line.substr(start, end - start)); break; }
-            start = end + 1; end = line.find('|', start); currentCol++;
-        }
-    }
-    return data;
-}
-
-inline std::vector<int> loadIntColumn(const std::string& filePath, int columnIndex) {
-    return loadColumn<int>(filePath, columnIndex, [](auto& v, const std::string& t) { v.push_back(std::stoi(t)); });
-}
-inline std::vector<float> loadFloatColumn(const std::string& filePath, int columnIndex) {
-    return loadColumn<float>(filePath, columnIndex, [](auto& v, const std::string& t) { v.push_back(std::stof(t)); });
-}
-inline std::vector<int> loadDateColumn(const std::string& filePath, int columnIndex) {
-    return loadColumn<int>(filePath, columnIndex, [](auto& v, std::string t) {
-        t.erase(std::remove(t.begin(), t.end(), '-'), t.end());
-        v.push_back(std::stoi(t));
-    });
-}
-inline std::vector<char> loadCharColumn(const std::string& filePath, int columnIndex, int fixed_width = 0) {
-    std::vector<char> data; std::ifstream file(filePath);
-    if (!file.is_open()) { std::cerr << "Error: Could not open file " << filePath << std::endl; return data; }
-    std::string line;
-    while (std::getline(file, line)) {
-        int currentCol = 0; size_t start = 0; size_t end = line.find('|');
-        while (end != std::string::npos) {
-            if (currentCol == columnIndex) {
-                std::string token = line.substr(start, end - start);
-                if (fixed_width > 0) { for (int i = 0; i < fixed_width; ++i) data.push_back(i < (int)token.length() ? token[i] : '\0'); }
-                else { data.push_back(token[0]); }
-                break;
-            }
-            start = end + 1; end = line.find('|', start); currentCol++;
-        }
-    }
-    return data;
-}
-
 // ===================================================================
 // SHARED TABLE LOADERS
 // ===================================================================
@@ -1247,53 +1161,9 @@ inline int findNationKey(const NationData& nat, const std::string& target) {
     return -1;
 }
 
-// --- CPU Bitmap Builder ---
-// Builds a bitmap for keys satisfying a predicate. Returns (bitmap_vector, bitmap_ints, max_key).
-struct CPUBitmap {
-    std::vector<uint> data;
-    uint ints;
-    int max_key;
-};
-
-template<typename Pred>
-inline CPUBitmap buildCPUBitmap(const std::vector<int>& keys, Pred pred) {
-    CPUBitmap b;
-    b.max_key = 0;
-    for (int k : keys) b.max_key = std::max(b.max_key, k);
-    b.ints = (b.max_key + 31) / 32 + 1;
-    b.data.assign(b.ints, 0);
-    for (size_t i = 0; i < keys.size(); i++) {
-        if (pred(i)) {
-            int k = keys[i];
-            b.data[k / 32] |= (1u << (k % 32));
-        }
-    }
-    return b;
-}
-
-// Overload: bitmap where every key qualifies (no predicate).
-inline CPUBitmap buildCPUBitmap(const std::vector<int>& keys) {
-    return buildCPUBitmap(keys, [](size_t) { return true; });
-}
-
-// Upload a CPU bitmap to a Metal buffer (caller must release).
-inline MTL::Buffer* uploadBitmap(MTL::Device* device, const CPUBitmap& bm) {
-    auto buf = device->newBuffer(bm.ints * sizeof(uint), MTL::ResourceStorageModeShared);
-    memcpy(buf->contents(), bm.data.data(), bm.ints * sizeof(uint));
-    return buf;
-}
-
 // ===================================================================
 // TIMING & BUFFER HELPERS
 // ===================================================================
-
-// --- Timing Summary ---
-inline void printTimingSummary(double parseMs, double gpuMs, double postMs) {
-    printf("  CPU Parsing (.tbl): %10.2f ms\n", parseMs);
-    printf("  GPU Execution:      %10.2f ms\n", gpuMs);
-    printf("  CPU Post Process:   %10.2f ms\n", postMs);
-    printf("  Total Execution:    %10.2f ms  (GPU + CPU post)\n", gpuMs + postMs);
-}
 
 // --- Detailed Timing Summary (codegen pipeline breakdown) ---
 struct DetailedTiming {
@@ -1304,7 +1174,9 @@ struct DetailedTiming {
     double codegenMs     = 0.0;
     double compileMs     = 0.0;
     double psoMs         = 0.0;
-    double dataLoadMs    = 0.0;
+    double dataLoadMs    = 0.0;  // ioMs + preprocessMs (umbrella, back-compat)
+    double ioMs          = 0.0;  // pure file I/O: mmap/read of .colbin/.tbl into host buffers
+    double preprocessMs  = 0.0;  // CPU prep: max-key scans, per-query preprocessing kernels
     double bufferAllocMs = 0.0;
     double gpuTotalMs    = 0.0;
     double postMs        = 0.0;
@@ -1325,17 +1197,28 @@ inline void printDetailedTimingSummary(const DetailedTiming& t, bool quiet = fal
     // Terminology (used in the table and the CSV):
     //   Compile Overhead = SQL analyze + plan + metal codegen/compile + PSO
     //                      (one-time per query; independent of input size)
-    //   Data Load (I/O)  = time to bring the query's columns into host memory
+    //   Data Load        = Pure I/O + CPU Preprocess
+    //     Pure I/O       = file read/mmap of column data into host memory
+    //     CPU Preprocess = max-key scans, per-query preprocessing kernels
     //   Buffer Setup     = Metal buffer allocation (pointers only, no copy)
     //   GPU Compute      = GPU kernel execution time
     //   CPU Compute      = CPU post-processing (sort/merge/format)
-    //   Query Compute    = GPU Compute + CPU Compute  (THE actual query work)
+    //   Query Compute    = GPU Compute + CPU Compute  (kernel-only query work)
+    //   Query Execution  = CPU Preprocess + Buffer Setup + Query Compute
+    //                      (everything actually executing the query, EXCLUDING pure I/O)
     //   End-to-End       = Compile Overhead + Data Load + Buffer Setup + Query Compute
     const double compileOverheadMs = t.analyzeMs + t.planMs + t.codegenMs +
                                      t.compileMs + t.psoMs;
     const double cpuComputeMs      = t.postMs;
     const double gpuComputeMs      = t.gpuTotalMs;
     const double queryComputeMs    = cpuComputeMs + gpuComputeMs;
+    // Back-compat: if ioMs/preprocessMs weren't populated, attribute the
+    // whole dataLoadMs window to I/O (matches legacy behavior).
+    const double ioMs              = (t.ioMs > 0.0 || t.preprocessMs > 0.0)
+                                     ? t.ioMs : t.dataLoadMs;
+    const double preprocessMs      = (t.ioMs > 0.0 || t.preprocessMs > 0.0)
+                                     ? t.preprocessMs : 0.0;
+    const double queryExecutionMs  = preprocessMs + t.bufferAllocMs + queryComputeMs;
     const double end2end           = compileOverheadMs + t.dataLoadMs +
                                      t.bufferAllocMs + queryComputeMs;
 
@@ -1382,17 +1265,19 @@ inline void printDetailedTimingSummary(const DetailedTiming& t, bool quiet = fal
             head(title);
         }
         bar();
-        rowMs("Load Time", t.dataLoadMs);
+        rowMs("Load Time (total)", t.dataLoadMs);
+        rowMs("  Pure I/O",        ioMs);
+        rowMs("  CPU Preprocess",  preprocessMs);
         if (t.loadBytes > 0) {
             char buf[32];
             snprintf(buf, sizeof(buf), "%.1f MiB", (double)t.loadBytes / (1024.0 * 1024.0));
             rowStr("Bytes", buf);
         }
-        if (t.loadBytes > 0 && t.dataLoadMs > 0.0) {
-            const double mibps = ((double)t.loadBytes / (1024.0 * 1024.0)) / (t.dataLoadMs / 1000.0);
+        if (t.loadBytes > 0 && ioMs > 0.0) {
+            const double mibps = ((double)t.loadBytes / (1024.0 * 1024.0)) / (ioMs / 1000.0);
             char buf[32];
             snprintf(buf, sizeof(buf), "%.1f MiB/s", mibps);
-            rowStr("Throughput", buf);
+            rowStr("I/O Throughput", buf);
         }
         if (t.ingestMs > 0.0) {
             const char* show = ::getenv("GPUDB_SHOW_INGEST");
@@ -1421,16 +1306,16 @@ inline void printDetailedTimingSummary(const DetailedTiming& t, bool quiet = fal
             rowStr("  GPU dist", buf);
         }
         rowMs("CPU Compute",    cpuComputeMs);
-        rowMsHi("Query Compute",     queryComputeMs);
+        rowMs("Query Compute",     queryComputeMs);
+        rowMsHi("Query Execution",   queryExecutionMs);
         bar();
 
         // --- 4. Totals --------------------------------------------------
         head("Totals");
         bar();
         rowMs("Compile Overhead",  compileOverheadMs);
-        rowMs("Data Load",         t.dataLoadMs);
-        rowMs("Buffer Setup",      t.bufferAllocMs);
-        rowMs("Query Compute",     queryComputeMs);
+        rowMs("Pure I/O",          ioMs);
+        rowMs("Query Execution",   queryExecutionMs);
         rowMsHi("End-to-End",      end2end);
         bar();
     }
@@ -1443,12 +1328,14 @@ inline void printDetailedTimingSummary(const DetailedTiming& t, bool quiet = fal
     //   cpu_total   -> compile_overhead + data_load + buffer_setup + cpu_compute
     //                  (retained for legacy scripts; excludes GPU)
     // Appended: query_compute_ms = cpu_compute_ms + gpu_compute_ms
-    double loadMibps = (t.dataLoadMs > 0.0 && t.loadBytes > 0)
-        ? ((double)t.loadBytes / (1024.0*1024.0)) / (t.dataLoadMs / 1000.0)
+    double loadMibps = (ioMs > 0.0 && t.loadBytes > 0)
+        ? ((double)t.loadBytes / (1024.0*1024.0)) / (ioMs / 1000.0)
         : 0.0;
     const double cpuTotalLegacy = compileOverheadMs + t.dataLoadMs +
                                   t.bufferAllocMs + cpuComputeMs;
-    printf("TIMING_CSV,%s,%s,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%s,%zu,%.3f,%.3f,%.3f,%d,%.3f,%.3f,%.3f\n",
+    // CSV trailer (appended fields, back-compat preserved): io_ms,
+    // preprocess_ms, query_execution_ms.
+    printf("TIMING_CSV,%s,%s,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%s,%zu,%.3f,%.3f,%.3f,%d,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f\n",
            t.scaleFactor.c_str(), t.queryName.c_str(),
            t.analyzeMs, t.planMs, t.codegenMs, t.compileMs, t.psoMs,
            t.dataLoadMs, t.bufferAllocMs, gpuComputeMs, cpuComputeMs,
@@ -1456,20 +1343,8 @@ inline void printDetailedTimingSummary(const DetailedTiming& t, bool quiet = fal
            t.loadSource.empty() ? "none" : t.loadSource.c_str(),
            t.loadBytes, loadMibps, t.ingestMs, queryComputeMs,
            // C1: per-trial GPU-time distribution (zeros if --repeat 1)
-           t.gpuTrialsN, t.gpuMsP10, t.gpuMsP90, t.gpuMsMad);
+           t.gpuTrialsN, t.gpuMsP10, t.gpuMsP90, t.gpuMsMad,
+           // I/O vs preprocess split + query-execution metric
+           ioMs, preprocessMs, queryExecutionMs);
 }
 
-// --- Bitmap Buffer Creation ---
-inline MTL::Buffer* createBitmapBuffer(MTL::Device* device, int maxKey) {
-    const uint ints = (maxKey + 31) / 32 + 1;
-    auto buf = device->newBuffer(ints * sizeof(uint), MTL::ResourceStorageModeShared);
-    memset(buf->contents(), 0, ints * sizeof(uint));
-    return buf;
-}
-
-// --- Filled Buffer Creation (allocate + memset in one call) ---
-inline MTL::Buffer* createFilledBuffer(MTL::Device* device, size_t bytes, int fillByte = 0) {
-    auto buf = device->newBuffer(bytes, MTL::ResourceStorageModeShared);
-    memset(buf->contents(), fillByte, bytes);
-    return buf;
-}

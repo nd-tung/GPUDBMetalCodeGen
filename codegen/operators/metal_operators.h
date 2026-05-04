@@ -38,16 +38,6 @@ public:
         : child_(std::move(child)) {}
 };
 
-class MetalBinaryOperator : public MetalOperator {
-protected:
-    std::unique_ptr<MetalOperator> build_;
-    std::unique_ptr<MetalOperator> probe_;
-public:
-    MetalBinaryOperator(std::unique_ptr<MetalOperator> build,
-                        std::unique_ptr<MetalOperator> probe)
-        : build_(std::move(build)), probe_(std::move(probe)) {}
-};
-
 // ===================================================================
 // LEAF OPERATORS — Table Scans
 // ===================================================================
