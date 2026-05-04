@@ -531,8 +531,7 @@ void extractTables(const json& fromItem, std::vector<std::string>& tables,
 // ===================================================================
 
 // Check if a predicate is a join condition (column = column across different tables)
-bool isJoinCondition(const PredPtr& pred, const std::vector<std::string>& tables,
-                     JoinClause& jc) {
+bool isJoinCondition(const PredPtr& pred, JoinClause& jc) {
     auto* cmp = std::get_if<Comparison>(&pred->node);
     if (!cmp || cmp->op != CmpOp::EQ) return false;
 
@@ -557,7 +556,7 @@ void separatePredicates(const PredPtr& pred, const std::vector<std::string>& tab
         return;
     }
     JoinClause jc;
-    if (isJoinCondition(pred, tables, jc))
+    if (isJoinCondition(pred, jc))
         joins.push_back(jc);
     else
         filters.push_back(pred);
