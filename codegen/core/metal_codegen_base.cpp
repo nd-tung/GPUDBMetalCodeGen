@@ -115,6 +115,12 @@ void MetalCodegen::setPhaseMaxThreadgroups(int max) {
     currentPhase_->maxThreadgroups = max;
 }
 
+void MetalCodegen::setPhasePostDispatchHook(PostDispatchHook hook) {
+    if (!currentPhase_)
+        throw std::runtime_error("setPhasePostDispatchHook: no active phase");
+    currentPhase_->postDispatchHook = std::move(hook);
+}
+
 // ===================================================================
 // Parameter registration
 // ===================================================================

@@ -118,6 +118,15 @@ public:
         return it != allocatedBuffers_.end() ? it->second : nullptr;
     }
 
+    // Access the command queue (used by preprocessing for blit-based
+    // GPU buffer fills).
+    MTL::CommandQueue* commandQueue() const { return cmdQueue_; }
+
+    // Access the device (used by post-dispatch hooks that need to
+    // allocate fresh buffers — e.g. Q16 group-bitmaps sized by the
+    // dict count produced by the previous GPU phase).
+    MTL::Device* device() const { return device_; }
+
 private:
     MTL::Device* device_;
     MTL::CommandQueue* cmdQueue_;

@@ -1,10 +1,14 @@
 #include "metal_plan_builder.h"
+#include "metal_generic_executor.h"
+#include "../execution/query_preprocessing.h"
 #include "tpch_schema.h"
 #include <sstream>
 #include <algorithm>
 #include <iostream>
 #include <set>
 #include <unordered_set>
+#include <unordered_map>
+#include <cstring>
 
 namespace codegen {
 
@@ -336,7 +340,7 @@ static std::optional<MetalQueryPlan> buildQ1Plan(const AnalyzedQuery& aq) {
 
     auto agg = std::make_unique<MetalKeyedAgg>(
         std::move(filtered), "d_q1_aggs", bucketExpr,
-        /*numBuckets=*/6, /*valuesPerBucket=*/10, "60");
+        /*numBuckets=*/6, /*valuesPerBucket=*/11, "66");
 
     // Add aggregates using columnar indexing — large sums use lo/hi pairs
     agg->addAggregate("sum_qty", 0, "(uint)(l_quantity[" + idxVar + "] * 100.0f)", "add", true, 100);
@@ -345,8 +349,8 @@ static std::optional<MetalQueryPlan> buildQ1Plan(const AnalyzedQuery& aq) {
                       "(uint)(l_extendedprice[" + idxVar + "] * (1.0f - l_discount[" + idxVar + "]) * 100.0f)", "add", true, 100);
     agg->addAggregate("sum_charge", 6,
                       "(uint)(l_extendedprice[" + idxVar + "] * (1.0f - l_discount[" + idxVar + "]) * (1.0f + l_tax[" + idxVar + "]) * 100.0f)", "add", true, 100);
-    agg->addAggregate("sum_disc", 8, "(uint)(l_discount[" + idxVar + "] * 10000.0f)", "add", false, 0);
-    agg->addAggregate("count_order", 9, "1u", "add", false, 0);
+    agg->addAggregate("sum_disc", 8, "(uint)(l_discount[" + idxVar + "] * 10000.0f)", "add", true, 0);
+    agg->addAggregate("count_order", 10, "1u", "add", false, 0);
 
     appendPhase(plan, "Q1_reduce", std::move(agg));
 
@@ -1299,11 +1303,51 @@ static bool q13_comment_match(const device char* comment, uint idx) {
 }
 
 // ===================================================================
-// Q22: Global Sales Opportunity — 2 phases
+// Q22: Global Sales Opportunity — 3 phases (GPU preprocessing for avg_bal)
 // ===================================================================
 static std::optional<MetalQueryPlan> buildQ22Plan_byName() {
     std::string idx = "i";
     MetalQueryPlan plan;
+
+    // Phase 0 (GPU preprocessing): scan customer, compute sum + count of
+    // c_acctbal for rows whose phone prefix is in the valid set and balance
+    // is positive. The post-dispatch hook divides sum/count and registers
+    // `avg_bal` as a scalar for the final aggregate phase. Replaces the
+    // CPU-side scan formerly in query_preprocessing.cpp (Q22 block).
+    {
+        auto scan = makeScan("customer", idx, {{"c_phone", "char"}, {"c_acctbal", "float"}});
+
+        auto computePrefix = std::make_unique<MetalComputeExpr>(
+            std::move(scan), "_prefix", "int",
+            "(c_phone[" + idx + " * 15] - '0') * 10 + (c_phone[" + idx + " * 15 + 1] - '0')");
+
+        std::string validPrefixCond =
+            "(_prefix == 13 || _prefix == 17 || _prefix == 18 || "
+            "_prefix == 23 || _prefix == 29 || _prefix == 30 || _prefix == 31) && "
+            "c_acctbal[" + idx + "] > 0.0f";
+        auto filtered = std::make_unique<MetalSelection>(std::move(computePrefix), validPrefixCond);
+
+        auto countOp = std::make_unique<MetalAtomicCount>(
+            std::move(filtered), "d_q22_avgbal_count", "0", "1");
+
+        auto sumOp = std::make_unique<MetalAtomicAgg>(
+            std::move(countOp), "d_q22_avgbal_sum",
+            "0", "c_acctbal[" + idx + "]", "1",
+            "atomic_float", "float");
+
+        auto& phase = appendPhase(plan, "Q22_compute_avg_bal", std::move(sumOp), 256);
+        phase.postDispatchHook = [](MetalGenericExecutor& ex) {
+            auto* sumBuf   = ex.getAllocatedBuffer("d_q22_avgbal_sum");
+            auto* countBuf = ex.getAllocatedBuffer("d_q22_avgbal_count");
+            float avg = 0.0f;
+            if (sumBuf && countBuf) {
+                float sum = *static_cast<float*>(sumBuf->contents());
+                uint32_t cnt = *static_cast<uint32_t*>(countBuf->contents());
+                if (cnt > 0) avg = sum / static_cast<float>(cnt);
+            }
+            ex.registerScalarFloat("avg_bal", avg);
+        };
+    }
 
     // Phase 1: Build orders bitmap
     {
@@ -1524,12 +1568,26 @@ static std::optional<MetalQueryPlan> buildQ15Plan_byName() {
 }
 
 // ===================================================================
-// Q18: Large Volume Customer — 1 GPU phase + CPU filter/sort
+// Q18: Large Volume Customer — 2 GPU phases + CPU filter/sort
 // ===================================================================
 static std::optional<MetalQueryPlan> buildQ18Plan_byName() {
     std::string idx = "i";
     MetalQueryPlan plan;
 
+    // Phase 1: build orderkey -> orders-row-index lookup on GPU
+    // (replaces the 1.5M sequential CPU writes that previously dominated
+    // Q18 preprocessing). fillByte = 0xFF gives -1 sentinel for missing
+    // orderkeys; orderkeys are unique by FK so no atomics needed.
+    {
+        auto scan = makeScan("orders", idx, {{"o_orderkey", "int"}});
+        auto store = std::make_unique<MetalArrayStore>(
+            std::move(scan), "d_q18_ok_lookup",
+            "o_orderkey[" + idx + "]", "(int)" + idx,
+            "int", "maxOrderkey", 0xFF);
+        appendPhase(plan, "Q18_build_ok_lookup", std::move(store), 256);
+    }
+
+    // Phase 2: per-orderkey sum(l_quantity)
     {
         auto scan = makeScan("lineitem", idx, {{"l_orderkey", "int"}, {"l_quantity", "float"}});
 
@@ -1546,39 +1604,92 @@ static std::optional<MetalQueryPlan> buildQ18Plan_byName() {
 
 // ===================================================================
 // Q17: Small-Quantity-Order Revenue
-// CPU pre-processing computes threshold[partkey] = 0.2 * avg(qty) for qualifying parts.
-// Single GPU phase: scan lineitem, lookup threshold, filter qty < threshold, sum extendedprice.
+// GPU preprocessing (3 phases): build qualifying-parts bitmap from `part`,
+// accumulate per-partkey sum + count of l_quantity from `lineitem` gated
+// by the bitmap, then the existing reduce phase reads sum & count and
+// applies the `l_quantity * cnt < 0.2 * sum` predicate inline (avoids
+// a per-key divide and a finalize phase).
 // ===================================================================
 static std::optional<MetalQueryPlan> buildQ17Plan_byName() {
     std::string idx = "i";
     MetalQueryPlan plan;
 
+    // Phase 1: build d_q17_bitmap from `part` (Brand#23 + MED BOX).
+    // Inline char compare matches the original CPU predicate byte-for-byte.
+    {
+        auto scan = makeScan("part", idx, {
+            {"p_partkey", "int"}, {"p_brand", "char"}, {"p_container", "char"}
+        });
+
+        std::string pred =
+            "p_brand[" + idx + "*10]=='B' && p_brand[" + idx + "*10+5]=='#' && "
+            "p_brand[" + idx + "*10+6]=='2' && p_brand[" + idx + "*10+7]=='3' && "
+            "p_container[" + idx + "*10]=='M' && p_container[" + idx + "*10+1]=='E' && "
+            "p_container[" + idx + "*10+2]=='D' && p_container[" + idx + "*10+3]==' ' && "
+            "p_container[" + idx + "*10+4]=='B' && p_container[" + idx + "*10+5]=='O' && "
+            "p_container[" + idx + "*10+6]=='X'";
+
+        auto filtered = std::make_unique<MetalSelection>(std::move(scan), pred);
+        auto bmp = std::make_unique<MetalBitmapBuild>(
+            std::move(filtered), "d_q17_bitmap",
+            "p_partkey[" + idx + "]", "(maxPartkey + 31) / 32");
+        appendPhase(plan, "Q17_build_bitmap", std::move(bmp));
+    }
+
+    // Phase 2: scan lineitem gated by bitmap, accumulate sum + count of
+    // l_quantity per partkey into d_q17_sumQty (atomic_float) and
+    // d_q17_cntQty (atomic_uint).
+    {
+        auto scan = makeScan("lineitem", idx, {
+            {"l_partkey", "int"}, {"l_quantity", "float"}
+        });
+        auto gated = std::make_unique<MetalSelection>(std::move(scan),
+            "bitmap_test(d_q17_bitmap, l_partkey[" + idx + "])");
+        auto cnt = std::make_unique<MetalAtomicCount>(
+            std::move(gated), "d_q17_cntQty",
+            "l_partkey[" + idx + "]", "maxPartkey");
+        auto sumOp = std::make_unique<MetalAtomicAgg>(
+            std::move(cnt), "d_q17_sumQty",
+            "l_partkey[" + idx + "]", "l_quantity[" + idx + "]",
+            "maxPartkey", "atomic_float", "float");
+        auto& phase = appendPhase(plan, "Q17_build_avg_qty", std::move(sumOp));
+        phase.bitmapReads.push_back({"d_q17_bitmap", ""});
+    }
+
+    // Phase 3: existing revenue reduce, modified to read sum & count from
+    // the GPU-built buffers and apply the threshold predicate inline as
+    // l_quantity * cnt < 0.2 * sum (mathematically equivalent to the
+    // original l_quantity < 0.2 * sum / cnt; avoids a divide).
     {
         auto scan = makeScan("lineitem", idx, {
             {"l_partkey", "int"}, {"l_quantity", "float"}, {"l_extendedprice", "float"}
         });
 
-        // First filter: bitmap test for qualifying parts (Brand#23 + MED BOX)
         auto bitmapFilter = std::make_unique<MetalSelection>(
             std::move(scan),
             "bitmap_test(d_q17_bitmap, l_partkey[" + idx + "])");
 
-        // Lookup pre-computed threshold: 0.0f means non-qualifying part
-        auto lookup = std::make_unique<MetalArrayLookup>(
-            std::move(bitmapFilter), "d_q17_threshold",
-            "l_partkey[" + idx + "]", "_thresh", "float", 0);
+        auto loadCnt = std::make_unique<MetalComputeExpr>(
+            std::move(bitmapFilter), "_cnt", "uint",
+            "d_q17_cntQty[l_partkey[" + idx + "]]");
 
-        // Filter: l_quantity < threshold for this partkey
-        auto filtered = std::make_unique<MetalSelection>(
-            std::move(lookup),
-            "l_quantity[" + idx + "] < _thresh");
+        auto cntFilt = std::make_unique<MetalSelection>(std::move(loadCnt), "_cnt > 0u");
 
-        // TGReduce revenue (float path)
-        auto reduce = std::make_unique<MetalTGReduce>(std::move(filtered), "d_q17");
+        auto loadSum = std::make_unique<MetalComputeExpr>(
+            std::move(cntFilt), "_sum", "float",
+            "d_q17_sumQty[l_partkey[" + idx + "]]");
+
+        auto thrFilt = std::make_unique<MetalSelection>(
+            std::move(loadSum),
+            "l_quantity[" + idx + "] * (float)_cnt < 0.2f * _sum");
+
+        auto reduce = std::make_unique<MetalTGReduce>(std::move(thrFilt), "d_q17");
         reduce->addAccumulator("revenue", "l_extendedprice[" + idx + "]", "float");
 
         auto& phase = appendPhase(plan, "Q17_reduce", std::move(reduce));
         phase.bitmapReads.push_back({"d_q17_bitmap", ""});
+        phase.extraBuffers.push_back({"d_q17_sumQty", "float", true, false});
+        phase.extraBuffers.push_back({"d_q17_cntQty", "uint",  true, false});
     }
 
     return plan;
@@ -1586,15 +1697,17 @@ static std::optional<MetalQueryPlan> buildQ17Plan_byName() {
 
 // ===================================================================
 // Q9: Product Type Profit Measure
-// CPU pre-processing builds: green-parts bitmap, s_nationkey[], o_year[],
-// partsupp hash table (keys + vals + mask scalar).
-// Single GPU phase: scan lineitem, filter+probe+compute profit, atomicAgg by (nation,year).
+// GPU preprocessing (4 phases): green-parts bitmap from `part`,
+// s_nationkey lookup from `supplier`, o_year lookup from `orders`,
+// (partkey,suppkey)→supplycost open-addressing HT from `partsupp`
+// gated by the bitmap. Final phase scans `lineitem` and aggregates
+// profit per (nation, year). Replaces ~110 lines of CPU preprocess.
 // ===================================================================
 static std::optional<MetalQueryPlan> buildQ9Plan_byName() {
     std::string idx = "i";
     MetalQueryPlan plan;
 
-    // Helper: hash probe function for partsupp HT
+    // Probe helper used by the final reduce phase (unchanged).
     plan.helpers.push_back(R"(
 static float q9_ht_probe(const device uint* ht_keys, const device float* ht_vals,
                           uint ht_mask, uint key) {
@@ -1609,6 +1722,115 @@ static float q9_ht_probe(const device uint* ht_keys, const device float* ht_vals
 }
 )");
 
+    // CAS-based insert helper for the partsupp HT build phase. Uses Knuth
+    // multiplicative hash (kKnuthHashMul) — must match the host-side mask
+    // computation and the q9_ht_probe constant above.
+    plan.helpers.push_back(R"(
+static void q9_ht_insert(device atomic_uint* ht_keys, device float* ht_vals,
+                          uint ht_mask, uint key, float val) {
+    uint h = (key * 2654435769u) & ht_mask;
+    for (uint step = 0; step <= ht_mask; step++) {
+        uint slot = (h + step) & ht_mask;
+        uint expected = 0xFFFFFFFFu;
+        if (atomic_compare_exchange_weak_explicit(
+                &ht_keys[slot], &expected, key,
+                memory_order_relaxed, memory_order_relaxed)) {
+            ht_vals[slot] = val;
+            return;
+        }
+        // expected now holds the slot's current key; duplicate (pk,sk) pairs
+        // do not occur for partsupp, but bail out defensively.
+        if (expected == key) return;
+    }
+}
+)");
+
+    // Phase 0: build d_q9_part_bitmap from `part` (p_name contains "green").
+    // Mirrors the CPU substring scan byte-for-byte over the 55-byte field.
+    {
+        auto scan = makeScan("part", idx, {{"p_partkey", "int"}, {"p_name", "char"}});
+        std::string pred;
+        for (int c = 0; c <= 50; c++) {
+            std::string base = "p_name[" + idx + "*55+" + std::to_string(c);
+            if (c > 0) pred += " || ";
+            pred += "(" + base + "]=='g' && " +
+                    base + "+1]=='r' && " +
+                    base + "+2]=='e' && " +
+                    base + "+3]=='e' && " +
+                    base + "+4]=='n')";
+        }
+        auto filtered = std::make_unique<MetalSelection>(std::move(scan), pred);
+        auto bmp = std::make_unique<MetalBitmapBuild>(
+            std::move(filtered), "d_q9_part_bitmap",
+            "p_partkey[" + idx + "]", "(maxPartkey + 31) / 32");
+        appendPhase(plan, "Q9_build_part_bitmap", std::move(bmp));
+    }
+
+    // Phase 1: build d_q9_s_nationkey lookup from supplier (sentinel -1).
+    {
+        auto scan = makeScan("supplier", idx, {{"s_suppkey", "int"}, {"s_nationkey", "int"}});
+        auto store = std::make_unique<MetalArrayStore>(
+            std::move(scan), "d_q9_s_nationkey",
+            "s_suppkey[" + idx + "]", "s_nationkey[" + idx + "]",
+            "int", "maxSuppkey", /*fillByte=*/0xFF);
+        appendPhase(plan, "Q9_build_s_nationkey", std::move(store));
+    }
+
+    // Phase 2: build d_q9_o_year lookup from orders (sentinel 0).
+    // Reduce phase later guards against 0 via MetalArrayLookup(sentinel=0).
+    {
+        auto scan = makeScan("orders", idx, {{"o_orderkey", "int"}, {"o_orderdate", "int"}});
+        auto store = std::make_unique<MetalArrayStore>(
+            std::move(scan), "d_q9_o_year",
+            "o_orderkey[" + idx + "]", "o_orderdate[" + idx + "] / 10000",
+            "int", "maxOrderkey", /*fillByte=*/0);
+        appendPhase(plan, "Q9_build_o_year", std::move(store));
+    }
+
+    // Phase 3: build (pk,sk)→supplycost HT from partsupp gated by green bitmap.
+    // Hand-emitted: needs CAS write semantics not provided by MetalArrayStore.
+    {
+        auto scan = makeScan("partsupp", idx, {
+            {"ps_partkey", "int"}, {"ps_suppkey", "int"}, {"ps_supplycost", "float"}
+        });
+        auto gated = std::make_unique<MetalSelection>(std::move(scan),
+            "bitmap_test(d_q9_part_bitmap, ps_partkey[" + idx + "])");
+        auto computeKey = std::make_unique<MetalComputeExpr>(
+            std::move(gated), "_psk", "uint",
+            "(uint)ps_partkey[" + idx + "] * supp_mul + (uint)ps_suppkey[" + idx + "]");
+
+        // Custom terminal: emits q9_ht_insert(...). We piggy-back on
+        // MetalComputeExpr's child production to register bindings, then
+        // append the call line ourselves via a passthrough terminal.
+        // Implemented via a tiny inline operator below.
+        struct HtInsertTerminal : MetalUnaryOperator {
+            std::string idx_;
+            HtInsertTerminal(std::unique_ptr<MetalOperator> c, std::string i)
+                : MetalUnaryOperator(std::move(c)), idx_(std::move(i)) {}
+            void produce(MetalCodegen& cg, ConsumerFn) override {
+                // Build phase outputs.
+                cg.addBufferParam("d_ps_ht_keys", "atomic_uint", "q9HtSize",
+                                  /*zeroInit=*/true, /*fillByte=*/0xFF);
+                cg.addBufferParam("d_ps_ht_vals", "float", "q9HtSize",
+                                  /*zeroInit=*/true, /*fillByte=*/0);
+                child_->produce(cg, [&]() {
+                    cg.addLine(
+                        "q9_ht_insert(d_ps_ht_keys, d_ps_ht_vals, d_ps_ht_mask, "
+                        "_psk, ps_supplycost[" + idx_ + "]);");
+                });
+            }
+            std::string describe() const override { return "Q9HtInsert"; }
+        };
+        auto term = std::make_unique<HtInsertTerminal>(std::move(computeKey), idx);
+
+        auto& phase = appendPhase(plan, "Q9_build_ps_ht", std::move(term));
+        phase.bitmapReads.push_back({"d_q9_part_bitmap", ""});
+        phase.scalarParams.push_back({"d_ps_ht_mask", "uint"});
+        phase.scalarParams.push_back({"supp_mul", "uint"});
+    }
+
+    // Phase 4 (existing reduce): scan lineitem, probe HT, accumulate profit
+    // per (nation, year) bucket.
     {
         auto scan = makeScan("lineitem", idx, {
             {"l_partkey", "int"}, {"l_suppkey", "int"}, {"l_orderkey", "int"},
@@ -1670,6 +1892,11 @@ static float q9_ht_probe(const device uint* ht_keys, const device float* ht_vals
 
 // ===================================================================
 // Q16: Parts/Supplier Relationship (COUNT DISTINCT)
+// Phase 0 (GPU): Scan part → filter (size in valid set, brand != #45,
+//      type doesn't start with "MEDIUM POLISHED") → atomically append
+//      (idx, key64) to compact compaction buffers. Post-dispatch hook
+//      builds the dict + d_q16_part_group_map on host from the ~12 %
+//      of qualifying rows (was a 4M-row CPU scan at SF20: ~470 ms).
 // Phase 1 (GPU): Scan supplier s_comment → build complaint bitmap
 // Phase 2 (GPU): scan partsupp → ArrayLookup(group_id) → Selection(>=0) →
 //      AntiBitmapProbe(complaint) → helper(per-group bitmap set).
@@ -1678,6 +1905,124 @@ static float q9_ht_probe(const device uint* ht_keys, const device float* ht_vals
 static std::optional<MetalQueryPlan> buildQ16Plan_byName() {
     std::string idx = "i";
     MetalQueryPlan plan;
+
+    // Helper: FNV-1a 32-bit over a 25-byte type field, plus the
+    // filter+key+atomic-append routine emitted per qualifying row.
+    plan.helpers.push_back(R"(
+static uint q16_fnv32_25(const device char* tp, uint base) {
+    uint h = 2166136261u;
+    for (uint k = 0; k < 25; k++) {
+        h ^= (uint)(uchar)tp[base + k];
+        h *= 16777619u;
+    }
+    return h;
+}
+static void q16_filter_emit(device atomic_uint* counter,
+                            device uint* out_idx,
+                            device ulong* out_key,
+                            const device char* p_brand,
+                            const device char* p_type,
+                            const device int*  p_size,
+                            uint i) {
+    int sz = p_size[i];
+    if (!(sz==49 || sz==14 || sz==23 || sz==45 ||
+          sz==19 || sz== 3 || sz==36 || sz== 9)) return;
+    uint bb = i * 10u;
+    if (p_brand[bb+0]=='B' && p_brand[bb+1]=='r' && p_brand[bb+2]=='a' &&
+        p_brand[bb+3]=='n' && p_brand[bb+4]=='d' && p_brand[bb+5]=='#' &&
+        p_brand[bb+6]=='4' && p_brand[bb+7]=='5') return;
+    uint tb = i * 25u;
+    if (p_type[tb+ 0]=='M' && p_type[tb+ 1]=='E' && p_type[tb+ 2]=='D' &&
+        p_type[tb+ 3]=='I' && p_type[tb+ 4]=='U' && p_type[tb+ 5]=='M' &&
+        p_type[tb+ 6]==' ' && p_type[tb+ 7]=='P' && p_type[tb+ 8]=='O' &&
+        p_type[tb+ 9]=='L' && p_type[tb+10]=='I' && p_type[tb+11]=='S' &&
+        p_type[tb+12]=='H' && p_type[tb+13]=='E' && p_type[tb+14]=='D') return;
+    uint bidx = (uint)(p_brand[bb+6] - '1') * 5u + (uint)(p_brand[bb+7] - '1');
+    uint h = q16_fnv32_25(p_type, tb);
+    ulong key = ((ulong)bidx << 56) | ((ulong)(uint)sz << 48) | (ulong)h;
+    uint slot = atomic_fetch_add_explicit(counter, 1u, memory_order_relaxed);
+    out_idx[slot] = i;
+    out_key[slot] = key;
+}
+)");
+
+    // Phase 0: GPU filter + compact. The ComputeExpr's value isn't used;
+    // the helper performs the atomic-append side-effect.
+    {
+        auto scan = makeScan("part", idx, {
+            {"p_partkey", "int"}, {"p_brand", "char"},
+            {"p_type", "char"}, {"p_size", "int"}});
+        auto sideEffect = std::make_unique<MetalComputeExpr>(
+            std::move(scan), "_q16_unused", "int",
+            "(q16_filter_emit(d_q16_filt_count, d_q16_filt_idx, d_q16_filt_key, "
+            "p_brand, p_type, p_size, " + idx + "), 0)");
+        auto& phase = appendPhase(plan, "Q16_filter_compact", std::move(sideEffect));
+        phase.extraBuffers.push_back({"d_q16_filt_count", "atomic_uint", false, true});
+        phase.extraBuffers.push_back({"d_q16_filt_idx",   "uint",        false, false});
+        phase.extraBuffers.push_back({"d_q16_filt_key",   "ulong",       false, false});
+
+        // Post-dispatch hook: read compact (idx, key) list, build dict
+        // and d_q16_part_group_map on host. Allocates d_q16_group_bitmaps
+        // sized exactly to numGroups * bvInts.
+        phase.postDispatchHook = [](MetalGenericExecutor& ex) {
+            auto& pd = g_q16Post;
+            auto* cntBuf = ex.getAllocatedBuffer("d_q16_filt_count");
+            auto* idxBuf = ex.getAllocatedBuffer("d_q16_filt_idx");
+            auto* keyBuf = ex.getAllocatedBuffer("d_q16_filt_key");
+            auto* mapBuf = ex.getAllocatedBuffer("d_q16_part_group_map");
+            if (!cntBuf || !idxBuf || !keyBuf || !mapBuf || !pd.p_brand) return;
+            uint32_t cnt = *static_cast<uint32_t*>(cntBuf->contents());
+            const uint32_t* fidx = static_cast<const uint32_t*>(idxBuf->contents());
+            const uint64_t* fkey = static_cast<const uint64_t*>(keyBuf->contents());
+            int* partGroupMap = static_cast<int*>(mapBuf->contents());
+            // map already pre-filled with -1 (0xFF) by preprocess.
+
+            std::unordered_map<uint64_t, int> groupMap;
+            groupMap.reserve(2048);
+            std::vector<Q16PostData::GroupKey> groups;
+            groups.reserve(2048);
+
+            for (uint32_t k = 0; k < cnt; k++) {
+                uint32_t i = fidx[k];
+                uint64_t key = fkey[k];
+                auto it = groupMap.find(key);
+                int gid;
+                if (it == groupMap.end()) {
+                    gid = (int)groups.size();
+                    groupMap.emplace(key, gid);
+                    const char* br = pd.p_brand + (size_t)i * 10;
+                    const char* tp = pd.p_type  + (size_t)i * 25;
+                    int brLen = 10;
+                    while (brLen > 0 && (br[brLen-1] == ' ' || br[brLen-1] == '\0')) brLen--;
+                    int tpLen = 25;
+                    while (tpLen > 0 && (tp[tpLen-1] == ' ' || tp[tpLen-1] == '\0')) tpLen--;
+                    int sz = (int)((key >> 48) & 0xFF);
+                    groups.push_back({std::string(br, brLen), std::string(tp, tpLen), sz});
+                } else {
+                    gid = it->second;
+                }
+                // partkey lookup cached on pd.p_partkey (set in preprocess).
+                int pk = pd.p_partkey ? pd.p_partkey[i] : 0;
+                if (pk >= 0 && pk <= pd.maxPartkey) partGroupMap[pk] = gid;
+            }
+
+            uint32_t numGroups = (uint32_t)groups.size();
+            uint32_t bvInts = ((uint32_t)pd.maxSk + 32) / 32;
+            size_t gbmBytes = (size_t)numGroups * bvInts * sizeof(uint32_t);
+            // Allocate d_q16_group_bitmaps now that numGroups is known.
+            auto* dev = ex.device();
+            size_t allocBytes = std::max<size_t>(gbmBytes, 4);
+            auto* gbmBuf = dev->newBuffer(allocBytes, MTL::ResourceStorageModeShared);
+            std::memset(gbmBuf->contents(), 0, allocBytes);
+            ex.registerAllocatedBuffer("d_q16_group_bitmaps", gbmBuf);
+            ex.registerScalarInt("d_q16_bv_ints", (int)bvInts);
+
+            pd.groups = std::move(groups);
+            pd.bvInts = bvInts;
+            pd.numGroups = numGroups;
+            pd.groupBitmapsBuf = gbmBuf;
+        };
+    }
 
     // Helper: substring search for "Customer" ... "Complaints" in s_comment
     plan.helpers.push_back(R"(
@@ -1758,15 +2103,32 @@ static void q16_bitmap_set(device atomic_uint* group_bitmaps, uint bv_ints,
 
 // ===================================================================
 // Q21: Suppliers Who Kept Orders Waiting
+// Phase 0 (GPU): Scan supplier → build SA-supplier bitmap (sa_nk scalar)
 // Phase 1 (GPU): Scan orders → build F-orders bitmap
 // Phase 2 (GPU): Scan lineitem → atomicCAS to build multi_supp/multi_late bitmaps
 // Phase 3 (GPU): Scan lineitem → filter → AtomicCount per supplier
-// CPU pre: SA-supplier bitmap (tiny), allocate first_supp/first_late arrays
+// CPU pre: nation→SAUDI ARABIA key lookup (25 rows), s_suppkey/s_name mirror
+//          for post-formatting; allocate first_supp/first_late counter arrays.
 // CPU post: read per-supp counts, join names, sort, top 100.
 // ===================================================================
 static std::optional<MetalQueryPlan> buildQ21Plan_byName() {
     std::string idx = "i";
     MetalQueryPlan plan;
+
+    // Phase 0: Build SAUDI-supplier bitmap on GPU. `sa_nk` scalar comes from
+    // the host's tiny nation lookup (registerNameKey) — keeping the lookup
+    // on CPU is cheaper than a 25-row dispatch.
+    {
+        auto scan = makeScan("supplier", idx,
+                             {{"s_suppkey", "int"}, {"s_nationkey", "int"}});
+        auto filter = std::make_unique<MetalSelection>(
+            std::move(scan), "s_nationkey[" + idx + "] == sa_nk");
+        auto bitmapBuild = std::make_unique<MetalBitmapBuild>(
+            std::move(filter), "d_q21_sa_supp", "s_suppkey[" + idx + "]",
+            "(maxSuppkey + 31) / 32");
+        auto& phase = appendPhase(plan, "Q21_build_sa_supp", std::move(bitmapBuild));
+        phase.scalarParams.push_back({"sa_nk", "int"});
+    }
 
     // Helper for Phase 2: atomic CAS to detect multi-supplier/multi-late orders
     plan.helpers.push_back(R"(
@@ -1956,15 +2318,24 @@ static void q2_atomic_min(device atomic_uint* min_cost, uint partkey, float cost
 
 // ===================================================================
 // Q20: Potential Part Promotion
-// CPU pre-processing builds: forest% bitmap, partsupp HT (pre-keyed), CANADA suppkey set.
-// GPU: scan lineitem (date filter 1994) → bitmap probe → hash probe → atomic_float add.
-// CPU post: scan partsupp, check availqty > 0.5 * sum_qty, filter CANADA suppliers.
+// Phase 0 (GPU): Scan part → build forest% bitmap on `d_q20_part_bitmap`.
+// Phase 1 (GPU): Scan partsupp gated by bitmap → CAS-insert
+//                (key=pk*supp_mul+sk, ps_idx) into 64-bit HT and zero-init
+//                d_q20_ht_vals; the row's partsupp index is recorded so
+//                CPU post can read availqty.
+// Phase 2 (GPU): Scan lineitem (date filter 1994) → bitmap probe →
+//                hash probe (q20_ht_add) → atomic_float add into ht_vals.
+// CPU pre: tiny CANADA-nation lookup + supplier/partsupp mirrors for post;
+//          q20HtSize/d_q20_ht_mask/supp_mul scalars.
+// CPU post: walk HT slots reading d_q20_ht_keys/_vals/_psidx (all GPU
+//           shared buffers) and check availqty > 0.5 * sum_qty against
+//           ps_availqty mirror; filter CANADA suppliers.
 // ===================================================================
 static std::optional<MetalQueryPlan> buildQ20Plan_byName() {
     std::string idx = "i";
     MetalQueryPlan plan;
 
-    // Helper: hash probe + atomic add
+    // Helper: hash probe + atomic add (read-only key view, used in agg phase).
     plan.helpers.push_back(R"(
 static void q20_ht_add(const device ulong* ht_keys, device atomic_float* ht_vals,
                         uint ht_mask, ulong key, float qty) {
@@ -1981,6 +2352,86 @@ static void q20_ht_add(const device ulong* ht_keys, device atomic_float* ht_vals
 }
 )");
 
+    // Helper: CAS-based insert for the build phase. Metal M1 does not
+    // support 64-bit atomic CAS, so we use atomic_int CAS on the ps_idx
+    // slot (-1 sentinel) for ownership and write the 64-bit key
+    // non-atomically afterwards. The agg phase that probes ht_keys runs
+    // in a separate command buffer (waitUntilCompleted barrier), so
+    // build-phase writes are fully visible at probe time.
+    plan.helpers.push_back(R"(
+static void q20_ht_insert(device atomic_int* ht_psidx, device ulong* ht_keys,
+                           uint ht_mask, ulong key, int ps_idx) {
+    uint h = ((uint)(key ^ (key >> 32)) * 2654435769u) & ht_mask;
+    for (uint step = 0; step <= ht_mask; step++) {
+        uint slot = (h + step) & ht_mask;
+        int expected = -1;
+        if (atomic_compare_exchange_weak_explicit(
+                &ht_psidx[slot], &expected, ps_idx,
+                memory_order_relaxed, memory_order_relaxed)) {
+            ht_keys[slot] = key;
+            return;
+        }
+        // Slot taken by another insert. partsupp rows have unique (pk,sk)
+        // so duplicates cannot occur; just probe the next slot.
+    }
+}
+)");
+
+    // Phase 0: forest% bitmap from `part`.
+    {
+        auto scan = makeScan("part", idx, {{"p_partkey", "int"}, {"p_name", "char"}});
+        // p_name is fixed-width 55 chars; "forest" check at offset 0 of each row.
+        std::string base = "p_name[" + idx + "*55";
+        std::string pred =
+            "(" + base + "+0]=='f' && " + base + "+1]=='o' && " +
+            base + "+2]=='r' && " + base + "+3]=='e' && " +
+            base + "+4]=='s' && " + base + "+5]=='t')";
+        auto filter = std::make_unique<MetalSelection>(std::move(scan), pred);
+        auto bmp = std::make_unique<MetalBitmapBuild>(
+            std::move(filter), "d_q20_part_bitmap",
+            "p_partkey[" + idx + "]", "(maxPartkey + 31) / 32");
+        appendPhase(plan, "Q20_build_part_bitmap", std::move(bmp));
+    }
+
+    // Phase 1: build (pk,sk)→ps_idx HT from partsupp gated by bitmap.
+    {
+        auto scan = makeScan("partsupp", idx, {{"ps_partkey", "int"}, {"ps_suppkey", "int"}});
+        auto gated = std::make_unique<MetalSelection>(std::move(scan),
+            "bitmap_test(d_q20_part_bitmap, ps_partkey[" + idx + "])");
+        auto computeKey = std::make_unique<MetalComputeExpr>(
+            std::move(gated), "_psk", "ulong",
+            "(ulong)ps_partkey[" + idx + "] * (ulong)supp_mul + "
+            "(ulong)ps_suppkey[" + idx + "]");
+
+        struct HtInsertTerminal : MetalUnaryOperator {
+            std::string idx_;
+            HtInsertTerminal(std::unique_ptr<MetalOperator> c, std::string i)
+                : MetalUnaryOperator(std::move(c)), idx_(std::move(i)) {}
+            void produce(MetalCodegen& cg, ConsumerFn) override {
+                cg.addBufferParam("d_q20_ht_keys", "ulong", "q20HtSize",
+                                  /*zeroInit=*/true, /*fillByte=*/0xFF);
+                cg.addBufferParam("d_q20_ht_psidx", "atomic_int", "q20HtSize",
+                                  /*zeroInit=*/true, /*fillByte=*/0xFF);
+                // Allocate ht_vals here so the agg phase's extraBuffer
+                // (empty sizeExpr) finds an existing buffer. zero-init.
+                cg.addBufferParam("d_q20_ht_vals", "float", "q20HtSize",
+                                  /*zeroInit=*/true, /*fillByte=*/0);
+                child_->produce(cg, [&]() {
+                    cg.addLine(
+                        "q20_ht_insert(d_q20_ht_psidx, d_q20_ht_keys, "
+                        "d_q20_ht_mask, _psk, (int)" + idx_ + ");");
+                });
+            }
+            std::string describe() const override { return "Q20HtInsert"; }
+        };
+        auto term = std::make_unique<HtInsertTerminal>(std::move(computeKey), idx);
+        auto& phase = appendPhase(plan, "Q20_build_ht", std::move(term));
+        phase.bitmapReads.push_back({"d_q20_part_bitmap", ""});
+        phase.scalarParams.push_back({"d_q20_ht_mask", "uint"});
+        phase.scalarParams.push_back({"supp_mul", "uint"});
+    }
+
+    // Phase 2: lineitem aggregation (existing logic).
     {
         auto scan = makeScan("lineitem", idx, {
             {"l_partkey", "int"}, {"l_suppkey", "int"},
@@ -2004,9 +2455,9 @@ static void q20_ht_add(const device ulong* ht_keys, device atomic_float* ht_vals
             "l_quantity[" + idx + "]), 0)");
 
         auto& phase = appendPhase(plan, "Q20_lineitem_agg", std::move(hashAgg));
-        // Extra buffers
+        // Extra buffers: HT keys read-only; vals as atomic_float for adds.
         phase.extraBuffers.push_back({"d_q20_ht_keys", "ulong", true, false});
-        phase.extraBuffers.push_back({"d_q20_ht_vals", "atomic_float", false, true});
+        phase.extraBuffers.push_back({"d_q20_ht_vals", "atomic_float", false, false});
         phase.scalarParams.push_back({"d_q20_ht_mask", "uint"});
         phase.scalarParams.push_back({"supp_mul", "uint"});
     }
@@ -2097,9 +2548,14 @@ std::optional<MetalQueryPlan> buildMetalPlan(const AnalyzedQuery& aq,
     static const std::unordered_set<std::string> kChunkableNames = {
         "Q1", "Q6", "Q12", "Q14", "Q19",   // Tier A
         "Q4", "Q13",                          // Tier A′
-        "Q3", "Q5", "Q7", "Q8", "Q9", "Q10",  // Tier B
-        "Q15", "Q17", "Q18",                  // Tier B′
+        "Q3", "Q5", "Q7", "Q8", "Q10",        // Tier B (Q9 dropped — see below)
+        "Q15", "Q18",                         // Tier B′
         "Q11", "Q22",                         // Tier C
+        // Q9 and Q17: dropped from chunkable set. Their plans now include
+        // pre-stream phases (bitmap/lookup/HT builds) whose outputs are
+        // read by the stream phase. The chunked driver only splits the
+        // stream table; supporting these would require running pre-stream
+        // phases once before chunk iteration.
     };
     const bool isMicrobench = queryName.rfind("MB", 0) == 0;
     if (kChunkableNames.count(queryName) || isMicrobench) {
@@ -2145,6 +2601,10 @@ MetalCodegen generateFromPlan(const MetalQueryPlan& plan) {
 
         if (phase.root) {
             phase.root->produce(cg, [](){});
+        }
+
+        if (phase.postDispatchHook) {
+            cg.setPhasePostDispatchHook(phase.postDispatchHook);
         }
 
         cg.endPhase();

@@ -177,14 +177,16 @@ MetalArrayStore::MetalArrayStore(std::unique_ptr<MetalOperator> child,
                                  const std::string& keyExpr,
                                  const std::string& valueExpr,
                                  const std::string& valueType,
-                                 const std::string& sizeExpr)
+                                 const std::string& sizeExpr,
+                                 int fillByte)
     : MetalUnaryOperator(std::move(child)),
       arrayName_(arrayName), keyExpr_(keyExpr), valueExpr_(valueExpr),
-      valueType_(valueType), sizeExpr_(sizeExpr) {}
+      valueType_(valueType), sizeExpr_(sizeExpr), fillByte_(fillByte) {}
 
 void MetalArrayStore::produce(MetalCodegen& cg, ConsumerFn consume) {
-    // Register array as device buffer, initialized to sentinel (-1 = 0xFF fill for int)
-    cg.addBufferParam(arrayName_, valueType_, sizeExpr_, true, 0xFF);
+    // Register array as device buffer; fillByte selects sentinel (0xFF = -1
+    // for signed-int arrays, 0 for non-negative value arrays).
+    cg.addBufferParam(arrayName_, valueType_, sizeExpr_, true, fillByte_);
 
     child_->produce(cg, [&]() {
         cg.addLine(arrayName_ + "[" + keyExpr_ + "] = " + valueExpr_ + ";");
@@ -394,7 +396,7 @@ void MetalKeyedAgg::produce(MetalCodegen& cg, ConsumerFn consume) {
     // the reduction overhead. With few aggs (e.g. 1 count), the barrier cost
     // exceeds the atomic savings, especially for low-selectivity joins.
     //
-    // Tuning knobs (empirical, see /memories/repo/metal_codegen_optimizations.md):
+    // Tuning knobs (empirical):
     //   - kMaxBucketsForTGReduce: per-thread accumulator array length cap.
     //     Above this, register pressure and TG-shared memory dominate.
     //   - kMinAggsForTGReduce: minimum aggs per row to amortise the two-level

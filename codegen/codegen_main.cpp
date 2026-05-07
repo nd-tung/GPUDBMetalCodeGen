@@ -56,9 +56,7 @@ static size_t g_chunkRowsExplicit = 0;    // user-set --chunk value (0 = unset);
 static bool   g_chunkDoubleBuffer = true;// --no-db uses one reusable chunk slot
 
 // Compare two canonical CSV blobs with float tolerance.
-// Column matching is done by name (header row), so queries whose GPU output
-// uses different column names (e.g. "bucket") or has extra/fewer columns than
-// the DuckDB golden are still validated for the columns they share.
+// Golden schemas must match exactly; numeric values are compared with tolerance.
 // Returns empty string on full match; a short diff message otherwise.
 static std::string compareCanonical(const std::string& got, const std::string& expected,
                                     double absTol, double relTol) {
@@ -124,6 +122,20 @@ static std::string compareCanonical(const std::string& got, const std::string& e
     auto aHdr = splitCsv(aLines[0]);
     auto bHdr = splitCsv(bLines[0]);
 
+    auto joinHdr = [](const std::vector<std::string>& hdr) {
+        std::string out;
+        for (size_t i = 0; i < hdr.size(); i++) {
+            if (i) out += ",";
+            out += hdr[i];
+        }
+        return out;
+    };
+
+    if (aHdr != bHdr) {
+        return "schema mismatch: got cols=[" + joinHdr(aHdr) +
+               "] expected cols=[" + joinHdr(bHdr) + "]";
+    }
+
     // Map: column name → (index-in-got, index-in-golden)
     std::vector<std::pair<size_t,size_t>> sharedCols;
     for (size_t ai = 0; ai < aHdr.size(); ai++) {
@@ -162,7 +174,13 @@ static std::string compareCanonical(const std::string& got, const std::string& e
         auto aRow = splitCsv(aLines[row + 1]);
         auto bRow = splitCsv(bLines[row + 1]);
         for (auto [ai, bi] : sharedCols) {
-            if (ai >= aRow.size() || bi >= bRow.size()) continue;
+            if (ai >= aRow.size() || bi >= bRow.size()) {
+                char buf[256];
+                snprintf(buf, sizeof(buf),
+                         "row %zu column count mismatch: got=%zu expected=%zu",
+                         row + 1, aRow.size(), bRow.size());
+                return buf;
+            }
             const std::string& av = aRow[ai];
             const std::string& bv = bRow[bi];
             if (av == bv) continue;
@@ -1366,13 +1384,15 @@ static bool runCodegenQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
         // Q18: filter qty > 300, join with preloaded orders, sort, top 100
         if (plan.name == "Q18") {
             auto* qtyBuf = executor.getAllocatedBuffer("d_order_qty");
-            if (qtyBuf) {
+            auto* lookupBuf = executor.getAllocatedBuffer("d_q18_ok_lookup");
+            if (qtyBuf && lookupBuf) {
                 float* qtys = (float*)qtyBuf->contents();
                 size_t n = qtyBuf->length() / sizeof(float);
-                auto& o_custkey = g_q18Post.o_custkey;
-                auto& o_totalprice = g_q18Post.o_totalprice;
-                auto& o_orderdate = g_q18Post.o_orderdate;
-                auto& okLookup = g_q18Post.okLookup;
+                const int*   o_custkey    = g_q18Post.o_custkey;
+                const float* o_totalprice = g_q18Post.o_totalprice;
+                const int*   o_orderdate  = g_q18Post.o_orderdate;
+                const int*   okLookup     = (const int*)lookupBuf->contents();
+                size_t okLookupLen = lookupBuf->length() / sizeof(int);
 
                 struct Q18Entry { int orderkey; int custkey; float totalprice; int orderdate; float qty; };
                 std::vector<Q18Entry> results;
@@ -1382,7 +1402,7 @@ static bool runCodegenQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
                     }
                 }
                 for (auto& r : results) {
-                    if (r.orderkey >= 0 && (size_t)r.orderkey < okLookup.size()) {
+                    if (r.orderkey >= 0 && (size_t)r.orderkey < okLookupLen) {
                         int idx = okLookup[r.orderkey];
                         if (idx >= 0) {
                             r.custkey = o_custkey[idx];
@@ -1488,12 +1508,17 @@ static bool runCodegenQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
         // Q20: check HT values against availqty, filter CANADA suppliers
         if (plan.name == "Q20") {
             auto& pd = g_q20Post;
-            if (pd.htValsBuf) {
-                const float* htVals = (const float*)pd.htValsBuf->contents();
+            auto* htKeysBuf  = executor.getAllocatedBuffer("d_q20_ht_keys");
+            auto* htValsBuf  = executor.getAllocatedBuffer("d_q20_ht_vals");
+            auto* htPsIdxBuf = executor.getAllocatedBuffer("d_q20_ht_psidx");
+            if (htKeysBuf && htValsBuf && htPsIdxBuf) {
+                const uint64_t* htKeys = (const uint64_t*)htKeysBuf->contents();
+                const float*    htVals = (const float*)htValsBuf->contents();
+                const int*      htPsIdx = (const int*)htPsIdxBuf->contents();
                 std::set<int> qualSuppkeys;
                 for (uint32_t slot = 0; slot < pd.htSlots; slot++) {
-                    if (pd.htKeys[slot] == ~uint64_t(0)) continue;
-                    int psIdx = pd.htPsIdx[slot];
+                    if (htKeys[slot] == ~uint64_t(0)) continue;
+                    int psIdx = htPsIdx[slot];
                     if (psIdx < 0) continue;
                     float sumQty = htVals[slot];
                     if (sumQty > 0.0f && (float)pd.ps_availqty[psIdx] > 0.5f * sumQty) {
@@ -1503,16 +1528,16 @@ static bool runCodegenQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
 
                 struct Q20Row { std::string name; std::string address; };
                 std::vector<Q20Row> rows;
-                auto extractFixedStr = [](const std::vector<char>& data, size_t idx, int width) {
-                    const char* base = data.data() + idx * width;
-                    int len = 0;
-                    while (len < width && base[len] != '\0') len++;
-                    return std::string(base, len);
-                };
-                for (size_t i = 0; i < pd.s_suppkey.size(); i++) {
+                for (size_t i = 0; i < pd.nS; i++) {
                     if (pd.s_nationkey[i] != pd.canada_nk) continue;
                     if (!qualSuppkeys.count(pd.s_suppkey[i])) continue;
-                    rows.push_back({extractFixedStr(pd.s_name, i, 25), extractFixedStr(pd.s_address, i, 40)});
+                    auto extractFixedStr = [](const char* base, int width) {
+                        int len = 0;
+                        while (len < width && base[len] != '\0') len++;
+                        return std::string(base, len);
+                    };
+                    rows.push_back({extractFixedStr(pd.s_name + i * 25, 25),
+                                    extractFixedStr(pd.s_address + i * 40, 40)});
                 }
                 std::sort(rows.begin(), rows.end(), [](const Q20Row& a, const Q20Row& b) {
                     return a.name < b.name;
@@ -1542,11 +1567,11 @@ static bool runCodegenQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
                 const uint32_t* partBitmap = (const uint32_t*)partBmpBuf->contents();
 
                 std::unordered_map<int, int> suppIdx;
-                for (size_t i = 0; i < pd.s_suppkey.size(); i++)
+                for (size_t i = 0; i < pd.nS; i++)
                     suppIdx[pd.s_suppkey[i]] = (int)i;
 
                 std::unordered_map<int, int> partIdx;
-                for (size_t i = 0; i < pd.p_partkey.size(); i++)
+                for (size_t i = 0; i < pd.nP; i++)
                     partIdx[pd.p_partkey[i]] = (int)i;
 
                 struct Q2Row {
@@ -1555,7 +1580,7 @@ static bool runCodegenQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
                     int p_partkey;
                 };
                 std::vector<Q2Row> rows;
-                for (size_t i = 0; i < pd.ps_partkey.size(); i++) {
+                for (size_t i = 0; i < pd.nPS; i++) {
                     int pk = pd.ps_partkey[i];
                     int sk = pd.ps_suppkey[i];
 
@@ -1581,18 +1606,17 @@ static bool runCodegenQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
                     row.s_acctbal = pd.s_acctbal[si];
                     row.p_partkey = pk;
 
-                    auto extractStr = [](const std::vector<char>& data, int idx, int width) {
-                        const char* base = data.data() + idx * width;
+                    auto extractStr = [](const char* base, int width) {
                         int len = 0;
                         while (len < width && base[len] != '\0') len++;
                         return std::string(base, len);
                     };
 
-                    row.s_name = extractStr(pd.s_name, si, 25);
-                    row.s_address = extractStr(pd.s_address, si, 40);
-                    row.s_phone = extractStr(pd.s_phone, si, 15);
-                    row.s_comment = extractStr(pd.s_comment, si, 101);
-                    row.p_mfgr = extractStr(pd.p_mfgr, pi, 25);
+                    row.s_name    = extractStr(pd.s_name    + si * 25,  25);
+                    row.s_address = extractStr(pd.s_address + si * 40,  40);
+                    row.s_phone   = extractStr(pd.s_phone   + si * 15,  15);
+                    row.s_comment = extractStr(pd.s_comment + si * 101, 101);
+                    row.p_mfgr    = extractStr(pd.p_mfgr    + pi * 25,  25);
                     row.n_name = (pd.s_nationkey[si] >= 0 && pd.s_nationkey[si] < (int)pd.nationNames.size())
                         ? pd.nationNames[pd.s_nationkey[si]] : "?";
 
@@ -1678,7 +1702,7 @@ static bool runCodegenQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
                 const uint32_t* suppCounts = (const uint32_t*)buf->contents();
 
                 std::unordered_map<int, int> suppIdx;
-                for (size_t i = 0; i < pd.s_suppkey.size(); i++)
+                for (size_t i = 0; i < pd.nS; i++)
                     suppIdx[pd.s_suppkey[i]] = (int)i;
 
                 struct Q21Row { std::string s_name; int numwait; };
@@ -1691,7 +1715,7 @@ static bool runCodegenQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
                             int len = 25;
                             while (len > 0 && (pd.s_name[si * 25 + len - 1] == ' ' ||
                                                pd.s_name[si * 25 + len - 1] == '\0')) len--;
-                            rows.push_back({std::string(pd.s_name.data() + si * 25, len),
+                            rows.push_back({std::string(pd.s_name + si * 25, len),
                                            (int)suppCounts[sk]});
                         }
                     }

@@ -7,6 +7,7 @@
 #include <map>
 #include <set>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace codegen {
@@ -127,7 +128,24 @@ MTL::Buffer* registerFilledBuffer(MTL::Device* device,
                                   int fillByte = 0) {
     size_t allocBytes = std::max(bytes, (size_t)4);
     auto* buffer = device->newBuffer(allocBytes, MTL::ResourceStorageModeShared);
-    memset(buffer->contents(), fillByte, allocBytes);
+    // Large fills are dominated by the CPU memset (>= 1 MB shows up in
+    // perf traces). Use a Metal blit fillBuffer for these — the GPU
+    // memsets at full bandwidth and overlaps with subsequent CPU prep.
+    // Small fills stay on CPU because the command-buffer dispatch is
+    // ~50 us of fixed overhead.
+    constexpr size_t kBlitThreshold = 256 * 1024;
+    if (allocBytes >= kBlitThreshold && executor.commandQueue()) {
+        auto* cmdBuf = executor.commandQueue()->commandBuffer();
+        auto* blit = cmdBuf->blitCommandEncoder();
+        blit->fillBuffer(buffer, NS::Range(0, allocBytes), (uint8_t)fillByte);
+        blit->endEncoding();
+        cmdBuf->commit();
+        // Don't wait — subsequent GPU phases naturally serialize behind
+        // this command buffer on the same queue. The buffer is safe to
+        // hand back immediately because no CPU reads it before phase 1.
+    } else {
+        memset(buffer->contents(), fillByte, allocBytes);
+    }
     executor.registerAllocatedBuffer(name, buffer);
     return buffer;
 }
@@ -177,401 +195,198 @@ bool prepareQueryPreprocessing(const std::string& queryName,
         if (!registerNameKey(device, executor, loadedTables, "nation", "BRAZIL",  "brazil_nk"))  return false;
     }
 
-    // Q22: compute avg balance for valid-prefix customers
-    if (queryName == "Q22") {
-        for (auto& [tblName, cols] : loadedTables) {
-            if (tblName == "customer") {
-                const auto& tdef = TPCHSchema::instance().table("customer");
-                const char*  phoneCols = cols.chars(tdef.col("c_phone").index);
-                const float* balCols   = cols.floats(tdef.col("c_acctbal").index);
-                size_t custCount = cols.rows();
-                double sumBal = 0.0;
-                int countBal = 0;
-                for (size_t j = 0; j < custCount; j++) {
-                    int prefix = (phoneCols[j * 15] - '0') * 10 + (phoneCols[j * 15 + 1] - '0');
-                    if (balCols[j] > 0.0f &&
-                        (prefix == 13 || prefix == 17 || prefix == 18 ||
-                         prefix == 23 || prefix == 29 || prefix == 30 || prefix == 31)) {
-                        sumBal += balCols[j];
-                        countBal++;
-                    }
-                }
-                float avgBal = (countBal > 0) ? (float)(sumBal / countBal) : 0.0f;
-                executor.registerScalarFloat("avg_bal", avgBal);
-                break;
-            }
-        }
-    }
+    // Q22: avg_bal computed on GPU via Q22_compute_avg_bal phase; the
+    // postDispatchHook registers the avg_bal scalar before the next phase.
 
     // Q11: resolve GERMANY nationkey
     if (queryName == "Q11") {
         if (!registerNameKey(device, executor, loadedTables, "nation", "GERMANY", "germany_nk")) return false;
     }
 
-    // Q17: build per-partkey threshold from loaded data
-    if (queryName == "Q17") {
-        auto pView = resolvePreprocessColumns(device, "part",
-            {{0, ColType::INT}, {3, ColType::CHAR_FIXED, 10}, {6, ColType::CHAR_FIXED, 10}},
-            loadedTables);
-        const auto& pCols = pView.get();
-        auto p_partkey = copyIntColumn(pCols, 0);
-        auto p_brand = copyCharColumn(pCols, 3, pCols.rows() * 10);
-        auto p_container = copyCharColumn(pCols, 6, pCols.rows() * 10);
-        size_t partRows = p_partkey.size();
+    // Q17: bitmap, per-partkey sum/count, and threshold test all run on
+    // GPU via Q17_build_bitmap and Q17_build_avg_qty phases.
 
-        // lineitem may be the stream table in chunked mode and therefore
-        // absent from loadedTables. resolvePreprocessColumns falls back to
-        // a one-time disk load (l_partkey + l_quantity = ~960 MB at SF20)
-        // which is freed when pView_li goes out of scope at end of block.
-        const auto& tpchSchema = TPCHSchema::instance();
-        const int liPartkeyIdx  = tpchSchema.table("lineitem").col("l_partkey").index;
-        const int liQuantityIdx = tpchSchema.table("lineitem").col("l_quantity").index;
-        auto liView = resolvePreprocessColumns(device, "lineitem",
-            {{liPartkeyIdx, ColType::INT}, {liQuantityIdx, ColType::FLOAT}},
-            loadedTables);
-        const auto& liCols = liView.get();
-        const int*   pl_partkey  = liCols.ints  (liPartkeyIdx);
-        const float* pl_quantity = liCols.floats(liQuantityIdx);
-        size_t liRows = liCols.rows();
-        if (!pl_partkey || !pl_quantity) {
-            std::cerr << "Q17 preprocessing: failed to obtain l_partkey/l_quantity\n";
+    // Q9: green-parts bitmap, lookup arrays, and partsupp HT all run on
+    // GPU. Host work: size the (pk,sk) HT and register its scalars
+    // (`d_ps_ht_mask`, `supp_mul`). HT is sized to next_pow2(2 * n_partsupp)
+    // so load factor stays ≤ 0.5.
+    if (queryName == "Q9") {
+        size_t nPartSupp = 0;
+        if (!executor.tryGetSymbol("n_partsupp", nPartSupp) || nPartSupp == 0) {
+            std::cerr << "Q9 preprocessing: n_partsupp symbol unavailable\n";
             return false;
         }
-
-        int maxPk = 0;
-        for (int pk : p_partkey) maxPk = std::max(maxPk, pk);
-        size_t mapSize = (size_t)(maxPk + 1);
-
-        std::vector<uint32_t> bitmap((mapSize + 31) / 32, 0);
-        for (size_t i = 0; i < partRows; i++) {
-            const char* brand = p_brand.data() + i * 10;
-            const char* cont = p_container.data() + i * 10;
-            bool isBrand23 = (brand[0]=='B' && brand[5]=='#' && brand[6]=='2' && brand[7]=='3');
-            bool isMedBox = (cont[0]=='M' && cont[1]=='E' && cont[2]=='D' && cont[3]==' ' &&
-                             cont[4]=='B' && cont[5]=='O' && cont[6]=='X');
-            if (isBrand23 && isMedBox) {
-                int pk = p_partkey[i];
-                bitmap[pk / 32] |= (1u << (pk % 32));
-            }
+        size_t maxSk = 0;
+        if (!executor.tryGetSymbol("maxSuppkey", maxSk) || maxSk == 0) {
+            std::cerr << "Q9 preprocessing: maxSuppkey symbol unavailable\n";
+            return false;
         }
-
-        std::vector<double> sumQty(mapSize, 0.0);
-        std::vector<int> cntQty(mapSize, 0);
-        for (size_t i = 0; i < liRows; i++) {
-            int pk = pl_partkey[i];
-            if (pk >= 0 && (size_t)pk < mapSize && (bitmap[pk / 32] >> (pk % 32)) & 1) {
-                sumQty[pk] += pl_quantity[i];
-                cntQty[pk]++;
-            }
-        }
-
-        std::vector<float> threshold(mapSize, 0.0f);
-        for (size_t pk = 0; pk < mapSize; pk++) {
-            if (cntQty[pk] > 0) {
-                threshold[pk] = (float)(0.2 * sumQty[pk] / cntQty[pk]);
-            }
-        }
-
-        uploadAndRegister(device, executor, "d_q17_threshold", threshold);
-        uploadAndRegister(device, executor, "d_q17_bitmap", bitmap);
+        size_t htSlots = 1;
+        while (htSlots < nPartSupp * 2) htSlots <<= 1;
+        executor.registerSymbol("q9HtSize", htSlots);
+        executor.registerScalarInt("d_ps_ht_mask", (int)(htSlots - 1));
+        executor.registerScalarInt("supp_mul", (int)maxSk);
     }
 
-    // Q9: build green-parts bitmap, lookup arrays, and partsupp HT
-    if (queryName == "Q9") {
-        auto pView = resolvePreprocessColumns(device, "part",
-            {{0, ColType::INT}, {1, ColType::CHAR_FIXED, 55}}, loadedTables);
-        const auto& pCols = pView.get();
-        auto p_partkey = copyIntColumn(pCols, 0);
-        auto p_name = copyCharColumn(pCols, 1, pCols.rows() * 55);
-
-        auto sView = resolvePreprocessColumns(device, "supplier",
-            {{0, ColType::INT}, {3, ColType::INT}}, loadedTables);
-        const auto& sCols = sView.get();
-        auto s_suppkey = copyIntColumn(sCols, 0);
-        auto s_nationkey = copyIntColumn(sCols, 3);
-
-        auto oView = resolvePreprocessColumns(device, "orders",
-            {{0, ColType::INT}, {4, ColType::DATE}}, loadedTables);
-        const auto& oCols = oView.get();
-        auto o_orderkey = copyIntColumn(oCols, 0);
-        auto o_orderdate = copyIntColumn(oCols, 4);
-
-        auto psView = resolvePreprocessColumns(device, "partsupp",
-            {{0, ColType::INT}, {1, ColType::INT}, {3, ColType::FLOAT}}, loadedTables);
-        const auto& psCols = psView.get();
-        auto ps_partkey = copyIntColumn(psCols, 0);
-        auto ps_suppkey = copyIntColumn(psCols, 1);
-        auto ps_supplycost = copyFloatColumn(psCols, 3);
-
-        auto nView = resolvePreprocessColumns(device, "nation",
-            {{0, ColType::INT}, {1, ColType::CHAR_FIXED, 25}}, loadedTables);
-        const auto& nCols = nView.get();
-        auto n_nationkey = copyIntColumn(nCols, 0);
-        auto n_name = copyCharColumn(nCols, 1, nCols.rows() * 25);
-
-        std::vector<std::string> nationNames(25);
-        for (size_t i = 0; i < n_nationkey.size(); i++) {
-            std::string nm;
-            for (int c = 0; c < 25; c++) {
-                char ch = n_name[i * 25 + c];
-                if (ch == ' ' || ch == '\0') break;
-                nm += ch;
-            }
-            nationNames[n_nationkey[i]] = nm;
-        }
-
-        int maxPk = 0;
-        for (int pk : p_partkey) maxPk = std::max(maxPk, pk);
-        size_t bmpInts = ((size_t)maxPk + 32) / 32;
-        std::vector<uint32_t> partBitmap(bmpInts, 0);
-        for (size_t i = 0; i < p_partkey.size(); i++) {
-            bool found = false;
-            for (int c = 0; c <= 50; c++) {
-                if (p_name[i * 55 + c] == 'g' && p_name[i * 55 + c + 1] == 'r' &&
-                    p_name[i * 55 + c + 2] == 'e' && p_name[i * 55 + c + 3] == 'e' &&
-                    p_name[i * 55 + c + 4] == 'n') { found = true; break; }
-            }
-            if (found) {
-                int pk = p_partkey[i];
-                partBitmap[pk / 32] |= (1u << (pk % 32));
-            }
-        }
-
-        int maxSk = 0;
-        for (int sk : s_suppkey) maxSk = std::max(maxSk, sk);
-        std::vector<int> sNatArray((size_t)maxSk + 1, -1);
-        for (size_t i = 0; i < s_suppkey.size(); i++)
-            sNatArray[s_suppkey[i]] = s_nationkey[i];
-
-        int maxOk = 0;
-        for (int ok : o_orderkey) maxOk = std::max(maxOk, ok);
-        std::vector<int> oYearArray((size_t)maxOk + 1, 0);
-        for (size_t i = 0; i < o_orderkey.size(); i++)
-            oYearArray[o_orderkey[i]] = o_orderdate[i] / 10000;
-
-        size_t psEntries = 0;
-        for (size_t i = 0; i < ps_partkey.size(); i++) {
-            int pk = ps_partkey[i];
-            if (pk >= 0 && (size_t)pk / 32 < bmpInts && (partBitmap[pk / 32] >> (pk % 32)) & 1)
-                psEntries++;
-        }
-        uint32_t htSlots = 1;
-        while (htSlots < psEntries * 2) htSlots <<= 1;
-        uint32_t htMask = htSlots - 1;
-        uint32_t suppMul = (uint32_t)(maxSk + 1);
-        std::vector<uint32_t> htKeys(htSlots, 0xFFFFFFFFu);
-        std::vector<float> htVals(htSlots, 0.0f);
-        for (size_t i = 0; i < ps_partkey.size(); i++) {
-            int pk = ps_partkey[i];
-            if (pk < 0 || (size_t)pk / 32 >= bmpInts || !((partBitmap[pk / 32] >> (pk % 32)) & 1))
-                continue;
-            uint32_t key = (uint32_t)pk * suppMul + (uint32_t)ps_suppkey[i];
-            uint32_t h = (key * kKnuthHashMul) & htMask;
-            for (uint32_t s = 0; s <= htMask; s++) {
-                uint32_t slot = (h + s) & htMask;
-                if (htKeys[slot] == 0xFFFFFFFFu) {
-                    htKeys[slot] = key;
-                    htVals[slot] = ps_supplycost[i];
-                    break;
-                }
-            }
-        }
-
-        uploadAndRegister(device, executor, "d_q9_part_bitmap", partBitmap);
-        uploadAndRegister(device, executor, "d_q9_s_nationkey", sNatArray);
-        uploadAndRegister(device, executor, "d_q9_o_year", oYearArray);
-        uploadAndRegister(device, executor, "d_ps_ht_keys", htKeys);
-        uploadAndRegister(device, executor, "d_ps_ht_vals", htVals);
-        executor.registerScalarInt("d_ps_ht_mask", (int)htMask);
-        executor.registerScalarInt("supp_mul", (int)suppMul);
-
-        static std::vector<std::string> q9NationNames;
-        q9NationNames = std::move(nationNames);
-    }
-
-    // Q20: build forest% bitmap, partsupp HT, CANADA filter
+    // Q20: forest bitmap, partsupp HT, and lineitem agg all run on GPU.
+    // Host work: tiny CANADA-nation lookup, supplier/partsupp mirrors for
+    // post-processing, HT sizing scalars.
     if (queryName == "Q20") {
-        auto pView = resolvePreprocessColumns(device, "part",
-            {{0, ColType::INT}, {1, ColType::CHAR_FIXED, 55}}, loadedTables);
-        const auto& pCols = pView.get();
-        auto p_partkey = copyIntColumn(pCols, 0);
-        auto p_name = copyCharColumn(pCols, 1, pCols.rows() * 55);
+        size_t nPartSupp = 0, maxSk = 0;
+        if (!executor.tryGetSymbol("n_partsupp", nPartSupp) || nPartSupp == 0) {
+            std::cerr << "Q20 preprocessing: n_partsupp symbol unavailable\n";
+            return false;
+        }
+        if (!executor.tryGetSymbol("maxSuppkey", maxSk) || maxSk == 0) {
+            std::cerr << "Q20 preprocessing: maxSuppkey symbol unavailable\n";
+            return false;
+        }
+        size_t htSlots = 1;
+        while (htSlots < nPartSupp * 2) htSlots <<= 1;
+        executor.registerSymbol("q20HtSize", htSlots);
+        executor.registerScalarInt("d_q20_ht_mask", (int)(htSlots - 1));
+        executor.registerScalarInt("supp_mul", (int)maxSk);
 
+        // Mirror borrows for post-processing.
         auto psView = resolvePreprocessColumns(device, "partsupp",
             {{0, ColType::INT}, {1, ColType::INT}, {2, ColType::INT}}, loadedTables);
-        const auto& psCols = psView.get();
-        auto ps_partkey = copyIntColumn(psCols, 0);
-        auto ps_suppkey = copyIntColumn(psCols, 1);
-        auto ps_availqty = copyIntColumn(psCols, 2);
+        if (!psView.borrowed) g_q20Post.ownedPartsupp = std::move(psView.owned);
+        const QueryColumns& psCols = psView.borrowed ? *psView.borrowed : g_q20Post.ownedPartsupp;
+        g_q20Post.ps_partkey  = psCols.ints(0);
+        g_q20Post.ps_suppkey  = psCols.ints(1);
+        g_q20Post.ps_availqty = psCols.ints(2);
+        g_q20Post.nPS = psCols.rows();
 
         auto sView = resolvePreprocessColumns(device, "supplier",
             {{0, ColType::INT}, {1, ColType::CHAR_FIXED, 25}, {2, ColType::CHAR_FIXED, 40}, {3, ColType::INT}},
             loadedTables);
-        const auto& sCols = sView.get();
-        auto s_suppkey = copyIntColumn(sCols, 0);
-        auto s_name = copyCharColumn(sCols, 1, sCols.rows() * 25);
-        auto s_address = copyCharColumn(sCols, 2, sCols.rows() * 40);
-        auto s_nationkey = copyIntColumn(sCols, 3);
+        if (!sView.borrowed) g_q20Post.ownedSupplier = std::move(sView.owned);
+        const QueryColumns& sCols = sView.borrowed ? *sView.borrowed : g_q20Post.ownedSupplier;
+        g_q20Post.s_suppkey   = sCols.ints(0);
+        g_q20Post.s_name      = sCols.chars(1);
+        g_q20Post.s_address   = sCols.chars(2);
+        g_q20Post.s_nationkey = sCols.ints(3);
+        g_q20Post.nS = sCols.rows();
 
         auto nView = resolvePreprocessColumns(device, "nation",
             {{0, ColType::INT}, {1, ColType::CHAR_FIXED, 25}}, loadedTables);
         const auto& nCols = nView.get();
-        auto n_nationkey = copyIntColumn(nCols, 0);
-        auto n_name = copyCharColumn(nCols, 1, nCols.rows() * 25);
-
-        int canada_nk = -1;
-        for (size_t i = 0; i < n_nationkey.size(); i++) {
-            if (n_name[i * 25] == 'C' && n_name[i * 25 + 1] == 'A' &&
-                n_name[i * 25 + 2] == 'N') {
-                canada_nk = n_nationkey[i];
+        const int*  nk_p = nCols.ints(0);
+        const char* nm_p = nCols.chars(1);
+        for (size_t i = 0; i < nCols.rows(); i++) {
+            if (nm_p[i*25]=='C' && nm_p[i*25+1]=='A' && nm_p[i*25+2]=='N') {
+                g_q20Post.canada_nk = nk_p[i];
                 break;
             }
         }
 
-        int maxPk = 0;
-        for (int pk : p_partkey) maxPk = std::max(maxPk, pk);
-        size_t bmpInts = ((size_t)maxPk + 32) / 32;
-        std::vector<uint32_t> partBitmap(bmpInts, 0);
-        for (size_t i = 0; i < p_partkey.size(); i++) {
-            const char* nm = p_name.data() + i * 55;
-            if (nm[0]=='f' && nm[1]=='o' && nm[2]=='r' && nm[3]=='e' &&
-                nm[4]=='s' && nm[5]=='t') {
-                partBitmap[p_partkey[i] / 32] |= (1u << (p_partkey[i] % 32));
-            }
-        }
-
-        size_t psEntries = 0;
-        for (size_t i = 0; i < ps_partkey.size(); i++) {
-            int pk = ps_partkey[i];
-            if (pk >= 0 && (size_t)pk / 32 < bmpInts && (partBitmap[pk / 32] >> (pk % 32)) & 1)
-                psEntries++;
-        }
-        uint32_t htSlots = 1;
-        while (htSlots < psEntries * 2) htSlots <<= 1;
-        uint32_t htMask = htSlots - 1;
-        int maxSk = 0;
-        for (int sk : ps_suppkey) maxSk = std::max(maxSk, sk);
-        uint32_t suppMul = (uint32_t)(maxSk + 1);
-        // 64-bit packed key: at SF20 maxPk*suppMul ~ 8e11 overflows uint32.
-        std::vector<uint64_t> htKeys(htSlots, ~uint64_t(0));
-        std::vector<int> htPsIdx(htSlots, -1);
-        for (size_t i = 0; i < ps_partkey.size(); i++) {
-            int pk = ps_partkey[i];
-            if (pk < 0 || (size_t)pk / 32 >= bmpInts || !((partBitmap[pk / 32] >> (pk % 32)) & 1))
-                continue;
-            uint64_t key = (uint64_t)pk * (uint64_t)suppMul + (uint64_t)ps_suppkey[i];
-            uint32_t h = ((uint32_t)(key ^ (key >> 32)) * kKnuthHashMul) & htMask;
-            for (uint32_t s = 0; s <= htMask; s++) {
-                uint32_t slot = (h + s) & htMask;
-                if (htKeys[slot] == ~uint64_t(0)) {
-                    htKeys[slot] = key;
-                    htPsIdx[slot] = (int)i;
-                    break;
-                }
-            }
-        }
-
-        uploadAndRegister(device, executor, "d_q20_part_bitmap", partBitmap);
-        uploadAndRegister(device, executor, "d_q20_ht_keys", htKeys);
-        auto* htValsBuf = registerFilledBuffer(device, executor, "d_q20_ht_vals",
-                               htSlots * sizeof(float));
-        executor.registerScalarInt("d_q20_ht_mask", (int)htMask);
-        executor.registerScalarInt("supp_mul", (int)suppMul);
-
-        g_q20Post.ps_partkey = std::move(ps_partkey);
-        g_q20Post.ps_suppkey = std::move(ps_suppkey);
-        g_q20Post.ps_availqty = std::move(ps_availqty);
-        g_q20Post.htKeys = std::move(htKeys);
-        g_q20Post.htPsIdx = std::move(htPsIdx);
-        g_q20Post.htMask = htMask;
-        g_q20Post.htSlots = htSlots;
-        g_q20Post.s_suppkey = std::move(s_suppkey);
-        g_q20Post.s_nationkey = std::move(s_nationkey);
-        g_q20Post.s_name = std::move(s_name);
-        g_q20Post.s_address = std::move(s_address);
-        g_q20Post.canada_nk = canada_nk;
-        g_q20Post.htValsBuf = htValsBuf;
+        g_q20Post.htMask = (uint32_t)(htSlots - 1);
+        g_q20Post.htSlots = (uint32_t)htSlots;
     }
 
     // Q2: build EUROPE supplier bitmap, allocate part bitmap (filled by GPU Phase 1)
     if (queryName == "Q2") {
         auto pView = resolvePreprocessColumns(device, "part",
             {{0, ColType::INT}, {2, ColType::CHAR_FIXED, 25}}, loadedTables);
-        const auto& pCols = pView.get();
-        auto p_partkey = copyIntColumn(pCols, 0);
-        auto p_mfgr = copyCharColumn(pCols, 2, pCols.rows() * 25);
-
         auto sView = resolvePreprocessColumns(device, "supplier", {
             {0, ColType::INT}, {1, ColType::CHAR_FIXED, 25}, {2, ColType::CHAR_FIXED, 40},
             {3, ColType::INT}, {4, ColType::CHAR_FIXED, 15}, {5, ColType::FLOAT},
             {6, ColType::CHAR_FIXED, 101}
         }, loadedTables);
-        const auto& sCols = sView.get();
-        auto s_suppkey = copyIntColumn(sCols, 0);
-        auto s_name = copyCharColumn(sCols, 1, sCols.rows() * 25);
-        auto s_address = copyCharColumn(sCols, 2, sCols.rows() * 40);
-        auto s_nationkey = copyIntColumn(sCols, 3);
-        auto s_phone = copyCharColumn(sCols, 4, sCols.rows() * 15);
-        auto s_acctbal = copyFloatColumn(sCols, 5);
-        auto s_comment = copyCharColumn(sCols, 6, sCols.rows() * 101);
-
         auto psView = resolvePreprocessColumns(device, "partsupp",
             {{0, ColType::INT}, {1, ColType::INT}, {3, ColType::FLOAT}}, loadedTables);
-        const auto& psCols = psView.get();
-        auto ps_partkey = copyIntColumn(psCols, 0);
-        auto ps_suppkey = copyIntColumn(psCols, 1);
-        auto ps_supplycost = copyFloatColumn(psCols, 3);
-
         auto nView = resolvePreprocessColumns(device, "nation",
             {{0, ColType::INT}, {1, ColType::CHAR_FIXED, 25}, {2, ColType::INT}}, loadedTables);
-        const auto& nCols = nView.get();
-        auto n_nationkey = copyIntColumn(nCols, 0);
-        auto n_name = copyCharColumn(nCols, 1, nCols.rows() * 25);
-        auto n_regionkey = copyIntColumn(nCols, 2);
-
         auto rView = resolvePreprocessColumns(device, "region",
             {{0, ColType::INT}, {1, ColType::CHAR_FIXED, 25}}, loadedTables);
+
+        if (!pView.borrowed)  g_q2Post.ownedPart     = std::move(pView.owned);
+        if (!sView.borrowed)  g_q2Post.ownedSupplier = std::move(sView.owned);
+        if (!psView.borrowed) g_q2Post.ownedPartsupp = std::move(psView.owned);
+        const QueryColumns& pCols  = pView.borrowed  ? *pView.borrowed  : g_q2Post.ownedPart;
+        const QueryColumns& sCols  = sView.borrowed  ? *sView.borrowed  : g_q2Post.ownedSupplier;
+        const QueryColumns& psCols = psView.borrowed ? *psView.borrowed : g_q2Post.ownedPartsupp;
+        const auto& nCols = nView.get();
         const auto& rCols = rView.get();
-        auto r_regionkey = copyIntColumn(rCols, 0);
-        auto r_name = copyCharColumn(rCols, 1, rCols.rows() * 25);
+
+        const size_t nP  = pCols.rows();
+        const size_t nS  = sCols.rows();
+        const size_t nPS = psCols.rows();
+        const size_t nN  = nCols.rows();
+        const size_t nR  = rCols.rows();
+
+        g_q2Post.ps_partkey    = psCols.ints(0);
+        g_q2Post.ps_suppkey    = psCols.ints(1);
+        g_q2Post.ps_supplycost = psCols.floats(3);
+        g_q2Post.nPS = nPS;
+
+        g_q2Post.s_suppkey   = sCols.ints(0);
+        g_q2Post.s_name      = sCols.chars(1);
+        g_q2Post.s_address   = sCols.chars(2);
+        g_q2Post.s_nationkey = sCols.ints(3);
+        g_q2Post.s_phone     = sCols.chars(4);
+        g_q2Post.s_acctbal   = sCols.floats(5);
+        g_q2Post.s_comment   = sCols.chars(6);
+        g_q2Post.nS = nS;
+
+        g_q2Post.p_partkey = pCols.ints(0);
+        g_q2Post.p_mfgr    = pCols.chars(2);
+        g_q2Post.nP = nP;
+
+        // Small serial work: nation/region scans + bitmap derivation.
+        const int*  n_nationkey = nCols.ints(0);
+        const char* n_name      = nCols.chars(1);
+        const int*  n_regionkey = nCols.ints(2);
+        const int*  r_regionkey = rCols.ints(0);
+        const char* r_name      = rCols.chars(1);
 
         int europe_rk = -1;
-        for (size_t i = 0; i < r_regionkey.size(); i++) {
-            if (r_name[i * 25] == 'E' && r_name[i * 25 + 1] == 'U' &&
-                r_name[i * 25 + 2] == 'R' && r_name[i * 25 + 3] == 'O') {
+        for (size_t i = 0; i < nR; i++) {
+            if (r_name[i*25]=='E' && r_name[i*25+1]=='U' &&
+                r_name[i*25+2]=='R' && r_name[i*25+3]=='O') {
                 europe_rk = r_regionkey[i];
                 break;
             }
         }
 
         std::set<int> europeNks;
-        for (size_t i = 0; i < n_nationkey.size(); i++) {
-            if (n_regionkey[i] == europe_rk)
-                europeNks.insert(n_nationkey[i]);
+        for (size_t i = 0; i < nN; i++) {
+            if (n_regionkey[i] == europe_rk) europeNks.insert(n_nationkey[i]);
         }
 
         std::vector<std::string> nationNames(25);
-        for (size_t i = 0; i < n_nationkey.size(); i++) {
+        for (size_t i = 0; i < nN; i++) {
             int len = 25;
-            while (len > 0 && (n_name[i * 25 + len - 1] == ' ' || n_name[i * 25 + len - 1] == '\0')) len--;
-            nationNames[n_nationkey[i]] = std::string(n_name.data() + i * 25, len);
+            while (len > 0 && (n_name[i*25 + len - 1] == ' ' || n_name[i*25 + len - 1] == '\0')) len--;
+            nationNames[n_nationkey[i]] = std::string(n_name + i*25, len);
         }
 
-        int maxSk = 0;
-        for (int sk : s_suppkey) maxSk = std::max(maxSk, sk);
+        // Use canonical maxSuppkey/maxPartkey symbols (registered as count = max + 1).
+        size_t maxSkSym = 0, maxPkSym = 0;
+        int maxSk, maxPk;
+        if (executor.tryGetSymbol("maxSuppkey", maxSkSym) && maxSkSym > 0) {
+            maxSk = (int)(maxSkSym - 1);
+        } else {
+            maxSk = 0;
+            for (size_t i = 0; i < nS; i++) maxSk = std::max(maxSk, g_q2Post.s_suppkey[i]);
+        }
+        if (executor.tryGetSymbol("maxPartkey", maxPkSym) && maxPkSym > 0) {
+            maxPk = (int)(maxPkSym - 1);
+        } else {
+            maxPk = 0;
+            for (size_t i = 0; i < nP; i++) maxPk = std::max(maxPk, g_q2Post.p_partkey[i]);
+        }
+
         size_t suppBmpInts = ((size_t)maxSk + 32) / 32;
         std::vector<uint32_t> eurSuppBitmap(suppBmpInts, 0);
-        for (size_t i = 0; i < s_suppkey.size(); i++) {
-            if (europeNks.count(s_nationkey[i])) {
-                int sk = s_suppkey[i];
+        for (size_t i = 0; i < nS; i++) {
+            if (europeNks.count(g_q2Post.s_nationkey[i])) {
+                int sk = g_q2Post.s_suppkey[i];
                 eurSuppBitmap[sk / 32] |= (1u << (sk % 32));
             }
         }
 
-        int maxPk = 0;
-        for (int pk : p_partkey) maxPk = std::max(maxPk, pk);
         size_t partBmpInts = ((size_t)maxPk + 32) / 32;
-
         registerFilledBuffer(device, executor, "d_q2_part_bitmap",
                      partBmpInts * sizeof(uint32_t));
 
@@ -580,195 +395,126 @@ bool prepareQueryPreprocessing(const std::string& queryName,
                             minCostSize * sizeof(uint32_t), 0xFF);
         uploadAndRegister(device, executor, "d_q2_supp_bitmap", eurSuppBitmap);
 
-        g_q2Post.ps_partkey = std::move(ps_partkey);
-        g_q2Post.ps_suppkey = std::move(ps_suppkey);
-        g_q2Post.ps_supplycost = std::move(ps_supplycost);
-        g_q2Post.s_suppkey = std::move(s_suppkey);
-        g_q2Post.s_nationkey = std::move(s_nationkey);
-        g_q2Post.s_acctbal = std::move(s_acctbal);
-        g_q2Post.s_name = std::move(s_name);
-        g_q2Post.s_address = std::move(s_address);
-        g_q2Post.s_phone = std::move(s_phone);
-        g_q2Post.s_comment = std::move(s_comment);
-        g_q2Post.p_partkey = std::move(p_partkey);
-        g_q2Post.p_mfgr = std::move(p_mfgr);
         g_q2Post.nationNames = std::move(nationNames);
         g_q2Post.eurSuppBitmap = std::move(eurSuppBitmap);
         g_q2Post.maxPartkey = maxPk;
         g_q2Post.minCostBuf = minCostBuf;
     }
 
-    // Q16: build part_group_map, allocate complaint bitmap (filled by GPU Phase 1)
+    // Q16: GPU-side filter+key compaction. The CPU dictionary build
+    // (formerly ~22-470 ms across SF1\u2013SF20) is replaced by a GPU phase
+    // (Q16_filter_compact in the plan) that emits a compact list of
+    // qualifying part rows + 64-bit (brand_idx, size, fnv32(type)) keys.
+    // The post-dispatch hook then builds the dict from ~12 % of the
+    // input rows.
     if (queryName == "Q16") {
         auto pView = resolvePreprocessColumns(device, "part",
             {{0, ColType::INT}, {3, ColType::CHAR_FIXED, 10}, {4, ColType::CHAR_FIXED, 25}, {5, ColType::INT}},
             loadedTables);
-        const auto& pCols = pView.get();
-        auto p_partkey = copyIntColumn(pCols, 0);
-        auto p_brand = copyCharColumn(pCols, 3, pCols.rows() * 10);
-        auto p_type = copyCharColumn(pCols, 4, pCols.rows() * 25);
-        auto p_size = copyIntColumn(pCols, 5);
+        if (!pView.borrowed) g_q16Post.ownedPart = std::move(pView.owned);
+        const QueryColumns& pCols = pView.borrowed ? *pView.borrowed : g_q16Post.ownedPart;
+        const int*  p_partkey = pCols.ints(0);
+        size_t nPart = pCols.rows();
+        g_q16Post.p_partkey = p_partkey;
+        g_q16Post.p_brand = pCols.chars(3);
+        g_q16Post.p_type  = pCols.chars(4);
+        g_q16Post.nPart   = nPart;
 
-        // Get maxSk from loaded supplier data (standard mechanism loads it for Phase 1)
-        int maxSk = 0;
-        const auto& tpchSchema3 = TPCHSchema::instance();
-        for (auto& [tblName, cols] : loadedTables) {
-            if (tblName == "supplier") {
-                const int* skCol = cols.ints(tpchSchema3.table("supplier").col("s_suppkey").index);
-                size_t n = cols.rows();
-                if (skCol) for (size_t i = 0; i < n; ++i) maxSk = std::max(maxSk, skCol[i]);
-            }
+        // maxSk for complaint bitmap from canonical maxSuppkey symbol
+        // (registered as count = max + 1) \u2014 avoids re-scanning supplier.tbl.
+        size_t maxSkSym = 0;
+        if (!executor.tryGetSymbol("maxSuppkey", maxSkSym) || maxSkSym == 0) {
+            std::cerr << "Q16 preprocessing: maxSuppkey symbol unavailable\n";
+            return false;
         }
+        int maxSk = (int)(maxSkSym - 1);
+        g_q16Post.maxSk = maxSk;
         size_t complaintBmpInts = ((size_t)maxSk + 32) / 32;
 
         registerFilledBuffer(device, executor, "d_q16_complaint_bitmap",
                      complaintBmpInts * sizeof(uint32_t));
 
-        std::set<int> validSizes = {49, 14, 23, 45, 19, 3, 36, 9};
-        struct GroupKey { std::string brand; std::string type; int size;
-            bool operator<(const GroupKey& o) const {
-                if (brand != o.brand) return brand < o.brand;
-                if (type != o.type) return type < o.type;
-                return size < o.size;
-            }
-        };
-        std::map<GroupKey, int> groupMap;
-        std::vector<Q16PostData::GroupKey> groups;
-
-        int maxPk = 0;
-        for (int pk : p_partkey) maxPk = std::max(maxPk, pk);
-        std::vector<int> partGroupMap((size_t)maxPk + 1, -1);
-
-        for (size_t i = 0; i < p_partkey.size(); i++) {
-            const char* br = p_brand.data() + i * 10;
-            int brLen = 10;
-            while (brLen > 0 && (br[brLen-1] == ' ' || br[brLen-1] == '\0')) brLen--;
-            std::string brand(br, brLen);
-
-            const char* tp = p_type.data() + i * 25;
-            int tpLen = 25;
-            while (tpLen > 0 && (tp[tpLen-1] == ' ' || tp[tpLen-1] == '\0')) tpLen--;
-            std::string type(tp, tpLen);
-
-            int size = p_size[i];
-
-            if (brand == "Brand#45") continue;
-            if (tpLen >= 15 && tp[0]=='M' && tp[1]=='E' && tp[2]=='D' && tp[3]=='I' &&
-                tp[4]=='U' && tp[5]=='M' && tp[6]==' ' && tp[7]=='P' && tp[8]=='O' &&
-                tp[9]=='L' && tp[10]=='I' && tp[11]=='S' && tp[12]=='H' && tp[13]=='E' &&
-                tp[14]=='D') continue;
-            if (!validSizes.count(size)) continue;
-
-            GroupKey gk{brand, type, size};
-            auto it = groupMap.find(gk);
-            int gid;
-            if (it == groupMap.end()) {
-                gid = (int)groups.size();
-                groupMap[gk] = gid;
-                groups.push_back({brand, type, size});
-            } else {
-                gid = it->second;
-            }
-            partGroupMap[p_partkey[i]] = gid;
+        // maxPartkey from canonical symbol (set during table load).
+        size_t maxPkSym = 0;
+        if (executor.tryGetSymbol("maxPartkey", maxPkSym) && maxPkSym > 0) {
+            g_q16Post.maxPartkey = (int)(maxPkSym - 1);
+        } else {
+            int maxPk = 0;
+            for (size_t i = 0; i < nPart; i++) maxPk = std::max(maxPk, p_partkey[i]);
+            g_q16Post.maxPartkey = maxPk;
         }
 
-        uint32_t numGroups = (uint32_t)groups.size();
-        uint32_t bvInts = ((uint32_t)maxSk + 32) / 32;
-
-        uploadAndRegister(device, executor, "d_q16_part_group_map", partGroupMap);
-        size_t gbmBytes = (size_t)numGroups * bvInts * sizeof(uint32_t);
-        auto* gbmBuf = registerFilledBuffer(device, executor, "d_q16_group_bitmaps", gbmBytes);
-        executor.registerScalarInt("d_q16_bv_ints", (int)bvInts);
-
-        g_q16Post.groups = std::move(groups);
-        g_q16Post.bvInts = bvInts;
-        g_q16Post.numGroups = numGroups;
-        g_q16Post.groupBitmapsBuf = gbmBuf;
+        // Pre-allocate compaction buffers + the part_group_map.  The
+        // Q16_filter_compact GPU phase fills filt_idx/filt_key/count;
+        // its post-dispatch hook builds groups[] and writes into
+        // d_q16_part_group_map (pre-filled with -1) directly.
+        registerFilledBuffer(device, executor, "d_q16_filt_count", sizeof(uint32_t));
+        registerFilledBuffer(device, executor, "d_q16_filt_idx",  nPart * sizeof(uint32_t));
+        registerFilledBuffer(device, executor, "d_q16_filt_key",  nPart * sizeof(uint64_t));
+        registerFilledBuffer(device, executor, "d_q16_part_group_map",
+                             ((size_t)g_q16Post.maxPartkey + 1) * sizeof(int32_t), 0xFF);
+        // d_q16_group_bitmaps is allocated by the post-dispatch hook
+        // once numGroups is known.
     }
 
-    // Q18: preload orders.tbl for post-processing (avoids reloading during post)
     if (queryName == "Q18") {
         auto oView = resolvePreprocessColumns(device, "orders",
-            {{0, ColType::INT}, {1, ColType::INT}, {3, ColType::FLOAT}, {4, ColType::DATE}},
+            {{1, ColType::INT}, {3, ColType::FLOAT}, {4, ColType::DATE}},
             loadedTables);
-        const auto& oCols = oView.get();
-        auto okeys = copyIntColumn(oCols, 0);
-        g_q18Post.o_custkey = copyIntColumn(oCols, 1);
-        g_q18Post.o_totalprice = copyFloatColumn(oCols, 3);
-        g_q18Post.o_orderdate = copyIntColumn(oCols, 4);
-        // Build direct-mapped orderkey -> row index
-        int maxOk = 0;
-        for (int k : okeys) if (k > maxOk) maxOk = k;
-        g_q18Post.okLookup.assign(maxOk + 1, -1);
-        for (size_t j = 0; j < okeys.size(); j++)
-            g_q18Post.okLookup[okeys[j]] = (int)j;
+        // Take ownership when the view had to be loaded fresh — otherwise
+        // the borrowed pointers below would dangle as soon as oView dies.
+        if (!oView.borrowed) g_q18Post.ownedOrders = std::move(oView.owned);
+        const QueryColumns& oCols = oView.borrowed ? *oView.borrowed : g_q18Post.ownedOrders;
+        g_q18Post.o_custkey    = oCols.ints(1);
+        g_q18Post.o_totalprice = oCols.floats(3);
+        g_q18Post.o_orderdate  = oCols.ints(4);
+        // okLookup is now built by the Q18_build_ok_lookup GPU phase
+        // and read directly from d_q18_ok_lookup in post.
     }
 
-    // Q21: allocate GPU buffers for phases, build SA-supp bitmap (tiny)
+    // Q21: GPU builds the SAUDI-supplier bitmap (Q21_build_sa_supp).
+    // Host: nation lookup for sa_nk, small s_suppkey/s_name mirror for
+    // post-processing, scratch-array allocations sized via the canonical
+    // maxOrderkey/maxSuppkey symbols.
     if (queryName == "Q21") {
-        // Load supplier/nation for SA bitmap + post-processing (small tables)
+        if (!registerNameKey(device, executor, loadedTables, "nation",
+                             "SAUDI ARABIA", "sa_nk")) {
+            return false;
+        }
+
         auto sView = resolvePreprocessColumns(device, "supplier",
-            {{0, ColType::INT}, {1, ColType::CHAR_FIXED, 25}, {3, ColType::INT}}, loadedTables);
-        const auto& sCols = sView.get();
-        auto s_suppkey = copyIntColumn(sCols, 0);
-        auto s_name = copyCharColumn(sCols, 1, sCols.rows() * 25);
-        auto s_nationkey = copyIntColumn(sCols, 3);
-
-        auto nView = resolvePreprocessColumns(device, "nation",
             {{0, ColType::INT}, {1, ColType::CHAR_FIXED, 25}}, loadedTables);
-        const auto& nCols = nView.get();
-        auto n_nationkey = copyIntColumn(nCols, 0);
-        auto n_name = copyCharColumn(nCols, 1, nCols.rows() * 25);
+        if (!sView.borrowed) g_q21Post.ownedSupplier = std::move(sView.owned);
+        const QueryColumns& sCols = sView.borrowed ? *sView.borrowed : g_q21Post.ownedSupplier;
+        g_q21Post.s_suppkey = sCols.ints(0);
+        g_q21Post.s_name    = sCols.chars(1);
+        g_q21Post.nS        = sCols.rows();
 
-        int sa_nk = -1;
-        for (size_t i = 0; i < n_nationkey.size(); i++) {
-            if (n_name[i * 25] == 'S' && n_name[i * 25 + 1] == 'A' &&
-                n_name[i * 25 + 2] == 'U' && n_name[i * 25 + 3] == 'D') {
-                sa_nk = n_nationkey[i];
-                break;
-            }
+        size_t maxOkSym = 0, maxSkSym = 0;
+        if (!executor.tryGetSymbol("maxOrderkey", maxOkSym) ||
+            !executor.tryGetSymbol("maxSuppkey", maxSkSym)) {
+            std::cerr << "Q21 preprocessing: maxOrderkey/maxSuppkey symbols unavailable\n";
+            return false;
         }
+        // Symbols are registered as actualMax + 1, i.e. element counts.
+        size_t fBmpInts = (maxOkSym + 31) / 32;
+        size_t okMapSize = maxOkSym;
+        size_t suppCountSize = maxSkSym;
 
-        int maxSk = 0;
-        for (int sk : s_suppkey) maxSk = std::max(maxSk, sk);
-        size_t saBmpInts = ((size_t)maxSk + 32) / 32;
-        std::vector<uint32_t> saBitmap(saBmpInts, 0);
-        for (size_t i = 0; i < s_suppkey.size(); i++) {
-            if (s_nationkey[i] == sa_nk) {
-                int sk = s_suppkey[i];
-                saBitmap[sk / 32] |= (1u << (sk % 32));
-            }
-        }
-
-        uploadAndRegister(device, executor, "d_q21_sa_supp", saBitmap);
-
-        // Find max orderkey from loaded orders data for buffer sizing
-        int maxOk = 0;
-        const auto& tpchSchema2 = TPCHSchema::instance();
-        for (auto& [tblName, cols] : loadedTables) {
-            if (tblName == "orders") {
-                const int* okCol = cols.ints(tpchSchema2.table("orders").col("o_orderkey").index);
-                size_t n = cols.rows();
-                if (okCol) for (size_t i = 0; i < n; ++i) maxOk = std::max(maxOk, okCol[i]);
-            }
-        }
-
-        size_t fBmpInts = ((size_t)maxOk + 32) / 32;
-        size_t okMapSize = (size_t)maxOk + 1;
-
-        registerFilledBuffer(device, executor, "d_q21_f_orders", fBmpInts * sizeof(uint32_t));
-        registerFilledBuffer(device, executor, "d_q21_first_supp", okMapSize * sizeof(int), 0xFF);
-        registerFilledBuffer(device, executor, "d_q21_first_late", okMapSize * sizeof(int), 0xFF);
-        registerFilledBuffer(device, executor, "d_q21_multi_supp", fBmpInts * sizeof(uint32_t));
-        registerFilledBuffer(device, executor, "d_q21_multi_late", fBmpInts * sizeof(uint32_t));
-
-        size_t suppCountSize = (size_t)maxSk + 1;
+        registerFilledBuffer(device, executor, "d_q21_f_orders",
+                     fBmpInts * sizeof(uint32_t));
+        registerFilledBuffer(device, executor, "d_q21_first_supp",
+                     okMapSize * sizeof(int), 0xFF);
+        registerFilledBuffer(device, executor, "d_q21_first_late",
+                     okMapSize * sizeof(int), 0xFF);
+        registerFilledBuffer(device, executor, "d_q21_multi_supp",
+                     fBmpInts * sizeof(uint32_t));
+        registerFilledBuffer(device, executor, "d_q21_multi_late",
+                     fBmpInts * sizeof(uint32_t));
         registerFilledBuffer(device, executor, "d_q21_supp_count",
                      suppCountSize * sizeof(uint32_t));
 
-        g_q21Post.s_suppkey = std::move(s_suppkey);
-        g_q21Post.s_name = std::move(s_name);
-        g_q21Post.maxSuppkey = maxSk;
+        g_q21Post.maxSuppkey = (int)(maxSkSym - 1);
     }
 
     return true;

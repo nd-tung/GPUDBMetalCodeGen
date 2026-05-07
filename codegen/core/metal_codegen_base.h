@@ -23,6 +23,12 @@ namespace codegen {
 using ConsumerFn = std::function<void()>;
 
 class MetalCodegen;
+class MetalGenericExecutor;
+
+// Host hook run after a phase's GPU dispatch completes. May read output
+// buffers via executor.getAllocatedBuffer() and feed scalars to later
+// phases via registerScalarFloat()/registerScalarInt().
+using PostDispatchHook = std::function<void(MetalGenericExecutor&)>;
 
 class MetalCodegen {
 public:
@@ -57,6 +63,7 @@ public:
     void setPhaseThreadgroupSize(int size);
     void setPhaseSingleThread(bool single);
     void setPhaseMaxThreadgroups(int max);
+    void setPhasePostDispatchHook(PostDispatchHook hook);
 
     // ---------------------------------------------------------------
     // Parameter registration (creates MetalParamBinding entries)
@@ -136,6 +143,10 @@ public:
         int maxThreadgroups = 0;
         bool isSingleThread = false;
         std::vector<MetalParamBinding> bindings;
+        // Optional host-side callback invoked by the executor after this
+        // phase's GPU dispatch completes. Used to read back GPU-computed
+        // scalars and feed them to later phases (replaces CPU preprocessing).
+        PostDispatchHook postDispatchHook;
     };
     const std::vector<PhaseInfo>& getPhases() const;
 

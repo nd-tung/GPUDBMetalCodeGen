@@ -320,16 +320,14 @@ inline std::vector<size_t> buildLineIndexParallel(const char* base, size_t size,
         for (auto& th : ts) th.join();
     }
     // Account for the implicit "line 0 start at offset 0" written by thread 0.
-    // Without this offset shift, thread 1 would overwrite thread 0's last
-    // newline-position write at slot threadCounts[0], and the very last entry
-    // would store the past-EOF position written by the last thread's final
-    // newline — producing a phantom all-zero "row" at the end of the table.
+    // Each later thread starts after all newline offsets written by earlier
+    // threads, plus the implicit line-0 entry.
     threadStarts[0] = 0;
     {
         size_t acc = 1;  // thread 0's implicit line-0 entry
         for (int t = 1; t < nThreads; t++) {
-            threadStarts[t] = acc;
             acc += threadCounts[t - 1];
+            threadStarts[t] = acc;
         }
     }
 

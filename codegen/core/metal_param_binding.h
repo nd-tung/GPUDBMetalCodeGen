@@ -60,7 +60,8 @@ struct MetalParamBinding {
     // Return the byte size of one element based on elementType.
     // Centralises type→size mapping that was previously scattered as string checks.
     size_t elemSizeBytes() const {
-        if (elementType == "long"  || elementType == "ulong"  || elementType == "double") return 8;
+        if (elementType == "long"  || elementType == "ulong"  || elementType == "double" ||
+            elementType == "atomic_long" || elementType == "atomic_ulong") return 8;
         if (elementType == "char"  || elementType == "uchar")  return 1;
         if (elementType == "short" || elementType == "ushort") return 2;
         return 4; // uint, int, float, atomic_uint, atomic_int, …
