@@ -282,6 +282,15 @@ bool prepareQueryPreprocessing(const std::string& queryName,
 
         g_q20Post.htMask = (uint32_t)(htSlots - 1);
         g_q20Post.htSlots = (uint32_t)htSlots;
+
+        // Q20_filter_ht_to_bitmap GPU phase: range scan htSlots and
+        // atomic-OR set qualifying suppkey bits into d_q20_qual_supp_bitmap.
+        // Replaces the q20HtSize-row CPU loop building std::set qualSuppkeys.
+        executor.registerSymbol("n_q20_ht_slots", htSlots);
+        executor.registerScalarInt("n_q20_ht_slots", (int)htSlots);
+        size_t qualBmpInts = (maxSk + 32) / 32;
+        registerFilledBuffer(device, executor, "d_q20_qual_supp_bitmap",
+                             qualBmpInts * sizeof(uint32_t));
     }
 
     // Q2: build EUROPE supplier bitmap, allocate part bitmap (filled by GPU Phase 1)
@@ -391,14 +400,42 @@ bool prepareQueryPreprocessing(const std::string& queryName,
                      partBmpInts * sizeof(uint32_t));
 
         size_t minCostSize = (size_t)maxPk + 1;
-        auto* minCostBuf = registerFilledBuffer(device, executor, "d_q2_min_cost",
+        registerFilledBuffer(device, executor, "d_q2_min_cost",
                             minCostSize * sizeof(uint32_t), 0xFF);
         uploadAndRegister(device, executor, "d_q2_supp_bitmap", eurSuppBitmap);
 
+        // Direct-address part/supp index arrays for the Q2 CPU post.
+        // Replaces unordered_map<int,int> builds (200K supp + 4M parts at SF20).
+        std::vector<int> partIdxArr((size_t)maxPk + 1, -1);
+        for (size_t i = 0; i < nP; i++) {
+            int pk = g_q2Post.p_partkey[i];
+            if (pk >= 0 && pk <= maxPk) partIdxArr[pk] = (int)i;
+        }
+        std::vector<int> suppIdxArr((size_t)maxSk + 1, -1);
+        for (size_t i = 0; i < nS; i++) {
+            int sk = g_q2Post.s_suppkey[i];
+            if (sk >= 0 && sk <= maxSk) suppIdxArr[sk] = (int)i;
+        }
+
         g_q2Post.nationNames = std::move(nationNames);
-        g_q2Post.eurSuppBitmap = std::move(eurSuppBitmap);
         g_q2Post.maxPartkey = maxPk;
-        g_q2Post.minCostBuf = minCostBuf;
+        g_q2Post.maxSuppkey = maxSk;
+        g_q2Post.partIdxArr = std::move(partIdxArr);
+        g_q2Post.suppIdxArr = std::move(suppIdxArr);
+
+        // Q2_compact GPU phase: re-scans partsupp with both bitmaps +
+        // cost==min equality, atomic-appends a compact (pk, sk, psi)
+        // list. Replaces the 80M-row CPU loop in Q2 post.
+        constexpr uint32_t kQ2CompactCap = 1u << 18;
+        executor.registerScalarInt("q2_compact_cap", (int)kQ2CompactCap);
+        registerFilledBuffer(device, executor, "d_q2_compact_count",
+                             sizeof(uint32_t));
+        registerFilledBuffer(device, executor, "d_q2_compact_pk",
+                             (size_t)kQ2CompactCap * sizeof(uint32_t));
+        registerFilledBuffer(device, executor, "d_q2_compact_sk",
+                             (size_t)kQ2CompactCap * sizeof(uint32_t));
+        registerFilledBuffer(device, executor, "d_q2_compact_psi",
+                             (size_t)kQ2CompactCap * sizeof(uint32_t));
     }
 
     // Q16: GPU-side filter+key compaction. The CPU dictionary build
@@ -457,6 +494,43 @@ bool prepareQueryPreprocessing(const std::string& queryName,
         // once numGroups is known.
     }
 
+    // Q3: GPU compact-emit needs range-scan size + compact buffers.
+    if (queryName == "Q3") {
+        size_t maxOk = 0;
+        executor.tryGetSymbol("maxOrderkey", maxOk);
+        executor.registerSymbol("n_q3_oks", maxOk);
+        executor.registerScalarInt("n_q3_oks", (int)maxOk);
+        // Q3 selectivity is ~5% of orders at SF1 (BUILDING segment * date<1995-03-15
+        // intersected with shipdate>1995-03-15); cap at maxOk to be safe.
+        size_t cap = std::max<size_t>(maxOk, (size_t)(1u << 12));
+        executor.registerScalarInt("q3_compact_cap", (int)cap);
+        registerFilledBuffer(device, executor, "d_q3_compact_count",
+                             sizeof(uint32_t));
+        registerFilledBuffer(device, executor, "d_q3_compact_ok",
+                             cap * sizeof(uint32_t));
+        registerFilledBuffer(device, executor, "d_q3_compact_rev",
+                             cap * sizeof(float));
+    }
+
+    // Q10: GPU compact-emit phase needs a range-scan size and capped
+    // output buffers. Falls back to no-op when symbols unavailable.
+    if (queryName == "Q10") {
+        size_t maxCk = 0;
+        executor.tryGetSymbol("maxCustkey", maxCk);
+        executor.registerSymbol("n_q10_cks", maxCk);
+        executor.registerScalarInt("n_q10_cks", (int)maxCk);
+        // Q10 selectivity is high: most customers have at least one
+        // returned-item lineitem at SF>=1. Cap at maxCk to be safe.
+        size_t cap = std::max<size_t>(maxCk, (size_t)(1u << 12));
+        executor.registerScalarInt("q10_compact_cap", (int)cap);
+        registerFilledBuffer(device, executor, "d_q10_compact_count",
+                             sizeof(uint32_t));
+        registerFilledBuffer(device, executor, "d_q10_compact_ck",
+                             cap * sizeof(uint32_t));
+        registerFilledBuffer(device, executor, "d_q10_compact_rev",
+                             cap * sizeof(float));
+    }
+
     if (queryName == "Q18") {
         auto oView = resolvePreprocessColumns(device, "orders",
             {{1, ColType::INT}, {3, ColType::FLOAT}, {4, ColType::DATE}},
@@ -470,6 +544,29 @@ bool prepareQueryPreprocessing(const std::string& queryName,
         g_q18Post.o_orderdate  = oCols.ints(4);
         // okLookup is now built by the Q18_build_ok_lookup GPU phase
         // and read directly from d_q18_ok_lookup in post.
+
+        // Q18_compact phase: range scan over [0, maxOrderkey+1) of
+        // d_order_qty, atomic-append qualifying (ok, qty) pairs into a
+        // small compact list. Replaces the maxOrderkey-sized CPU loop
+        // (~150M iterations at SF100) with ~few-hundred CPU iterations.
+        size_t maxOk = 0;
+        executor.tryGetSymbol("maxOrderkey", maxOk);
+        // n_q18_oks doubles as both the dispatch sizing symbol (used by
+        // the executor when scannedTable=="q18_oks") and the kernel's
+        // loop bound scalar.
+        executor.registerSymbol("n_q18_oks", maxOk);
+        executor.registerScalarInt("n_q18_oks", (int)maxOk);
+        // Cap matches the d_q18_compact_* buffer slot count. At all
+        // realistic SF the qualifying-order count is in the hundreds;
+        // 1<<20 leaves multiple orders of safety margin.
+        constexpr uint32_t kQ18CompactCap = 1u << 20;
+        executor.registerScalarInt("q18_compact_cap", (int)kQ18CompactCap);
+        registerFilledBuffer(device, executor, "d_q18_compact_count",
+                             sizeof(uint32_t));
+        registerFilledBuffer(device, executor, "d_q18_compact_ok",
+                             (size_t)kQ18CompactCap * sizeof(uint32_t));
+        registerFilledBuffer(device, executor, "d_q18_compact_qty",
+                             (size_t)kQ18CompactCap * sizeof(float));
     }
 
     // Q21: GPU builds the SAUDI-supplier bitmap (Q21_build_sa_supp).
@@ -513,8 +610,6 @@ bool prepareQueryPreprocessing(const std::string& queryName,
                      fBmpInts * sizeof(uint32_t));
         registerFilledBuffer(device, executor, "d_q21_supp_count",
                      suppCountSize * sizeof(uint32_t));
-
-        g_q21Post.maxSuppkey = (int)(maxSkSym - 1);
     }
 
     return true;

@@ -53,6 +53,35 @@ std::string MetalGridStrideScan::describe() const {
 }
 
 // ===================================================================
+// MetalRangeScan
+// ===================================================================
+
+MetalRangeScan::MetalRangeScan(const std::string& rangeName, const std::string& idxVar)
+    : rangeName_(rangeName), idxVar_(idxVar) {}
+
+void MetalRangeScan::produce(MetalCodegen& cg, ConsumerFn consume) {
+    cg.setPhaseScannedTable(rangeName_);
+    cg.addScalarParam("n_" + rangeName_, "uint");
+    for (const auto& sc : sideColumns_) {
+        cg.addColumnParam(sc.param, sc.type, sc.table);
+    }
+    cg.addBlock("for (uint " + idxVar_ + " = tid; " + idxVar_ + " < n_" +
+                rangeName_ + "; " + idxVar_ + " += tpg)", [&]() {
+        consume();
+    });
+}
+
+void MetalRangeScan::addSideColumn(const std::string& tableName,
+                                    const std::string& paramName,
+                                    const std::string& metalType) {
+    sideColumns_.push_back({tableName, paramName, metalType});
+}
+
+std::string MetalRangeScan::describe() const {
+    return "RangeScan(" + rangeName_ + ")";
+}
+
+// ===================================================================
 // MetalSelection
 // ===================================================================
 

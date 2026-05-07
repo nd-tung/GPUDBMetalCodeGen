@@ -741,6 +741,41 @@ static std::optional<MetalQueryPlan> buildQ10Plan(const AnalyzedQuery& aq) {
         appendPhase(plan, "Q10_probe_aggregate", std::move(agg));
     }
 
+    // Phase 3: GPU compact-emit qualifying customers (rev > 0). Range
+    // scan over [0, n_q10_cks) reads dense d_cust_revenue and atomic-
+    // appends (custkey, revenue) pairs into a compact list. Replaces
+    // the maxCustkey-sized CPU loop with iteration over only the
+    // (typically all-customers) qualifying set.
+    plan.helpers.push_back(R"(
+static void q10_compact_emit(device atomic_uint* counter,
+                              device uint* out_ck,
+                              device float* out_rev,
+                              const device float* d_cust_revenue,
+                              uint q10_compact_cap,
+                              uint ck) {
+    float r = d_cust_revenue[ck];
+    if (!(r > 0.0f)) return;
+    uint slot = atomic_fetch_add_explicit(counter, 1u, memory_order_relaxed);
+    if (slot < q10_compact_cap) {
+        out_ck[slot] = ck;
+        out_rev[slot] = r;
+    }
+}
+)");
+    {
+        auto rscan = std::make_unique<MetalRangeScan>("q10_cks", idxVar);
+        auto sideEffect = std::make_unique<MetalComputeExpr>(
+            std::move(rscan), "_q10_unused", "int",
+            "(q10_compact_emit(d_q10_compact_count, d_q10_compact_ck, "
+            "d_q10_compact_rev, d_cust_revenue, q10_compact_cap, " + idxVar + "), 0)");
+        auto& phase = appendPhase(plan, "Q10_compact", std::move(sideEffect));
+        phase.extraBuffers.push_back({"d_q10_compact_count", "atomic_uint", false, true});
+        phase.extraBuffers.push_back({"d_q10_compact_ck",    "uint",        false, false});
+        phase.extraBuffers.push_back({"d_q10_compact_rev",   "float",       false, false});
+        phase.extraBuffers.push_back({"d_cust_revenue",      "float",       true,  false});
+        phase.scalarParams.push_back({"q10_compact_cap", "uint"});
+    }
+
     return plan;
 }
 
@@ -1239,6 +1274,41 @@ static std::optional<MetalQueryPlan> buildQ3Plan_byName() {
         appendPhase(plan, "Q3_probe_aggregate", std::move(agg));
     }
 
+    // Phase 4: GPU compact-emit qualifying (orderkey, revenue) pairs.
+    // Range scan over [0, n_q3_oks) reads dense d_order_revenue and
+    // atomic-appends to a compact list. CPU joins with the existing
+    // d_orders_date_map / d_orders_prio_map for date+prio and partial-
+    // sorts to top 10.
+    plan.helpers.push_back(R"(
+static void q3_compact_emit(device atomic_uint* counter,
+                             device uint* out_ok,
+                             device float* out_rev,
+                             const device float* d_order_revenue,
+                             uint q3_compact_cap,
+                             uint ok) {
+    float r = d_order_revenue[ok];
+    if (!(r > 0.0f)) return;
+    uint slot = atomic_fetch_add_explicit(counter, 1u, memory_order_relaxed);
+    if (slot < q3_compact_cap) {
+        out_ok[slot] = ok;
+        out_rev[slot] = r;
+    }
+}
+)");
+    {
+        auto rscan = std::make_unique<MetalRangeScan>("q3_oks", idx);
+        auto sideEffect = std::make_unique<MetalComputeExpr>(
+            std::move(rscan), "_q3_unused", "int",
+            "(q3_compact_emit(d_q3_compact_count, d_q3_compact_ok, "
+            "d_q3_compact_rev, d_order_revenue, q3_compact_cap, " + idx + "), 0)");
+        auto& phase = appendPhase(plan, "Q3_compact", std::move(sideEffect));
+        phase.extraBuffers.push_back({"d_q3_compact_count", "atomic_uint", false, true});
+        phase.extraBuffers.push_back({"d_q3_compact_ok",    "uint",        false, false});
+        phase.extraBuffers.push_back({"d_q3_compact_rev",   "float",       false, false});
+        phase.extraBuffers.push_back({"d_order_revenue",    "float",       true,  false});
+        phase.scalarParams.push_back({"q3_compact_cap", "uint"});
+    }
+
     return plan;
 }
 
@@ -1568,11 +1638,31 @@ static std::optional<MetalQueryPlan> buildQ15Plan_byName() {
 }
 
 // ===================================================================
-// Q18: Large Volume Customer — 2 GPU phases + CPU filter/sort
+// Q18: Large Volume Customer — 3 GPU phases (incl. compact emit), CPU sort
 // ===================================================================
 static std::optional<MetalQueryPlan> buildQ18Plan_byName() {
     std::string idx = "i";
     MetalQueryPlan plan;
+
+    // Helper: per-orderkey filter + atomic-append into compact list.
+    // Caps writes at q18CompactCap to avoid out-of-bounds on extreme inputs;
+    // the tight cap is sized in preprocessing (1<<20 slots).
+    plan.helpers.push_back(R"(
+static void q18_compact_emit(device atomic_uint* counter,
+                              device uint* out_ok,
+                              device float* out_qty,
+                              const device float* d_order_qty,
+                              uint q18_compact_cap,
+                              uint ok) {
+    float q = d_order_qty[ok];
+    if (!(q > 300.0f)) return;
+    uint slot = atomic_fetch_add_explicit(counter, 1u, memory_order_relaxed);
+    if (slot < q18_compact_cap) {
+        out_ok[slot] = ok;
+        out_qty[slot] = q;
+    }
+}
+)");
 
     // Phase 1: build orderkey -> orders-row-index lookup on GPU
     // (replaces the 1.5M sequential CPU writes that previously dominated
@@ -1597,6 +1687,24 @@ static std::optional<MetalQueryPlan> buildQ18Plan_byName() {
             "atomic_float", "float");
 
         appendPhase(plan, "Q18_aggregate", std::move(agg));
+    }
+
+    // Phase 3: GPU compact-emit qualifying orderkeys (qty > 300).
+    // Range scan over [0, n_q18_oks) reads the dense d_order_qty
+    // direct-address array and appends compact (ok, qty) pairs. The CPU
+    // post then iterates only the small qualifying set.
+    {
+        auto rscan = std::make_unique<MetalRangeScan>("q18_oks", idx);
+        auto sideEffect = std::make_unique<MetalComputeExpr>(
+            std::move(rscan), "_q18_unused", "int",
+            "(q18_compact_emit(d_q18_compact_count, d_q18_compact_ok, "
+            "d_q18_compact_qty, d_order_qty, q18_compact_cap, " + idx + "), 0)");
+        auto& phase = appendPhase(plan, "Q18_compact", std::move(sideEffect));
+        phase.extraBuffers.push_back({"d_q18_compact_count", "atomic_uint", false, true});
+        phase.extraBuffers.push_back({"d_q18_compact_ok",    "uint",        false, false});
+        phase.extraBuffers.push_back({"d_q18_compact_qty",   "float",       false, false});
+        phase.extraBuffers.push_back({"d_order_qty",         "float",       true,  false});
+        phase.scalarParams.push_back({"q18_compact_cap", "uint"});
     }
 
     return plan;
@@ -2017,10 +2125,19 @@ static void q16_filter_emit(device atomic_uint* counter,
             ex.registerAllocatedBuffer("d_q16_group_bitmaps", gbmBuf);
             ex.registerScalarInt("d_q16_bv_ints", (int)bvInts);
 
+            // Phase 4 (Q16_popcount_groups) reduces each group's bitmap on
+            // GPU. Allocate the count buffer and register the dispatch
+            // size symbol/scalar (one thread per word).
+            size_t cntBytes = std::max<size_t>((size_t)numGroups * sizeof(uint32_t), 4);
+            auto* cntBuf2 = dev->newBuffer(cntBytes, MTL::ResourceStorageModeShared);
+            std::memset(cntBuf2->contents(), 0, cntBytes);
+            ex.registerAllocatedBuffer("d_q16_group_counts", cntBuf2);
+            size_t popWords = (size_t)numGroups * (size_t)bvInts;
+            ex.registerSymbol("n_q16_pop_words", popWords);
+            ex.registerScalarInt("n_q16_pop_words", (int)popWords);
+
             pd.groups = std::move(groups);
-            pd.bvInts = bvInts;
             pd.numGroups = numGroups;
-            pd.groupBitmapsBuf = gbmBuf;
         };
     }
 
@@ -2095,6 +2212,38 @@ static void q16_bitmap_set(device atomic_uint* group_bitmaps, uint bv_ints,
 
         auto& phase = appendPhase(plan, "Q16_scan_bitmap", std::move(bitmapSet));
         phase.extraBuffers.push_back({"d_q16_group_bitmaps", "atomic_uint", false});
+        phase.scalarParams.push_back({"d_q16_bv_ints", "uint"});
+    }
+
+    // Phase 4: GPU popcount per group → d_q16_group_counts. Replaces a
+    // CPU popcount loop over numGroups * bvInts uint32 entries (~70 ms
+    // at SF20). Dispatch is one thread per (group, word) — each thread
+    // reads one uint32, popcounts it, and atomically adds to its group
+    // counter. This keeps SIMD-group memory accesses sequential.
+    plan.helpers.push_back(R"(
+static void q16_popcount_word(const device uint* group_bitmaps,
+                               device atomic_uint* group_counts,
+                               uint bv_ints,
+                               uint i) {
+    uint gid = i / bv_ints;
+    uint w   = i - gid * bv_ints;
+    uint p = popcount(group_bitmaps[i]);
+    if (p) atomic_fetch_add_explicit(&group_counts[gid], p, memory_order_relaxed);
+    (void)w;
+}
+)");
+    {
+        auto rscan = std::make_unique<MetalRangeScan>("q16_pop_words", idx);
+        auto sideEffect = std::make_unique<MetalComputeExpr>(
+            std::move(rscan), "_q16_pc_unused", "int",
+            "(q16_popcount_word(d_q16_group_bitmaps, d_q16_group_counts, "
+            "d_q16_bv_ints, " + idx + "), 0)");
+        auto& phase = appendPhase(plan, "Q16_popcount_groups", std::move(sideEffect));
+        // Re-bind d_q16_group_bitmaps as plain uint readonly (same MTL::Buffer
+        // as the prior phase's atomic_uint binding — bit-identical storage,
+        // queue barrier makes prior atomic-OR writes visible).
+        phase.extraBuffers.push_back({"d_q16_group_bitmaps", "uint",        true,  false});
+        phase.extraBuffers.push_back({"d_q16_group_counts",  "atomic_uint", false, true});
         phase.scalarParams.push_back({"d_q16_bv_ints", "uint"});
     }
 
@@ -2313,6 +2462,54 @@ static void q2_atomic_min(device atomic_uint* min_cost, uint partkey, float cost
         phase.extraBuffers.push_back({"d_q2_min_cost", "atomic_uint", false});
     }
 
+    // Phase 3: GPU compact-emit. Scan partsupp once more with both
+    // bitmap probes AND the supplycost==min_cost equality test, atomic-
+    // append (partkey, suppkey, ps_idx) to a small list. Replaces the
+    // 80M-row CPU loop in the post block.
+    plan.helpers.push_back(R"(
+static void q2_compact_emit(device atomic_uint* counter,
+                             device uint* out_pk, device uint* out_sk, device uint* out_psi,
+                             const device uint* d_q2_min_cost,
+                             uint cap, uint pk, uint sk, float supplycost, uint i) {
+    uint minU = d_q2_min_cost[pk];
+    if (minU == 0xFFFFFFFFu) return;
+    float minCost = as_type<float>(minU);
+    if (supplycost != minCost) return;
+    uint slot = atomic_fetch_add_explicit(counter, 1u, memory_order_relaxed);
+    if (slot < cap) {
+        out_pk[slot] = pk;
+        out_sk[slot] = sk;
+        out_psi[slot] = i;
+    }
+}
+)");
+    {
+        auto scan = makeScan("partsupp", idx, {
+            {"ps_partkey", "int"}, {"ps_suppkey", "int"}, {"ps_supplycost", "float"}
+        });
+        auto partProbe = std::make_unique<MetalBitmapProbe>(
+            std::move(scan), "d_q2_part_bitmap", "ps_partkey[" + idx + "]");
+        auto suppProbe = std::make_unique<MetalBitmapProbe>(
+            std::move(partProbe), "d_q2_supp_bitmap", "ps_suppkey[" + idx + "]");
+        auto sideEffect = std::make_unique<MetalComputeExpr>(
+            std::move(suppProbe), "_q2_unused", "int",
+            "(q2_compact_emit(d_q2_compact_count, d_q2_compact_pk, "
+            "d_q2_compact_sk, d_q2_compact_psi, d_q2_min_cost, "
+            "q2_compact_cap, "
+            "(uint)ps_partkey[" + idx + "], (uint)ps_suppkey[" + idx + "], "
+            "ps_supplycost[" + idx + "], " + idx + "), 0)");
+        auto& phase = appendPhase(plan, "Q2_compact", std::move(sideEffect));
+        phase.extraBuffers.push_back({"d_q2_compact_count", "atomic_uint", false, true});
+        phase.extraBuffers.push_back({"d_q2_compact_pk",    "uint",        false, false});
+        phase.extraBuffers.push_back({"d_q2_compact_sk",    "uint",        false, false});
+        phase.extraBuffers.push_back({"d_q2_compact_psi",   "uint",        false, false});
+        // Re-bind the existing d_q2_min_cost buffer as read-only `uint`.
+        // The same MTL::Buffer is bound; the type is just for kernel
+        // compilation since this phase only reads (no atomics).
+        phase.extraBuffers.push_back({"d_q2_min_cost",      "uint",        true,  false});
+        phase.scalarParams.push_back({"q2_compact_cap", "uint"});
+    }
+
     return plan;
 }
 
@@ -2460,6 +2657,53 @@ static void q20_ht_insert(device atomic_int* ht_psidx, device ulong* ht_keys,
         phase.extraBuffers.push_back({"d_q20_ht_vals", "atomic_float", false, false});
         phase.scalarParams.push_back({"d_q20_ht_mask", "uint"});
         phase.scalarParams.push_back({"supp_mul", "uint"});
+    }
+
+    // Phase 3: GPU-build the qualifying-supplier bitmap. Range scan
+    // over [0, n_q20_ht_slots) reads ht_keys/ht_vals/ht_psidx and
+    // ps_availqty/ps_suppkey, then atomic-OR sets a bit for each
+    // qualifying suppkey. Replaces the q20HtSize-row CPU scan + std::set
+    // build that previously dominated Q20 post.
+    plan.helpers.push_back(R"(
+static void q20_qual_emit(const device ulong* ht_keys,
+                           const device float* ht_vals,
+                           const device int*   ht_psidx,
+                           const device int*   ps_availqty,
+                           const device int*   ps_suppkey,
+                           device atomic_uint* qual_supp_bitmap,
+                           uint slot) {
+    ulong k = ht_keys[slot];
+    if (k == 0xFFFFFFFFFFFFFFFFul) return;
+    int psIdx = ht_psidx[slot];
+    if (psIdx < 0) return;
+    float sumQty = ht_vals[slot];
+    if (!(sumQty > 0.0f)) return;
+    if ((float)ps_availqty[psIdx] <= 0.5f * sumQty) return;
+    int sk = ps_suppkey[psIdx];
+    if (sk < 0) return;
+    uint w = (uint)sk >> 5;
+    uint b = 1u << ((uint)sk & 31u);
+    atomic_fetch_or_explicit(&qual_supp_bitmap[w], b, memory_order_relaxed);
+}
+)");
+    {
+        auto rscan = std::make_unique<MetalRangeScan>("q20_ht_slots", idx);
+        rscan->addSideColumn("partsupp", "ps_availqty", "int");
+        rscan->addSideColumn("partsupp", "ps_suppkey",  "int");
+        auto sideEffect = std::make_unique<MetalComputeExpr>(
+            std::move(rscan), "_q20_unused", "int",
+            "(q20_qual_emit(d_q20_ht_keys, d_q20_ht_vals, d_q20_ht_psidx, "
+            "ps_availqty, ps_suppkey, d_q20_qual_supp_bitmap, " + idx + "), 0)");
+        auto& phase = appendPhase(plan, "Q20_filter_ht_to_bitmap", std::move(sideEffect));
+        // Re-bind the same MTL::Buffer for ht_keys/ht_vals/ht_psidx
+        // under their original names but as non-atomic read-only types
+        // (atomic-backed storage is bit-identical to its plain twin, and
+        // a queue barrier between phases makes the build-phase writes
+        // visible).
+        phase.extraBuffers.push_back({"d_q20_ht_keys",          "ulong", true,  false});
+        phase.extraBuffers.push_back({"d_q20_ht_vals",          "float", true,  false});
+        phase.extraBuffers.push_back({"d_q20_ht_psidx",         "int",   true,  false});
+        phase.extraBuffers.push_back({"d_q20_qual_supp_bitmap", "atomic_uint", false, true});
     }
 
     return plan;

@@ -24,7 +24,6 @@
 #include <mach/mach.h>
 #include <set>
 #include <map>
-#include <unordered_map>
 #include <algorithm>
 #include <memory>
 #include <optional>
@@ -1120,19 +1119,31 @@ static bool runCodegenQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
         // The correctness oracle (golden check) runs AFTER all blocks below.
         // ---------------------------------------------------------------
 
-        // Q10: top-20 from cust_revenue array
+        // Q10: GPU compact emits qualifying (custkey, revenue) pairs;
+        // CPU partial-sorts to top 20.
         if (plan.name == "Q10") {
-            auto* revBuf = executor.getAllocatedBuffer("d_cust_revenue");
-            if (revBuf) {
-                float* rev = (float*)revBuf->contents();
-                size_t numCust = revBuf->length() / sizeof(float);
+            auto* cntBuf = executor.getAllocatedBuffer("d_q10_compact_count");
+            auto* ckBuf  = executor.getAllocatedBuffer("d_q10_compact_ck");
+            auto* revBuf = executor.getAllocatedBuffer("d_q10_compact_rev");
+            if (cntBuf && ckBuf && revBuf) {
+                uint32_t n = *static_cast<uint32_t*>(cntBuf->contents());
+                size_t cap = ckBuf->length() / sizeof(uint32_t);
+                if (n > cap) n = (uint32_t)cap;
+                const uint32_t* cks  = (const uint32_t*)ckBuf->contents();
+                const float*    revs = (const float*)revBuf->contents();
                 std::vector<std::pair<float, int>> entries;
-                for (size_t ck = 0; ck < numCust; ck++) {
-                    if (rev[ck] > 0.0f) entries.push_back({rev[ck], (int)ck});
-                }
-                std::sort(entries.begin(), entries.end(),
-                          [](auto& a, auto& b) { return a.first > b.first; });
+                entries.reserve(n);
+                for (uint32_t k = 0; k < n; k++)
+                    entries.push_back({revs[k], (int)cks[k]});
                 int show = std::min((int)entries.size(), 20);
+                if (show < (int)entries.size()) {
+                    std::partial_sort(entries.begin(), entries.begin() + show,
+                                      entries.end(),
+                                      [](auto& a, auto& b) { return a.first > b.first; });
+                } else {
+                    std::sort(entries.begin(), entries.end(),
+                              [](auto& a, auto& b) { return a.first > b.first; });
+                }
                 result.result.columns = {{"c_custkey","int"},{"revenue","float"}};
                 result.result.rows.clear();
                 for (int j = 0; j < show; j++)
@@ -1226,28 +1237,42 @@ static bool runCodegenQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
             }
         }
 
-        // Q3: top-10 by revenue desc with date/prio
+        // Q3: GPU compact emits qualifying (orderkey, revenue); CPU
+        // joins with date_map + prio_map and partial-sorts top 10.
         if (plan.name == "Q3") {
-            auto* revBuf = executor.getAllocatedBuffer("d_order_revenue");
+            auto* cntBuf  = executor.getAllocatedBuffer("d_q3_compact_count");
+            auto* okBuf   = executor.getAllocatedBuffer("d_q3_compact_ok");
+            auto* revBuf  = executor.getAllocatedBuffer("d_q3_compact_rev");
             auto* dateBuf = executor.getAllocatedBuffer("d_orders_date_map");
             auto* prioBuf = executor.getAllocatedBuffer("d_orders_prio_map");
-            if (revBuf && dateBuf && prioBuf) {
-                float* rev = (float*)revBuf->contents();
+            if (cntBuf && okBuf && revBuf && dateBuf && prioBuf) {
+                uint32_t n = *static_cast<uint32_t*>(cntBuf->contents());
+                size_t cap = okBuf->length() / sizeof(uint32_t);
+                if (n > cap) n = (uint32_t)cap;
+                const uint32_t* oks  = (const uint32_t*)okBuf->contents();
+                const float*    revs = (const float*)revBuf->contents();
                 int* dates = (int*)dateBuf->contents();
                 int* prios = (int*)prioBuf->contents();
-                size_t n = revBuf->length() / sizeof(float);
+                size_t mapLen = dateBuf->length() / sizeof(int);
                 std::vector<std::tuple<float, int, int, int>> entries;
-                for (size_t ok = 0; ok < n; ok++) {
-                    if (rev[ok] > 0.0f) {
-                        entries.push_back({rev[ok], dates[ok], (int)ok, prios[ok]});
-                    }
+                entries.reserve(n);
+                for (uint32_t k = 0; k < n; k++) {
+                    int ok = (int)oks[k];
+                    int d  = ((size_t)ok < mapLen) ? dates[ok] : -1;
+                    int p  = ((size_t)ok < mapLen) ? prios[ok] : 0;
+                    entries.push_back({revs[k], d, ok, p});
                 }
-                std::sort(entries.begin(), entries.end(),
-                    [](auto& a, auto& b) {
-                        if (std::get<0>(a) != std::get<0>(b)) return std::get<0>(a) > std::get<0>(b);
-                        return std::get<1>(a) < std::get<1>(b);
-                    });
                 int show = std::min((int)entries.size(), 10);
+                auto cmp = [](auto& a, auto& b) {
+                    if (std::get<0>(a) != std::get<0>(b)) return std::get<0>(a) > std::get<0>(b);
+                    return std::get<1>(a) < std::get<1>(b);
+                };
+                if (show < (int)entries.size()) {
+                    std::partial_sort(entries.begin(), entries.begin() + show,
+                                      entries.end(), cmp);
+                } else {
+                    std::sort(entries.begin(), entries.end(), cmp);
+                }
                 result.result.columns = {{"l_orderkey","int"},{"revenue","float"},{"o_orderdate","string"},{"o_shippriority","int"}};
                 result.result.rows.clear();
                 for (int j = 0; j < show; j++) {
@@ -1381,13 +1406,21 @@ static bool runCodegenQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
             }
         }
 
-        // Q18: filter qty > 300, join with preloaded orders, sort, top 100
+        // Q18: GPU compact emits qualifying (orderkey, qty) pairs; CPU
+        // joins via okLookup and partial-sorts to top 100.
         if (plan.name == "Q18") {
-            auto* qtyBuf = executor.getAllocatedBuffer("d_order_qty");
+            auto* cntBuf    = executor.getAllocatedBuffer("d_q18_compact_count");
+            auto* okBuf     = executor.getAllocatedBuffer("d_q18_compact_ok");
+            auto* qtyBuf    = executor.getAllocatedBuffer("d_q18_compact_qty");
             auto* lookupBuf = executor.getAllocatedBuffer("d_q18_ok_lookup");
-            if (qtyBuf && lookupBuf) {
-                float* qtys = (float*)qtyBuf->contents();
-                size_t n = qtyBuf->length() / sizeof(float);
+            if (cntBuf && okBuf && qtyBuf && lookupBuf) {
+                uint32_t n = *static_cast<uint32_t*>(cntBuf->contents());
+                // Guard against any cap overflow — kernel already drops
+                // writes past the cap, but cap the loop too.
+                size_t cap = okBuf->length() / sizeof(uint32_t);
+                if (n > cap) n = (uint32_t)cap;
+                const uint32_t* oks = (const uint32_t*)okBuf->contents();
+                const float*    qtys = (const float*)qtyBuf->contents();
                 const int*   o_custkey    = g_q18Post.o_custkey;
                 const float* o_totalprice = g_q18Post.o_totalprice;
                 const int*   o_orderdate  = g_q18Post.o_orderdate;
@@ -1396,27 +1429,33 @@ static bool runCodegenQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
 
                 struct Q18Entry { int orderkey; int custkey; float totalprice; int orderdate; float qty; };
                 std::vector<Q18Entry> results;
-                for (size_t ok = 0; ok < n; ok++) {
-                    if (qtys[ok] > 300.0f) {
-                        results.push_back({(int)ok, 0, 0.0f, 0, qtys[ok]});
+                results.reserve(n);
+                for (uint32_t k = 0; k < n; k++) {
+                    int ok = (int)oks[k];
+                    int idx = (ok >= 0 && (size_t)ok < okLookupLen) ? okLookup[ok] : -1;
+                    int custkey = 0; float tp = 0.0f; int od = 0;
+                    if (idx >= 0) {
+                        custkey = o_custkey[idx];
+                        tp = o_totalprice[idx];
+                        od = o_orderdate[idx];
                     }
+                    results.push_back({ok, custkey, tp, od, qtys[k]});
                 }
-                for (auto& r : results) {
-                    if (r.orderkey >= 0 && (size_t)r.orderkey < okLookupLen) {
-                        int idx = okLookup[r.orderkey];
-                        if (idx >= 0) {
-                            r.custkey = o_custkey[idx];
-                            r.totalprice = o_totalprice[idx];
-                            r.orderdate = o_orderdate[idx];
-                        }
-                    }
-                }
-                std::sort(results.begin(), results.end(),
-                    [](auto& a, auto& b) {
-                        if (a.totalprice != b.totalprice) return a.totalprice > b.totalprice;
-                        return a.orderdate < b.orderdate;
-                    });
                 int show = std::min((int)results.size(), 100);
+                if (show < (int)results.size()) {
+                    std::partial_sort(results.begin(), results.begin() + show,
+                                      results.end(),
+                                      [](auto& a, auto& b) {
+                                          if (a.totalprice != b.totalprice) return a.totalprice > b.totalprice;
+                                          return a.orderdate < b.orderdate;
+                                      });
+                } else {
+                    std::sort(results.begin(), results.end(),
+                              [](auto& a, auto& b) {
+                                  if (a.totalprice != b.totalprice) return a.totalprice > b.totalprice;
+                                  return a.orderdate < b.orderdate;
+                              });
+                }
                 result.result.columns = {{"c_custkey","int"},{"o_orderkey","int"},{"o_orderdate","string"},{"o_totalprice","float"},{"sum(l_quantity)","float"}};
                 result.result.rows.clear();
                 for (int j = 0; j < show; j++) {
@@ -1505,37 +1544,30 @@ static bool runCodegenQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
             }
         }
 
-        // Q20: check HT values against availqty, filter CANADA suppliers
+        // Q20: GPU built d_q20_qual_supp_bitmap (one bit per qualifying
+        // suppkey). CPU iterates supplier mirror filtered by nation +
+        // bitmap probe — replaces the q20HtSize-row scan and std::set.
         if (plan.name == "Q20") {
             auto& pd = g_q20Post;
-            auto* htKeysBuf  = executor.getAllocatedBuffer("d_q20_ht_keys");
-            auto* htValsBuf  = executor.getAllocatedBuffer("d_q20_ht_vals");
-            auto* htPsIdxBuf = executor.getAllocatedBuffer("d_q20_ht_psidx");
-            if (htKeysBuf && htValsBuf && htPsIdxBuf) {
-                const uint64_t* htKeys = (const uint64_t*)htKeysBuf->contents();
-                const float*    htVals = (const float*)htValsBuf->contents();
-                const int*      htPsIdx = (const int*)htPsIdxBuf->contents();
-                std::set<int> qualSuppkeys;
-                for (uint32_t slot = 0; slot < pd.htSlots; slot++) {
-                    if (htKeys[slot] == ~uint64_t(0)) continue;
-                    int psIdx = htPsIdx[slot];
-                    if (psIdx < 0) continue;
-                    float sumQty = htVals[slot];
-                    if (sumQty > 0.0f && (float)pd.ps_availqty[psIdx] > 0.5f * sumQty) {
-                        qualSuppkeys.insert(pd.ps_suppkey[psIdx]);
-                    }
-                }
+            auto* qualBmpBuf = executor.getAllocatedBuffer("d_q20_qual_supp_bitmap");
+            if (qualBmpBuf) {
+                const uint32_t* qualBmp = (const uint32_t*)qualBmpBuf->contents();
+                size_t qualBmpInts = qualBmpBuf->length() / sizeof(uint32_t);
 
                 struct Q20Row { std::string name; std::string address; };
                 std::vector<Q20Row> rows;
+                auto extractFixedStr = [](const char* base, int width) {
+                    int len = 0;
+                    while (len < width && base[len] != '\0') len++;
+                    return std::string(base, len);
+                };
                 for (size_t i = 0; i < pd.nS; i++) {
                     if (pd.s_nationkey[i] != pd.canada_nk) continue;
-                    if (!qualSuppkeys.count(pd.s_suppkey[i])) continue;
-                    auto extractFixedStr = [](const char* base, int width) {
-                        int len = 0;
-                        while (len < width && base[len] != '\0') len++;
-                        return std::string(base, len);
-                    };
+                    int sk = pd.s_suppkey[i];
+                    if (sk < 0) continue;
+                    size_t w = (size_t)sk >> 5;
+                    if (w >= qualBmpInts) continue;
+                    if (!((qualBmp[w] >> ((uint32_t)sk & 31u)) & 1u)) continue;
                     rows.push_back({extractFixedStr(pd.s_name + i * 25, 25),
                                     extractFixedStr(pd.s_address + i * 40, 40)});
                 }
@@ -1558,21 +1590,26 @@ static bool runCodegenQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
             }
         }
 
-        // Q2: read min_cost, match suppliers, join strings, sort, top 100
+        // Q2: GPU compact emits qualifying (partkey, suppkey). CPU joins
+        // via direct-address part/supp index arrays (built once in
+        // preprocessing) and sorts the small qualifying set.
         if (plan.name == "Q2") {
             auto& pd = g_q2Post;
-            auto* partBmpBuf = executor.getAllocatedBuffer("d_q2_part_bitmap");
-            if (pd.minCostBuf && partBmpBuf) {
-                const uint32_t* minCostU = (const uint32_t*)pd.minCostBuf->contents();
-                const uint32_t* partBitmap = (const uint32_t*)partBmpBuf->contents();
+            auto* cntBuf = executor.getAllocatedBuffer("d_q2_compact_count");
+            auto* pkBuf  = executor.getAllocatedBuffer("d_q2_compact_pk");
+            auto* skBuf  = executor.getAllocatedBuffer("d_q2_compact_sk");
+            if (cntBuf && pkBuf && skBuf) {
+                uint32_t n = *static_cast<uint32_t*>(cntBuf->contents());
+                size_t cap = pkBuf->length() / sizeof(uint32_t);
+                if (n > cap) n = (uint32_t)cap;
+                const uint32_t* pks = (const uint32_t*)pkBuf->contents();
+                const uint32_t* sks = (const uint32_t*)skBuf->contents();
 
-                std::unordered_map<int, int> suppIdx;
-                for (size_t i = 0; i < pd.nS; i++)
-                    suppIdx[pd.s_suppkey[i]] = (int)i;
-
-                std::unordered_map<int, int> partIdx;
-                for (size_t i = 0; i < pd.nP; i++)
-                    partIdx[pd.p_partkey[i]] = (int)i;
+                // Direct-address lookups built once in preprocessing.
+                const int* suppIdxArr = pd.suppIdxArr.data();
+                const int* partIdxArr = pd.partIdxArr.data();
+                const int  maxSk = pd.maxSuppkey;
+                const int  maxPk = pd.maxPartkey;
 
                 struct Q2Row {
                     float s_acctbal;
@@ -1580,38 +1617,25 @@ static bool runCodegenQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
                     int p_partkey;
                 };
                 std::vector<Q2Row> rows;
-                for (size_t i = 0; i < pd.nPS; i++) {
-                    int pk = pd.ps_partkey[i];
-                    int sk = pd.ps_suppkey[i];
+                rows.reserve(n);
 
-                    if (pk < 0 || pk > pd.maxPartkey) continue;
-                    if (!((partBitmap[pk / 32] >> (pk % 32)) & 1)) continue;
+                auto extractStr = [](const char* base, int width) {
+                    int len = 0;
+                    while (len < width && base[len] != '\0') len++;
+                    return std::string(base, len);
+                };
 
-                    if (sk < 0 || (size_t)(sk / 32) >= pd.eurSuppBitmap.size()) continue;
-                    if (!((pd.eurSuppBitmap[sk / 32] >> (sk % 32)) & 1)) continue;
-
-                    uint32_t minU = minCostU[pk];
-                    if (minU == 0xFFFFFFFFu) continue;
-                    float minCost;
-                    memcpy(&minCost, &minU, sizeof(float));
-                    if (pd.ps_supplycost[i] != minCost) continue;
-
-                    auto sit = suppIdx.find(sk);
-                    auto pit = partIdx.find(pk);
-                    if (sit == suppIdx.end() || pit == partIdx.end()) continue;
-                    int si = sit->second;
-                    int pi = pit->second;
+                for (uint32_t k = 0; k < n; k++) {
+                    int pk = (int)pks[k];
+                    int sk = (int)sks[k];
+                    if (sk < 0 || sk > maxSk || pk < 0 || pk > maxPk) continue;
+                    int si = suppIdxArr[sk];
+                    int pi = partIdxArr[pk];
+                    if (si < 0 || pi < 0) continue;
 
                     Q2Row row;
                     row.s_acctbal = pd.s_acctbal[si];
                     row.p_partkey = pk;
-
-                    auto extractStr = [](const char* base, int width) {
-                        int len = 0;
-                        while (len < width && base[len] != '\0') len++;
-                        return std::string(base, len);
-                    };
-
                     row.s_name    = extractStr(pd.s_name    + si * 25,  25);
                     row.s_address = extractStr(pd.s_address + si * 40,  40);
                     row.s_phone   = extractStr(pd.s_phone   + si * 15,  15);
@@ -1619,7 +1643,6 @@ static bool runCodegenQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
                     row.p_mfgr    = extractStr(pd.p_mfgr    + pi * 25,  25);
                     row.n_name = (pd.s_nationkey[si] >= 0 && pd.s_nationkey[si] < (int)pd.nationNames.size())
                         ? pd.nationNames[pd.s_nationkey[si]] : "?";
-
                     rows.push_back(std::move(row));
                 }
 
@@ -1650,19 +1673,19 @@ static bool runCodegenQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
             }
         }
 
-        // Q16: popcount per-group bitmaps, sort, print
+        // Q16: GPU-popcounted per-group counts (Phase Q16_popcount_groups);
+        // CPU joins back to (brand,type,size) and sorts.
         if (plan.name == "Q16") {
             auto& pd = g_q16Post;
-            if (pd.groupBitmapsBuf) {
-                const uint32_t* gbm = (const uint32_t*)pd.groupBitmapsBuf->contents();
+            auto* cntBuf = executor.getAllocatedBuffer("d_q16_group_counts");
+            if (cntBuf && pd.numGroups > 0) {
+                const uint32_t* cnts = (const uint32_t*)cntBuf->contents();
 
                 struct Q16Result { std::string brand; std::string type; int size; int supplier_cnt; };
                 std::vector<Q16Result> results;
+                results.reserve(pd.numGroups);
                 for (uint32_t g = 0; g < pd.numGroups; g++) {
-                    int cnt = 0;
-                    for (uint32_t w = 0; w < pd.bvInts; w++) {
-                        cnt += __builtin_popcount(gbm[g * pd.bvInts + w]);
-                    }
+                    int cnt = (int)cnts[g];
                     if (cnt > 0) {
                         results.push_back({pd.groups[g].brand, pd.groups[g].type, pd.groups[g].size, cnt});
                     }
@@ -1700,25 +1723,22 @@ static bool runCodegenQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
             auto* buf = executor.getAllocatedBuffer("d_q21_supp_count");
             if (buf) {
                 const uint32_t* suppCounts = (const uint32_t*)buf->contents();
-
-                std::unordered_map<int, int> suppIdx;
-                for (size_t i = 0; i < pd.nS; i++)
-                    suppIdx[pd.s_suppkey[i]] = (int)i;
+                size_t suppCountLen = buf->length() / sizeof(uint32_t);
 
                 struct Q21Row { std::string s_name; int numwait; };
                 std::vector<Q21Row> rows;
-                for (int sk = 0; sk <= pd.maxSuppkey; sk++) {
-                    if (suppCounts[sk] > 0) {
-                        auto it = suppIdx.find(sk);
-                        if (it != suppIdx.end()) {
-                            int si = it->second;
-                            int len = 25;
-                            while (len > 0 && (pd.s_name[si * 25 + len - 1] == ' ' ||
-                                               pd.s_name[si * 25 + len - 1] == '\0')) len--;
-                            rows.push_back({std::string(pd.s_name + si * 25, len),
-                                           (int)suppCounts[sk]});
-                        }
-                    }
+                // Iterate suppliers directly (nS rows) instead of scanning
+                // [0, maxSuppkey] via an unordered_map: nS << maxSuppkey
+                // at high SF and avoids the per-query hash build.
+                for (size_t i = 0; i < pd.nS; i++) {
+                    int sk = pd.s_suppkey[i];
+                    if (sk < 0 || (size_t)sk >= suppCountLen) continue;
+                    uint32_t cnt = suppCounts[sk];
+                    if (cnt == 0) continue;
+                    int len = 25;
+                    while (len > 0 && (pd.s_name[i * 25 + len - 1] == ' ' ||
+                                       pd.s_name[i * 25 + len - 1] == '\0')) len--;
+                    rows.push_back({std::string(pd.s_name + i * 25, len), (int)cnt});
                 }
 
                 std::sort(rows.begin(), rows.end(), [](const Q21Row& a, const Q21Row& b) {

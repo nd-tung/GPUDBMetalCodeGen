@@ -53,9 +53,13 @@ struct Q2PostData {
     size_t nP = 0;
 
     std::vector<std::string> nationNames;
-    std::vector<uint32_t> eurSuppBitmap;
     int maxPartkey = 0;
-    MTL::Buffer* minCostBuf = nullptr;
+    int maxSuppkey = 0;
+    // Direct-address lookups: index by key, -1 if absent. Built once
+    // during preprocessing to replace per-query unordered_map<int,int>
+    // builds (a 4M-row hash insert at SF20 dominated CPU time).
+    std::vector<int> partIdxArr;
+    std::vector<int> suppIdxArr;
 
     // Backing storage when the table wasn't already in loadedTables.
     QueryColumns ownedPart, ownedSupplier, ownedPartsupp;
@@ -64,9 +68,7 @@ struct Q2PostData {
 struct Q16PostData {
     struct GroupKey { std::string brand; std::string type; int size; };
     std::vector<GroupKey> groups;
-    uint32_t bvInts = 0;
     uint32_t numGroups = 0;
-    MTL::Buffer* groupBitmapsBuf = nullptr;
     // Inputs cached for the Q16_filter_compact post-dispatch hook,
     // which reads the GPU-emitted compact (idx, key) list and builds
     // groups[] + d_q16_part_group_map on host.
@@ -83,7 +85,6 @@ struct Q21PostData {
     const int*  s_suppkey = nullptr;
     const char* s_name = nullptr;  // width 25
     size_t nS = 0;
-    int maxSuppkey = 0;
     QueryColumns ownedSupplier;
 };
 
