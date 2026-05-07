@@ -167,7 +167,8 @@ public:
                     const std::string& keyExpr,
                     const std::string& valueExpr,
                     const std::string& valueType = "int",
-                    const std::string& sizeExpr = "");
+                    const std::string& sizeExpr = "",
+                    int fillByte = 0xFF);
     void produce(MetalCodegen& cg, ConsumerFn consume) override;
     std::string describe() const override;
 
@@ -177,6 +178,7 @@ private:
     std::string valueExpr_;
     std::string valueType_;
     std::string sizeExpr_;
+    int fillByte_;
 };
 
 // Lookup: type var = map[key]; (with optional guard for sentinel value)

@@ -198,6 +198,14 @@ void MetalGenericExecutor::bindPhaseBuffers(MTL::ComputeCommandEncoder* encoder,
                 auto it = buffers.find(b.name);
                 if (it != buffers.end() && it->second) {
                     encoder->setBuffer(it->second, 0, b.bufferIndex);
+                } else {
+                    // Fallback: a post-dispatch hook from an earlier phase
+                    // may have registered this buffer after the executor
+                    // built its per-execute() snapshot. Look it up live.
+                    auto it2 = allocatedBuffers_.find(b.name);
+                    if (it2 != allocatedBuffers_.end() && it2->second) {
+                        encoder->setBuffer(it2->second, 0, b.bufferIndex);
+                    }
                 }
                 break;
             }
@@ -330,7 +338,16 @@ MetalExecutionResult MetalGenericExecutor::execute(
 
         const bool isMeasured = (iter == totalRuns - 1);
 
-        if (!isMeasured) {
+        // If any phase has a postDispatchHook, the host must observe the
+        // dispatch results between phases (so the hook can register scalars
+        // consumed by later phases via setBytes). Force per-phase command
+        // buffers in that case, matching the measured-run path.
+        bool hasHook = false;
+        for (int _pi = firstPhase; _pi < lastPhase; _pi++) {
+            if (allPhases[_pi].postDispatchHook) { hasHook = true; break; }
+        }
+
+        if (!isMeasured && !hasHook) {
             // Warmup run: single command buffer for all phases (fastest path)
             auto* cmdBuf = cmdQueue_->commandBuffer();
             auto* encoder = cmdBuf->computeCommandEncoder();
@@ -356,7 +373,8 @@ MetalExecutionResult MetalGenericExecutor::execute(
             continue;
         }
 
-        // Measured run: one command buffer per phase for per-kernel timing.
+        // Measured run, or warmup with hooks: one command buffer per phase
+        // (per-kernel timing for measured; required ordering for hooks).
         double totalGpuSec = 0.0;
         execResult.phaseTimesMs.clear();
         execResult.phaseNames.clear();
@@ -374,6 +392,15 @@ MetalExecutionResult MetalGenericExecutor::execute(
                 continue;
             }
 
+            // Refresh allBuffers from allocatedBuffers_: a previous phase's
+            // post-dispatch hook may have replaced or newly registered a
+            // buffer (e.g. Q16's Q16_filter_compact hook allocates the
+            // exactly-sized d_q16_group_bitmaps once numGroups is known).
+            for (auto& kv : allBuffers) {
+                auto it = allocatedBuffers_.find(kv.first);
+                if (it != allocatedBuffers_.end() && it->second) kv.second = it->second;
+            }
+
             auto* cmdBuf = cmdQueue_->commandBuffer();
             auto* encoder = cmdBuf->computeCommandEncoder();
 
@@ -382,6 +409,12 @@ MetalExecutionResult MetalGenericExecutor::execute(
             encoder->endEncoding();
             cmdBuf->commit();
             cmdBuf->waitUntilCompleted();
+
+            // Invoke host-side post-dispatch hook (e.g. read GPU-computed
+            // scalar back into scalarFloats_ for later phases).
+            if (phase.postDispatchHook) {
+                phase.postDispatchHook(*this);
+            }
 
             double phaseSec = cmdBuf->GPUEndTime() - cmdBuf->GPUStartTime();
             totalGpuSec += phaseSec;

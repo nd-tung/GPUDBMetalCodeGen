@@ -14,28 +14,51 @@ namespace codegen {
 using LoadedQueryTable = std::pair<std::string, QueryColumns>;
 
 struct Q20PostData {
-    std::vector<int> ps_partkey, ps_suppkey, ps_availqty;
-    std::vector<uint64_t> htKeys;
-    std::vector<int> htPsIdx;
+    // Borrowed pointers (mmap views).
+    const int* ps_partkey = nullptr;
+    const int* ps_suppkey = nullptr;
+    const int* ps_availqty = nullptr;
+    size_t nPS = 0;
+
+    const int*  s_suppkey = nullptr;
+    const int*  s_nationkey = nullptr;
+    const char* s_name = nullptr;     // width 25
+    const char* s_address = nullptr;  // width 40
+    size_t nS = 0;
+
     uint32_t htMask = 0, htSlots = 0;
-    std::vector<int> s_suppkey, s_nationkey;
-    std::vector<char> s_name, s_address;
     int canada_nk = -1;
-    MTL::Buffer* htValsBuf = nullptr;
+
+    QueryColumns ownedPartsupp, ownedSupplier;
 };
 
 struct Q2PostData {
-    std::vector<int> ps_partkey, ps_suppkey;
-    std::vector<float> ps_supplycost;
-    std::vector<int> s_suppkey, s_nationkey;
-    std::vector<float> s_acctbal;
-    std::vector<char> s_name, s_address, s_phone, s_comment;
-    std::vector<int> p_partkey;
-    std::vector<char> p_mfgr;
+    // Borrowed pointers (mmap views). See Q18 note on lifetime.
+    const int*   ps_partkey = nullptr;
+    const int*   ps_suppkey = nullptr;
+    const float* ps_supplycost = nullptr;
+    size_t nPS = 0;
+
+    const int*   s_suppkey = nullptr;
+    const int*   s_nationkey = nullptr;
+    const float* s_acctbal = nullptr;
+    const char*  s_name = nullptr;
+    const char*  s_address = nullptr;
+    const char*  s_phone = nullptr;
+    const char*  s_comment = nullptr;
+    size_t nS = 0;
+
+    const int*  p_partkey = nullptr;
+    const char* p_mfgr = nullptr;
+    size_t nP = 0;
+
     std::vector<std::string> nationNames;
     std::vector<uint32_t> eurSuppBitmap;
     int maxPartkey = 0;
     MTL::Buffer* minCostBuf = nullptr;
+
+    // Backing storage when the table wasn't already in loadedTables.
+    QueryColumns ownedPart, ownedSupplier, ownedPartsupp;
 };
 
 struct Q16PostData {
@@ -44,18 +67,36 @@ struct Q16PostData {
     uint32_t bvInts = 0;
     uint32_t numGroups = 0;
     MTL::Buffer* groupBitmapsBuf = nullptr;
+    // Inputs cached for the Q16_filter_compact post-dispatch hook,
+    // which reads the GPU-emitted compact (idx, key) list and builds
+    // groups[] + d_q16_part_group_map on host.
+    const int*  p_partkey = nullptr;
+    const char* p_brand = nullptr;   // width 10
+    const char* p_type  = nullptr;   // width 25
+    size_t nPart = 0;
+    int    maxPartkey = 0;
+    int    maxSk = 0;
+    QueryColumns ownedPart;          // empty if borrowed
 };
 
 struct Q21PostData {
-    std::vector<int> s_suppkey;
-    std::vector<char> s_name;
+    const int*  s_suppkey = nullptr;
+    const char* s_name = nullptr;  // width 25
+    size_t nS = 0;
     int maxSuppkey = 0;
+    QueryColumns ownedSupplier;
 };
 
 struct Q18PostData {
-    std::vector<int> o_custkey, o_orderdate;
-    std::vector<float> o_totalprice;
-    std::vector<int> okLookup;
+    // Borrowed pointers into orders columns (mmap view). Backing storage
+    // is either loadedTables (in main) or `ownedOrders` below when the
+    // view had to be loaded fresh by preprocessing.
+    const int*   o_custkey = nullptr;
+    const int*   o_orderdate = nullptr;
+    const float* o_totalprice = nullptr;
+    QueryColumns ownedOrders;  // empty if borrowed
+    // The orderkey -> row-index lookup is built by the
+    // Q18_build_ok_lookup GPU phase into d_q18_ok_lookup.
 };
 
 extern Q20PostData g_q20Post;

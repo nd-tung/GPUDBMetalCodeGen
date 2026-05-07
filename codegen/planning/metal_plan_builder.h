@@ -37,6 +37,10 @@ struct MetalQueryPlan {
         // Extra buffer params not added by operators (e.g., pre-built hash tables)
         struct ExtraBuffer { std::string name; std::string type; bool readOnly = true; bool zeroInit = false; };
         std::vector<ExtraBuffer> extraBuffers;
+        // Optional host-side callback after this phase's GPU dispatch (see
+        // PostDispatchHook in metal_codegen_base.h). Used by GPU
+        // preprocessing migration to read back computed scalars.
+        PostDispatchHook postDispatchHook;
     };
     std::vector<Phase> phases;
 
@@ -55,7 +59,7 @@ struct MetalQueryPlan {
     //     results combine correctly across chunks,
     //   - any pre/post phases are bounded in size and read-only against
     //     the streamed table.
-    // The default (false) is the safe choice — see DOCUMENTATION.md §9.4.
+    // Default false is the safe choice.
     bool chunkable = false;
 
     // CPU-side post-processing
