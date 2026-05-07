@@ -75,6 +75,38 @@ private:
     std::vector<ColumnDesc> columns_;
 };
 
+// Grid-stride loop over a synthetic [0, n_<rangeName>) index range.
+// Useful for scanning sparse direct-address arrays keyed by a maxKey
+// (e.g. d_order_revenue[orderkey]) without an actual table to drive
+// the scan. The caller must register `n_<rangeName>` with the executor
+// as BOTH a sizeResolver symbol (for dispatch sizing) and a scalar int
+// (for the kernel's loop bound) before this phase runs.
+//
+// Emits:
+//   for (uint {idxVar} = tid; {idxVar} < n_{rangeName}; {idxVar} += tpg) {
+//       <consume()>
+//   }
+class MetalRangeScan : public MetalOperator {
+public:
+    MetalRangeScan(const std::string& rangeName,
+                   const std::string& idxVar = "i");
+    void produce(MetalCodegen& cg, ConsumerFn consume) override;
+    std::string describe() const override;
+    const std::string& rangeName() const { return rangeName_; }
+    const std::string& idxVar() const { return idxVar_; }
+    // Side-load one or more columns of a real GPU table without driving
+    // the scan from that table. The columns become read-only kernel
+    // params (TableData kind) the consumer can index by any expression.
+    void addSideColumn(const std::string& tableName,
+                       const std::string& paramName,
+                       const std::string& metalType);
+private:
+    struct SideColumn { std::string table, param, type; };
+    std::string rangeName_;
+    std::string idxVar_;
+    std::vector<SideColumn> sideColumns_;
+};
+
 // ===================================================================
 // UNARY OPERATORS — Pipeline operators
 // ===================================================================
