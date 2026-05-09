@@ -20,6 +20,7 @@ struct ColumnDef {
 };
 
 struct TableDef {
+    std::string maxKeySymbol;
     std::string name;
     std::vector<ColumnDef> columns;
     std::unordered_map<std::string, int> nameToIdx; // column name → index in columns[]

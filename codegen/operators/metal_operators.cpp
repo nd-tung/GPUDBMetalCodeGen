@@ -260,6 +260,138 @@ std::string MetalArrayLookup::describe() const {
 }
 
 // ===================================================================
+// MetalHashMapBuild
+// ===================================================================
+
+namespace {
+inline std::string hmKeys1(const std::string& m) { return m + "_keys1"; }
+inline std::string hmKeys2(const std::string& m) { return m + "_keys2"; }
+inline std::string hmValues(const std::string& m) { return m + "_values"; }
+} // namespace
+
+MetalHashMapBuild::MetalHashMapBuild(std::unique_ptr<MetalOperator> child,
+                                     const std::string& mapName,
+                                     const std::string& key1Expr,
+                                     const std::string& key2Expr,
+                                     const std::string& valueExpr,
+                                     const std::string& capacityExpr)
+    : MetalUnaryOperator(std::move(child)),
+      mapName_(mapName), key1Expr_(key1Expr), key2Expr_(key2Expr),
+      valueExpr_(valueExpr), capacityExpr_(capacityExpr) {}
+
+void MetalHashMapBuild::produce(MetalCodegen& cg, ConsumerFn consume) {
+    // Keys initialised to 0xFFFFFFFFu sentinel; value slot zero-init.
+    cg.addAtomicBufferParam(hmKeys1(mapName_), "atomic_uint", capacityExpr_, 0xFF);
+    cg.addAtomicBufferParam(hmKeys2(mapName_), "atomic_uint", capacityExpr_, 0xFF);
+    cg.addAtomicBufferParam(hmValues(mapName_), "atomic_uint", capacityExpr_, 0);
+    cg.addResolvedScalarParam("n_" + mapName_, "uint", capacityExpr_);
+
+    child_->produce(cg, [&]() {
+        cg.addLine("hashmap_insert_kv(" + hmKeys1(mapName_) + ", " +
+                   hmKeys2(mapName_) + ", " + hmValues(mapName_) + ", n_" +
+                   mapName_ + ", (uint)(" + key1Expr_ + "), (uint)(" +
+                   key2Expr_ + "), (uint)(" + valueExpr_ + "));");
+        consume();
+    });
+}
+
+std::string MetalHashMapBuild::describe() const {
+    return "HashMapBuild(" + mapName_ + ", k=(" + key1Expr_ + "," + key2Expr_ +
+           "), v=" + valueExpr_ + ")";
+}
+
+// ===================================================================
+// MetalHashMapAgg
+// ===================================================================
+
+MetalHashMapAgg::MetalHashMapAgg(std::unique_ptr<MetalOperator> child,
+                                 const std::string& mapName,
+                                 const std::string& key1Expr,
+                                 const std::string& key2Expr,
+                                 const std::string& valueExpr,
+                                 const std::string& capacityExpr,
+                                 bool valueIsFloat)
+    : MetalUnaryOperator(std::move(child)),
+      mapName_(mapName), key1Expr_(key1Expr), key2Expr_(key2Expr),
+      valueExpr_(valueExpr), capacityExpr_(capacityExpr),
+      valueIsFloat_(valueIsFloat) {}
+
+void MetalHashMapAgg::produce(MetalCodegen& cg, ConsumerFn consume) {
+    cg.addAtomicBufferParam(hmKeys1(mapName_), "atomic_uint", capacityExpr_, 0xFF);
+    cg.addAtomicBufferParam(hmKeys2(mapName_), "atomic_uint", capacityExpr_, 0xFF);
+    cg.addAtomicBufferParam(hmValues(mapName_), "atomic_uint", capacityExpr_, 0);
+    cg.addResolvedScalarParam("n_" + mapName_, "uint", capacityExpr_);
+
+    child_->produce(cg, [&]() {
+        if (valueIsFloat_) {
+            cg.addLine("hashmap_insert_add_float(" + hmKeys1(mapName_) + ", " +
+                       hmKeys2(mapName_) + ", " + hmValues(mapName_) + ", n_" +
+                       mapName_ + ", (uint)(" + key1Expr_ + "), (uint)(" +
+                       key2Expr_ + "), (float)(" + valueExpr_ + "));");
+        } else {
+            cg.addLine("hashmap_insert_add(" + hmKeys1(mapName_) + ", " +
+                       hmKeys2(mapName_) + ", " + hmValues(mapName_) + ", n_" +
+                       mapName_ + ", (uint)(" + key1Expr_ + "), (uint)(" +
+                       key2Expr_ + "), (uint)(" + valueExpr_ + "));");
+        }
+        consume();
+    });
+}
+
+std::string MetalHashMapAgg::describe() const {
+    return "HashMapAgg(" + mapName_ + ", k=(" + key1Expr_ + "," + key2Expr_ +
+           "), +=" + valueExpr_ + ")";
+}
+
+// ===================================================================
+// MetalHashMapLookup
+// ===================================================================
+
+MetalHashMapLookup::MetalHashMapLookup(std::unique_ptr<MetalOperator> child,
+                                       const std::string& mapName,
+                                       const std::string& key1Expr,
+                                       const std::string& key2Expr,
+                                       const std::string& capacityExpr,
+                                       const std::string& resultVar,
+                                       const std::string& resultType)
+    : MetalUnaryOperator(std::move(child)),
+      mapName_(mapName), key1Expr_(key1Expr), key2Expr_(key2Expr),
+      capacityExpr_(capacityExpr),
+      resultVar_(resultVar), resultType_(resultType) {}
+
+void MetalHashMapLookup::produce(MetalCodegen& cg, ConsumerFn consume) {
+    cg.addBufferParam(hmKeys1(mapName_), "uint", "", false);
+    cg.addBufferParam(hmKeys2(mapName_), "uint", "", false);
+    cg.addBufferParam(hmValues(mapName_), "uint", "", false);
+    cg.addResolvedScalarParam("n_" + mapName_, "uint", capacityExpr_);
+
+    child_->produce(cg, [&]() {
+        std::string slot = resultVar_ + "_slot";
+        cg.addLine("uint " + slot + " = hashmap_lookup(" + hmKeys1(mapName_) +
+                   ", " + hmKeys2(mapName_) + ", n_" + mapName_ +
+                   ", (uint)(" + key1Expr_ + "), (uint)(" + key2Expr_ + "));");
+        cg.addIf(slot + " != 0xFFFFFFFFu", [&]() {
+            std::string raw = hmValues(mapName_) + "[" + slot + "]";
+            std::string casted;
+            if (resultType_ == "float") {
+                casted = "as_type<float>(" + raw + ")";
+            } else if (resultType_ == "int") {
+                casted = "(int)(" + raw + ")";
+            } else {
+                casted = raw;
+            }
+            cg.addLine(resultType_ + " " + resultVar_ + " = " + casted + ";");
+            consume();
+        });
+    });
+}
+
+std::string MetalHashMapLookup::describe() const {
+    return "HashMapLookup(" + mapName_ + ", k=(" + key1Expr_ + "," + key2Expr_ +
+           ") -> " + resultVar_ + ")";
+}
+
+// ===================================================================
 // MetalTGReduce
 // ===================================================================
 

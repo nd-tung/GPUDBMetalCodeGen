@@ -526,6 +526,132 @@ inline void atomic_max_long_pair_seen(device atomic_uint* lo,
     atomic_max_long_pair(lo, hi, val);
 }
 
+// ------------------------------------------------------------------
+// Linear-probing hash map helpers (composite-key, single-value).
+// Layout: keys1[cap], keys2[cap] (atomic_uint, sentinel = 0xFFFFFFFFu),
+//         values[cap] (atomic_uint, interpretation via as_type<>).
+// `cap` MUST be a power of two so (slot & (cap-1)) wraps cleanly.
+// Sentinel key encoding: (0xFFFFFFFFu, 0xFFFFFFFFu) means "empty".
+// Real keys are zero-extended ints; we forbid -1 as a real key to keep
+// the sentinel unambiguous.
+// ------------------------------------------------------------------
+
+inline uint hashmap_mix2(uint a, uint b) {
+    uint h = a * 2654435761u;
+    h ^= (b * 2246822519u);
+    h ^= (h >> 16);
+    h *= 2654435761u;
+    h ^= (h >> 16);
+    return h;
+}
+
+// Insert (key1, key2, value).  If the slot is empty, claim it via CAS
+// and write key2 + value.  If already occupied with the same composite
+// key, leave value as-is (first-writer-wins).  Returns slot index, or
+// 0xFFFFFFFFu if the table is full (should not happen if cap is sized
+// > 2x the build cardinality).
+inline uint hashmap_insert_kv(device atomic_uint* keys1,
+                              device atomic_uint* keys2,
+                              device atomic_uint* values,
+                              uint cap, uint key1, uint key2, uint value) {
+    uint mask = cap - 1u;
+    uint slot = hashmap_mix2(key1, key2) & mask;
+    for (uint probe = 0u; probe < cap; ++probe) {
+        uint expected = 0xFFFFFFFFu;
+        if (atomic_compare_exchange_weak_explicit(&keys1[slot], &expected, key1,
+                memory_order_relaxed, memory_order_relaxed)) {
+            atomic_store_explicit(&keys2[slot], key2, memory_order_relaxed);
+            atomic_store_explicit(&values[slot], value, memory_order_relaxed);
+            return slot;
+        }
+        if (expected == key1) {
+            // Wait for keys2 to be initialised before comparing.
+            uint k2 = atomic_load_explicit(&keys2[slot], memory_order_relaxed);
+            while (k2 == 0xFFFFFFFFu) {
+                k2 = atomic_load_explicit(&keys2[slot], memory_order_relaxed);
+            }
+            if (k2 == key2) return slot;
+        }
+        slot = (slot + 1u) & mask;
+    }
+    return 0xFFFFFFFFu;
+}
+
+// Insert + atomic-add aggregation on `value`.  Used for HashGroupJoin.
+inline uint hashmap_insert_add(device atomic_uint* keys1,
+                                device atomic_uint* keys2,
+                                device atomic_uint* values,
+                                uint cap, uint key1, uint key2, uint value) {
+    uint mask = cap - 1u;
+    uint slot = hashmap_mix2(key1, key2) & mask;
+    for (uint probe = 0u; probe < cap; ++probe) {
+        uint expected = 0xFFFFFFFFu;
+        if (atomic_compare_exchange_weak_explicit(&keys1[slot], &expected, key1,
+                memory_order_relaxed, memory_order_relaxed)) {
+            atomic_store_explicit(&keys2[slot], key2, memory_order_relaxed);
+            atomic_fetch_add_explicit(&values[slot], value, memory_order_relaxed);
+            return slot;
+        }
+        if (expected == key1) {
+            uint k2 = atomic_load_explicit(&keys2[slot], memory_order_relaxed);
+            while (k2 == 0xFFFFFFFFu) {
+                k2 = atomic_load_explicit(&keys2[slot], memory_order_relaxed);
+            }
+            if (k2 == key2) {
+                atomic_fetch_add_explicit(&values[slot], value, memory_order_relaxed);
+                return slot;
+            }
+        }
+        slot = (slot + 1u) & mask;
+    }
+    return 0xFFFFFFFFu;
+}
+
+inline void hashmap_insert_add_float(device atomic_uint* keys1,
+                                      device atomic_uint* keys2,
+                                      device atomic_uint* values,
+                                      uint cap, uint key1, uint key2, float value) {
+    uint mask = cap - 1u;
+    uint slot = hashmap_mix2(key1, key2) & mask;
+    for (uint probe = 0u; probe < cap; ++probe) {
+        uint expected = 0xFFFFFFFFu;
+        if (atomic_compare_exchange_weak_explicit(&keys1[slot], &expected, key1,
+                memory_order_relaxed, memory_order_relaxed)) {
+            atomic_store_explicit(&keys2[slot], key2, memory_order_relaxed);
+            atomic_store_explicit(&values[slot], as_type<uint>(value), memory_order_relaxed);
+            return;
+        }
+        if (expected == key1) {
+            uint k2 = atomic_load_explicit(&keys2[slot], memory_order_relaxed);
+            while (k2 == 0xFFFFFFFFu) {
+                k2 = atomic_load_explicit(&keys2[slot], memory_order_relaxed);
+            }
+            if (k2 == key2) {
+                atomic_add_float(&values[slot], value);
+                return;
+            }
+        }
+        slot = (slot + 1u) & mask;
+    }
+}
+
+// Lookup by composite key. Returns slot index, or 0xFFFFFFFFu if absent.
+// Read by Probe phase (after a phase break) so plain non-atomic reads
+// of keys/values are safe.
+inline uint hashmap_lookup(const device uint* keys1,
+                           const device uint* keys2,
+                           uint cap, uint key1, uint key2) {
+    uint mask = cap - 1u;
+    uint slot = hashmap_mix2(key1, key2) & mask;
+    for (uint probe = 0u; probe < cap; ++probe) {
+        uint k1 = keys1[slot];
+        if (k1 == 0xFFFFFFFFu) return 0xFFFFFFFFu;
+        if (k1 == key1 && keys2[slot] == key2) return slot;
+        slot = (slot + 1u) & mask;
+    }
+    return 0xFFFFFFFFu;
+}
+
 )METAL";
 
 } // namespace codegen

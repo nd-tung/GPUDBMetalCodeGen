@@ -4,8 +4,13 @@
 
 #include <algorithm>
 #include <cctype>
+#include <functional>
+#include <map>
 #include <optional>
 #include <set>
+#include <sstream>
+#include <unordered_map>
+#include <unordered_set>
 #include <variant>
 #include <vector>
 
@@ -723,6 +728,786 @@ std::optional<MetalQueryPlan> buildMaterializePlan(const AnalyzedQuery& aq) {
     return plan;
 }
 
+// ===================================================================
+// MULTI-TABLE GENERIC AD-HOC BUILDER
+// ===================================================================
+//
+// Plans an arbitrary equi-join query whose join graph forms a tree
+// rooted at the largest referenced table (the "probe").  Build-side
+// tables that contribute no values to the output are realised as
+// SemiJoins (Bitmap build/probe).  Build tables that supply values
+// to SELECT / GROUP BY / aggregate inputs become IndexJoins
+// (ArrayStore on the build side, ArrayLookup on the probe side).
+// Values originating in deeper nodes are forwarded one level at a
+// time, so a value from `customer` can reach `lineitem` via an
+// intermediate ArrayStore at `orders`.
+//
+// Supported terminal patterns:
+//   - Scalar aggregation (no GROUP BY)            → MetalTGReduce
+//   - Grouped aggregation by a single small-int
+//     domain key (probe-side or carried)         → MetalKeyedAgg
+//
+// The plan is rejected when:
+//   - the join graph is not a connected tree
+//   - any non-probe table has no PK descriptor (composite-key joins
+//     such as partsupp/lineitem are not yet supported)
+//   - a non-probe table carries a non-integer column forward
+//   - HAVING / ORDER BY / LIMIT / DISTINCT are present (deferred)
+// ===================================================================
+
+struct MultiTablePkInfo {
+    std::string column;
+    std::string sizeSym;
+};
+
+std::optional<MultiTablePkInfo> multiTablePkInfo(const std::string& table) {
+    if (table == "customer") return MultiTablePkInfo{"c_custkey",   "maxCustkey"};
+    if (table == "orders")   return MultiTablePkInfo{"o_orderkey",  "maxOrderkey"};
+    if (table == "supplier") return MultiTablePkInfo{"s_suppkey",   "maxSuppkey"};
+    if (table == "part")     return MultiTablePkInfo{"p_partkey",   "maxPartkey"};
+    if (table == "nation")   return MultiTablePkInfo{"n_nationkey", "25"};
+    if (table == "region")   return MultiTablePkInfo{"r_regionkey", "5"};
+    return std::nullopt;
+}
+
+// Larger value = better probe candidate (largest TPC-H tables first).
+int multiTableProbePriority(const std::string& t) {
+    if (t == "lineitem") return 100;
+    if (t == "orders")   return 80;
+    if (t == "partsupp") return 70;
+    if (t == "customer") return 50;
+    if (t == "part")     return 40;
+    if (t == "supplier") return 30;
+    if (t == "nation")   return 10;
+    if (t == "region")   return 5;
+    return 0;
+}
+
+struct MultiTableTreeNode {
+    std::string table;
+    int parent = -1;
+    std::string keyOnSelf;    // column on this table participating in edge to parent
+    std::string keyOnParent;  // column on parent participating in edge to this
+    // Composite-key support: when keyOnSelf2/keyOnParent2 are non-empty,
+    // the edge to the parent is a 2-column join (HashJoin).  The single-
+    // column path is used only when keyOnSelf2 is empty.
+    std::string keyOnSelf2;
+    std::string keyOnParent2;
+    std::vector<int> children;
+    bool composite() const { return !keyOnSelf2.empty(); }
+};
+
+// Build a tree rooted at `probeIdx` from `aq.joins`.  Each edge is
+// consumed exactly once via BFS; if any join is unused or any table
+// is unreachable the function returns false.  Edges between the same
+// pair of tables are coalesced into a single composite-key edge.
+bool multiTableBuildJoinTree(const AnalyzedQuery& aq, int probeIdx,
+                             std::vector<MultiTableTreeNode>& nodes,
+                             std::string* error) {
+    const size_t n = aq.tables.size();
+    nodes.assign(n, MultiTableTreeNode{});
+    for (size_t i = 0; i < n; ++i) nodes[i].table = aq.tables[i];
+
+    // Coalesce JoinClauses by unordered (table, table) pair.  Each
+    // coalesced edge carries 1 or 2 column pairs.
+    struct Edge {
+        std::string a, b;                 // table names
+        std::vector<std::pair<std::string, std::string>> cols; // (col_a, col_b)
+    };
+    std::vector<Edge> edges;
+    auto findEdge = [&](const std::string& l, const std::string& r) -> int {
+        for (size_t i = 0; i < edges.size(); ++i) {
+            if ((edges[i].a == l && edges[i].b == r) ||
+                (edges[i].a == r && edges[i].b == l)) return (int)i;
+        }
+        return -1;
+    };
+    for (const auto& jc : aq.joins) {
+        int ei = findEdge(jc.leftTable, jc.rightTable);
+        if (ei < 0) {
+            Edge e;
+            e.a = jc.leftTable; e.b = jc.rightTable;
+            e.cols.emplace_back(jc.leftCol, jc.rightCol);
+            edges.push_back(std::move(e));
+        } else {
+            // Normalise column pair to edge orientation.
+            if (edges[ei].a == jc.leftTable) {
+                edges[ei].cols.emplace_back(jc.leftCol, jc.rightCol);
+            } else {
+                edges[ei].cols.emplace_back(jc.rightCol, jc.leftCol);
+            }
+        }
+    }
+    for (const auto& e : edges) {
+        if (e.cols.size() > 2) {
+            if (error) *error = "Multi-table planner: more than 2 join columns between '" +
+                                e.a + "' and '" + e.b + "' not supported.";
+            return false;
+        }
+    }
+    if (edges.size() != n - 1) {
+        if (error) *error = "Multi-table planner expects a tree-shaped join graph (n-1 edges).";
+        return false;
+    }
+
+    auto findIdx = [&](const std::string& t) -> int {
+        for (size_t k = 0; k < n; ++k) if (aq.tables[k] == t) return (int)k;
+        return -1;
+    };
+
+    std::vector<bool> visited(n, false);
+    std::vector<int> order;
+    order.push_back(probeIdx);
+    visited[probeIdx] = true;
+    std::vector<bool> edgeUsed(edges.size(), false);
+
+    for (size_t qhead = 0; qhead < order.size(); ++qhead) {
+        int u = order[qhead];
+        const std::string& uTable = aq.tables[u];
+        for (size_t ei = 0; ei < edges.size(); ++ei) {
+            if (edgeUsed[ei]) continue;
+            const auto& e = edges[ei];
+            int other = -1;
+            // Determine which side is `u` and pick column orientations.
+            std::vector<std::pair<std::string, std::string>> oriented; // (col_on_u, col_on_other)
+            if (e.a == uTable) {
+                other = findIdx(e.b);
+                for (const auto& c : e.cols) oriented.emplace_back(c.first, c.second);
+            } else if (e.b == uTable) {
+                other = findIdx(e.a);
+                for (const auto& c : e.cols) oriented.emplace_back(c.second, c.first);
+            }
+            if (other < 0 || visited[other]) continue;
+            edgeUsed[ei] = true;
+            visited[other] = true;
+            nodes[other].parent = u;
+            nodes[other].keyOnSelf   = oriented[0].second;
+            nodes[other].keyOnParent = oriented[0].first;
+            if (oriented.size() == 2) {
+                nodes[other].keyOnSelf2   = oriented[1].second;
+                nodes[other].keyOnParent2 = oriented[1].first;
+            }
+            nodes[u].children.push_back(other);
+            order.push_back(other);
+        }
+    }
+
+    if (order.size() != n) {
+        if (error) *error = "Multi-table planner: join graph is not connected or contains cycles.";
+        return false;
+    }
+    return true;
+}
+
+// Identifier for a column to be carried forward toward the probe.
+struct CarriedKey {
+    std::string table;
+    std::string column;
+    bool operator<(const CarriedKey& o) const {
+        if (table != o.table) return table < o.table;
+        return column < o.column;
+    }
+    bool operator==(const CarriedKey& o) const {
+        return table == o.table && column == o.column;
+    }
+    std::string varName() const { return "_carry_" + table + "_" + column; }
+    std::string storageArray(const std::string& storedAtTable) const {
+        return "d_carry_" + table + "_" + column + "_at_" + storedAtTable;
+    }
+};
+
+// Replace every `<column>[<idxVar>]` occurrence in `expr` with the
+// carried-variable name for ColRefs whose origin table is not the
+// probe.  Column names in the TPC-H schema are unique so a textual
+// substitution is unambiguous.
+std::string rewriteForProbe(std::string expr,
+                             const std::string& idxVar,
+                             const std::map<CarriedKey, std::string>& carryVar) {
+    for (const auto& [key, var] : carryVar) {
+        const std::string from = key.column + "[" + idxVar + "]";
+        size_t pos = 0;
+        while ((pos = expr.find(from, pos)) != std::string::npos) {
+            expr.replace(pos, from.size(), var);
+            pos += var.size();
+        }
+    }
+    return expr;
+}
+
+// Returns the table that owns column `c` (looking up the schema).
+// If the column appears in multiple tables (column-name collision is
+// not present in TPC-H), returns the first match.
+std::string ownerTableForColumn(const AnalyzedQuery& aq, const std::string& c) {
+    for (const auto& t : aq.tables) {
+        const auto& tdef = TPCHSchema::instance().table(t);
+        if (tdef.nameToIdx.count(c)) return t;
+    }
+    return "";
+}
+
+bool carriedColumnSupported(DataType type) {
+    return type == DataType::INT || type == DataType::DATE;
+}
+
+std::optional<MetalQueryPlan> buildGenericMultiTableAdhocPlan_impl(
+    const AnalyzedQuery& aq, std::string* error) {
+
+    auto fail = [&](const std::string& msg) -> std::optional<MetalQueryPlan> {
+        if (error) *error = msg;
+        return std::nullopt;
+    };
+
+    if (aq.tables.size() < 2) return std::nullopt;
+    for (const auto& t : aq.tables) {
+        if (t == "__subquery__") return std::nullopt;
+    }
+    if (aq.joins.empty()) return std::nullopt;
+
+    if (aq.having)        return fail("HAVING not supported by generic multi-table planner.");
+    if (!aq.orderBy.empty()) return fail("ORDER BY not supported by generic multi-table planner.");
+    if (aq.limit >= 0)    return fail("LIMIT not supported by generic multi-table planner.");
+    if (!aq.hasAggregation())
+        return fail("Multi-table planner requires aggregation (no materialize support).");
+
+    // Aggregations: SUM/COUNT/AVG/MIN/MAX (no DISTINCT).
+    for (const auto& t : aq.targets) {
+        if (t.isAgg) {
+            if (!t.agg) return fail("Malformed aggregate target.");
+            if (t.agg->func == AggFunc::COUNT_DISTINCT)
+                return fail("COUNT(DISTINCT) not supported by generic multi-table planner.");
+        }
+    }
+
+    if (!filtersSupported(aq.filters))
+        return fail("WHERE clause contains expressions not supported on GPU.");
+
+    // ---------- Pick probe table ----------
+    int probeIdx = 0;
+    int bestPrio = -1;
+    for (size_t i = 0; i < aq.tables.size(); ++i) {
+        int p = multiTableProbePriority(aq.tables[i]);
+        if (p > bestPrio) { bestPrio = p; probeIdx = (int)i; }
+    }
+    const std::string& probeTable = aq.tables[probeIdx];
+
+    // ---------- Build join tree ----------
+    std::vector<MultiTableTreeNode> nodes;
+    if (!multiTableBuildJoinTree(aq, probeIdx, nodes, error)) return std::nullopt;
+
+    // ---------- Validate non-probe nodes ----------
+    // Single-column edges require the build side's join column to be the
+    // table's PK (so we can use direct-address ArrayStore/BitmapBuild).
+    // Composite-key edges relax that requirement (we use a hash map),
+    // but to keep value propagation simple we require:
+    //   - the composite-key edge connects directly to the probe
+    //   - the build node is a leaf (no further children)
+    //   - the build subtree carries 0 or 1 value to the probe
+    for (size_t i = 0; i < nodes.size(); ++i) {
+        if ((int)i == probeIdx) continue;
+        if (nodes[i].composite()) {
+            if (nodes[i].parent != probeIdx) {
+                return fail("Multi-table planner: composite-key joins are only "
+                            "supported when the build table connects directly to "
+                            "the probe table.");
+            }
+            if (!nodes[i].children.empty()) {
+                return fail("Multi-table planner: composite-key build side must be "
+                            "a leaf (chained joins on the build side not supported).");
+            }
+            continue;
+        }
+        auto pk = multiTablePkInfo(nodes[i].table);
+        if (!pk)
+            return fail("Multi-table planner: table '" + nodes[i].table + "' has no PK descriptor.");
+        if (pk->column != nodes[i].keyOnSelf) {
+            return fail("Multi-table planner: join on '" + nodes[i].table + "." +
+                        nodes[i].keyOnSelf + "' is not the table's primary key (" +
+                        pk->column + ").");
+        }
+    }
+
+    // ---------- Per-table filters ----------
+    std::map<std::string, std::vector<PredPtr>> filtersByTable;
+    for (const auto& f : aq.filters) {
+        std::set<std::string> cols;
+        collectColumns(f, cols);
+        std::set<std::string> tbls;
+        for (const auto& c : cols) {
+            std::string owner = ownerTableForColumn(aq, c);
+            if (!owner.empty()) tbls.insert(owner);
+        }
+        if (tbls.size() != 1)
+            return fail("Multi-table planner: cross-table filter not supported (must be a join condition).");
+        filtersByTable[*tbls.begin()].push_back(f);
+    }
+
+    // ---------- Collect needed (carried) columns per table ----------
+    // A column is "needed at the probe" when it appears in any
+    // SELECT target, GROUP BY, or aggregate inner expression.
+    std::map<std::string, std::set<std::string>> neededByTable;
+
+    auto addNeededFromExpr = [&](const ExprPtr& e) {
+        if (!e) return;
+        std::set<std::string> cols;
+        collectColumns(e, cols);
+        for (const auto& c : cols) {
+            std::string owner = ownerTableForColumn(aq, c);
+            if (!owner.empty()) neededByTable[owner].insert(c);
+        }
+    };
+
+    for (const auto& t : aq.targets) {
+        if (t.isAgg) {
+            if (t.agg && !t.agg->isStar) addNeededFromExpr(t.agg->innerExpr);
+        } else {
+            addNeededFromExpr(t.expr);
+        }
+    }
+    for (const auto& g : aq.groupBy) addNeededFromExpr(g);
+
+    // ---------- Carried columns: per-non-probe-table local + subtree ----------
+    std::map<int, std::vector<CarriedKey>> localCarry;       // owned by this node
+    std::map<int, std::vector<CarriedKey>> subtreeCarry;     // local + descendants
+    std::function<void(int)> dfs = [&](int u) {
+        const std::string& tname = aq.tables[u];
+        // Local carries: columns from this table needed at probe, EXCEPT
+        // the join key itself when the value is implicitly carried by
+        // probe's lookup key.
+        if (u != probeIdx) {
+            const auto& need = neededByTable[tname];
+            for (const auto& c : need) {
+                CarriedKey ck{tname, c};
+                if (!carriedColumnSupported(TPCHSchema::instance().table(tname).col(c).type)) {
+                    // Defer: only int/date carried columns.
+                    // We'll fail later if such a column is actually required.
+                    continue;
+                }
+                localCarry[u].push_back(ck);
+                subtreeCarry[u].push_back(ck);
+            }
+        }
+        for (int c : nodes[u].children) {
+            dfs(c);
+            auto& subC = subtreeCarry[c];
+            subtreeCarry[u].insert(subtreeCarry[u].end(), subC.begin(), subC.end());
+        }
+    };
+    dfs(probeIdx);
+
+    // Validate that every needed non-probe column was supportable.
+    for (const auto& [tname, cols] : neededByTable) {
+        if (tname == probeTable) continue;
+        for (const auto& c : cols) {
+            const auto& cdef = TPCHSchema::instance().table(tname).col(c);
+            if (!carriedColumnSupported(cdef.type)) {
+                return fail("Multi-table planner: carried column '" + tname + "." + c +
+                            "' has unsupported type (only INT/DATE are carried).");
+            }
+        }
+    }
+
+    // ---------- Assemble plan ----------
+    MetalQueryPlan plan;
+    plan.name = "ADHOC_MULTI_TABLE";
+    const std::string idxVar = "i";
+
+    // BFS order of nodes from probe; build phases are produced in
+    // reverse (deepest leaves first) so that every ArrayStore is
+    // available when its parent runs.
+    std::vector<int> bfsOrder;
+    {
+        std::vector<bool> seen(nodes.size(), false);
+        bfsOrder.push_back(probeIdx); seen[probeIdx] = true;
+        for (size_t h = 0; h < bfsOrder.size(); ++h) {
+            int u = bfsOrder[h];
+            for (int c : nodes[u].children) {
+                if (!seen[c]) { seen[c] = true; bfsOrder.push_back(c); }
+            }
+        }
+    }
+
+    auto scanColsForTable = [&](int u, std::set<std::string>& out) {
+        const std::string& tname = aq.tables[u];
+        for (const auto& f : filtersByTable[tname]) collectColumns(f, out);
+        // Edge to parent: probe key on self
+        if (u != probeIdx) {
+            out.insert(nodes[u].keyOnSelf);
+            if (nodes[u].composite()) out.insert(nodes[u].keyOnSelf2);
+        }
+        // Edges to children: probe keys for child join (column on this table)
+        for (int c : nodes[u].children) {
+            // child's keyOnParent is on `u`
+            out.insert(nodes[c].keyOnParent);
+            if (nodes[c].composite()) out.insert(nodes[c].keyOnParent2);
+        }
+        // Local carried columns (originating here)
+        if (u != probeIdx) {
+            for (const auto& ck : localCarry[u]) out.insert(ck.column);
+        } else {
+            // Probe scan must also bind columns referenced directly by
+            // SELECT/agg/groupBy and probe's filters.
+            for (const auto& c : neededByTable[tname]) out.insert(c);
+        }
+    };
+
+    // Build phases for each non-probe node in reverse BFS order (leaves first).
+    for (auto it = bfsOrder.rbegin(); it != bfsOrder.rend(); ++it) {
+        int u = *it;
+        if (u == probeIdx) continue;
+
+        const std::string& tname = aq.tables[u];
+
+        std::set<std::string> scanCols;
+        scanColsForTable(u, scanCols);
+        auto scan = makeScanForCols(tname, idxVar, scanCols);
+        std::unique_ptr<MetalOperator> pipe = std::move(scan);
+
+        // Per-table filters
+        std::string filterCond = combineFilters(filtersByTable[tname], idxVar);
+        pipe = maybeSelect(std::move(pipe), filterCond);
+
+        // For each child of u, attach probe (BitmapProbe or ArrayLookup
+        // for each carried column from that child's subtree).
+        for (int c : nodes[u].children) {
+            const std::string& probeKey = nodes[c].keyOnParent + "[" + idxVar + "]";
+            const auto& subC = subtreeCarry[c];
+            // Composite-key children are validated to attach only to the
+            // probe (not to interior build nodes), so we don't need a
+            // HashMapLookup branch here.
+            if (subC.empty()) {
+                pipe = std::make_unique<MetalBitmapProbe>(
+                    std::move(pipe), "d_bitmap_" + aq.tables[c], probeKey);
+            } else {
+                for (const auto& ck : subC) {
+                    pipe = std::make_unique<MetalArrayLookup>(
+                        std::move(pipe), ck.storageArray(aq.tables[c]),
+                        probeKey, ck.varName(), "int", -1);
+                }
+            }
+        }
+
+        // Now emit storage for parent.
+        const std::string storeKey = nodes[u].keyOnSelf + "[" + idxVar + "]";
+
+        if (nodes[u].composite()) {
+            // Composite-key edge: build a hash map keyed by (col1, col2).
+            // The build subtree is restricted to a leaf, so subtreeCarry
+            // contains at most this table's local carry list.
+            const auto& sub = subtreeCarry[u];
+            if (sub.size() > 1) {
+                return fail("Multi-table planner: composite-key build can carry "
+                            "at most one column to the probe.");
+            }
+            const std::string mapName = "hm_" + tname;
+            const std::string capExpr = "next_pow2((" +
+                tableSizeName(tname) + ") * 4 + 16)";
+            const std::string k1 = nodes[u].keyOnSelf + "[" + idxVar + "]";
+            const std::string k2 = nodes[u].keyOnSelf2 + "[" + idxVar + "]";
+            std::string valExpr = "0u";
+            if (!sub.empty()) {
+                const auto& ck = sub.front();
+                valExpr = ck.column + "[" + idxVar + "]";
+            }
+            pipe = std::make_unique<MetalHashMapBuild>(
+                std::move(pipe), mapName, k1, k2, valExpr, capExpr);
+            appendPhase(plan, "ADHOC_multi_build_" + tname, std::move(pipe));
+            continue;
+        }
+
+        auto pkU = multiTablePkInfo(tname);
+        const std::string sizeSym = pkU->sizeSym;
+
+        const auto& sub = subtreeCarry[u];
+        if (sub.empty()) {
+            // Pure semi-join: bitmap.
+            pipe = std::make_unique<MetalBitmapBuild>(
+                std::move(pipe), "d_bitmap_" + tname, storeKey,
+                "(" + sizeSym + " + 31) / 32");
+        } else {
+            // For each carried column, emit an ArrayStore.  The
+            // value source is either a local column or a variable
+            // produced by an earlier ArrayLookup.
+            for (const auto& ck : sub) {
+                std::string valExpr;
+                if (ck.table == tname) {
+                    valExpr = ck.column + "[" + idxVar + "]";
+                } else {
+                    valExpr = ck.varName();
+                }
+                pipe = std::make_unique<MetalArrayStore>(
+                    std::move(pipe), ck.storageArray(tname),
+                    storeKey, valExpr, "int", sizeSym);
+            }
+        }
+
+        appendPhase(plan, "ADHOC_multi_build_" + tname, std::move(pipe));
+    }
+
+    // ---------- Probe phase ----------
+    std::set<std::string> probeScanCols;
+    scanColsForTable(probeIdx, probeScanCols);
+    auto probeScan = makeScanForCols(probeTable, idxVar, probeScanCols);
+    std::unique_ptr<MetalOperator> probePipe = std::move(probeScan);
+
+    // Probe's own filters.
+    probePipe = maybeSelect(std::move(probePipe),
+                            combineFilters(filtersByTable[probeTable], idxVar));
+
+    // Probe each direct child.
+    std::map<CarriedKey, std::string> carryVar; // for expression rewrite
+    for (int c : nodes[probeIdx].children) {
+        const std::string& probeKey = nodes[c].keyOnParent + "[" + idxVar + "]";
+        const auto& subC = subtreeCarry[c];
+
+        if (nodes[c].composite()) {
+            // HashJoin probe.  Capacity expression must match the
+            // build-phase choice exactly so that resolve() yields the
+            // same value here.
+            const std::string mapName = "hm_" + aq.tables[c];
+            const std::string capExpr = "next_pow2((" +
+                tableSizeName(aq.tables[c]) + ") * 4 + 16)";
+            const std::string k2 = nodes[c].keyOnParent2 + "[" + idxVar + "]";
+            if (subC.empty()) {
+                // Semi-join: lookup with a discardable result variable.
+                std::string dummy = "_hjsemi_" + aq.tables[c];
+                probePipe = std::make_unique<MetalHashMapLookup>(
+                    std::move(probePipe), mapName, probeKey, k2, capExpr,
+                    dummy, "uint");
+            } else {
+                const auto& ck = subC.front();
+                probePipe = std::make_unique<MetalHashMapLookup>(
+                    std::move(probePipe), mapName, probeKey, k2, capExpr,
+                    ck.varName(), "int");
+                carryVar[ck] = ck.varName();
+            }
+            continue;
+        }
+
+        if (subC.empty()) {
+            probePipe = std::make_unique<MetalBitmapProbe>(
+                std::move(probePipe), "d_bitmap_" + aq.tables[c], probeKey);
+        } else {
+            for (const auto& ck : subC) {
+                probePipe = std::make_unique<MetalArrayLookup>(
+                    std::move(probePipe), ck.storageArray(aq.tables[c]),
+                    probeKey, ck.varName(), "int", -1);
+                carryVar[ck] = ck.varName();
+            }
+        }
+    }
+
+    // ---------- Terminal: scalar agg vs. grouped agg ----------
+    if (!aq.hasGroupBy()) {
+        // Scalar reduction over probe rows that survived all joins.
+        auto reduce = std::make_unique<MetalTGReduce>(std::move(probePipe), "d_adhoc_multi_scalar");
+        for (size_t ti = 0; ti < aq.targets.size(); ++ti) {
+            const auto& target = aq.targets[ti];
+            if (!target.isAgg || !target.agg)
+                return fail("Non-aggregate target without GROUP BY in multi-table query.");
+            std::string alias = displayNameForTarget(target, ti);
+            std::string accName = "a" + std::to_string(ti) + "_" + sanitizeIdentifier(alias);
+            AggFunc func = target.agg->func;
+
+            if (func == AggFunc::COUNT) {
+                int idx = reduce->addAccumulator(accName, "1", "long");
+                reduce->setAccumulatorResultAlias(alias, idx, 0);
+                continue;
+            }
+
+            if (!target.agg->innerExpr || !exprSupported(target.agg->innerExpr, false))
+                return fail("Aggregate expression not supported on GPU.");
+            if (!isNumericLike(inferExprDataType(target.agg->innerExpr)))
+                return fail("Aggregate expression must be numeric.");
+
+            std::string raw = exprToMetal(target.agg->innerExpr, idxVar);
+            std::string finalExpr = rewriteForProbe(raw, idxVar, carryVar);
+
+            if (func == AggFunc::AVG) {
+                int sumIdx = reduce->addAccumulator(accName + "_sum", finalExpr, "float");
+                int cntIdx = reduce->addAccumulator(accName + "_count", "1.0f", "float");
+                reduce->setAverageResultAlias(alias, sumIdx, cntIdx, 0);
+            } else {
+                DataType vt = inferExprDataType(target.agg->innerExpr);
+                std::string outType = (vt == DataType::FLOAT) ? "float" : "long";
+                MetalTGReduce::ReduceOp op = MetalTGReduce::ReduceOp::SUM;
+                if (func == AggFunc::MIN) op = MetalTGReduce::ReduceOp::MIN;
+                else if (func == AggFunc::MAX) op = MetalTGReduce::ReduceOp::MAX;
+                if (op != MetalTGReduce::ReduceOp::SUM && vt != DataType::FLOAT) outType = "int";
+                int idx = reduce->addAccumulator(accName, finalExpr, outType, "", "", op);
+                reduce->setAccumulatorResultAlias(alias, idx, 0);
+            }
+        }
+        appendPhase(plan, "ADHOC_multi_probe_scalar", std::move(reduce));
+        return plan;
+    }
+
+    // ---------- Grouped aggregation ----------
+    // Currently restrict to a single group key over a small-int domain.
+    if (aq.groupBy.size() != 1)
+        return fail("Multi-table planner: only single-column GROUP BY supported (extend later).");
+    auto* gc = std::get_if<ColRef>(&aq.groupBy[0]->node);
+    if (!gc) return fail("GROUP BY expression must be a column reference.");
+
+    auto domain = smallIntGroupDomain(*gc);
+    if (!domain || domain->maxValue < domain->minValue)
+        return fail("Multi-table planner: GROUP BY column has no known small-int domain.");
+    int numBuckets = domain->maxValue - domain->minValue + 1;
+    if (numBuckets > 4096)
+        return fail("Multi-table planner: GROUP BY domain exceeds 4096 buckets.");
+
+    // Source for the bucket value: probe column or carried variable.
+    std::string keySource;
+    if (gc->table == probeTable) {
+        keySource = gc->column + "[" + idxVar + "]";
+    } else {
+        CarriedKey ck{gc->table, gc->column};
+        auto it = carryVar.find(ck);
+        if (it == carryVar.end())
+            return fail("GROUP BY column not present on probe path: " + gc->table + "." + gc->column);
+        keySource = it->second;
+    }
+    std::string bucketExpr = (domain->minValue != 0)
+        ? "(" + keySource + " - " + std::to_string(domain->minValue) + ")"
+        : keySource;
+    bucketExpr = "clamp(" + bucketExpr + ", 0, " + std::to_string(numBuckets - 1) + ")";
+
+    // Layout aggregates and slot count.
+    struct PendingAgg {
+        std::string display;
+        std::string name;
+        int offset = 0;
+        std::string valueExpr;
+        bool isLongPair = false;
+        int scaleDown = 0;
+        bool isFloatSum = false;
+        bool isMinMax = false;
+        std::string atomicOp = "add";
+    };
+    std::vector<PendingAgg> pending;
+    int valuesPerBucket = 0;
+
+    for (size_t ti = 0; ti < aq.targets.size(); ++ti) {
+        const auto& target = aq.targets[ti];
+        if (!target.isAgg) continue;
+        if (!target.agg) return fail("Malformed aggregate target.");
+        AggFunc func = target.agg->func;
+        std::string display = displayNameForTarget(target, ti);
+        std::string sname = sanitizeIdentifier(display);
+
+        if (func == AggFunc::COUNT) {
+            PendingAgg p;
+            p.display = display;
+            p.name = "a" + std::to_string(ti) + "_" + sname;
+            p.offset = valuesPerBucket++;
+            p.valueExpr = "1u";
+            p.atomicOp = "add";
+            pending.push_back(std::move(p));
+            continue;
+        }
+
+        if (!target.agg->innerExpr || !exprSupported(target.agg->innerExpr, false))
+            return fail("Aggregate expression not supported on GPU.");
+        DataType vt = inferExprDataType(target.agg->innerExpr);
+
+        std::string raw = exprToMetal(target.agg->innerExpr, idxVar);
+        std::string finalExpr = rewriteForProbe(raw, idxVar, carryVar);
+
+        if (func == AggFunc::AVG) {
+            bool isFloat = (vt == DataType::FLOAT);
+            PendingAgg sumA;
+            sumA.display = display;
+            sumA.name = "a" + std::to_string(ti) + "_" + sname + "_sum";
+            sumA.offset = valuesPerBucket;
+            sumA.valueExpr = finalExpr;
+            sumA.scaleDown = -1;
+            sumA.atomicOp = "add";
+            if (isFloat) {
+                sumA.isFloatSum = true;
+                valuesPerBucket += 1;
+            } else {
+                sumA.isLongPair = true;
+                valuesPerBucket += 2;
+            }
+            pending.push_back(std::move(sumA));
+
+            PendingAgg cntA;
+            cntA.display = display + "_cnt";
+            cntA.name = "a" + std::to_string(ti) + "_" + sname + "_cnt";
+            cntA.offset = valuesPerBucket++;
+            cntA.valueExpr = "1u";
+            cntA.atomicOp = "add";
+            pending.push_back(std::move(cntA));
+            continue;
+        }
+
+        if (func == AggFunc::MIN || func == AggFunc::MAX) {
+            PendingAgg p;
+            p.display = display;
+            p.name = "a" + std::to_string(ti) + "_" + sname;
+            p.offset = valuesPerBucket++;
+            p.valueExpr = finalExpr;
+            p.atomicOp = (func == AggFunc::MIN) ? "min" : "max";
+            p.isMinMax = true;
+            if (vt == DataType::FLOAT) p.isFloatSum = true;
+            pending.push_back(std::move(p));
+            continue;
+        }
+
+        if (func != AggFunc::SUM)
+            return fail("Aggregate function not supported by multi-table planner.");
+
+        PendingAgg p;
+        p.display = display;
+        p.name = "a" + std::to_string(ti) + "_" + sname;
+        p.offset = valuesPerBucket;
+        p.valueExpr = finalExpr;
+        p.atomicOp = "add";
+        if (vt == DataType::FLOAT) {
+            p.isFloatSum = true;
+            valuesPerBucket += 1;
+        } else {
+            p.isLongPair = true;
+            valuesPerBucket += 2;
+        }
+        pending.push_back(std::move(p));
+    }
+
+    if (pending.empty())
+        return fail("Multi-table planner: no aggregate output columns.");
+
+    // Build keyed-agg operator.
+    auto agg = std::make_unique<MetalKeyedAgg>(
+        std::move(probePipe), "d_adhoc_multi_group_aggs", bucketExpr,
+        numBuckets, valuesPerBucket,
+        std::to_string(numBuckets * valuesPerBucket));
+
+    // Decode info for the (single) key.
+    std::string keyDisplay = gc->column;
+    for (size_t ti = 0; ti < aq.targets.size(); ++ti) {
+        const auto& target = aq.targets[ti];
+        if (target.isAgg) continue;
+        if (target.expr && exprIsColumn(target.expr, *gc)) {
+            keyDisplay = displayNameForTarget(target, ti);
+            break;
+        }
+    }
+    GroupKeyDecode decode;
+    decode.name = keyDisplay;
+    decode.numValues = numBuckets;
+    decode.stride = 1;
+    decode.keyBase = domain->minValue;
+    agg->setMultiKeyResult({keyDisplay}, {decode}, numBuckets);
+
+    for (const auto& p : pending) {
+        agg->addAggregateWithMeta(p.display, p.offset, p.valueExpr,
+                                  p.atomicOp, p.isLongPair, p.scaleDown,
+                                  p.isFloatSum, p.isMinMax);
+    }
+
+    appendPhase(plan, "ADHOC_multi_probe_group", std::move(agg));
+    return plan;
+}
+
 } // namespace
 
 std::optional<MetalQueryPlan> buildGenericSingleTableAdhocPlan(const AnalyzedQuery& aq) {
@@ -733,6 +1518,11 @@ std::optional<MetalQueryPlan> buildGenericSingleTableAdhocPlan(const AnalyzedQue
     if (auto scalar = buildScalarAggPlan(aq)) return scalar;
     if (auto grouped = buildGroupedAggPlan(aq)) return grouped;
     return buildMaterializePlan(aq);
+}
+
+std::optional<MetalQueryPlan> buildGenericMultiTableAdhocPlan(
+    const AnalyzedQuery& aq, std::string* error) {
+    return buildGenericMultiTableAdhocPlan_impl(aq, error);
 }
 
 } // namespace codegen

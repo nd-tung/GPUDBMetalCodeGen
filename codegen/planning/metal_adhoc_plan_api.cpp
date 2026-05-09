@@ -9,6 +9,8 @@ std::optional<MetalQueryPlan> buildAdhocSQLPlan(const AnalyzedQuery& aq,
     auto dispatch = [&]() -> std::optional<MetalQueryPlan> {
         // Generic single-table path first (most expressive for supported patterns).
         if (auto p = buildGenericSingleTableAdhocPlan(aq)) return p;
+        // Generic multi-table path: handles tree-shaped equi-join queries.
+        if (auto p = buildGenericMultiTableAdhocPlan(aq)) return p;
         // Simple scalar-agg fallback (Q6 serves as generic scalar dispatcher).
         if (auto p = buildQ6Plan(aq)) return p;
         // TPC-H-specific recognizers only for queries the generic path can't handle.

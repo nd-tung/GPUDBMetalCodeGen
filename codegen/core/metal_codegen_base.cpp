@@ -204,7 +204,8 @@ void MetalCodegen::addBufferParam(const std::string& name, const std::string& el
 
 void MetalCodegen::addAtomicBufferParam(const std::string& name,
                                          const std::string& atomicType,
-                                         const std::string& sizeExpr) {
+                                         const std::string& sizeExpr,
+                                         int fillByte) {
     MetalParamBinding b;
     b.name = name;
     b.metalTypeDecl = "device " + atomicType + "*";
@@ -212,6 +213,7 @@ void MetalCodegen::addAtomicBufferParam(const std::string& name,
     b.elementType = atomicType;
     b.sizeExpr = sizeExpr;
     b.zeroInit = true;
+    b.fillByte = fillByte;
     pushBinding("addAtomicBufferParam", std::move(b), /*dedup=*/true);
 }
 
@@ -222,6 +224,18 @@ void MetalCodegen::addScalarParam(const std::string& name, const std::string& ty
     b.kind = MetalParamKind::ConstantScalar;
     b.elementType = type;
     pushBinding("addScalarParam", std::move(b), /*dedup=*/true);
+}
+
+void MetalCodegen::addResolvedScalarParam(const std::string& name,
+                                          const std::string& type,
+                                          const std::string& sizeExpr) {
+    MetalParamBinding b;
+    b.name = name;
+    b.metalTypeDecl = "constant " + type + "&";
+    b.kind = MetalParamKind::ConstantScalar;
+    b.elementType = type;
+    b.sizeExpr = sizeExpr;
+    pushBinding("addResolvedScalarParam", std::move(b), /*dedup=*/true);
 }
 
 void MetalCodegen::addConstantDataParam(const std::string& name, const std::string& type,
