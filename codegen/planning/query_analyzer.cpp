@@ -509,9 +509,17 @@ void extractTables(const json& fromItem, std::vector<std::string>& tables,
         extractTables(je["rarg"], tables, aliases);
     }
     if (fromItem.contains("RangeSubselect")) {
-        // Subquery in FROM — push a placeholder
-        tables.push_back("__subquery__");
         auto& rs = fromItem["RangeSubselect"];
+        if (rs.contains("subquery") && rs["subquery"].contains("SelectStmt")) {
+            auto& sub = rs["subquery"]["SelectStmt"];
+            if (sub.contains("fromClause")) {
+                for (auto& item : sub["fromClause"])
+                    extractTables(item, tables, aliases);
+                return;
+            }
+        }
+
+        tables.push_back("__subquery__");
         if (rs.contains("alias")) {
             auto& a = rs["alias"];
             if (a.contains("Alias"))

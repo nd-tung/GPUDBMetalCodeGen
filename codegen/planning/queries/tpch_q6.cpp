@@ -3,6 +3,28 @@
 
 namespace codegen {
 
+namespace {
+
+std::optional<MetalQueryPlan> buildQ6PlanForShape(const std::set<std::string>& usedCols,
+                                                  const std::string& filterCond,
+                                                  const std::string& aggExpr,
+                                                  const std::string& alias) {
+    MetalQueryPlan plan;
+    plan.name = "Q6";
+
+    std::string idxVar = "i";
+    auto filtered = maybeSelect(makeScanForCols("lineitem", idxVar, usedCols), filterCond);
+
+    auto reduce = std::make_unique<MetalTGReduce>(std::move(filtered), tableDataName(alias));
+    reduce->addAccumulator(alias, "(long)(" + aggExpr + " * 100.0f)", "long");
+    reduce->setResultAlias(alias, 100);
+
+    appendPhase(plan, "Q6_reduce", std::move(reduce));
+    return plan;
+}
+
+} // namespace
+
 // ===================================================================
 // Q6 Plan Builder
 // ===================================================================
@@ -20,9 +42,6 @@ std::optional<MetalQueryPlan> buildQ6Plan(const AnalyzedQuery& aq) {
             hasSumAgg = true;
     }
     if (!hasSumAgg) return std::nullopt;
-
-    MetalQueryPlan plan;
-    plan.name = "Q6";
 
     // Collect all referenced columns from filters and aggregates
     std::set<std::string> usedCols;
@@ -45,18 +64,17 @@ std::optional<MetalQueryPlan> buildQ6Plan(const AnalyzedQuery& aq) {
     // Build filter predicate using columnar indexing
     std::string filterCond = combineFilters(aq.filters, idxVar);
 
-    auto filtered = maybeSelect(makeScanForCols("lineitem", idxVar, usedCols), filterCond);
+    return buildQ6PlanForShape(usedCols, filterCond, aggExpr, alias);
+}
 
-    auto reduce = std::make_unique<MetalTGReduce>(std::move(filtered), tableDataName(alias));
-    // For Q6, use long (fixed-point 100x) accumulation for precision
-    reduce->addAccumulator(alias, "(long)(" + aggExpr + " * 100.0f)", "long");
-
-    // Register result schema: scalar aggregate, 1 column, scale down by 100
-    reduce->setResultAlias(alias, 100);
-
-    appendPhase(plan, "Q6_reduce", std::move(reduce));
-
-    return plan;
+std::optional<MetalQueryPlan> buildQ6Plan_byName() {
+    return buildQ6PlanForShape(
+        {"l_shipdate", "l_discount", "l_quantity", "l_extendedprice"},
+        "l_shipdate[i] >= 19940101 && l_shipdate[i] < 19950101 && "
+        "(l_discount[i] >= 0.050000f && l_discount[i] <= 0.070000f) && "
+        "l_quantity[i] < 24.000000f",
+        "(l_extendedprice[i] * l_discount[i])",
+        "revenue");
 }
 
 } // namespace codegen

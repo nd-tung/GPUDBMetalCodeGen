@@ -3,6 +3,52 @@
 
 namespace codegen {
 
+namespace {
+
+std::optional<MetalQueryPlan> buildQ4PlanForDateFilter(const std::string& filterCond) {
+    MetalQueryPlan plan;
+    plan.name = "Q4";
+    std::string idxVar = "i";
+
+    {
+        auto scan = makeScan("lineitem", idxVar, {
+            {"l_orderkey", "int"}, {"l_commitdate", "int"}, {"l_receiptdate", "int"}
+        });
+
+        auto filter = std::make_unique<MetalSelection>(std::move(scan),
+            "l_commitdate[" + idxVar + "] < l_receiptdate[" + idxVar + "]");
+
+        auto bitmapBuild = std::make_unique<MetalBitmapBuild>(
+            std::move(filter), "d_late_bitmap",
+            "l_orderkey[" + idxVar + "]", "(maxOrderkey + 31) / 32 + 1");
+
+        appendPhase(plan, "Q4_build_bitmap", std::move(bitmapBuild));
+    }
+
+    {
+        auto scan = makeScan("orders", idxVar, {
+            {"o_orderkey", "int"}, {"o_orderdate", "int"}, {"o_orderpriority", "char"}
+        });
+
+        auto filtered = maybeSelect(std::move(scan), filterCond);
+        auto probed = std::make_unique<MetalBitmapProbe>(
+            std::move(filtered), "d_late_bitmap",
+            "o_orderkey[" + idxVar + "]");
+
+        std::string bucketExpr = "(o_orderpriority[" + idxVar + "] - '1')";
+        auto agg = std::make_unique<MetalKeyedAgg>(
+            std::move(probed), "d_q4_counts", bucketExpr,
+            /*numBuckets=*/5, /*valuesPerBucket=*/1, "5");
+        agg->addAggregate("order_count", 0, "1u", "add", false, 0);
+
+        appendPhase(plan, "Q4_count", std::move(agg));
+    }
+
+    return plan;
+}
+
+} // namespace
+
 // ===================================================================
 // Q4 Plan Builder — Order Priority Checking
 // Pattern: BitmapBuild(lineitem, late) → Filter+KeyedAgg(orders, date)
@@ -39,61 +85,19 @@ std::optional<MetalQueryPlan> buildQ4Plan(const AnalyzedQuery& aq) {
     }
     if (!groupByPriority) return std::nullopt;
 
-    MetalQueryPlan plan;
-    plan.name = "Q4";
     std::string idxVar = "i";
 
-    // Phase 1: Build late-delivery bitmap from lineitem
-    // Set bit for l_orderkey where l_commitdate < l_receiptdate
-    {
-        auto scan = makeScan("lineitem", idxVar, {
-            {"l_orderkey", "int"}, {"l_commitdate", "int"}, {"l_receiptdate", "int"}
-        });
-
-        auto filter = std::make_unique<MetalSelection>(std::move(scan),
-            "l_commitdate[" + idxVar + "] < l_receiptdate[" + idxVar + "]");
-
-        auto bitmapBuild = std::make_unique<MetalBitmapBuild>(
-            std::move(filter), "d_late_bitmap",
-            "l_orderkey[" + idxVar + "]", "(maxOrderkey + 31) / 32 + 1");
-
-        appendPhase(plan, "Q4_build_bitmap", std::move(bitmapBuild));
+    std::vector<PredPtr> dateFilters;
+    for (auto& f : aq.filters) {
+        std::set<std::string> cols;
+        collectColumns(f, cols);
+        if (cols.count("o_orderdate")) dateFilters.push_back(f);
     }
+    return buildQ4PlanForDateFilter(combineFilters(dateFilters, idxVar));
+}
 
-    // Phase 2: Scan orders, filter by date + bitmap probe, count by priority
-    {
-        auto scan = makeScan("orders", idxVar, {
-            {"o_orderkey", "int"}, {"o_orderdate", "int"}, {"o_orderpriority", "char"}
-        });
-
-        // Extract date filter from the analyzed query
-        std::vector<PredPtr> dateFilters;
-        for (auto& f : aq.filters) {
-            std::set<std::string> cols;
-            collectColumns(f, cols);
-            if (cols.count("o_orderdate")) dateFilters.push_back(f);
-        }
-        std::string filterCond = combineFilters(dateFilters, idxVar);
-
-        auto filtered = maybeSelect(std::move(scan), filterCond);
-
-        // Bitmap probe: only orders with late lineitem deliveries
-        auto probed = std::make_unique<MetalBitmapProbe>(
-            std::move(filtered), "d_late_bitmap",
-            "o_orderkey[" + idxVar + "]");
-
-        // KeyedAgg: 5 priority bins (o_orderpriority first char '1'..'5' → bins 0..4)
-        // o_orderpriority is CHAR1, first char at o_orderpriority[i]
-        std::string bucketExpr = "(o_orderpriority[" + idxVar + "] - '1')";
-        auto agg = std::make_unique<MetalKeyedAgg>(
-            std::move(probed), "d_q4_counts", bucketExpr,
-            /*numBuckets=*/5, /*valuesPerBucket=*/1, "5");
-        agg->addAggregate("order_count", 0, "1u", "add", false, 0);
-
-        appendPhase(plan, "Q4_count", std::move(agg));
-    }
-
-    return plan;
+std::optional<MetalQueryPlan> buildQ4Plan_byName() {
+    return buildQ4PlanForDateFilter("o_orderdate[i] >= 19930701 && o_orderdate[i] < 19931001");
 }
 
 } // namespace codegen

@@ -3,7 +3,7 @@
 // Metal Param Binding — metadata-driven buffer management
 // ===================================================================
 //
-// Adapts the CUDA ParamBinding concept to Metal's buffer/constant model.
+// Metadata-driven bridge from logical query parameters to Metal buffers.
 // Each binding describes one kernel parameter: its Metal type, memory
 // management, symbolic size, and auto-assigned [[buffer(N)]] index.
 // ===================================================================
@@ -20,7 +20,7 @@ namespace codegen {
 // Knuth multiplicative hash constant (golden-ratio reciprocal × 2^32).
 // Used by the open-addressing hash tables in query_preprocessing.cpp
 // (host-side build) and by the matching Metal probes emitted from
-// metal_plan_builder.cpp (`q9_ht_probe`, `q20_ht_add`). Host and device
+// TPC-H query builders (`q9_ht_probe`, `q20_ht_add`). Host and device
 // MUST use the same constant or probes will miss; if you change this
 // value, update both sides.
 inline constexpr uint32_t kKnuthHashMul = 2654435769u;
@@ -122,8 +122,12 @@ struct MetalResultSchema {
         std::string displayName;
         std::string loBuffer;       // lo part (or main buffer if not long pair)
         std::string hiBuffer;       // hi part (empty if not long pair)
+        std::string denomLoBuffer;  // optional denominator for AVG-style output
+        std::string denomHiBuffer;
         std::string elementType;    // "uint" for long pair, "float" for direct
         bool isLongPair = false;
+        bool denomIsLongPair = false;
+        bool divideByDenominator = false;
         int scaleDown = 0;          // divide by 10^scaleDown (e.g. 2 for cents→dollars)
     };
     std::vector<ScalarAggEntry> scalarAggs;
@@ -139,6 +143,8 @@ struct MetalResultSchema {
         int numBuckets = 0;
         int valuesPerBucket = 0;
         std::string bufferName;
+        std::string keyDisplayName;
+        int keyBase = 0;
         std::vector<KeyedAggSlot> slots; // describes each logical value
     };
     KeyedAggInfo keyedAgg;

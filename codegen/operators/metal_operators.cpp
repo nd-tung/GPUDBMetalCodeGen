@@ -267,23 +267,40 @@ MetalTGReduce::MetalTGReduce(std::unique_ptr<MetalOperator> child,
                              const std::string& outputPrefix)
     : MetalUnaryOperator(std::move(child)), outputPrefix_(outputPrefix) {}
 
-void MetalTGReduce::addAccumulator(const std::string& name,
-                                    const std::string& valueExpr,
-                                    const std::string& type,
-                                    const std::string& loBuffer,
-                                    const std::string& hiBuffer) {
+int MetalTGReduce::addAccumulator(const std::string& name,
+                                   const std::string& valueExpr,
+                                   const std::string& type,
+                                   const std::string& loBuffer,
+                                   const std::string& hiBuffer,
+                                   ReduceOp op) {
     Accumulator acc;
     acc.name = name;
     acc.valueExpr = valueExpr;
     acc.type = type;
+    acc.op = op;
     acc.loBuffer = loBuffer.empty() ? (outputPrefix_ + "_" + name + "_lo") : loBuffer;
     acc.hiBuffer = hiBuffer.empty() ? (type == "long" ? (outputPrefix_ + "_" + name + "_hi") : "") : hiBuffer;
+    if (op != ReduceOp::SUM) acc.stateBuffer = outputPrefix_ + "_" + name + "_state";
     acc.binIndex = static_cast<int>(accumulators_.size());
     accumulators_.push_back(acc);
+    return acc.binIndex;
 }
 
 void MetalTGReduce::setResultAlias(const std::string& displayName, int scaleDown) {
-    resultInfos_.push_back({displayName, scaleDown});
+    setAccumulatorResultAlias(displayName, static_cast<int>(resultInfos_.size()), scaleDown);
+}
+
+void MetalTGReduce::setAccumulatorResultAlias(const std::string& displayName,
+                                              int accumulatorIndex,
+                                              int scaleDown) {
+    resultInfos_.push_back({displayName, scaleDown, accumulatorIndex, -1});
+}
+
+void MetalTGReduce::setAverageResultAlias(const std::string& displayName,
+                                          int numeratorIndex,
+                                          int denominatorIndex,
+                                          int scaleDown) {
+    resultInfos_.push_back({displayName, scaleDown, numeratorIndex, denominatorIndex});
 }
 
 void MetalTGReduce::produce(MetalCodegen& cg, ConsumerFn consume) {
@@ -294,10 +311,15 @@ void MetalTGReduce::produce(MetalCodegen& cg, ConsumerFn consume) {
         if (acc.type == "float") {
             // Float path: single atomic_uint buffer (reinterpreted as float via CAS)
             cg.addAtomicBufferParam(acc.loBuffer, "atomic_uint", "1");
+        } else if (acc.type == "int") {
+            cg.addAtomicBufferParam(acc.loBuffer, "atomic_int", "1");
         } else {
             // Long path: lo/hi atomic_uint pair
             cg.addAtomicBufferParam(acc.loBuffer, "atomic_uint", "1");
             cg.addAtomicBufferParam(acc.hiBuffer, "atomic_uint", "1");
+        }
+        if (acc.op != ReduceOp::SUM) {
+            cg.addAtomicBufferParam(acc.stateBuffer, "atomic_uint", "1");
         }
     }
 
@@ -309,11 +331,40 @@ void MetalTGReduce::produce(MetalCodegen& cg, ConsumerFn consume) {
         child_->produce(cg, [&]() {
             for (const auto& acc : accumulators_) {
                 if (acc.type == "float") {
-                    cg.addLine("atomic_add_float(" + acc.loBuffer + ", (float)("
-                               + acc.valueExpr + "));");
+                    std::string value = "(float)(" + acc.valueExpr + ")";
+                    if (acc.op == ReduceOp::MIN) {
+                        cg.addLine("atomic_min_float_seen(" + acc.loBuffer + ", " +
+                                   acc.stateBuffer + ", " + value + ");");
+                    } else if (acc.op == ReduceOp::MAX) {
+                        cg.addLine("atomic_max_float_seen(" + acc.loBuffer + ", " +
+                                   acc.stateBuffer + ", " + value + ");");
+                    } else {
+                        cg.addLine("atomic_add_float(" + acc.loBuffer + ", " + value + ");");
+                    }
+                } else if (acc.type == "int") {
+                    std::string value = "(int)(" + acc.valueExpr + ")";
+                    if (acc.op == ReduceOp::MIN) {
+                        cg.addLine("atomic_min_int_seen(" + acc.loBuffer + ", " +
+                                   acc.stateBuffer + ", " + value + ");");
+                    } else if (acc.op == ReduceOp::MAX) {
+                        cg.addLine("atomic_max_int_seen(" + acc.loBuffer + ", " +
+                                   acc.stateBuffer + ", " + value + ");");
+                    } else {
+                        cg.addLine("atomic_fetch_add_explicit(" + acc.loBuffer + ", " +
+                                   value + ", memory_order_relaxed);");
+                    }
                 } else {
-                    cg.addLine("atomic_add_long_pair(" + acc.loBuffer + ", "
-                               + acc.hiBuffer + ", (long)(" + acc.valueExpr + "));");
+                    std::string value = "(long)(" + acc.valueExpr + ")";
+                    if (acc.op == ReduceOp::MIN) {
+                        cg.addLine("atomic_min_long_pair_seen(" + acc.loBuffer + ", " +
+                                   acc.hiBuffer + ", " + acc.stateBuffer + ", " + value + ");");
+                    } else if (acc.op == ReduceOp::MAX) {
+                        cg.addLine("atomic_max_long_pair_seen(" + acc.loBuffer + ", " +
+                                   acc.hiBuffer + ", " + acc.stateBuffer + ", " + value + ");");
+                    } else {
+                        cg.addLine("atomic_add_long_pair(" + acc.loBuffer + ", "
+                                   + acc.hiBuffer + ", " + value + ");");
+                    }
                 }
             }
             consume();
@@ -322,9 +373,20 @@ void MetalTGReduce::produce(MetalCodegen& cg, ConsumerFn consume) {
         // Declare local accumulators
         for (const auto& acc : accumulators_) {
             if (acc.type == "float") {
-                cg.addLine("float local_" + acc.name + " = 0.0f;");
+                std::string init = "0.0f";
+                if (acc.op == ReduceOp::MIN) init = "3.402823466e+38f";
+                else if (acc.op == ReduceOp::MAX) init = "-3.402823466e+38f";
+                cg.addLine("float local_" + acc.name + " = " + init + ";");
+            } else if (acc.type == "int") {
+                std::string init = "0";
+                if (acc.op == ReduceOp::MIN) init = "2147483647";
+                else if (acc.op == ReduceOp::MAX) init = "-2147483647";
+                cg.addLine("int local_" + acc.name + " = " + init + ";");
             } else {
-                cg.addLine("long local_" + acc.name + " = 0;");
+                std::string init = "0";
+                if (acc.op == ReduceOp::MIN) init = "9223372036854775807L";
+                else if (acc.op == ReduceOp::MAX) init = "-9223372036854775807L";
+                cg.addLine("long local_" + acc.name + " = " + init + ";");
             }
         }
 
@@ -332,9 +394,41 @@ void MetalTGReduce::produce(MetalCodegen& cg, ConsumerFn consume) {
         child_->produce(cg, [&]() {
             for (const auto& acc : accumulators_) {
                 if (acc.type == "float") {
-                    cg.addLine("local_" + acc.name + " += (float)(" + acc.valueExpr + ");");
+                    std::string valueVar = "_value_" + acc.name;
+                    cg.addLine("float " + valueVar + " = (float)(" + acc.valueExpr + ");");
+                    if (acc.op == ReduceOp::MIN) {
+                        cg.addLine("local_" + acc.name + " = (" + valueVar + " < local_" +
+                                   acc.name + ") ? " + valueVar + " : local_" + acc.name + ";");
+                    } else if (acc.op == ReduceOp::MAX) {
+                        cg.addLine("local_" + acc.name + " = (" + valueVar + " > local_" +
+                                   acc.name + ") ? " + valueVar + " : local_" + acc.name + ";");
+                    } else {
+                        cg.addLine("local_" + acc.name + " += " + valueVar + ";");
+                    }
+                } else if (acc.type == "int") {
+                    std::string valueVar = "_value_" + acc.name;
+                    cg.addLine("int " + valueVar + " = (int)(" + acc.valueExpr + ");");
+                    if (acc.op == ReduceOp::MIN) {
+                        cg.addLine("local_" + acc.name + " = (" + valueVar + " < local_" +
+                                   acc.name + ") ? " + valueVar + " : local_" + acc.name + ";");
+                    } else if (acc.op == ReduceOp::MAX) {
+                        cg.addLine("local_" + acc.name + " = (" + valueVar + " > local_" +
+                                   acc.name + ") ? " + valueVar + " : local_" + acc.name + ";");
+                    } else {
+                        cg.addLine("local_" + acc.name + " += " + valueVar + ";");
+                    }
                 } else {
-                    cg.addLine("local_" + acc.name + " += (long)(" + acc.valueExpr + ");");
+                    std::string valueVar = "_value_" + acc.name;
+                    cg.addLine("long " + valueVar + " = (long)(" + acc.valueExpr + ");");
+                    if (acc.op == ReduceOp::MIN) {
+                        cg.addLine("local_" + acc.name + " = (" + valueVar + " < local_" +
+                                   acc.name + ") ? " + valueVar + " : local_" + acc.name + ";");
+                    } else if (acc.op == ReduceOp::MAX) {
+                        cg.addLine("local_" + acc.name + " = (" + valueVar + " > local_" +
+                                   acc.name + ") ? " + valueVar + " : local_" + acc.name + ";");
+                    } else {
+                        cg.addLine("local_" + acc.name + " += " + valueVar + ";");
+                    }
                 }
             }
             consume();
@@ -348,18 +442,59 @@ void MetalTGReduce::produce(MetalCodegen& cg, ConsumerFn consume) {
 
             if (acc.type == "float") {
                 cg.addLine("threadgroup float tg_shared_" + acc.name + "[32];");
-                cg.addLine("float " + tgVar + " = tg_reduce_float(" + localVar +
+                std::string reduceFn = "tg_reduce_float";
+                if (acc.op == ReduceOp::MIN) reduceFn = "tg_reduce_min_float";
+                else if (acc.op == ReduceOp::MAX) reduceFn = "tg_reduce_max_float";
+                cg.addLine("float " + tgVar + " = " + reduceFn + "(" + localVar +
                            ", lid, tg_size, tg_shared_" + acc.name + ");");
                 cg.addIf("lid == 0", [&]() {
-                    cg.addLine("atomic_add_float(" + acc.loBuffer + ", " + tgVar + ");");
+                    if (acc.op == ReduceOp::MIN) {
+                        cg.addLine("atomic_min_float_seen(" + acc.loBuffer + ", " +
+                                   acc.stateBuffer + ", " + tgVar + ");");
+                    } else if (acc.op == ReduceOp::MAX) {
+                        cg.addLine("atomic_max_float_seen(" + acc.loBuffer + ", " +
+                                   acc.stateBuffer + ", " + tgVar + ");");
+                    } else {
+                        cg.addLine("atomic_add_float(" + acc.loBuffer + ", " + tgVar + ");");
+                    }
+                });
+            } else if (acc.type == "int") {
+                cg.addLine("threadgroup int tg_shared_" + acc.name + "[32];");
+                std::string reduceFn = "tg_reduce_uint";
+                if (acc.op == ReduceOp::MIN) reduceFn = "tg_reduce_min_int";
+                else if (acc.op == ReduceOp::MAX) reduceFn = "tg_reduce_max_int";
+                cg.addLine("int " + tgVar + " = " + reduceFn + "(" + localVar +
+                           ", lid, tg_size, tg_shared_" + acc.name + ");");
+                cg.addIf("lid == 0", [&]() {
+                    if (acc.op == ReduceOp::MIN) {
+                        cg.addLine("atomic_min_int_seen(" + acc.loBuffer + ", " +
+                                   acc.stateBuffer + ", " + tgVar + ");");
+                    } else if (acc.op == ReduceOp::MAX) {
+                        cg.addLine("atomic_max_int_seen(" + acc.loBuffer + ", " +
+                                   acc.stateBuffer + ", " + tgVar + ");");
+                    } else {
+                        cg.addLine("atomic_fetch_add_explicit(" + acc.loBuffer + ", " +
+                                   tgVar + ", memory_order_relaxed);");
+                    }
                 });
             } else {
                 cg.addLine("threadgroup long tg_shared_" + acc.name + "[32];");
-                cg.addLine("long " + tgVar + " = tg_reduce_long(" + localVar +
+                std::string reduceFn = "tg_reduce_long";
+                if (acc.op == ReduceOp::MIN) reduceFn = "tg_reduce_min_long";
+                else if (acc.op == ReduceOp::MAX) reduceFn = "tg_reduce_max_long";
+                cg.addLine("long " + tgVar + " = " + reduceFn + "(" + localVar +
                            ", lid, tg_size, tg_shared_" + acc.name + ");");
                 cg.addIf("lid == 0", [&]() {
-                    cg.addLine("atomic_add_long_pair(" + acc.loBuffer + ", " +
-                               acc.hiBuffer + ", " + tgVar + ");");
+                    if (acc.op == ReduceOp::MIN) {
+                        cg.addLine("atomic_min_long_pair_seen(" + acc.loBuffer + ", " +
+                                   acc.hiBuffer + ", " + acc.stateBuffer + ", " + tgVar + ");");
+                    } else if (acc.op == ReduceOp::MAX) {
+                        cg.addLine("atomic_max_long_pair_seen(" + acc.loBuffer + ", " +
+                                   acc.hiBuffer + ", " + acc.stateBuffer + ", " + tgVar + ");");
+                    } else {
+                        cg.addLine("atomic_add_long_pair(" + acc.loBuffer + ", " +
+                                   acc.hiBuffer + ", " + tgVar + ");");
+                    }
                 });
             }
         }
@@ -367,11 +502,21 @@ void MetalTGReduce::produce(MetalCodegen& cg, ConsumerFn consume) {
 
     // Register result schema
     if (!resultInfos_.empty()) {
-        for (size_t i = 0; i < accumulators_.size() && i < resultInfos_.size(); i++) {
-            const auto& acc = accumulators_[i];
-            const auto& info = resultInfos_[i];
-            cg.registerScalarAggOutput(acc.loBuffer, acc.hiBuffer, acc.type);
-            cg.registerScalarAggColumn(info.displayName, (int)i, info.scaleDown);
+        for (const auto& info : resultInfos_) {
+            if (info.accumulatorIndex < 0 ||
+                static_cast<size_t>(info.accumulatorIndex) >= accumulators_.size()) continue;
+            const auto& acc = accumulators_[info.accumulatorIndex];
+            if (info.denominatorIndex >= 0 &&
+                static_cast<size_t>(info.denominatorIndex) < accumulators_.size()) {
+                const auto& denom = accumulators_[info.denominatorIndex];
+                cg.registerScalarAggAverageColumn(info.displayName,
+                                                  acc.loBuffer, acc.hiBuffer,
+                                                  denom.loBuffer, denom.hiBuffer,
+                                                  acc.type, info.scaleDown);
+            } else {
+                cg.registerScalarAggOutput(acc.loBuffer, acc.hiBuffer, acc.type);
+                cg.registerScalarAggColumn(info.displayName, info.accumulatorIndex, info.scaleDown);
+            }
         }
     }
 }
@@ -401,6 +546,11 @@ void MetalKeyedAgg::addAggregate(const std::string& name, int offset,
                                   bool isLongPair,
                                   int scaleDown) {
     aggregates_.push_back({name, offset, valueExpr, atomicOp, isLongPair, scaleDown});
+}
+
+void MetalKeyedAgg::setKeyResult(const std::string& displayName, int base) {
+    keyDisplayName_ = displayName;
+    keyBase_ = base;
 }
 
 void MetalKeyedAgg::produce(MetalCodegen& cg, ConsumerFn consume) {
@@ -529,7 +679,8 @@ void MetalKeyedAgg::produce(MetalCodegen& cg, ConsumerFn consume) {
     for (const auto& agg : aggregates_) {
         slots.push_back({agg.name, agg.offset, agg.isLongPair, agg.scaleDown});
     }
-    cg.registerKeyedAggOutput(outputArrayName_, numBuckets_, valuesPerBucket_, slots);
+    cg.registerKeyedAggOutput(outputArrayName_, numBuckets_, valuesPerBucket_, slots,
+                              keyDisplayName_, keyBase_);
 }
 
 std::string MetalKeyedAgg::describe() const {
@@ -641,9 +792,10 @@ MetalMaterialize::MetalMaterialize(std::unique_ptr<MetalOperator> child,
 void MetalMaterialize::addColumn(const std::string& arrayName, const std::string& type,
                                   const std::string& valueExpr,
                                   const std::string& displayName,
-                                  const std::string& sizeExpr) {
+                                  const std::string& sizeExpr,
+                                  int stringLen) {
     columns_.push_back({arrayName, type, valueExpr,
-                        displayName.empty() ? arrayName : displayName, sizeExpr});
+                        displayName.empty() ? arrayName : displayName, sizeExpr, stringLen});
 }
 
 void MetalMaterialize::produce(MetalCodegen& cg, ConsumerFn consume) {
@@ -658,7 +810,7 @@ void MetalMaterialize::produce(MetalCodegen& cg, ConsumerFn consume) {
     // Register result schema
     cg.registerMaterializeOutput(counterName_);
     for (const auto& col : columns_) {
-        cg.registerOutputColumn(col.displayName, col.arrayName, col.type);
+        cg.registerOutputColumn(col.displayName, col.arrayName, col.type, col.stringLen);
     }
 
     child_->produce(cg, [&]() {
@@ -667,7 +819,14 @@ void MetalMaterialize::produce(MetalCodegen& cg, ConsumerFn consume) {
                    "[0], 1u, memory_order_relaxed);");
         // Scatter values to output arrays
         for (const auto& col : columns_) {
-            cg.addLine(col.arrayName + "[_pos] = " + col.valueExpr + ";");
+            if (col.stringLen > 0) {
+                cg.addBlock("for (uint _ci = 0; _ci < " + std::to_string(col.stringLen) + "; _ci++)", [&]() {
+                    cg.addLine(col.arrayName + "[_pos * " + std::to_string(col.stringLen) + " + _ci] = " +
+                               "(" + col.valueExpr + ")[_ci];");
+                });
+            } else {
+                cg.addLine(col.arrayName + "[_pos] = " + col.valueExpr + ";");
+            }
         }
         consume();
     });

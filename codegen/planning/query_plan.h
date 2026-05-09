@@ -121,6 +121,10 @@ struct ExistsPred {
     bool negated = false;
     // child query index in AnalyzedQuery::subqueries
     int subqueryIdx = -1;
+
+    ExistsPred() = default;
+    ExistsPred(bool negated_, int subqueryIdx_)
+        : negated(negated_), subqueryIdx(subqueryIdx_) {}
 };
 
 struct Predicate {

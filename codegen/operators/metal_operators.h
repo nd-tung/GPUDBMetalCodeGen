@@ -241,25 +241,37 @@ private:
 // Emits per-thread local accumulation + tg_reduce_float/long + atomic to global.
 class MetalTGReduce : public MetalUnaryOperator {
 public:
+    enum class ReduceOp { SUM, MIN, MAX };
+
     struct Accumulator {
         std::string name;        // local variable name
         std::string loBuffer;    // output buffer name (lo part or direct)
         std::string hiBuffer;    // output buffer name (hi part, empty if float)
+        std::string stateBuffer; // min/max initialization guard
         std::string valueExpr;   // expression to accumulate
         std::string type;        // "float" or "long"
+        ReduceOp op = ReduceOp::SUM;
         int binIndex = 0;        // for multi-bin, which index in the output
     };
 
     MetalTGReduce(std::unique_ptr<MetalOperator> child,
                   const std::string& outputPrefix);
-    void addAccumulator(const std::string& name, const std::string& valueExpr,
-                        const std::string& type = "float",
-                        const std::string& loBuffer = "",
-                        const std::string& hiBuffer = "");
+    int addAccumulator(const std::string& name, const std::string& valueExpr,
+                       const std::string& type = "float",
+                       const std::string& loBuffer = "",
+                       const std::string& hiBuffer = "",
+                       ReduceOp op = ReduceOp::SUM);
 
     // Register result schema for this reduce's output
     // scaleDown: divisor for fixed-point (e.g. 100 means stored as val*100)
     void setResultAlias(const std::string& displayName, int scaleDown = 0);
+    void setAccumulatorResultAlias(const std::string& displayName,
+                                   int accumulatorIndex,
+                                   int scaleDown = 0);
+    void setAverageResultAlias(const std::string& displayName,
+                               int numeratorIndex,
+                               int denominatorIndex,
+                               int scaleDown = 0);
 
     void produce(MetalCodegen& cg, ConsumerFn consume) override;
     std::string describe() const override;
@@ -272,6 +284,8 @@ private:
     struct ResultInfo {
         std::string displayName;
         int scaleDown = 0;
+        int accumulatorIndex = -1;
+        int denominatorIndex = -1;
     };
     std::vector<ResultInfo> resultInfos_;
 };
@@ -304,6 +318,7 @@ public:
                       const std::string& atomicOp = "add",
                       bool isLongPair = false,
                       int scaleDown = 0);
+    void setKeyResult(const std::string& displayName, int base = 0);
     void produce(MetalCodegen& cg, ConsumerFn consume) override;
     std::string describe() const override;
 
@@ -313,6 +328,8 @@ private:
     int numBuckets_;
     int valuesPerBucket_;
     std::string sizeExpr_;
+    std::string keyDisplayName_;
+    int keyBase_ = 0;
     std::vector<Aggregate> aggregates_;
 };
 
@@ -367,6 +384,7 @@ public:
         std::string valueExpr;
         std::string displayName;
         std::string sizeExpr;
+        int stringLen = 0;
     };
 
     MetalMaterialize(std::unique_ptr<MetalOperator> child,
@@ -374,7 +392,7 @@ public:
                      const std::string& counterSizeExpr = "1");
     void addColumn(const std::string& arrayName, const std::string& type,
                    const std::string& valueExpr, const std::string& displayName = "",
-                   const std::string& sizeExpr = "");
+                   const std::string& sizeExpr = "", int stringLen = 0);
     void produce(MetalCodegen& cg, ConsumerFn consume) override;
     std::string describe() const override;
 
