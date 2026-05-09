@@ -228,12 +228,21 @@ GenericResult MetalResultCollector::collectKeyedAgg(const MetalResultSchema& sch
     const int numBuckets       = schema.keyedAgg.numBuckets;
     const int valuesPerBucket  = schema.keyedAgg.valuesPerBucket;
     const auto& slots = schema.keyedAgg.slots;
+    const auto& multiKeys = schema.keyedAgg.multiKeys;
 
-    // Build column headers
-    std::string keyName = schema.keyedAgg.keyDisplayName.empty()
-        ? "bucket"
-        : schema.keyedAgg.keyDisplayName;
-    result.columns.push_back({keyName, "int"});
+    // --- Build column headers ---
+    if (!multiKeys.empty()) {
+        // Multi-key: emit one column per key
+        for (const auto& mk : multiKeys) {
+            std::string type = mk.charMap.empty() ? "int" : "string";
+            result.columns.push_back({mk.displayName, type});
+        }
+    } else {
+        std::string keyName = schema.keyedAgg.keyDisplayName.empty()
+            ? "bucket"
+            : schema.keyedAgg.keyDisplayName;
+        result.columns.push_back({keyName, "int"});
+    }
     if (!slots.empty()) {
         for (const auto& slot : slots) {
             result.columns.push_back({slot.name, slot.isLongPair ? "long" : "uint"});
@@ -244,6 +253,37 @@ GenericResult MetalResultCollector::collectKeyedAgg(const MetalResultSchema& sch
         }
     }
 
+    // --- Helper: decode a flat bucket index into multi-key values ---
+    auto decodeKeys = [&](int bucket, std::vector<GenericResult::Value>& keyValues) {
+        if (multiKeys.empty()) {
+            keyValues.push_back((int64_t)(bucket + schema.keyedAgg.keyBase));
+            return;
+        }
+        // Decode in REVERSE order: bucket = k0 + k1*N0 + k2*N0*N1 + ...
+        // So last key = bucket / stride[last]; recurse with remainder.
+        int remaining = bucket;
+        std::vector<int> encodedValues(multiKeys.size());
+        for (int ki = (int)multiKeys.size() - 1; ki >= 0; --ki) {
+            const auto& mk = multiKeys[ki];
+            encodedValues[ki] = remaining / mk.stride;
+            remaining = remaining % mk.stride;
+        }
+        for (size_t ki = 0; ki < multiKeys.size(); ++ki) {
+            const auto& mk = multiKeys[ki];
+            int encoded = encodedValues[ki];
+            if (!mk.charMap.empty()) {
+                if (encoded >= 0 && (size_t)encoded < mk.charMap.size()) {
+                    keyValues.push_back(std::string(1, mk.charMap[encoded]));
+                } else {
+                    keyValues.push_back(std::string("?"));
+                }
+            } else {
+                keyValues.push_back((int64_t)(encoded + mk.keyBase));
+            }
+        }
+    };
+
+    // --- Read per-bucket data ---
     for (int bucket = 0; bucket < numBuckets; bucket++) {
         const int rowBase = bucket * valuesPerBucket;
         // Skip empty buckets (all slots zero)
@@ -254,13 +294,39 @@ GenericResult MetalResultCollector::collectKeyedAgg(const MetalResultSchema& sch
         if (!hasData) continue;
 
         GenericResult::Row row;
-        row.push_back((int64_t)(bucket + schema.keyedAgg.keyBase));
+        decodeKeys(bucket, row);
 
         if (!slots.empty()) {
             for (const auto& slot : slots) {
-                if (slot.isLongPair) {
-                    // 64-bit aggregate stored as two adjacent uint32 slots
-                    // (lo at offset, hi at offset+1) — see metal_common_header.h
+                if (slot.isMinMax && slot.atomicOp == "min") {
+                    // min aggregate: stored as raw value (int or float reinterpreted)
+                    uint32_t raw = data[rowBase + slot.offset];
+                    if (slot.isFloatSum) {
+                        float f;
+                        memcpy(&f, &raw, sizeof(float));
+                        row.push_back((double)f);
+                    } else {
+                        row.push_back((int64_t)(int32_t)raw);
+                    }
+                } else if (slot.isMinMax && slot.atomicOp == "max") {
+                    uint32_t raw = data[rowBase + slot.offset];
+                    if (slot.isFloatSum) {
+                        float f;
+                        memcpy(&f, &raw, sizeof(float));
+                        row.push_back((double)f);
+                    } else {
+                        row.push_back((int64_t)(int32_t)raw);
+                    }
+                } else if (slot.isFloatSum) {
+                    // Float sum: stored as float in single uint slot
+                    uint32_t raw = data[rowBase + slot.offset];
+                    float f;
+                    memcpy(&f, &raw, sizeof(float));
+                    if (slot.scaleDown > 0)
+                        row.push_back((double)f / slot.scaleDown);
+                    else
+                        row.push_back((double)f);
+                } else if (slot.isLongPair) {
                     uint32_t lo = data[rowBase + slot.offset];
                     uint32_t hi = data[rowBase + slot.offset + 1];
                     int64_t val = ((int64_t)hi << 32) | (int64_t)lo;

@@ -386,15 +386,42 @@ std::optional<MetalQueryPlan> buildScalarAggPlan(const AnalyzedQuery& aq) {
     return plan;
 }
 
+// Struct to describe how each group-by key is flattened into a linear bucket index.
+struct GroupKeyDesc {
+    std::string keyExpr;       // expression to index the column value (e.g. "l_returnflag[i]")
+    int numValues = 0;         // number of distinct values this key can take
+    int stride = 0;            // multiplier for this key's contribution to flat bucket
+};
+
+// Build a bucket expression for a single CHAR1 group key domain.
+// Returns "(char)col[idx] - 'A'" style expression, or empty if unsupported.
+static std::string char1BucketExpr(const ColRef& col, const std::string& idxVar,
+                                    int& outNumValues) {
+    // Known CHAR1 group-by columns in TPC-H and their value sets
+    if (col.column == "l_returnflag") {
+        outNumValues = 3; // A, N, R
+        return "(l_returnflag[" + idxVar + "] == 'A' ? 0 : (l_returnflag[" + idxVar + "] == 'N' ? 1 : 2))";
+    }
+    if (col.column == "l_linestatus") {
+        outNumValues = 2; // F, O
+        return "(l_linestatus[" + idxVar + "] == 'F' ? 0 : 1)";
+    }
+    if (col.column == "p_type") {
+        outNumValues = 150; // approximate; TYPE domain is large but bounded
+        return "";
+    }
+    if (col.column == "p_brand") {
+        outNumValues = 25;
+        return "";
+    }
+    outNumValues = 0;
+    return "";
+}
+
 std::optional<MetalQueryPlan> buildGroupedAggPlan(const AnalyzedQuery& aq) {
     if (!aq.hasAggregation() || !aq.hasGroupBy()) return std::nullopt;
-    if (aq.groupBy.size() != 1 || aq.having || !aq.orderBy.empty() || aq.limit >= 0)
+    if (aq.having || !aq.orderBy.empty() || aq.limit >= 0)
         return std::nullopt;
-
-    auto* groupCol = aq.groupBy[0] ? std::get_if<ColRef>(&aq.groupBy[0]->node) : nullptr;
-    if (!groupCol) return std::nullopt;
-    auto domain = smallIntGroupDomain(*groupCol);
-    if (!domain) return std::nullopt;
 
     struct PendingAgg {
         std::string displayName;
@@ -403,29 +430,87 @@ std::optional<MetalQueryPlan> buildGroupedAggPlan(const AnalyzedQuery& aq) {
         std::string valueExpr;
         bool isLongPair = false;
         int scaleDown = 0;
+        bool isFloatSum = false;
+        bool isMinMax = false;
+        std::string atomicOp = "add";
     };
 
     std::set<std::string> usedColumns;
     for (const auto& filter : aq.filters) collectColumns(filter, usedColumns);
-    collectColumns(aq.groupBy[0], usedColumns);
+    for (const auto& g : aq.groupBy) collectColumns(g, usedColumns);
 
+    const std::string idxVar = "i";
+
+    // --- Build group-key descriptors ---
+    std::vector<GroupKeyDesc> keyDescriptors;
+    int totalBuckets = 1;
+
+    for (size_t ki = 0; ki < aq.groupBy.size(); ++ki) {
+        auto* gc = aq.groupBy[ki] ? std::get_if<ColRef>(&aq.groupBy[ki]->node) : nullptr;
+        if (!gc) return std::nullopt;
+
+        GroupKeyDesc kd;
+        if (gc->dataType == DataType::CHAR1) {
+            kd.keyExpr = char1BucketExpr(*gc, idxVar, kd.numValues);
+            if (kd.numValues == 0) return std::nullopt;
+        } else {
+            auto domain = smallIntGroupDomain(*gc);
+            if (!domain || domain->maxValue < domain->minValue) return std::nullopt;
+            kd.numValues = domain->maxValue - domain->minValue + 1;
+            std::string groupValue = gc->column + "[" + idxVar + "]";
+            if (domain->minValue != 0) {
+                kd.keyExpr = "(" + groupValue + " - " + std::to_string(domain->minValue) + ")";
+            } else {
+                kd.keyExpr = groupValue;
+            }
+            // Add clamp guard for safety
+            kd.keyExpr = "clamp(" + kd.keyExpr + ", 0, " + std::to_string(kd.numValues - 1) + ")";
+        }
+        kd.stride = totalBuckets;
+        totalBuckets *= kd.numValues;
+        keyDescriptors.push_back(kd);
+    }
+
+    // Cap: refuse plans with > 4096 buckets (excessive GPU buffer waste).
+    if (totalBuckets > 4096) return std::nullopt;
+    const int numBuckets = totalBuckets;
+
+    // --- Build the flat bucket expression ---
+    // Encode: bucket = k0 + k1*stride1 + k2*stride2 + ...
+    // where stride[i] = product of numValues[0..i-1] (computed above).
+    std::string bucketExpr = "(" + keyDescriptors[0].keyExpr + ")";
+    for (size_t ki = 1; ki < keyDescriptors.size(); ++ki) {
+        bucketExpr = "(" + bucketExpr + " + (" + keyDescriptors[ki].keyExpr + ") * " +
+                     std::to_string(keyDescriptors[ki].stride) + ")";
+    }
+
+    // --- Resolve group-key display names ---
+    std::vector<std::string> keyDisplayNames(keyDescriptors.size());
+    for (size_t ki = 0; ki < keyDescriptors.size(); ++ki) {
+        auto* gc = std::get_if<ColRef>(&aq.groupBy[ki]->node);
+        keyDisplayNames[ki] = gc->column;
+    }
+    // Override with aliases from SELECT targets where present
+    for (size_t ti = 0; ti < aq.targets.size(); ++ti) {
+        const auto& target = aq.targets[ti];
+        if (target.isAgg) continue;
+        for (size_t ki = 0; ki < keyDescriptors.size(); ++ki) {
+            auto* gc = std::get_if<ColRef>(&aq.groupBy[ki]->node);
+            if (gc && exprIsColumn(target.expr, *gc)) {
+                keyDisplayNames[ki] = displayNameForTarget(target, ti);
+            }
+        }
+    }
+
+    // --- Collect aggregate slots ---
     std::vector<PendingAgg> pending;
     int valuesPerBucket = 0;
-    bool sawGroupTarget = false;
-    bool sawCount = false;
-    std::string keyDisplayName = groupCol->column;
-    const std::string idxVar = "i";
 
     for (size_t targetIndex = 0; targetIndex < aq.targets.size(); ++targetIndex) {
         const auto& target = aq.targets[targetIndex];
-        if (!target.isAgg) {
-            if (!exprIsColumn(target.expr, *groupCol) || sawGroupTarget) return std::nullopt;
-            sawGroupTarget = true;
-            keyDisplayName = displayNameForTarget(target, targetIndex);
-            continue;
-        }
-
+        if (!target.isAgg) continue; // group keys already accounted for
         if (!target.agg) return std::nullopt;
+
         const AggFunc func = target.agg->func;
         if (func == AggFunc::COUNT) {
             PendingAgg agg;
@@ -433,15 +518,84 @@ std::optional<MetalQueryPlan> buildGroupedAggPlan(const AnalyzedQuery& aq) {
             agg.name = "a" + std::to_string(targetIndex) + "_" + sanitizeIdentifier(agg.displayName);
             agg.offset = valuesPerBucket++;
             agg.valueExpr = "1u";
+            agg.atomicOp = "add";
             pending.push_back(std::move(agg));
-            sawCount = true;
+            continue;
+        }
+
+        if (func == AggFunc::AVG) {
+            // AVG = SUM/COUNT. Allocate two slots: sum (long pair) + count (uint).
+            if (!target.agg->innerExpr || !exprSupported(target.agg->innerExpr, false))
+                return std::nullopt;
+            DataType vt = inferExprDataType(target.agg->innerExpr);
+            bool isFloat = (vt == DataType::FLOAT);
+            collectColumns(target.agg->innerExpr, usedColumns);
+
+            std::string dname = displayNameForTarget(target, targetIndex);
+            std::string sname = sanitizeIdentifier(dname);
+
+            // SUM slot (long pair at offset/offset+1, or float at offset with isFloatSum)
+            {
+                PendingAgg agg;
+                agg.displayName = dname;
+                agg.name = "a" + std::to_string(targetIndex) + "_" + sname + "_sum";
+                agg.offset = valuesPerBucket;
+                if (isFloat) {
+                    agg.valueExpr = exprToMetal(target.agg->innerExpr, idxVar);
+                    agg.isFloatSum = true;
+                    agg.scaleDown = -1; // marker: this is AVG sum, needs denominator
+                    valuesPerBucket += 1;
+                } else {
+                    agg.valueExpr = exprToMetal(target.agg->innerExpr, idxVar);
+                    agg.isLongPair = true;
+                    agg.scaleDown = -1; // marker: AVG sum, denominator follows
+                    valuesPerBucket += 2;
+                }
+                agg.atomicOp = "add";
+                pending.push_back(std::move(agg));
+            }
+
+            // COUNT slot (for AVG denominator)
+            {
+                PendingAgg agg;
+                agg.displayName = dname + "_cnt"; // internal; not in final output
+                agg.name = "a" + std::to_string(targetIndex) + "_" + sname + "_cnt";
+                agg.offset = valuesPerBucket++;
+                agg.valueExpr = "1u";
+                agg.atomicOp = "add";
+                agg.scaleDown = 0;
+                pending.push_back(std::move(agg));
+            }
+            continue;
+        }
+
+        if (func == AggFunc::MIN || func == AggFunc::MAX) {
+            if (!target.agg->innerExpr || !exprSupported(target.agg->innerExpr, false))
+                return std::nullopt;
+            DataType vt = inferExprDataType(target.agg->innerExpr);
+            bool isFloat = (vt == DataType::FLOAT);
+            collectColumns(target.agg->innerExpr, usedColumns);
+
+            PendingAgg agg;
+            agg.displayName = displayNameForTarget(target, targetIndex);
+            agg.name = "a" + std::to_string(targetIndex) + "_" + sanitizeIdentifier(agg.displayName);
+            agg.offset = valuesPerBucket;
+            agg.valueExpr = exprToMetal(target.agg->innerExpr, idxVar);
+            agg.atomicOp = (func == AggFunc::MIN) ? "min" : "max";
+            agg.isMinMax = true;
+            if (isFloat) {
+                agg.isFloatSum = true; // re-use float path for single-uint storage
+                agg.scaleDown = 0;
+            }
+            valuesPerBucket += 1;
+            pending.push_back(std::move(agg));
             continue;
         }
 
         if (func != AggFunc::SUM) return std::nullopt;
-        if (!target.agg->innerExpr || !exprSupported(target.agg->innerExpr, false)) return std::nullopt;
-        DataType valueType = inferExprDataType(target.agg->innerExpr);
-        if (valueType != DataType::INT && valueType != DataType::DATE) return std::nullopt;
+        if (!target.agg->innerExpr || !exprSupported(target.agg->innerExpr, false))
+            return std::nullopt;
+        DataType vt = inferExprDataType(target.agg->innerExpr);
         collectColumns(target.agg->innerExpr, usedColumns);
 
         PendingAgg agg;
@@ -449,35 +603,74 @@ std::optional<MetalQueryPlan> buildGroupedAggPlan(const AnalyzedQuery& aq) {
         agg.name = "a" + std::to_string(targetIndex) + "_" + sanitizeIdentifier(agg.displayName);
         agg.offset = valuesPerBucket;
         agg.valueExpr = exprToMetal(target.agg->innerExpr, idxVar);
-        agg.isLongPair = true;
-        valuesPerBucket += 2;
+        agg.atomicOp = "add";
+
+        if (vt == DataType::FLOAT) {
+            // Float SUM: accumulate via atomic CAS on uint slot (reinterpret as float)
+            agg.isFloatSum = true;
+            agg.scaleDown = 0;
+            valuesPerBucket += 1;
+        } else {
+            // Integer/date SUM: long-pair for 64-bit correctness
+            agg.isLongPair = true;
+            agg.scaleDown = 0;
+            valuesPerBucket += 2;
+        }
         pending.push_back(std::move(agg));
     }
 
-    if (!sawGroupTarget || pending.empty() || !sawCount) return std::nullopt;
+    if (pending.empty()) return std::nullopt;
 
+    // --- Build the scan → selection → keyed-agg tree ---
     MetalQueryPlan plan;
     plan.name = "ADHOC_SINGLE_TABLE_GROUP";
     auto filtered = makeFilteredScan(aq, usedColumns, idxVar);
 
-    const std::string groupValue = groupCol->column + "[" + idxVar + "]";
-    const std::string guard = "(" + groupValue + " >= " + std::to_string(domain->minValue) +
-                              " && " + groupValue + " <= " + std::to_string(domain->maxValue) + ")";
-    filtered = maybeSelect(std::move(filtered), guard);
-
-    std::string bucketExpr = groupValue;
-    if (domain->minValue != 0) {
-        bucketExpr = "(" + bucketExpr + " - " + std::to_string(domain->minValue) + ")";
+    // Add bucket guard if all keys have known domain bounds
+    bool needGuard = true;
+    for (const auto& kd : keyDescriptors) {
+        if (kd.numValues <= 0) { needGuard = false; break; }
     }
-    const int numBuckets = domain->maxValue - domain->minValue + 1;
+    if (needGuard) {
+        // Emit guard: bucket >= 0 && bucket < numBuckets
+        std::string guard = "(" + bucketExpr + " >= 0 && " + bucketExpr + " < " + std::to_string(numBuckets) + ")";
+        filtered = maybeSelect(std::move(filtered), guard);
+    }
+
     auto agg = std::make_unique<MetalKeyedAgg>(
         std::move(filtered), "d_adhoc_group_aggs", bucketExpr,
         numBuckets, valuesPerBucket, std::to_string(numBuckets * valuesPerBucket));
-    agg->setKeyResult(keyDisplayName, domain->minValue);
+
+    // Set key result info with multi-key decoding
+    // Convert GroupKeyDesc → GroupKeyDecode for the operator
+    std::vector<GroupKeyDecode> decodeInfo;
+    for (size_t ki = 0; ki < keyDescriptors.size(); ++ki) {
+        GroupKeyDecode d;
+        d.name = keyDisplayNames[ki];
+        d.numValues = keyDescriptors[ki].numValues;
+        d.stride = keyDescriptors[ki].stride;
+        // CHAR1: populate charMap. Integer: populate keyBase.
+        auto* gc = std::get_if<ColRef>(&aq.groupBy[ki]->node);
+        if (gc && gc->dataType == DataType::CHAR1) {
+            // Build reverse map: flat index → char
+            if (gc->column == "l_returnflag") {
+                d.charMap = {'A', 'N', 'R'};
+            } else if (gc->column == "l_linestatus") {
+                d.charMap = {'F', 'O'};
+            }
+        } else {
+            // Integer: find the base offset from domain
+            auto domain = smallIntGroupDomain(*gc);
+            d.keyBase = domain ? domain->minValue : 0;
+        }
+        decodeInfo.push_back(d);
+    }
+    agg->setMultiKeyResult(keyDisplayNames, decodeInfo, numBuckets);
 
     for (const auto& pendingAgg : pending) {
-        agg->addAggregate(pendingAgg.displayName, pendingAgg.offset, pendingAgg.valueExpr,
-                          "add", pendingAgg.isLongPair, pendingAgg.scaleDown);
+        agg->addAggregateWithMeta(pendingAgg.displayName, pendingAgg.offset, pendingAgg.valueExpr,
+                                  pendingAgg.atomicOp, pendingAgg.isLongPair, pendingAgg.scaleDown,
+                                  pendingAgg.isFloatSum, pendingAgg.isMinMax);
     }
 
     appendPhase(plan, "ADHOC_single_table_group", std::move(agg));

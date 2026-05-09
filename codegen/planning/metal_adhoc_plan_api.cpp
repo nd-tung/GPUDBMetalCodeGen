@@ -7,14 +7,17 @@ namespace codegen {
 std::optional<MetalQueryPlan> buildAdhocSQLPlan(const AnalyzedQuery& aq,
                                                 const std::string& label) {
     auto dispatch = [&]() -> std::optional<MetalQueryPlan> {
+        // Generic single-table path first (most expressive for supported patterns).
+        if (auto p = buildGenericSingleTableAdhocPlan(aq)) return p;
+        // Simple scalar-agg fallback (Q6 serves as generic scalar dispatcher).
         if (auto p = buildQ6Plan(aq)) return p;
+        // TPC-H-specific recognizers only for queries the generic path can't handle.
         if (auto p = buildQ1Plan(aq)) return p;
         if (auto p = buildQ14Plan(aq)) return p;
         if (auto p = buildQ4Plan(aq)) return p;
         if (auto p = buildQ12Plan(aq)) return p;
         if (auto p = buildQ10Plan(aq)) return p;
         if (auto p = buildQ7Plan(aq)) return p;
-        if (auto p = buildGenericSingleTableAdhocPlan(aq)) return p;
         return std::nullopt;
     };
 
