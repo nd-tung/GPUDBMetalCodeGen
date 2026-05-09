@@ -545,12 +545,33 @@ void MetalKeyedAgg::addAggregate(const std::string& name, int offset,
                                   const std::string& atomicOp,
                                   bool isLongPair,
                                   int scaleDown) {
-    aggregates_.push_back({name, offset, valueExpr, atomicOp, isLongPair, scaleDown});
+    aggregates_.push_back({name, offset, valueExpr, atomicOp, isLongPair, scaleDown,
+                           false, false});
+}
+
+void MetalKeyedAgg::addAggregateWithMeta(const std::string& name, int offset,
+                                          const std::string& valueExpr,
+                                          const std::string& atomicOp,
+                                          bool isLongPair,
+                                          int scaleDown,
+                                          bool isFloatSum,
+                                          bool isMinMax) {
+    aggregates_.push_back({name, offset, valueExpr, atomicOp, isLongPair, scaleDown,
+                           isFloatSum, isMinMax});
 }
 
 void MetalKeyedAgg::setKeyResult(const std::string& displayName, int base) {
     keyDisplayName_ = displayName;
     keyBase_ = base;
+    multiKeyDecode_.clear();
+}
+
+void MetalKeyedAgg::setMultiKeyResult(const std::vector<std::string>& displayNames,
+                                       const std::vector<GroupKeyDecode>& keys,
+                                       int /*totalBuckets*/) {
+    keyDisplayName_ = displayNames.empty() ? "bucket" : displayNames[0];
+    keyBase_ = 0;
+    multiKeyDecode_ = keys;
 }
 
 void MetalKeyedAgg::produce(MetalCodegen& cg, ConsumerFn consume) {
@@ -589,7 +610,12 @@ void MetalKeyedAgg::produce(MetalCodegen& cg, ConsumerFn consume) {
 
         // Declare thread-local accumulator arrays (before the scan loop)
         for (const auto& agg : aggregates_) {
-            if (agg.isLongPair) {
+            if (agg.isFloatSum) {
+                cg.addLine("float _local_" + agg.name + "[" + std::to_string(numBuckets_) + "];");
+                cg.addBlock("for (int _b = 0; _b < " + std::to_string(numBuckets_) + "; _b++)", [&]() {
+                    cg.addLine("_local_" + agg.name + "[_b] = 0.0f;");
+                });
+            } else if (agg.isLongPair) {
                 cg.addLine("long _local_" + agg.name + "[" + std::to_string(numBuckets_) + "];");
                 cg.addBlock("for (int _b = 0; _b < " + std::to_string(numBuckets_) + "; _b++)", [&]() {
                     cg.addLine("_local_" + agg.name + "[_b] = 0;");
@@ -606,7 +632,9 @@ void MetalKeyedAgg::produce(MetalCodegen& cg, ConsumerFn consume) {
         child_->produce(cg, [&]() {
             cg.addLine("int _bucket = " + bucketExpr_ + ";");
             for (const auto& agg : aggregates_) {
-                if (agg.isLongPair) {
+                if (agg.isFloatSum) {
+                    cg.addLine("_local_" + agg.name + "[_bucket] += (float)(" + agg.valueExpr + ");");
+                } else if (agg.isLongPair) {
                     cg.addLine("_local_" + agg.name + "[_bucket] += (long)(" + agg.valueExpr + ");");
                 } else {
                     cg.addLine("_local_" + agg.name + "[_bucket] += (uint)(" + agg.valueExpr + ");");
@@ -618,7 +646,18 @@ void MetalKeyedAgg::produce(MetalCodegen& cg, ConsumerFn consume) {
         // After the loop: TG reduction per bucket per aggregate, then single atomic
         cg.addComment("--- Threadgroup reduction for keyed aggregation ---");
         for (const auto& agg : aggregates_) {
-            if (agg.isLongPair) {
+            if (agg.isFloatSum) {
+                cg.addLine("threadgroup float _tg_shared_" + agg.name + "[32];");
+                cg.addBlock("for (int _b = 0; _b < " + std::to_string(numBuckets_) + "; _b++)", [&]() {
+                    cg.addLine("float _tg_val = tg_reduce_float(_local_" + agg.name +
+                               "[_b], lid, tg_size, _tg_shared_" + agg.name + ");");
+                    cg.addIf("lid == 0 && _tg_val != 0.0f", [&]() {
+                        std::string idx = "_b * " + std::to_string(valuesPerBucket_) + " + " + std::to_string(agg.offset);
+                        cg.addLine("atomic_add_float(&" + outputArrayName_ + "[" + idx +
+                                   "], _tg_val);");
+                    });
+                });
+            } else if (agg.isLongPair) {
                 cg.addLine("threadgroup long _tg_shared_" + agg.name + "[32];");
                 cg.addBlock("for (int _b = 0; _b < " + std::to_string(numBuckets_) + "; _b++)", [&]() {
                     cg.addLine("long _tg_val = tg_reduce_long(_local_" + agg.name +
@@ -650,7 +689,11 @@ void MetalKeyedAgg::produce(MetalCodegen& cg, ConsumerFn consume) {
             cg.addLine("int _bucket = " + bucketExpr_ + ";");
             for (const auto& agg : aggregates_) {
                 std::string base = "_bucket * " + std::to_string(valuesPerBucket_);
-                if (agg.isLongPair && agg.atomicOp == "add") {
+                if (agg.isFloatSum && agg.atomicOp == "add") {
+                    std::string idx = base + " + " + std::to_string(agg.offset);
+                    cg.addLine("atomic_add_float(&" + outputArrayName_ + "[" + idx +
+                               "], (float)(" + agg.valueExpr + "));");
+                } else if (agg.isLongPair && agg.atomicOp == "add") {
                     std::string loIdx = base + " + " + std::to_string(agg.offset);
                     std::string hiIdx = base + " + " + std::to_string(agg.offset + 1);
                     cg.addLine("atomic_add_long_pair(&" + outputArrayName_ + "[" + loIdx +
@@ -677,10 +720,23 @@ void MetalKeyedAgg::produce(MetalCodegen& cg, ConsumerFn consume) {
     // Register result schema with slot layout
     std::vector<MetalResultSchema::KeyedAggSlot> slots;
     for (const auto& agg : aggregates_) {
-        slots.push_back({agg.name, agg.offset, agg.isLongPair, agg.scaleDown});
+        slots.push_back({agg.name, agg.offset, agg.isLongPair, agg.scaleDown,
+                         agg.isFloatSum, agg.isMinMax, agg.atomicOp, -1});
     }
     cg.registerKeyedAggOutput(outputArrayName_, numBuckets_, valuesPerBucket_, slots,
                               keyDisplayName_, keyBase_);
+    // If multi-key decode info is present, set it on the schema
+    if (!multiKeyDecode_.empty()) {
+        for (const auto& mk : multiKeyDecode_) {
+            MetalResultSchema::KeyedAggInfo::MultiKeyInfo info;
+            info.displayName = mk.name;
+            info.numValues = mk.numValues;
+            info.stride = mk.stride;
+            info.charMap = mk.charMap;
+            info.keyBase = mk.keyBase;
+            cg.getResultSchemaMutable().keyedAgg.multiKeys.push_back(info);
+        }
+    }
 }
 
 std::string MetalKeyedAgg::describe() const {

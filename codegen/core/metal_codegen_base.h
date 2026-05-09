@@ -137,6 +137,7 @@ public:
                                 const std::string& keyDisplayName = "",
                                 int keyBase = 0);
     const MetalResultSchema& getResultSchema() const;
+    MetalResultSchema& getResultSchemaMutable();
 
     // ---------------------------------------------------------------
     // Code generation — produce final Metal source

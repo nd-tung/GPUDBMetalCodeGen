@@ -371,6 +371,10 @@ const MetalResultSchema& MetalCodegen::getResultSchema() const {
     return resultSchema_;
 }
 
+MetalResultSchema& MetalCodegen::getResultSchemaMutable() {
+    return resultSchema_;
+}
+
 // ===================================================================
 // Buffer index assignment
 // ===================================================================

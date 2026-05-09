@@ -293,6 +293,17 @@ private:
 // Keyed aggregation using atomics.
 // For "add" with isLongPair=true, uses atomic_add_long_pair for 64-bit correctness.
 // offset/offset+1 form the lo/hi pair in the output buffer.
+// Descriptor for one group-by key in multi-key encoding.
+struct GroupKeyDecode {
+    std::string name;   // display name (e.g. "l_returnflag")
+    int numValues = 0;  // distinct values this key can take
+    int stride = 0;     // multiplier for this key in flat bucket
+    // CHAR1 decode map: for each flat value 0..numValues-1, what CHAR1 does it map to.
+    // Empty for integer keys (recovered via keyBase + value).
+    std::vector<char> charMap;
+    int keyBase = 0;    // additive constant for integer keys after extraction
+};
+
 class MetalKeyedAgg : public MetalUnaryOperator {
 public:
     struct Aggregate {
@@ -305,6 +316,8 @@ public:
         // see MetalResultCollector::collectKeyedAgg. The GPU kernel always
         // accumulates the raw fixed-point value; this divisor is for display.
         int scaleDown = 0;      // result divisor (e.g. 100 for cents→dollars, 0=none)
+        bool isFloatSum = false; // true → float value stored via atomic CAS in single uint slot
+        bool isMinMax = false;   // true → min/max aggregate using special init/update logic
     };
 
     MetalKeyedAgg(std::unique_ptr<MetalOperator> child,
@@ -318,7 +331,21 @@ public:
                       const std::string& atomicOp = "add",
                       bool isLongPair = false,
                       int scaleDown = 0);
+    // Extended version that also sets isFloatSum / isMinMax flags.
+    void addAggregateWithMeta(const std::string& name, int offset,
+                              const std::string& valueExpr,
+                              const std::string& atomicOp,
+                              bool isLongPair,
+                              int scaleDown,
+                              bool isFloatSum,
+                              bool isMinMax);
     void setKeyResult(const std::string& displayName, int base = 0);
+    // Multi-key result info: caller provides list of GroupKeyDecode descriptors
+    // (one per group-by key) so the result collector can reconstruct each
+    // key column from the flat bucket index.
+    void setMultiKeyResult(const std::vector<std::string>& displayNames,
+                           const std::vector<GroupKeyDecode>& keys,
+                           int totalBuckets);
     void produce(MetalCodegen& cg, ConsumerFn consume) override;
     std::string describe() const override;
 
@@ -331,6 +358,7 @@ private:
     std::string keyDisplayName_;
     int keyBase_ = 0;
     std::vector<Aggregate> aggregates_;
+    std::vector<GroupKeyDecode> multiKeyDecode_;
 };
 
 // Simple atomic add to array: atomic_fetch_add(&arr[bucket], value)

@@ -138,14 +138,27 @@ struct MetalResultSchema {
         int offset;                 // slot offset within bucket
         bool isLongPair = false;    // true → lo/hi at offset/offset+1
         int scaleDown = 0;          // divisor for fixed-point
+        bool isFloatSum = false;    // true → float atomic buffer, read as float
+        bool isMinMax = false;      // true → min/max aggregate (special init logic)
+        std::string atomicOp;       // "add", "min", "max" (for result post-processing hint)
+        int avgDenomOffset = -1;    // for AVG: offset of the count slot (≥0 → divide by count)
     };
     struct KeyedAggInfo {
         int numBuckets = 0;
         int valuesPerBucket = 0;
         std::string bufferName;
-        std::string keyDisplayName;
-        int keyBase = 0;
+        std::string keyDisplayName;  // single-key display name (backwards compat)
+        int keyBase = 0;             // single-key base (backwards compat)
         std::vector<KeyedAggSlot> slots; // describes each logical value
+        // Multi-key decode info (when non-empty, overrides keyDisplayName/keyBase)
+        struct MultiKeyInfo {
+            std::string displayName;
+            int numValues = 0;
+            int stride = 0;
+            std::vector<char> charMap;  // for CHAR1 keys (reverse map: valueIndex→char)
+            int keyBase = 0;            // for integer keys (additive constant)
+        };
+        std::vector<MultiKeyInfo> multiKeys;
     };
     KeyedAggInfo keyedAgg;
 };
