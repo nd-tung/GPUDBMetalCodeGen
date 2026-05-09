@@ -1,12 +1,13 @@
 #pragma once
 // ===================================================================
-// Metal Query Plan Builder — converts AnalyzedQuery → operator trees
+// Metal Query Plan Builder — converts query planning decisions → operator trees
 // ===================================================================
 //
 // Produces MetalQueryPlan containing per-phase operator trees that
 // can be fed to MetalCodegen for Metal shader generation.
 //
-// This is the active planning path used by the codegen binary.
+// Predefined TPC-H planning enters by query name; ad-hoc SQL planning enters
+// through AnalyzedQuery. Both produce this MetalQueryPlan representation.
 // ===================================================================
 
 #include "metal_operators.h"
@@ -69,11 +70,12 @@ struct MetalQueryPlan {
         int limit = -1;
     };
     std::optional<CpuSort> cpuSort;
+
 };
 
-// Build a MetalQueryPlan from an analyzed query.
-// queryName (e.g. "Q7") is used for patterns the analyzer can't match by structure alone.
-// Returns nullopt if the query pattern is not yet supported.
+// Legacy compatibility wrapper. New callers should prefer the explicit APIs in
+// metal_tpch_plan_api.h (predefined TPC-H) or metal_adhoc_plan_api.h
+// (ad-hoc supported SQL patterns).
 std::optional<MetalQueryPlan> buildMetalPlan(const AnalyzedQuery& aq,
                                               const std::string& queryName = "");
 

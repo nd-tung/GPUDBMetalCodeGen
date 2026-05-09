@@ -122,11 +122,20 @@ public:
     void registerScalarAggOutput(const std::string& loBuffer, const std::string& hiBuffer,
                                  const std::string& type);
     void registerScalarAggColumn(const std::string& displayName, int index, int scaleDown = 0);
+    void registerScalarAggAverageColumn(const std::string& displayName,
+                                        const std::string& numeratorLoBuffer,
+                                        const std::string& numeratorHiBuffer,
+                                        const std::string& denominatorLoBuffer,
+                                        const std::string& denominatorHiBuffer,
+                                        const std::string& type,
+                                        int scaleDown = 0);
     void registerMaterializeOutput(const std::string& counterBuffer);
     void registerOutputColumn(const std::string& displayName, const std::string& bufferName,
                               const std::string& elementType, int stringLen = 0);
     void registerKeyedAggOutput(const std::string& bufferName, int numBuckets, int valuesPerBucket,
-                                const std::vector<MetalResultSchema::KeyedAggSlot>& slots = {});
+                                const std::vector<MetalResultSchema::KeyedAggSlot>& slots = {},
+                                const std::string& keyDisplayName = "",
+                                int keyBase = 0);
     const MetalResultSchema& getResultSchema() const;
 
     // ---------------------------------------------------------------
@@ -175,6 +184,7 @@ private:
     MetalResultSchema resultSchema_;
     std::string scalarAggPendingLo_;
     std::string scalarAggPendingHi_;
+    std::string scalarAggPendingType_;
 
     // Current indentation
     unsigned indentLevel_ = 1;

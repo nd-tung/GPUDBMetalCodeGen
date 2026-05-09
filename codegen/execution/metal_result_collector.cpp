@@ -159,28 +159,44 @@ GenericResult MetalResultCollector::collectScalarAgg(const MetalResultSchema& sc
     GenericResult result;
     GenericResult::Row row;
 
-    for (const auto& entry : schema.scalarAggs) {
-        result.columns.push_back({entry.displayName, entry.isLongPair ? "long" : "float"});
-
-        double value = 0.0;
-        if (entry.isLongPair) {
-            auto loIt = buffers.find(entry.loBuffer);
-            auto hiIt = buffers.find(entry.hiBuffer);
+    auto readScalar = [&](const std::string& loBuffer,
+                          const std::string& hiBuffer,
+                          bool isLongPair) -> double {
+        if (isLongPair) {
+            auto loIt = buffers.find(loBuffer);
+            auto hiIt = buffers.find(hiBuffer);
             if (loIt != buffers.end() && hiIt != buffers.end()) {
                 uint32_t lo = *static_cast<uint32_t*>(loIt->second->contents());
                 uint32_t hi = *static_cast<uint32_t*>(hiIt->second->contents());
-                int64_t raw = reconstructLong(lo, hi);
-                value = static_cast<double>(raw);
+                return static_cast<double>(reconstructLong(lo, hi));
             }
-        } else {
-            auto it = buffers.find(entry.loBuffer);
-            if (it != buffers.end()) {
-                // Could be float stored as uint via atomic
-                uint32_t raw = *static_cast<uint32_t*>(it->second->contents());
-                float fval;
-                memcpy(&fval, &raw, sizeof(float));
-                value = static_cast<double>(fval);
+            return 0.0;
+        }
+
+        auto it = buffers.find(loBuffer);
+        if (it == buffers.end()) return 0.0;
+        if (loBuffer.empty()) return 0.0;
+        if (!isLongPair) {
+            auto schemaIt = std::find_if(schema.scalarAggs.begin(), schema.scalarAggs.end(),
+                [&](const auto& candidate) { return candidate.loBuffer == loBuffer; });
+            if (schemaIt != schema.scalarAggs.end() && schemaIt->elementType == "int") {
+                return static_cast<double>(*static_cast<int32_t*>(it->second->contents()));
             }
+        }
+        uint32_t raw = *static_cast<uint32_t*>(it->second->contents());
+        float fval;
+        memcpy(&fval, &raw, sizeof(float));
+        return static_cast<double>(fval);
+    };
+
+    for (const auto& entry : schema.scalarAggs) {
+        result.columns.push_back({entry.displayName, entry.isLongPair ? "long" : entry.elementType});
+
+        double value = readScalar(entry.loBuffer, entry.hiBuffer, entry.isLongPair);
+        if (entry.divideByDenominator) {
+            double denominator = readScalar(entry.denomLoBuffer, entry.denomHiBuffer,
+                                           entry.denomIsLongPair);
+            value = denominator != 0.0 ? value / denominator : 0.0;
         }
 
         // Apply scale-down (divide by the scaleDown factor, e.g. 100 → /100)
@@ -214,7 +230,10 @@ GenericResult MetalResultCollector::collectKeyedAgg(const MetalResultSchema& sch
     const auto& slots = schema.keyedAgg.slots;
 
     // Build column headers
-    result.columns.push_back({"bucket", "int"});
+    std::string keyName = schema.keyedAgg.keyDisplayName.empty()
+        ? "bucket"
+        : schema.keyedAgg.keyDisplayName;
+    result.columns.push_back({keyName, "int"});
     if (!slots.empty()) {
         for (const auto& slot : slots) {
             result.columns.push_back({slot.name, slot.isLongPair ? "long" : "uint"});
@@ -235,7 +254,7 @@ GenericResult MetalResultCollector::collectKeyedAgg(const MetalResultSchema& sch
         if (!hasData) continue;
 
         GenericResult::Row row;
-        row.push_back((int64_t)bucket);  // bucket key
+        row.push_back((int64_t)(bucket + schema.keyedAgg.keyBase));
 
         if (!slots.empty()) {
             for (const auto& slot : slots) {

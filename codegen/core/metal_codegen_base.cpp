@@ -293,11 +293,11 @@ void MetalCodegen::registerScalarAggOutput(const std::string& loBuffer,
     resultSchema_.kind = MetalResultSchema::SCALAR_AGG;
     // Store the buffer names for the next scalarAgg entry
     // (will be associated with the column added by registerScalarAggColumn)
-    (void)type;
     // We store lo/hi buffers temporarily — they'll be set on the scalarAggs entry
     // by registerScalarAggColumn which is called right after
     scalarAggPendingLo_ = loBuffer;
     scalarAggPendingHi_ = hiBuffer;
+    scalarAggPendingType_ = type;
 }
 
 void MetalCodegen::registerScalarAggColumn(const std::string& displayName, int index,
@@ -309,8 +309,30 @@ void MetalCodegen::registerScalarAggColumn(const std::string& displayName, int i
     entry.loBuffer = scalarAggPendingLo_;
     entry.hiBuffer = scalarAggPendingHi_;
     entry.isLongPair = !scalarAggPendingHi_.empty();
-    entry.elementType = entry.isLongPair ? "uint" : "float";
+    entry.elementType = scalarAggPendingType_;
     (void)index;
+    resultSchema_.scalarAggs.push_back(entry);
+}
+
+void MetalCodegen::registerScalarAggAverageColumn(const std::string& displayName,
+                                                  const std::string& numeratorLoBuffer,
+                                                  const std::string& numeratorHiBuffer,
+                                                  const std::string& denominatorLoBuffer,
+                                                  const std::string& denominatorHiBuffer,
+                                                  const std::string& type,
+                                                  int scaleDown) {
+    resultSchema_.kind = MetalResultSchema::SCALAR_AGG;
+    MetalResultSchema::ScalarAggEntry entry;
+    entry.displayName = displayName;
+    entry.scaleDown = scaleDown;
+    entry.loBuffer = numeratorLoBuffer;
+    entry.hiBuffer = numeratorHiBuffer;
+    entry.denomLoBuffer = denominatorLoBuffer;
+    entry.denomHiBuffer = denominatorHiBuffer;
+    entry.isLongPair = !numeratorHiBuffer.empty();
+    entry.denomIsLongPair = !denominatorHiBuffer.empty();
+    entry.divideByDenominator = true;
+    entry.elementType = type == "long" ? "uint" : "float";
     resultSchema_.scalarAggs.push_back(entry);
 }
 
@@ -333,11 +355,15 @@ void MetalCodegen::registerOutputColumn(const std::string& displayName,
 
 void MetalCodegen::registerKeyedAggOutput(const std::string& bufferName,
                                            int numBuckets, int valuesPerBucket,
-                                           const std::vector<MetalResultSchema::KeyedAggSlot>& slots) {
+                                           const std::vector<MetalResultSchema::KeyedAggSlot>& slots,
+                                           const std::string& keyDisplayName,
+                                           int keyBase) {
     resultSchema_.kind = MetalResultSchema::KEYED_AGG;
     resultSchema_.keyedAgg.bufferName = bufferName;
     resultSchema_.keyedAgg.numBuckets = numBuckets;
     resultSchema_.keyedAgg.valuesPerBucket = valuesPerBucket;
+    resultSchema_.keyedAgg.keyDisplayName = keyDisplayName;
+    resultSchema_.keyedAgg.keyBase = keyBase;
     resultSchema_.keyedAgg.slots = slots;
 }
 

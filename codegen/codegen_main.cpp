@@ -1,13 +1,15 @@
 // Codegen standalone entry point
-// Usage: GPUDBCodegen [sf1|sf10|sf20|sf50|sf100] q<N>
+// Usage: GPUDBCodegen [sf1|sf10|sf20|sf50|sf100] q<N>|--sql-file FILE|--sql SQL
 //
-// This binary performs SQL → AnalyzedQuery → MetalQueryPlan → operators → Metal → GPU
-// for all 22 TPC-H queries via runtime code generation.
+// This binary exposes separate predefined TPC-H and ad-hoc SQL routes. Both
+// produce a MetalQueryPlan, then share operators → Metal → GPU execution.
 
 #include "core/infra.h"
 #include "query_analyzer.h"
 #include "runtime_compiler.h"
 #include "metal_plan_builder.h"
+#include "metal_adhoc_plan_api.h"
+#include "metal_tpch_plan_api.h"
 #include "metal_generic_executor.h"
 #include "max_key_symbols.h"
 #include "query_preprocessing.h"
@@ -53,6 +55,11 @@ static size_t g_chunkRowsExplicit = 0;    // user-set --chunk value (0 = unset);
                                           // auto-chunk trigger and reset between
                                           // queries to g_chunkRowsExplicit.
 static bool   g_chunkDoubleBuffer = true;// --no-db uses one reusable chunk slot
+
+enum class QueryApiKind {
+    PredefinedTPCH,
+    AdhocSQL,
+};
 
 // Compare two canonical CSV blobs with float tolerance.
 // Golden schemas must match exactly; numeric values are compared with tolerance.
@@ -238,6 +245,58 @@ static bool parseRowCountWithSuffix(const std::string& text, size_t& out) {
     return out > 0;
 }
 
+static int compareResultValues(const codegen::GenericResult::Value& left,
+                               const codegen::GenericResult::Value& right) {
+    if (std::holds_alternative<std::string>(left) || std::holds_alternative<std::string>(right)) {
+        std::string l = std::holds_alternative<std::string>(left)
+            ? std::get<std::string>(left) : std::to_string(std::holds_alternative<int64_t>(left)
+                ? static_cast<double>(std::get<int64_t>(left)) : std::get<double>(left));
+        std::string r = std::holds_alternative<std::string>(right)
+            ? std::get<std::string>(right) : std::to_string(std::holds_alternative<int64_t>(right)
+                ? static_cast<double>(std::get<int64_t>(right)) : std::get<double>(right));
+        if (l < r) return -1;
+        if (l > r) return 1;
+        return 0;
+    }
+
+    double l = std::holds_alternative<int64_t>(left)
+        ? static_cast<double>(std::get<int64_t>(left)) : std::get<double>(left);
+    double r = std::holds_alternative<int64_t>(right)
+        ? static_cast<double>(std::get<int64_t>(right)) : std::get<double>(right);
+    if (l < r) return -1;
+    if (l > r) return 1;
+    return 0;
+}
+
+static void applyCpuSortAndLimit(codegen::GenericResult& result,
+                                 const codegen::MetalQueryPlan::CpuSort& cpuSort) {
+    std::vector<std::pair<size_t, bool>> keys;
+    for (const auto& key : cpuSort.keys) {
+        auto it = std::find_if(result.columns.begin(), result.columns.end(), [&](const auto& col) {
+            return col.name == key.column;
+        });
+        if (it == result.columns.end()) {
+            throw std::runtime_error("CPU sort key not present in result: " + key.column);
+        }
+        keys.push_back({static_cast<size_t>(std::distance(result.columns.begin(), it)), key.descending});
+    }
+
+    if (!keys.empty()) {
+        std::stable_sort(result.rows.begin(), result.rows.end(), [&](const auto& left, const auto& right) {
+            for (const auto& [idx, descending] : keys) {
+                int cmp = compareResultValues(left[idx], right[idx]);
+                if (cmp == 0) continue;
+                return descending ? (cmp > 0) : (cmp < 0);
+            }
+            return false;
+        });
+    }
+
+    if (cpuSort.limit >= 0 && result.rows.size() > static_cast<size_t>(cpuSort.limit)) {
+        result.rows.resize(static_cast<size_t>(cpuSort.limit));
+    }
+}
+
 // ===================================================================
 // Peek at a .colbin file header to read row count + file size without
 // mapping the full file.  Returns false if file is absent / invalid.
@@ -286,7 +345,8 @@ static std::string autoDetectStreamTable(
 
 // ===================================================================
 static bool runCodegenQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
-                            const std::string& sql, const std::string& queryName) {
+                            const std::string& sql, const std::string& queryName,
+                            QueryApiKind apiKind) {
     if (!g_csv) printf("\n=== Codegen: %s ===\n", queryName.c_str());
     // Reset effective chunk size to whatever the user explicitly asked for.
     // Without this, an earlier query's auto-chunk decision would leak into
@@ -311,21 +371,44 @@ static bool runCodegenQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
             }
         }
 
-        // 1. Analyze SQL
-        auto tAnalyze0 = clk::now();
+        // 1. Analyze SQL. Predefined TPC-H does not parse/plan SQL text;
+        // only ad-hoc SQL and microbenchmarks do.
         codegen::AnalyzedQuery analyzed;
-        try {
-            analyzed = codegen::analyzeSQL(sql);
-        } catch (...) {
-            // Name-based builders don't need analyzed query
+        bool analyzedOk = false;
+        if (apiKind == QueryApiKind::AdhocSQL) {
+            auto tAnalyze0 = clk::now();
+            try {
+                analyzed = codegen::analyzeSQL(sql);
+                analyzedOk = true;
+            } catch (const std::exception& e) {
+                std::cerr << "Codegen: SQL analysis failed for " << queryName
+                          << ": " << e.what() << std::endl;
+                return false;
+            }
+            timing.analyzeMs = elapsedMs(tAnalyze0, clk::now());
         }
-        timing.analyzeMs = elapsedMs(tAnalyze0, clk::now());
 
         // 2. Build operator-based plan
         auto tPlan0 = clk::now();
-        auto maybePlan = codegen::buildMetalPlan(analyzed, queryName);
+        std::optional<codegen::MetalQueryPlan> maybePlan;
+        if (apiKind == QueryApiKind::PredefinedTPCH) {
+            maybePlan = codegen::buildPredefinedTPCHPlan(queryName);
+        } else {
+            if (!analyzedOk) {
+                std::cerr << "Codegen: ad-hoc SQL requires successful analysis for "
+                          << queryName << std::endl;
+                return false;
+            }
+            maybePlan = codegen::buildAdhocSQLPlan(analyzed, queryName);
+        }
         if (!maybePlan) {
-            std::cerr << "Codegen: query pattern not yet supported for " << queryName << std::endl;
+            if (apiKind == QueryApiKind::PredefinedTPCH) {
+                std::cerr << "Codegen: predefined TPC-H plan not available for "
+                          << queryName << std::endl;
+            } else {
+                std::cerr << "Codegen: ad-hoc SQL pattern not yet supported for "
+                          << queryName << std::endl;
+            }
             return false;
         }
         auto& plan = *maybePlan;
@@ -335,8 +418,7 @@ static bool runCodegenQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
         // ----------------------------------------------------------------
         // Data-larger-than-memory (DLM) safety gate.
         //   * Hard error if the user explicitly passed --chunk for a query
-        //     whose plan is not yet certified chunkable (see DOCUMENTATION
-        //     §9.4 — only Q1/Q4/Q6/Q12/Q13/Q14/Q19 + microbenchmarks today).
+        //     whose plan is not yet certified chunkable (see DOCUMENTATION §9.4).
         //   * Otherwise force g_chunkRows back to 0 so the auto-chunk
         //     trigger below cannot silently engage and produce wrong
         //     output for joins / sorts / non-associative aggregates.
@@ -1106,6 +1188,10 @@ static bool runCodegenQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
             result.result.rows.push_back({std::string("SHIP"), shipHigh, shipLow});
         }
 
+        if (plan.cpuSort && !result.result.columns.empty()) {
+            applyCpuSortAndLimit(result.result, *plan.cpuSort);
+        }
+
         // 7. Print generic results.
         // Queries whose final output is assembled by CPU post-processing below
         // leave result.result.columns empty here; those queries do their own printf.
@@ -1825,14 +1911,22 @@ static bool runCodegenQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
 
 int main(int argc, const char* argv[]) {
     std::string query;
+    std::string inlineSql;
+    std::string sqlFile;
+    bool hasInlineSql = false;
+    bool hasSqlFile = false;
     for (int i = 1; i < argc; i++) {
         std::string arg(argv[i]);
         if (arg == "help" || arg == "--help" || arg == "-h") {
             printf("GPU Database Codegen\n");
-            printf("Usage: GPUDBCodegen [flags] [sf1|sf10|sf20|sf50|sf100] q<N>|mb<N>\n");
-            printf("  q1..q22       - Run TPC-H query via codegen pipeline\n");
-            printf("  all           - Run all 22 queries\n");
-            printf("  mb1..mb7      - Run microbenchmark (sql/mb<N>.sql)\n");
+            printf("Usage: GPUDBCodegen [flags] [sf1|sf10|sf20|sf50|sf100] q<N>|mb<N>|--sql SQL|--sql-file FILE\n");
+            printf("Predefined TPC-H API:\n");
+            printf("  q1..q22       - Run predefined TPC-H query\n");
+            printf("  all           - Run all 22 predefined TPC-H queries\n");
+            printf("Ad-hoc SQL API:\n");
+            printf("  --sql SQL     - Run supported-pattern SQL text through the analyzer route\n");
+            printf("  --sql-file F  - Run supported-pattern SQL file through the analyzer route\n");
+            printf("  mb1..mb7      - Run microbenchmark SQL through the analyzer route\n");
             printf("  mball         - Run all microbenchmarks\n");
             printf("Loader flags:\n");
             printf("  --no-zerocopy        Disable zero-copy mmap path (force buffer copies)\n");
@@ -1882,6 +1976,20 @@ int main(int argc, const char* argv[]) {
             continue;
         }
         if (arg == "--scalar-atomic")     { ::setenv("GPUDB_SCALAR_ATOMIC", "1", 1); continue; }
+        if (arg == "--sql") {
+            if (i + 1 >= argc) { std::cerr << "Missing value for --sql\n"; return 1; }
+            inlineSql = argv[++i]; hasInlineSql = true; continue;
+        }
+        if (arg.rfind("--sql=", 0) == 0) {
+            inlineSql = arg.substr(6); hasInlineSql = true; continue;
+        }
+        if (arg == "--sql-file") {
+            if (i + 1 >= argc) { std::cerr << "Missing value for --sql-file\n"; return 1; }
+            sqlFile = argv[++i]; hasSqlFile = true; continue;
+        }
+        if (arg.rfind("--sql-file=", 0) == 0) {
+            sqlFile = arg.substr(11); hasSqlFile = true; continue;
+        }
         if (arg == "--csv")               { g_csv = true; continue; }
         if (arg == "--no-pipeline-cache") { g_noPipelineCache = true; continue; }
         if (arg == "--fastmath")          { g_fastMath = true; continue; }
@@ -1937,8 +2045,18 @@ int main(int argc, const char* argv[]) {
         query = arg;
     }
 
-    if (query.empty()) {
-        std::cerr << "Usage: GPUDBCodegen [sf1|sf10|sf20|sf50|sf100] q<N>" << std::endl;
+    if (hasInlineSql && hasSqlFile) {
+        std::cerr << "Use either --sql or --sql-file, not both" << std::endl;
+        return 1;
+    }
+    const bool hasSqlRequest = hasInlineSql || hasSqlFile;
+    if (hasSqlRequest && !query.empty()) {
+        std::cerr << "Ad-hoc SQL options cannot be combined with q<N>, all, mb<N>, or mball" << std::endl;
+        return 1;
+    }
+
+    if (query.empty() && !hasSqlRequest) {
+        std::cerr << "Usage: GPUDBCodegen [sf1|sf10|sf20|sf50|sf100] q<N>|--sql SQL|--sql-file FILE" << std::endl;
         return 1;
     }
 
@@ -1956,8 +2074,7 @@ int main(int argc, const char* argv[]) {
 
     printSystemInfo(getSystemInfo(device));
 
-    auto runQuery = [&](int qNum) -> bool {
-        std::string path = "sql/q" + std::to_string(qNum) + ".sql";
+    auto readSqlFile = [](const std::string& path, std::string& sql) -> bool {
         std::ifstream f(path);
         if (!f.is_open()) {
             std::cerr << "Cannot open SQL file: " << path << std::endl;
@@ -1965,27 +2082,33 @@ int main(int argc, const char* argv[]) {
         }
         std::stringstream ss;
         ss << f.rdbuf();
-        std::string sql = ss.str();
+        sql = ss.str();
+        return true;
+    };
+
+    auto runQuery = [&](int qNum) -> bool {
         std::string name = "Q" + std::to_string(qNum);
-        return runCodegenQuery(device, cmdQueue, sql, name);
+        return runCodegenQuery(device, cmdQueue, "", name, QueryApiKind::PredefinedTPCH);
     };
 
     auto runMicrobench = [&](int mbNum) -> bool {
         std::string path = "sql/mb" + std::to_string(mbNum) + ".sql";
-        std::ifstream f(path);
-        if (!f.is_open()) {
-            std::cerr << "Cannot open SQL file: " << path << std::endl;
-            return false;
-        }
-        std::stringstream ss;
-        ss << f.rdbuf();
-        std::string sql = ss.str();
+        std::string sql;
+        if (!readSqlFile(path, sql)) return false;
         std::string name = "MB" + std::to_string(mbNum);
-        return runCodegenQuery(device, cmdQueue, sql, name);
+        return runCodegenQuery(device, cmdQueue, sql, name, QueryApiKind::AdhocSQL);
     };
 
     bool ok = true;
-    if (query == "all") {
+    if (hasSqlRequest) {
+        std::string sql;
+        if (hasInlineSql) {
+            sql = inlineSql;
+        } else if (!readSqlFile(sqlFile, sql)) {
+            return 1;
+        }
+        ok = runCodegenQuery(device, cmdQueue, sql, "SQL", QueryApiKind::AdhocSQL);
+    } else if (query == "all") {
         for (int q = 1; q <= 22; q++) ok = runQuery(q) && ok;
     } else if (query == "mball") {
         for (int m = 1; m <= 7; m++) ok = runMicrobench(m) && ok;
