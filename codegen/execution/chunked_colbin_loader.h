@@ -1,6 +1,6 @@
 #pragma once
 
-#include "../../src/infra.h"
+#include "../core/infra.h"
 
 #include <Metal/Metal.hpp>
 #include <cstddef>

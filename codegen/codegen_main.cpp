@@ -4,7 +4,7 @@
 // This binary performs SQL → AnalyzedQuery → MetalQueryPlan → operators → Metal → GPU
 // for all 22 TPC-H queries via runtime code generation.
 
-#include "../src/infra.h"
+#include "core/infra.h"
 #include "query_analyzer.h"
 #include "runtime_compiler.h"
 #include "metal_plan_builder.h"
