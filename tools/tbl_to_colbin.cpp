@@ -8,7 +8,7 @@
 // Skips tables whose .colbin already matches source size + mtime.
 // Use GPUDB_FORCE_REBUILD=1 to regenerate unconditionally.
 
-#include "../src/infra.h"
+#include "../codegen/core/infra.h"
 #include "tpch_schema.h"
 
 #include <cstdlib>
