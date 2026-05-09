@@ -234,6 +234,88 @@ private:
 };
 
 // ===================================================================
+// HASH-MAP OPERATORS  (composite-key, linear-probing)
+// ===================================================================
+//
+// Layout (registered via cg.addHashMapParam / addHashMapReadParam):
+//   <map>_keys1 (atomic_uint, sentinel = 0xFFFFFFFFu)
+//   <map>_keys2 (atomic_uint, sentinel = 0xFFFFFFFFu)
+//   <map>_values (atomic_uint -- holds either an int payload or the
+//                 bit-pattern of a float, interpreted by the lookup
+//                 result type)
+//   n_<map>     (uint capacity, MUST be a power of two)
+//
+// Use HashMapBuild + HashMapLookup for HashJoin (composite-key equi-
+// join carrying one value).  Use HashMapAgg + HashMapLookup for
+// HashGroupJoin (composite-key build aggregates a value per key).
+// ===================================================================
+
+// HashMapBuild: insert (key1, key2) -> value at hashed slot.
+// First-writer-wins on duplicate composite keys.
+class MetalHashMapBuild : public MetalUnaryOperator {
+public:
+    MetalHashMapBuild(std::unique_ptr<MetalOperator> child,
+                      const std::string& mapName,
+                      const std::string& key1Expr,
+                      const std::string& key2Expr,
+                      const std::string& valueExpr,
+                      const std::string& capacityExpr);
+    void produce(MetalCodegen& cg, ConsumerFn consume) override;
+    std::string describe() const override;
+
+private:
+    std::string mapName_;
+    std::string key1Expr_, key2Expr_;
+    std::string valueExpr_;
+    std::string capacityExpr_;
+};
+
+// HashMapAgg: insert + atomic-add aggregation on `value`.  When
+// valueIsFloat is true the value buffer is read as float bits.
+class MetalHashMapAgg : public MetalUnaryOperator {
+public:
+    MetalHashMapAgg(std::unique_ptr<MetalOperator> child,
+                    const std::string& mapName,
+                    const std::string& key1Expr,
+                    const std::string& key2Expr,
+                    const std::string& valueExpr,
+                    const std::string& capacityExpr,
+                    bool valueIsFloat = false);
+    void produce(MetalCodegen& cg, ConsumerFn consume) override;
+    std::string describe() const override;
+
+private:
+    std::string mapName_;
+    std::string key1Expr_, key2Expr_;
+    std::string valueExpr_;
+    std::string capacityExpr_;
+    bool valueIsFloat_;
+};
+
+// HashMapLookup: probe (key1, key2); on hit emits
+//   <resultType> resultVar = <values>[slot];
+// and gates the consumer chain on the lookup hit.
+class MetalHashMapLookup : public MetalUnaryOperator {
+public:
+    MetalHashMapLookup(std::unique_ptr<MetalOperator> child,
+                       const std::string& mapName,
+                       const std::string& key1Expr,
+                       const std::string& key2Expr,
+                       const std::string& capacityExpr,
+                       const std::string& resultVar,
+                       const std::string& resultType = "uint");
+    void produce(MetalCodegen& cg, ConsumerFn consume) override;
+    std::string describe() const override;
+
+private:
+    std::string mapName_;
+    std::string key1Expr_, key2Expr_;
+    std::string capacityExpr_;
+    std::string resultVar_;
+    std::string resultType_;
+};
+
+// ===================================================================================
 // AGGREGATION OPERATORS
 // ===================================================================
 

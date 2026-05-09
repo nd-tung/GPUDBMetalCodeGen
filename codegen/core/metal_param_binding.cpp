@@ -56,6 +56,20 @@ size_t MetalSizeResolver::resolve(const std::string& expr) const {
     if (hasSymbol(e))
         return getSymbol(e);
 
+    // Function call: next_pow2(<expr>) → smallest power of two >= inner
+    {
+        const std::string fn = "next_pow2";
+        if (e.size() > fn.size() + 2 && e.compare(0, fn.size(), fn) == 0 &&
+            e[fn.size()] == '(' && e.back() == ')') {
+            std::string inner = trim(e.substr(fn.size() + 1, e.size() - fn.size() - 2));
+            size_t v = resolve(inner);
+            if (v <= 1) return 1;
+            size_t p = 1;
+            while (p < v) p <<= 1;
+            return p;
+        }
+    }
+
     // Standard precedence expression parsing:
     // 1. Find the LAST top-level (not inside parens) + or - → split there
     // 2. Else find the LAST top-level * or / → split there

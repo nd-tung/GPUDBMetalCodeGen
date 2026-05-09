@@ -227,6 +227,18 @@ void MetalGenericExecutor::bindPhaseBuffers(MTL::ComputeCommandEncoder* encoder,
                     auto fi = scalarFloats_.find(b.name);
                     if (fi != scalarFloats_.end()) {
                         encoder->setBytes(&fi->second, sizeof(float), b.bufferIndex);
+                    } else if (!b.sizeExpr.empty()) {
+                        // Derived scalar: resolve from sizeResolver_ (e.g.
+                        // hash-map capacity expressed as
+                        // "next_pow2(n_partsupp * 2)").
+                        uint32_t v = static_cast<uint32_t>(
+                            sizeResolver_.resolve(b.sizeExpr));
+                        encoder->setBytes(&v, sizeof(uint32_t), b.bufferIndex);
+                    } else if (sizeResolver_.hasSymbol(b.name)) {
+                        // Symbol registered directly via registerSymbol().
+                        uint32_t v = static_cast<uint32_t>(
+                            sizeResolver_.getSymbol(b.name));
+                        encoder->setBytes(&v, sizeof(uint32_t), b.bufferIndex);
                     }
                 }
                 break;

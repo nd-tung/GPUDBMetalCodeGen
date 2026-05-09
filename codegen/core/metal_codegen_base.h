@@ -82,12 +82,25 @@ public:
     void addBufferParam(const std::string& name, const std::string& elemType,
                         const std::string& sizeExpr, bool zeroInit = true, int fillByte = 0);
 
-    // Atomic device buffer: device atomic_uint* (read-write, always zero-init)
+    // Atomic device buffer: device atomic_uint* (read-write).
+    // fillByte selects the memset value used to (re)initialise the buffer
+    // before each kernel dispatch (0 by default; 0xFF for sentinel-of-(-1)
+    // patterns such as hash-map key arrays).
     void addAtomicBufferParam(const std::string& name, const std::string& atomicType,
-                              const std::string& sizeExpr);
+                              const std::string& sizeExpr, int fillByte = 0);
 
     // Constant scalar: constant T& (passed via setBytes)
+    // Constant scalar param: constant T& — value supplied via
+    // registerScalarInt/registerScalarFloat on the executor.
     void addScalarParam(const std::string& name, const std::string& type);
+
+    // Resolved scalar param: same Metal-side declaration as addScalarParam,
+    // but the value is derived at dispatch time by evaluating `sizeExpr`
+    // through the executor's MetalSizeResolver (supports literals, symbols,
+    // arithmetic, and `next_pow2(...)`). Used for hash-map capacities and
+    // similar size-derived constants that depend on table cardinalities.
+    void addResolvedScalarParam(const std::string& name, const std::string& type,
+                                const std::string& sizeExpr);
 
     // Constant data: constant T* (host data, passed via setBytes)
     void addConstantDataParam(const std::string& name, const std::string& type,
