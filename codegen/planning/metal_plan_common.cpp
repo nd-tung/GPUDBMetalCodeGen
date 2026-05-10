@@ -249,6 +249,8 @@ std::string exprToMetalForPredicate(const ExprPtr& expr,
 // Helper: expression to Metal code string (columnar access: col[idx])
 // ===================================================================
 
+std::string predToMetal(const PredPtr& pred, const std::string& idxVar);
+
 // Collect all column references in an expression
 void collectColumns(const ExprPtr& expr, std::set<std::string>& cols) {
     if (!expr) return;
@@ -340,14 +342,23 @@ std::string exprToMetal(const ExprPtr& expr, const std::string& idxVar) {
             return os.str();
         }
         else if constexpr (std::is_same_v<T, CaseWhen>) {
-            // CASE WHEN conditions are stored as Expr (not Pred), so full
-            // condition evaluation is not yet available.  Return the first
-            // branch's result as a best-effort approximation.
-            if (!node.branches.empty())
-                return exprToMetal(node.branches[0].result, idxVar);
+            if (node.branches.empty()) {
+                if (node.elseResult) return exprToMetal(node.elseResult, idxVar);
+                return "0";
+            }
+            std::string result = "(";
+            for (size_t i = 0; i < node.branches.size(); ++i) {
+                if (i > 0) result += " : ";
+                std::string cond = predToMetal(node.branches[i].condition, idxVar);
+                std::string val = exprToMetal(node.branches[i].result, idxVar);
+                result += cond + " ? " + val;
+            }
             if (node.elseResult)
-                return exprToMetal(node.elseResult, idxVar);
-            return "0";
+                result += " : " + exprToMetal(node.elseResult, idxVar);
+            else
+                result += " : 0";
+            result += ")";
+            return result;
         }
         else {
             return "/* unknown expr */";

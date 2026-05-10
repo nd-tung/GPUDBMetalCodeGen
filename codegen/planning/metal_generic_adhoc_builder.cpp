@@ -170,6 +170,11 @@ DataType inferExprDataType(const ExprPtr& expr) {
             if (node.op == ExprOp::DIV || leftType == DataType::FLOAT || rightType == DataType::FLOAT)
                 return DataType::FLOAT;
             return DataType::INT;
+        } else if constexpr (std::is_same_v<Node, CaseWhen>) {
+            // Return type of first branch result, or elseResult, or INT.
+            if (!node.branches.empty()) return inferExprDataType(node.branches[0].result);
+            if (node.elseResult) return inferExprDataType(node.elseResult);
+            return DataType::INT;
         } else {
             return DataType::INT;
         }
@@ -242,6 +247,9 @@ bool fixedStringLikeSupported(const Like& like) {
     return std::all_of(segmentLens.begin(), segmentLens.end(), [](size_t len) { return len <= 16; });
 }
 
+bool exprSupported(const ExprPtr& expr, bool allowChar1Literal);
+bool predSupported(const PredPtr& pred);
+
 bool exprSupported(const ExprPtr& expr, bool allowChar1Literal) {
     if (!expr) return false;
     return std::visit([&](auto&& node) -> bool {
@@ -259,6 +267,21 @@ bool exprSupported(const ExprPtr& expr, bool allowChar1Literal) {
                    exprSupported(node.right, allowChar1Literal) &&
                    isNumericLike(inferExprDataType(node.left)) &&
                    isNumericLike(inferExprDataType(node.right));
+        } else if constexpr (std::is_same_v<Node, CaseWhen>) {
+            for (const auto& br : node.branches) {
+                if (!predSupported(br.condition)) return false;
+                DataType rt = inferExprDataType(br.result);
+                if (rt != DataType::INT && rt != DataType::FLOAT && rt != DataType::DATE)
+                    return false;
+                if (!exprSupported(br.result, allowChar1Literal)) return false;
+            }
+            if (node.elseResult) {
+                DataType et = inferExprDataType(node.elseResult);
+                if (et != DataType::INT && et != DataType::FLOAT && et != DataType::DATE)
+                    return false;
+                if (!exprSupported(node.elseResult, allowChar1Literal)) return false;
+            }
+            return true;
         } else {
             return false;
         }

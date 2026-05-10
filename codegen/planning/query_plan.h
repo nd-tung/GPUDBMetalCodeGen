@@ -46,7 +46,7 @@ struct BinaryExpr {
 };
 
 struct CaseWhen {
-    struct Branch { ExprPtr condition, result; };
+    struct Branch { std::shared_ptr<struct Predicate> condition; ExprPtr result; };
     std::vector<Branch> branches;
     ExprPtr elseResult;
 };
