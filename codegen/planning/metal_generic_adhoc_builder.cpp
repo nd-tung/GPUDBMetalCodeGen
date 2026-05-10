@@ -324,6 +324,14 @@ bool predSupported(const PredPtr& pred) {
             if (node.op == CmpOp::EQ || node.op == CmpOp::NE) {
                 if (fixedStringCompareSupported(node.left, node.right) ||
                     fixedStringCompareSupported(node.right, node.left)) return true;
+                // CHAR1 column compared to string literal (e.g. c_mktsegment = 'BUILDING')
+                auto* lc = node.left ? std::get_if<ColRef>(&node.left->node) : nullptr;
+                auto* rc = node.right ? std::get_if<ColRef>(&node.right->node) : nullptr;
+                auto* ll = node.left ? std::get_if<Literal>(&node.left->node) : nullptr;
+                auto* rl = node.right ? std::get_if<Literal>(&node.right->node) : nullptr;
+                if ((lc && lc->dataType == DataType::CHAR1 && rl && std::holds_alternative<std::string>(rl->value)) ||
+                    (rc && rc->dataType == DataType::CHAR1 && ll && std::holds_alternative<std::string>(ll->value)))
+                    return true;
             }
             return comparisonExprsSupported(node.left, node.right);
         } else if constexpr (std::is_same_v<Node, Between>) {
