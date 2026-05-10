@@ -297,6 +297,98 @@ static void applyCpuSortAndLimit(codegen::GenericResult& result,
     }
 }
 
+// Host-side GROUP BY for MaterializeAgg fallback.
+// Groups raw rows by keyColumns and applies aggregate functions.
+static void applyCpuGroupBy(codegen::GenericResult& result,
+                             const codegen::MetalQueryPlan::CpuGroupBy& gb) {
+    if (gb.keyColumns.empty() || gb.aggColumns.empty()) return;
+    if (result.rows.empty()) return;
+
+    // Map column names to indices.
+    std::vector<size_t> keyIdx, aggIdx;
+    for (const auto& kc : gb.keyColumns) {
+        for (size_t i = 0; i < result.columns.size(); ++i) {
+            if (result.columns[i].name == kc) { keyIdx.push_back(i); break; }
+        }
+    }
+    for (const auto& ac : gb.aggColumns) {
+        for (size_t i = 0; i < result.columns.size(); ++i) {
+            if (result.columns[i].name == ac) { aggIdx.push_back(i); break; }
+        }
+    }
+    if (keyIdx.size() != gb.keyColumns.size()) return;
+    if (aggIdx.size() != gb.aggColumns.size()) return;
+
+    auto valToStr = [](const codegen::GenericResult::Value& v) -> std::string {
+        if (auto* s = std::get_if<std::string>(&v)) return *s;
+        if (auto* i = std::get_if<int64_t>(&v)) return std::to_string(*i);
+        if (auto* d = std::get_if<double>(&v)) return std::to_string(*d);
+        return "";
+    };
+
+    auto valToDouble = [](const codegen::GenericResult::Value& v) -> double {
+        if (auto* d = std::get_if<double>(&v)) return *d;
+        if (auto* i = std::get_if<int64_t>(&v)) return static_cast<double>(*i);
+        return 0.0;
+    };
+
+    struct GroupAcc {
+        codegen::GenericResult::Row keyValues;
+        std::vector<double> sums;
+        std::vector<double> counts;
+    };
+    std::map<std::string, GroupAcc> groups;
+
+    for (auto& row : result.rows) {
+        std::string key;
+        for (auto ki : keyIdx) key += valToStr(row[ki]) + "\x01";
+
+        auto& ga = groups[key];
+        if (ga.sums.empty()) {
+            ga.sums.resize(aggIdx.size(), 0.0);
+            ga.counts.resize(aggIdx.size(), 0.0);
+            for (auto ki : keyIdx) ga.keyValues.push_back(row[ki]);
+        }
+
+        for (size_t a = 0; a < aggIdx.size(); ++a) {
+            double val = valToDouble(row[aggIdx[a]]);
+            const std::string& fn = gb.aggFuncs[a];
+            if (fn == "COUNT" || fn == "SUM") {
+                ga.sums[a] += val;
+                ga.counts[a] += (fn == "COUNT") ? 1.0 : 0.0;
+            } else if (fn == "AVG") {
+                ga.sums[a] += val;
+                ga.counts[a] += 1.0;
+            } else if (fn == "MIN") {
+                ga.sums[a] = (ga.counts[a] == 0) ? val : std::min(ga.sums[a], val);
+                ga.counts[a] = 1.0;
+            } else if (fn == "MAX") {
+                ga.sums[a] = (ga.counts[a] == 0) ? val : std::max(ga.sums[a], val);
+                ga.counts[a] = 1.0;
+            }
+        }
+    }
+
+    // Build result with aggregates computed.
+    codegen::GenericResult out;
+    out.columns = result.columns;
+    for (auto& [k, ga] : groups) {
+        codegen::GenericResult::Row row(result.columns.size());
+        for (size_t ki = 0; ki < keyIdx.size(); ++ki) {
+            row[keyIdx[ki]] = ga.keyValues[ki];
+        }
+        for (size_t a = 0; a < aggIdx.size(); ++a) {
+            const std::string& fn = gb.aggFuncs[a];
+            if (fn == "AVG" && ga.counts[a] > 0.0)
+                row[aggIdx[a]] = ga.sums[a] / ga.counts[a];
+            else
+                row[aggIdx[a]] = ga.sums[a];
+        }
+        out.rows.push_back(std::move(row));
+    }
+    result = std::move(out);
+}
+
 // ===================================================================
 // Peek at a .colbin file header to read row count + file size without
 // mapping the full file.  Returns false if file is absent / invalid.
@@ -1186,6 +1278,10 @@ static bool runCodegenQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
             result.result.rows.clear();
             result.result.rows.push_back({std::string("MAIL"), mailHigh, mailLow});
             result.result.rows.push_back({std::string("SHIP"), shipHigh, shipLow});
+        }
+
+        if (plan.cpuGroupBy && !result.result.columns.empty()) {
+            applyCpuGroupBy(result.result, *plan.cpuGroupBy);
         }
 
         if (plan.cpuSort && !result.result.columns.empty()) {

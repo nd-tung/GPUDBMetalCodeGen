@@ -71,6 +71,15 @@ struct MetalQueryPlan {
     };
     std::optional<CpuSort> cpuSort;
 
+    // Host-side GROUP BY when GPU KeyedAgg cannot handle it.
+    // Columns map by display name to aggregate function: "SUM", "COUNT", "AVG", "MIN", "MAX".
+    struct CpuGroupBy {
+        std::vector<std::string> keyColumns;       // column names in result
+        std::vector<std::string> aggColumns;       // aggregate result columns
+        std::vector<std::string> aggFuncs;         // "SUM", "COUNT", "AVG", "MIN", "MAX"
+    };
+    std::optional<CpuGroupBy> cpuGroupBy;
+
 };
 
 // Legacy compatibility wrapper. New callers should prefer the explicit APIs in
