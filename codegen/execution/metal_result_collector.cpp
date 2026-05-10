@@ -214,6 +214,207 @@ GenericResult MetalResultCollector::collectScalarAgg(const MetalResultSchema& sc
 }
 
 // ===================================================================
+// HAVING Predicate Evaluation
+// ===================================================================
+
+// Context for evaluating HAVING predicates over aggregated results
+struct HavingContext {
+    const GenericResult::Row&                row;              // decoded keys + agg values
+    const std::vector<MetalResultSchema::KeyedAggSlot>& slots; // agg slot metadata
+    const std::vector<MetalResultSchema::KeyedAggInfo::MultiKeyInfo>& multiKeys;
+    const std::string& keyDisplayName;
+    int numMultiKeys;  // count of GROUP BY keys (at front of row)
+    int keyBase;
+};
+
+// Forward declare evaluateExpr
+static GenericResult::Value evaluateExpr(const ExprPtr& expr, const HavingContext& ctx);
+
+// Evaluate a predicate tree, returning true if the row satisfies it
+static bool evaluatePredicate(const PredPtr& pred, const HavingContext& ctx) {
+    if (!pred) return true;  // null predicate always true
+
+    auto& node = pred->node;
+
+    // Comparison: left CMP right
+    if (auto* cmp = std::get_if<Comparison>(&node)) {
+        auto lval = evaluateExpr(cmp->left, ctx);
+        auto rval = evaluateExpr(cmp->right, ctx);
+
+        // Extract comparable values
+        double l = 0, r = 0;
+        bool lIsDouble = false, rIsDouble = false;
+
+        std::visit([&](auto&& v) {
+            using T = std::decay_t<decltype(v)>;
+            if constexpr (std::is_same_v<T, double>) { l = v; lIsDouble = true; }
+            else if constexpr (std::is_same_v<T, int64_t>) { l = (double)v; lIsDouble = true; }
+            else if constexpr (std::is_same_v<T, std::string>) { /* skip */ }
+        }, lval);
+
+        std::visit([&](auto&& v) {
+            using T = std::decay_t<decltype(v)>;
+            if constexpr (std::is_same_v<T, double>) { r = v; rIsDouble = true; }
+            else if constexpr (std::is_same_v<T, int64_t>) { r = (double)v; rIsDouble = true; }
+            else if constexpr (std::is_same_v<T, std::string>) { /* skip */ }
+        }, rval);
+
+        if (!lIsDouble || !rIsDouble) return true;  // non-numeric comparison: skip
+
+        bool result = false;
+        switch (cmp->op) {
+            case CmpOp::EQ: result = (l == r); break;
+            case CmpOp::NE: result = (l != r); break;
+            case CmpOp::LT: result = (l < r); break;
+            case CmpOp::LE: result = (l <= r); break;
+            case CmpOp::GT: result = (l > r); break;
+            case CmpOp::GE: result = (l >= r); break;
+        }
+        return result;
+    }
+
+    // LogicalAnd: all children must be true
+    if (auto* land = std::get_if<LogicalAnd>(&node)) {
+        for (const auto& child : land->children) {
+            if (!evaluatePredicate(child, ctx)) return false;
+        }
+        return true;
+    }
+
+    // LogicalOr: any child being true means true
+    if (auto* lor = std::get_if<LogicalOr>(&node)) {
+        for (const auto& child : lor->children) {
+            if (evaluatePredicate(child, ctx)) return true;
+        }
+        return false;
+    }
+
+    // LogicalNot: negate the child
+    if (auto* lnot = std::get_if<LogicalNot>(&node)) {
+        return !evaluatePredicate(lnot->child, ctx);
+    }
+
+    // Other predicate types (Between, InList, Like, ExistsPred): not supported in HAVING
+    // For now, return true (allow the row)
+    return true;
+}
+
+// Evaluate an expression in the context of aggregated row data
+static GenericResult::Value evaluateExpr(const ExprPtr& expr, const HavingContext& ctx) {
+    if (!expr) return (int64_t)0;
+
+    auto& node = expr->node;
+
+    // Literal: return directly
+    if (auto* lit = std::get_if<Literal>(&node)) {
+        if (auto* i = std::get_if<int>(&lit->value)) {
+            return (int64_t)*i;
+        }
+        if (auto* f = std::get_if<float>(&lit->value)) {
+            return (double)*f;
+        }
+        if (auto* s = std::get_if<std::string>(&lit->value)) {
+            return *s;
+        }
+        return (int64_t)0;
+    }
+
+    // ColRef: look up from GROUP BY keys (first N positions in row)
+    if (auto* col = std::get_if<ColRef>(&node)) {
+        if (!ctx.multiKeys.empty()) {
+            // Multi-key: look up by matching display name
+            for (size_t ki = 0; ki < ctx.multiKeys.size(); ++ki) {
+                if (ctx.multiKeys[ki].displayName == col->column) {
+                    if (ki < ctx.row.size()) {
+                        return ctx.row[ki];
+                    }
+                }
+            }
+        } else {
+            // Single key: always at position 0
+            if (!ctx.row.empty()) {
+                return ctx.row[0];
+            }
+        }
+        return (int64_t)0;
+    }
+
+    // FuncCall: handle aggregate functions
+    if (auto* call = std::get_if<FuncCall>(&node)) {
+        std::string funcName = call->name;
+        
+        // Convert function name to uppercase for comparison
+        for (auto& c : funcName) c = std::toupper((unsigned char)c);
+
+        // Special handling for SUM(col), COUNT(*), etc.
+        // The function name might be "SUM", "COUNT", "AVG", "MIN", "MAX"
+        // In the slots, the name is like "SUM(o_totalprice)" or "COUNT(*)"
+        // We need to match by looking for slots that start with the function name
+        
+        for (size_t si = 0; si < ctx.slots.size(); ++si) {
+            const auto& slot = ctx.slots[si];
+            std::string slotName = slot.name;
+            for (auto& c : slotName) c = std::toupper((unsigned char)c);
+
+            // Check if this slot matches the aggregate function
+            if (slotName.find(funcName) == 0) {
+                int valueIdx = ctx.numMultiKeys + si;
+                if (valueIdx < (int)ctx.row.size()) {
+                    return ctx.row[valueIdx];
+                }
+            }
+        }
+
+        // If not found, return 0
+        return (int64_t)0;
+    }
+
+    // BinaryExpr: evaluate both sides and apply operator
+    if (auto* binexpr = std::get_if<BinaryExpr>(&node)) {
+        auto lval = evaluateExpr(binexpr->left, ctx);
+        auto rval = evaluateExpr(binexpr->right, ctx);
+
+        // Convert to numbers
+        double l = 0, r = 0;
+        std::visit([&](auto&& v) {
+            using T = std::decay_t<decltype(v)>;
+            if constexpr (std::is_same_v<T, double>) l = v;
+            else if constexpr (std::is_same_v<T, int64_t>) l = (double)v;
+        }, lval);
+        std::visit([&](auto&& v) {
+            using T = std::decay_t<decltype(v)>;
+            if constexpr (std::is_same_v<T, double>) r = v;
+            else if constexpr (std::is_same_v<T, int64_t>) r = (double)v;
+        }, rval);
+
+        double result = 0;
+        switch (binexpr->op) {
+            case ExprOp::ADD: result = l + r; break;
+            case ExprOp::SUB: result = l - r; break;
+            case ExprOp::MUL: result = l * r; break;
+            case ExprOp::DIV: result = (r != 0) ? l / r : 0; break;
+        }
+        return result;
+    }
+
+    // CaseWhen: not typically in HAVING, return 0
+    if (auto* casewhen = std::get_if<CaseWhen>(&node)) {
+        for (const auto& branch : casewhen->branches) {
+            // For simplicity, just evaluate first branch (not a true CASE evaluation)
+            if (branch.result) {
+                return evaluateExpr(branch.result, ctx);
+            }
+        }
+        if (casewhen->elseResult) {
+            return evaluateExpr(casewhen->elseResult, ctx);
+        }
+        return (int64_t)0;
+    }
+
+    return (int64_t)0;
+}
+
+// ===================================================================
 // collectKeyedAgg
 // ===================================================================
 
@@ -347,6 +548,24 @@ GenericResult MetalResultCollector::collectKeyedAgg(const MetalResultSchema& sch
                 row.push_back((int64_t)data[rowBase + v]);
             }
         }
+
+        // Apply HAVING predicate filter if present and not already evaluated on GPU
+        if (schema.keyedAgg.havingPredicate && !schema.keyedAgg.havingEvaluatedOnGPU) {
+            HavingContext ctx{
+                row,
+                slots,
+                multiKeys,
+                schema.keyedAgg.keyDisplayName,
+                static_cast<int>(multiKeys.empty() ? 1 : multiKeys.size()),
+                schema.keyedAgg.keyBase
+            };
+
+            if (!evaluatePredicate(schema.keyedAgg.havingPredicate, ctx)) {
+                // Row does not satisfy HAVING: skip it
+                continue;
+            }
+        }
+
         result.rows.push_back(std::move(row));
     }
 

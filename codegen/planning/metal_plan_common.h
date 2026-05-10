@@ -20,6 +20,19 @@ std::string exprToMetal(const ExprPtr& expr, const std::string& idxVar);
 std::string predToMetal(const PredPtr& pred, const std::string& idxVar);
 std::string combineFilters(const std::vector<PredPtr>& filters, const std::string& idxVar);
 
+struct MetalKeyedAggSlotForHaving {
+    std::string name;       // aggregate slot display name (e.g. "sum(l_quantity)")
+    bool isFloatSum = false;
+    bool isLongPair = false;
+    std::string funcName;   // aggregate function name ("SUM", "COUNT", "AVG", "MIN", "MAX")
+    std::string innerColumn; // referenced column (empty for COUNT(*))
+};
+
+std::string exprToMetalForHaving(const ExprPtr& expr,
+                                 const std::vector<MetalKeyedAggSlotForHaving>& slots);
+std::string predToMetalForHaving(const PredPtr& pred,
+                                 const std::vector<MetalKeyedAggSlotForHaving>& slots);
+
 std::unique_ptr<MetalGridStrideScan> makeScan(const std::string& table,
                                               const std::string& idxVar,
                                               ColumnList columns);

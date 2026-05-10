@@ -400,6 +400,11 @@ public:
         int scaleDown = 0;      // result divisor (e.g. 100 for cents→dollars, 0=none)
         bool isFloatSum = false; // true → float value stored via atomic CAS in single uint slot
         bool isMinMax = false;   // true → min/max aggregate using special init/update logic
+        // Agg function metadata for HAVING predicate matching.
+        // funcName is uppercase ("SUM","COUNT","AVG","MIN","MAX").
+        // innerColumn is the referenced column for SUM/AVG/MIN/MAX (empty for COUNT(*) star).
+        std::string funcName;    // aggregate function name for HAVING matching
+        std::string innerColumn; // column referenced by the aggregate (empty for COUNT(*))
     };
 
     MetalKeyedAgg(std::unique_ptr<MetalOperator> child,
@@ -415,12 +420,14 @@ public:
                       int scaleDown = 0);
     // Extended version that also sets isFloatSum / isMinMax flags.
     void addAggregateWithMeta(const std::string& name, int offset,
-                              const std::string& valueExpr,
-                              const std::string& atomicOp,
-                              bool isLongPair,
-                              int scaleDown,
-                              bool isFloatSum,
-                              bool isMinMax);
+                               const std::string& valueExpr,
+                               const std::string& atomicOp,
+                               bool isLongPair,
+                               int scaleDown,
+                               bool isFloatSum,
+                               bool isMinMax,
+                               const std::string& funcName = "",
+                               const std::string& innerColumn = "");
     void setKeyResult(const std::string& displayName, int base = 0);
     // Multi-key result info: caller provides list of GroupKeyDecode descriptors
     // (one per group-by key) so the result collector can reconstruct each
@@ -428,6 +435,7 @@ public:
     void setMultiKeyResult(const std::vector<std::string>& displayNames,
                            const std::vector<GroupKeyDecode>& keys,
                            int totalBuckets);
+    void setHaving(const PredPtr& havingPredicate) { havingPredicate_ = havingPredicate; }
     void produce(MetalCodegen& cg, ConsumerFn consume) override;
     std::string describe() const override;
 
@@ -441,6 +449,7 @@ private:
     int keyBase_ = 0;
     std::vector<Aggregate> aggregates_;
     std::vector<GroupKeyDecode> multiKeyDecode_;
+    PredPtr havingPredicate_;  // Optional HAVING filter
 };
 
 // Simple atomic add to array: atomic_fetch_add(&arr[bucket], value)

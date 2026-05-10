@@ -1,4 +1,5 @@
 #include "metal_operators.h"
+#include "metal_plan_common.h"
 #include <sstream>
 #include <cstdlib>
 
@@ -687,9 +688,11 @@ void MetalKeyedAgg::addAggregateWithMeta(const std::string& name, int offset,
                                           bool isLongPair,
                                           int scaleDown,
                                           bool isFloatSum,
-                                          bool isMinMax) {
+                                          bool isMinMax,
+                                          const std::string& funcName,
+                                          const std::string& innerColumn) {
     aggregates_.push_back({name, offset, valueExpr, atomicOp, isLongPair, scaleDown,
-                           isFloatSum, isMinMax});
+                           isFloatSum, isMinMax, funcName, innerColumn});
 }
 
 void MetalKeyedAgg::setKeyResult(const std::string& displayName, int base) {
@@ -738,7 +741,12 @@ void MetalKeyedAgg::produce(MetalCodegen& cg, ConsumerFn consume) {
     if (allAdds && numBuckets_ <= kMaxBucketsForTGReduce &&
         (int)aggregates_.size() >= kMinAggsForTGReduce) {
         // === OPTIMIZED PATH: thread-local + TG reduction ===
-        cg.setPhaseMaxThreadgroups(1024);
+        // When HAVING is present, force single-threadgroup dispatch so the
+        // threadgroup reduction produces global (not just per-TG) totals.
+        if (havingPredicate_)
+            cg.setPhaseMaxThreadgroups(1);
+        else
+            cg.setPhaseMaxThreadgroups(1024);
 
         // Declare thread-local accumulator arrays (before the scan loop)
         for (const auto& agg : aggregates_) {
@@ -775,44 +783,119 @@ void MetalKeyedAgg::produce(MetalCodegen& cg, ConsumerFn consume) {
             consume();
         });
 
-        // After the loop: TG reduction per bucket per aggregate, then single atomic
+        // After the loop: TG reduction per bucket per aggregate, then single atomic.
+        // When a HAVING predicate is present, restructure to per-bucket outer loop
+        // so the GPU can filter groups before writing to global memory.
         cg.addComment("--- Threadgroup reduction for keyed aggregation ---");
-        for (const auto& agg : aggregates_) {
-            if (agg.isFloatSum) {
-                cg.addLine("threadgroup float _tg_shared_" + agg.name + "[32];");
-                cg.addBlock("for (int _b = 0; _b < " + std::to_string(numBuckets_) + "; _b++)", [&]() {
-                    cg.addLine("float _tg_val = tg_reduce_float(_local_" + agg.name +
-                               "[_b], lid, tg_size, _tg_shared_" + agg.name + ");");
-                    cg.addIf("lid == 0 && _tg_val != 0.0f", [&]() {
-                        std::string idx = "_b * " + std::to_string(valuesPerBucket_) + " + " + std::to_string(agg.offset);
-                        cg.addLine("atomic_add_float(&" + outputArrayName_ + "[" + idx +
-                                   "], _tg_val);");
-                    });
+
+        if (havingPredicate_) {
+            // === HAVING-AWARE path: per-bucket loop, reduce all aggs, filter, write ===
+
+            // Declare all TG shared arrays upfront (one per aggregate)
+            for (const auto& agg : aggregates_) {
+                if (agg.isFloatSum)
+                    cg.addLine("threadgroup float _tg_shared_" + agg.name + "[32];");
+                else if (agg.isLongPair)
+                    cg.addLine("threadgroup long _tg_shared_" + agg.name + "[32];");
+                else
+                    cg.addLine("threadgroup uint _tg_shared_" + agg.name + "[32];");
+            }
+
+            // Build slot info for HAVING expression translation
+            std::vector<MetalKeyedAggSlotForHaving> havingSlots;
+            for (const auto& agg : aggregates_) {
+                havingSlots.push_back({agg.name, agg.isFloatSum, agg.isLongPair,
+                                       agg.funcName, agg.innerColumn});
+            }
+            std::string havingCond = predToMetalForHaving(havingPredicate_, havingSlots);
+
+            cg.addBlock("for (int _b = 0; _b < " + std::to_string(numBuckets_) + "; _b++)", [&]() {
+                // Reduce each aggregate for this bucket
+                for (const auto& agg : aggregates_) {
+                    if (agg.isFloatSum) {
+                        cg.addLine("float _tg_" + agg.name + " = tg_reduce_float(_local_" +
+                                   agg.name + "[_b], lid, tg_size, _tg_shared_" + agg.name + ");");
+                    } else if (agg.isLongPair) {
+                        cg.addLine("long _tg_" + agg.name + " = tg_reduce_long(_local_" +
+                                   agg.name + "[_b], lid, tg_size, _tg_shared_" + agg.name + ");");
+                    } else {
+                        cg.addLine("uint _tg_" + agg.name + " = tg_reduce_uint(_local_" +
+                                   agg.name + "[_b], lid, tg_size, _tg_shared_" + agg.name + ");");
+                    }
+                }
+
+                cg.addLine("threadgroup_barrier(mem_flags::mem_threadgroup);");
+
+                // HAVING check + conditional atomic write of all aggregates
+                cg.addIf("lid == 0 && " + havingCond, [&]() {
+                    for (const auto& agg : aggregates_) {
+                        if (agg.isFloatSum) {
+                            std::string idx = "_b * " + std::to_string(valuesPerBucket_) +
+                                              " + " + std::to_string(agg.offset);
+                            cg.addLine("if (_tg_" + agg.name + " != 0.0f) atomic_add_float(&" +
+                                       outputArrayName_ + "[" + idx + "], _tg_" + agg.name + ");");
+                        } else if (agg.isLongPair) {
+                            std::string loIdx = "_b * " + std::to_string(valuesPerBucket_) +
+                                                " + " + std::to_string(agg.offset);
+                            std::string hiIdx = "_b * " + std::to_string(valuesPerBucket_) +
+                                                " + " + std::to_string(agg.offset + 1);
+                            cg.addLine("if (_tg_" + agg.name + " != 0) atomic_add_long_pair(&" +
+                                       outputArrayName_ + "[" + loIdx + "], &" +
+                                       outputArrayName_ + "[" + hiIdx + "], _tg_" + agg.name + ");");
+                        } else {
+                            std::string idx = "_b * " + std::to_string(valuesPerBucket_) +
+                                              " + " + std::to_string(agg.offset);
+                            cg.addLine("if (_tg_" + agg.name + " != 0) atomic_fetch_add_explicit(&" +
+                                       outputArrayName_ + "[" + idx + "], _tg_" + agg.name +
+                                       ", memory_order_relaxed);");
+                        }
+                    }
                 });
-            } else if (agg.isLongPair) {
-                cg.addLine("threadgroup long _tg_shared_" + agg.name + "[32];");
-                cg.addBlock("for (int _b = 0; _b < " + std::to_string(numBuckets_) + "; _b++)", [&]() {
-                    cg.addLine("long _tg_val = tg_reduce_long(_local_" + agg.name +
-                               "[_b], lid, tg_size, _tg_shared_" + agg.name + ");");
-                    cg.addIf("lid == 0 && _tg_val != 0", [&]() {
-                        std::string loIdx = "_b * " + std::to_string(valuesPerBucket_) + " + " + std::to_string(agg.offset);
-                        std::string hiIdx = "_b * " + std::to_string(valuesPerBucket_) + " + " + std::to_string(agg.offset + 1);
-                        cg.addLine("atomic_add_long_pair(&" + outputArrayName_ + "[" + loIdx +
-                                   "], &" + outputArrayName_ + "[" + hiIdx +
-                                   "], _tg_val);");
+
+                cg.addLine("threadgroup_barrier(mem_flags::mem_threadgroup);");
+            });
+
+            // Mark HAVING as evaluated on GPU so the CPU-side result collector skips it
+            cg.setKeyedAggHavingEvaluatedOnGPU();
+        } else {
+            // === ORIGINAL path (no HAVING): per-aggregate outer loop ===
+            for (const auto& agg : aggregates_) {
+                if (agg.isFloatSum) {
+                    cg.addLine("threadgroup float _tg_shared_" + agg.name + "[32];");
+                    cg.addBlock("for (int _b = 0; _b < " + std::to_string(numBuckets_) + "; _b++)", [&]() {
+                        cg.addLine("float _tg_val = tg_reduce_float(_local_" + agg.name +
+                                   "[_b], lid, tg_size, _tg_shared_" + agg.name + ");");
+                        cg.addIf("lid == 0 && _tg_val != 0.0f", [&]() {
+                            std::string idx = "_b * " + std::to_string(valuesPerBucket_) + " + " + std::to_string(agg.offset);
+                            cg.addLine("atomic_add_float(&" + outputArrayName_ + "[" + idx +
+                                       "], _tg_val);");
+                        });
                     });
-                });
-            } else {
-                cg.addLine("threadgroup uint _tg_shared_" + agg.name + "[32];");
-                cg.addBlock("for (int _b = 0; _b < " + std::to_string(numBuckets_) + "; _b++)", [&]() {
-                    cg.addLine("uint _tg_val = tg_reduce_uint(_local_" + agg.name +
-                               "[_b], lid, tg_size, _tg_shared_" + agg.name + ");");
-                    cg.addIf("lid == 0 && _tg_val != 0", [&]() {
-                        std::string idx = "_b * " + std::to_string(valuesPerBucket_) + " + " + std::to_string(agg.offset);
-                        cg.addLine("atomic_fetch_add_explicit(&" + outputArrayName_ + "[" + idx +
-                                   "], _tg_val, memory_order_relaxed);");
+                } else if (agg.isLongPair) {
+                    cg.addLine("threadgroup long _tg_shared_" + agg.name + "[32];");
+                    cg.addBlock("for (int _b = 0; _b < " + std::to_string(numBuckets_) + "; _b++)", [&]() {
+                        cg.addLine("long _tg_val = tg_reduce_long(_local_" + agg.name +
+                                   "[_b], lid, tg_size, _tg_shared_" + agg.name + ");");
+                        cg.addIf("lid == 0 && _tg_val != 0", [&]() {
+                            std::string loIdx = "_b * " + std::to_string(valuesPerBucket_) + " + " + std::to_string(agg.offset);
+                            std::string hiIdx = "_b * " + std::to_string(valuesPerBucket_) + " + " + std::to_string(agg.offset + 1);
+                            cg.addLine("atomic_add_long_pair(&" + outputArrayName_ + "[" + loIdx +
+                                       "], &" + outputArrayName_ + "[" + hiIdx +
+                                       "], _tg_val);");
+                        });
                     });
-                });
+                } else {
+                    cg.addLine("threadgroup uint _tg_shared_" + agg.name + "[32];");
+                    cg.addBlock("for (int _b = 0; _b < " + std::to_string(numBuckets_) + "; _b++)", [&]() {
+                        cg.addLine("uint _tg_val = tg_reduce_uint(_local_" + agg.name +
+                                   "[_b], lid, tg_size, _tg_shared_" + agg.name + ");");
+                        cg.addIf("lid == 0 && _tg_val != 0", [&]() {
+                            std::string idx = "_b * " + std::to_string(valuesPerBucket_) + " + " + std::to_string(agg.offset);
+                            cg.addLine("atomic_fetch_add_explicit(&" + outputArrayName_ + "[" + idx +
+                                       "], _tg_val, memory_order_relaxed);");
+                        });
+                    });
+                }
             }
         }
     } else {
@@ -857,6 +940,10 @@ void MetalKeyedAgg::produce(MetalCodegen& cg, ConsumerFn consume) {
     }
     cg.registerKeyedAggOutput(outputArrayName_, numBuckets_, valuesPerBucket_, slots,
                               keyDisplayName_, keyBase_);
+    // Set HAVING predicate if present
+    if (havingPredicate_) {
+        cg.setKeyedAggHaving(havingPredicate_);
+    }
     // If multi-key decode info is present, set it on the schema
     if (!multiKeyDecode_.empty()) {
         for (const auto& mk : multiKeyDecode_) {

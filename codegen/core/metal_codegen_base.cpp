@@ -381,6 +381,14 @@ void MetalCodegen::registerKeyedAggOutput(const std::string& bufferName,
     resultSchema_.keyedAgg.slots = slots;
 }
 
+void MetalCodegen::setKeyedAggHaving(const PredPtr& havingPredicate) {
+    resultSchema_.keyedAgg.havingPredicate = havingPredicate;
+}
+
+void MetalCodegen::setKeyedAggHavingEvaluatedOnGPU() {
+    resultSchema_.keyedAgg.havingEvaluatedOnGPU = true;
+}
+
 const MetalResultSchema& MetalCodegen::getResultSchema() const {
     return resultSchema_;
 }

@@ -494,4 +494,110 @@ MetalQueryPlan::Phase& appendPhase(MetalQueryPlan& plan, const std::string& name
     return plan.phases.back();
 }
 
+std::string exprToMetalForHaving(const ExprPtr& expr,
+                                 const std::vector<MetalKeyedAggSlotForHaving>& slots) {
+    if (!expr) return "0";
+
+    return std::visit([&](auto&& node) -> std::string {
+        using T = std::decay_t<decltype(node)>;
+
+        if constexpr (std::is_same_v<T, Literal>) {
+            return std::visit([](auto&& v) -> std::string {
+                using V = std::decay_t<decltype(v)>;
+                if constexpr (std::is_same_v<V, int>)
+                    return std::to_string(v);
+                else if constexpr (std::is_same_v<V, float>)
+                    return std::to_string(v) + "f";
+                else
+                    return "\"" + v + "\"";
+            }, node.value);
+        }
+        else if constexpr (std::is_same_v<T, FuncCall>) {
+            std::string funcUpper = node.name;
+            for (auto& c : funcUpper) c = (char)std::toupper((unsigned char)c);
+
+            std::string refCol;
+            if (!node.args.empty()) {
+                if (auto* cr = std::get_if<ColRef>(&node.args[0]->node)) {
+                    refCol = cr->column;
+                }
+            }
+
+            for (const auto& slot : slots) {
+                if (slot.funcName == funcUpper) {
+                    if (refCol.empty() || slot.innerColumn == refCol) {
+                        return "((float)(_tg_" + slot.name + "))";
+                    }
+                }
+            }
+            // Fallback: match by funcName only (skip innerColumn check)
+            for (const auto& slot : slots) {
+                if (slot.funcName == funcUpper) {
+                    return "((float)(_tg_" + slot.name + "))";
+                }
+            }
+            return "0";
+        }
+        else if constexpr (std::is_same_v<T, BinaryExpr>) {
+            std::string l = exprToMetalForHaving(node.left, slots);
+            std::string r = exprToMetalForHaving(node.right, slots);
+            switch (node.op) {
+                case ExprOp::ADD: return "(" + l + " + " + r + ")";
+                case ExprOp::SUB: return "(" + l + " - " + r + ")";
+                case ExprOp::MUL: return "(" + l + " * " + r + ")";
+                case ExprOp::DIV: return "(" + l + " / " + r + ")";
+            }
+            return l;
+        }
+        else {
+            return "0";
+        }
+    }, expr->node);
+}
+
+std::string predToMetalForHaving(const PredPtr& pred,
+                                 const std::vector<MetalKeyedAggSlotForHaving>& slots) {
+    if (!pred) return "true";
+
+    return std::visit([&](auto&& node) -> std::string {
+        using T = std::decay_t<decltype(node)>;
+
+        if constexpr (std::is_same_v<T, Comparison>) {
+            std::string l = exprToMetalForHaving(node.left, slots);
+            std::string r = exprToMetalForHaving(node.right, slots);
+            switch (node.op) {
+                case CmpOp::EQ: return "(" + l + " == " + r + ")";
+                case CmpOp::NE: return "(" + l + " != " + r + ")";
+                case CmpOp::LT: return "(" + l + " < " + r + ")";
+                case CmpOp::LE: return "(" + l + " <= " + r + ")";
+                case CmpOp::GT: return "(" + l + " > " + r + ")";
+                case CmpOp::GE: return "(" + l + " >= " + r + ")";
+            }
+            return "(" + l + " == " + r + ")";
+        }
+        else if constexpr (std::is_same_v<T, LogicalAnd>) {
+            std::string cond;
+            for (size_t i = 0; i < node.children.size(); i++) {
+                if (i) cond += " && ";
+                cond += "(" + predToMetalForHaving(node.children[i], slots) + ")";
+            }
+            return cond;
+        }
+        else if constexpr (std::is_same_v<T, LogicalOr>) {
+            std::string cond;
+            for (size_t i = 0; i < node.children.size(); i++) {
+                if (i) cond += " || ";
+                cond += "(" + predToMetalForHaving(node.children[i], slots) + ")";
+            }
+            return "(" + cond + ")";
+        }
+        else if constexpr (std::is_same_v<T, LogicalNot>) {
+            return "!(" + predToMetalForHaving(node.child, slots) + ")";
+        }
+        else {
+            return "true";
+        }
+    }, pred->node);
+}
+
 } // namespace codegen
