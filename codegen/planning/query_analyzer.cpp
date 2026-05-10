@@ -519,8 +519,18 @@ void extractTables(const json& fromItem, std::vector<std::string>& tables,
         if (vit != g_views.end()) {
             auto& [viewBody, viewCols] = vit->second;
             if (viewBody.contains("fromClause")) {
-                for (auto& item : viewBody["fromClause"])
-                    extractTables(item, tables, aliases);
+                for (auto& item : viewBody["fromClause"]) {
+                    // Only add tables not already present (dedup for scalar subqueries).
+                    std::vector<std::string> newTables, newAliases;
+                    extractTables(item, newTables, newAliases);
+                    for (size_t ni = 0; ni < newTables.size(); ++ni) {
+                        if (std::find(tables.begin(), tables.end(), newTables[ni]) == tables.end()) {
+                            tables.push_back(newTables[ni]);
+                            if (ni < newAliases.size()) aliases.push_back(newAliases[ni]);
+                            else aliases.push_back(newTables[ni]);
+                        }
+                    }
+                }
             }
             return;
         }
