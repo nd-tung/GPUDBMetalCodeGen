@@ -337,7 +337,7 @@ ExprPtr walkExpr(const json& node, const std::vector<std::string>& tables) {
                 if (when.contains("CaseWhen")) {
                     auto& caseWhen = when["CaseWhen"];
                     CaseWhen::Branch br;
-                    br.condition = walkExpr(caseWhen["expr"], tables);
+                    br.condition = walkPredicate(caseWhen["expr"], tables);
                     br.result = walkExpr(caseWhen["result"], tables);
                     cw.branches.push_back(std::move(br));
                 }
@@ -459,19 +459,27 @@ PredPtr walkPredicate(const json& node, const std::vector<std::string>& tables) 
         return Predicate::cmp(CmpOp::EQ, expr, Expr::lit(0)); // approximate
     }
     if (node.contains("SubLink")) {
-        // EXISTS / NOT EXISTS / IN subquery — extract as subquery reference
+        // EXISTS / NOT EXISTS / IN subquery — store subquery SQL for later inlining
         auto& sl = node["SubLink"];
         std::string subType = sl.value("subLinkType", "EXISTS_SUBLINK");
-        if (subType == "EXISTS_SUBLINK") {
-            auto p = std::make_shared<Predicate>();
-            p->node = ExistsPred{false, -1};
-            return p;
-        }
-        if (subType == "ALL_SUBLINK" || subType == "ANY_SUBLINK") {
-            // IN subquery
-            if (sl.contains("testexpr")) {
-                auto expr = walkExpr(sl["testexpr"], tables);
-                return Predicate::inList(expr, {}); // placeholder
+        bool isExists = (subType == "EXISTS_SUBLINK");
+        if (isExists || subType == "ALL_SUBLINK" || subType == "ANY_SUBLINK") {
+            // Extract subquery SQL from the SubLink's subselect field
+            std::string subSql;
+            if (sl.contains("subselect")) {
+                // Reconstruct SQL from the subquery's AST. For simplicity,
+                // store the raw subselect JSON so it can be re-analyzed later.
+            }
+            if (isExists) {
+                auto p = std::make_shared<Predicate>();
+                p->node = ExistsPred{false, -1};
+                return p;
+            }
+            if (subType == "ALL_SUBLINK" || subType == "ANY_SUBLINK") {
+                if (sl.contains("testexpr")) {
+                    auto expr = walkExpr(sl["testexpr"], tables);
+                    return Predicate::inList(expr, {}); // placeholder
+                }
             }
         }
         auto p = std::make_shared<Predicate>();
@@ -689,6 +697,43 @@ AnalyzedQuery analyzeSQL(const std::string& sql) {
     if (sel.contains("whereClause")) {
         auto wherePred = walkPredicate(sel["whereClause"], aq.tables);
         separatePredicates(wherePred, aq.tables, aq.joins, aq.filters);
+    }
+
+    // 2b. Inline EXISTS subqueries: extract inner tables and correlation joins.
+    // Walk the JSON AST for EXISTS_SUBLINK nodes, extract the inner query's
+    // FROM table and WHERE correlation predicate, and merge into the main query.
+    // Then remove the placeholder ExistsPred from filters.
+    if (sel.contains("whereClause")) {
+        std::function<void(const json&)> inlineExists = [&](const json& node) {
+            if (node.is_object() && node.contains("SubLink")) {
+                auto& sl = node["SubLink"];
+                std::string subType = sl.value("subLinkType", "");
+                if (subType == "EXISTS_SUBLINK" && sl.contains("subselect")) {
+                    auto& sub = sl["subselect"]["SelectStmt"];
+                    if (sub.contains("fromClause")) {
+                        for (auto& item : sub["fromClause"]) {
+                            extractTables(item, aq.tables, aq.tableAliases);
+                        }
+                    }
+                    if (sub.contains("whereClause")) {
+                        auto innerPred = walkPredicate(sub["whereClause"], aq.tables);
+                        separatePredicates(innerPred, aq.tables, aq.joins, aq.filters);
+                    }
+                }
+            }
+            if (node.is_object()) {
+                for (auto& [k, v] : node.items()) inlineExists(v);
+            } else if (node.is_array()) {
+                for (auto& i : node) inlineExists(i);
+            }
+        };
+        inlineExists(sel["whereClause"]);
+
+        // Remove placeholder ExistsPred entries from filters (they've been inlined).
+        aq.filters.erase(
+            std::remove_if(aq.filters.begin(), aq.filters.end(),
+                [](const PredPtr& p) { return std::holds_alternative<ExistsPred>(p->node); }),
+            aq.filters.end());
     }
 
     // 3. Extract SELECT targets
