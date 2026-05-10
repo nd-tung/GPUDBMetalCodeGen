@@ -428,6 +428,12 @@ public:
                                bool isMinMax,
                                const std::string& funcName = "",
                                const std::string& innerColumn = "");
+    // Register a COUNT(DISTINCT col) bitmap: one bit per distinct value.
+    // `valueExpr` is the column expression, `maxValueExpr` is the max possible
+    // value (e.g., "maxSuppkey"), used to compute bitmapStride.
+    void addDistinctBitmap(const std::string& outputName,
+                           const std::string& valueExpr,
+                           const std::string& maxValueExpr);
     void setKeyResult(const std::string& displayName, int base = 0);
     // Multi-key result info: caller provides list of GroupKeyDecode descriptors
     // (one per group-by key) so the result collector can reconstruct each
@@ -449,7 +455,15 @@ private:
     int keyBase_ = 0;
     std::vector<Aggregate> aggregates_;
     std::vector<GroupKeyDecode> multiKeyDecode_;
-    PredPtr havingPredicate_;  // Optional HAVING filter
+    PredPtr havingPredicate_;
+
+    struct DistinctBitmap {
+        std::string outputName;     // buffer name for popcount output
+        std::string bitmapName;     // buffer name for atomicOr bitmap
+        std::string valueExpr;      // column expression (e.g., "s_suppkey[i]")
+        std::string maxValueExpr;   // max value symbol (e.g., "maxSuppkey")
+    };
+    std::vector<DistinctBitmap> distinctBitmaps_;  // Optional HAVING filter
 };
 
 // Simple atomic add to array: atomic_fetch_add(&arr[bucket], value)
@@ -519,6 +533,85 @@ private:
     std::string counterName_;
     std::string counterSizeExpr_;
     std::vector<Column> columns_;
+};
+
+// COUNT(DISTINCT) popcount kernel: counts set bits per group in a bitmap.
+// Emits a grid-stride loop over numGroups, with popcount(bitmap[g * stride + w]).
+class MetalBitmapPopcount : public MetalOperator {
+public:
+    MetalBitmapPopcount(const std::string& bitmapName,
+                        const std::string& outputName,
+                        const std::string& numGroupsExpr,
+                        const std::string& bitmapStrideExpr);
+    void produce(MetalCodegen& cg, ConsumerFn consume) override;
+    std::string describe() const override;
+
+private:
+    std::string bitmapName_;
+    std::string outputName_;
+    std::string numGroupsExpr_;
+    std::string bitmapStrideExpr_;
+};
+
+// ===================================================================
+// GPU Bitonic Sort operators
+// ===================================================================
+//
+// MetalInitSortKeys: encodes a source column into sort keys (uint64_t)
+// and row indices.  Grid-strides over the source data.  Supports
+// ascending/descending direction via key encoding.
+//
+// MetalBitonicSortStep: a single comparison-swap step of the bitonic
+// sort network.  The kernel takes (k, j) constants and swaps elements
+// if needed.  The plan attaches a PostDispatchHook that re-dispaches
+// this kernel in the classic (k, j) nested loop.
+
+class MetalInitSortKeys : public MetalOperator {
+public:
+    // sourceColumn: name of the source buffer to sort (e.g. "d_adhoc_0_expr")
+    // sourceType: "int" or "float" (or "double" for Metal float)
+    // sortKeyBuf: name of output uint64_t sort key buffer
+    // sortIdxBuf: name of output int row index buffer
+    // nResultsExpr: expression for the number of source rows
+    // descending: if true, invert sort keys so ascending sort → descending order
+    MetalInitSortKeys(const std::string& sourceColumn, const std::string& sourceType,
+                      const std::string& sortKeyBuf, const std::string& sortIdxBuf,
+                      const std::string& nResultsExpr, bool descending);
+    void produce(MetalCodegen& cg, ConsumerFn consume) override;
+    std::string describe() const override;
+
+    // Exposed for the sort hook: the padded element count (next power of 2)
+    static unsigned int nextPow2(unsigned int n);
+    // Build the PostDispatchHook that runs the (k, j) bitonic loop after the
+    // sort-step phase.  The caller attaches this to the sort-step phase.
+    static PostDispatchHook makeBitonicHook(
+        const std::string& sortPhaseName,
+        const std::string& sortKeyBufName,
+        const std::string& sortIdxBufName,
+        const std::string& nResultsExpr);
+
+private:
+    std::string sourceColumn_;
+    std::string sourceType_;
+    std::string sortKeyBuf_;
+    std::string sortIdxBuf_;
+    std::string nResultsExpr_;
+    bool descending_;
+};
+
+class MetalBitonicSortStep : public MetalOperator {
+public:
+    // sortKeyBuf / sortIdxBuf: buffer names matching those in MetalInitSortKeys
+    // nResultsExpr: same expression used for init — used for grid sizing
+    MetalBitonicSortStep(const std::string& sortKeyBuf, const std::string& sortIdxBuf,
+                         const std::string& nResultsExpr);
+    void produce(MetalCodegen& cg, ConsumerFn consume) override;
+    std::string describe() const override;
+
+private:
+    std::string sortKeyBuf_;
+    std::string sortIdxBuf_;
+    std::string nResultsExpr_;
 };
 
 } // namespace codegen

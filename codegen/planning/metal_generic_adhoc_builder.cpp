@@ -1,5 +1,6 @@
 #include "metal_generic_adhoc_builder.h"
 #include "metal_plan_common.h"
+#include "metal_generic_executor.h"
 #include "tpch_schema.h"
 
 #include <algorithm>
@@ -379,23 +380,34 @@ std::unique_ptr<MetalOperator> makeFilteredScan(const AnalyzedQuery& aq,
     return maybeSelect(std::move(scan), combineFilters(aq.filters, idxVar));
 }
 
-std::optional<MetalQueryPlan> buildScalarAggPlan(const AnalyzedQuery& aq) {
+std::optional<MetalQueryPlan> buildScalarAggPlan(const AnalyzedQuery& aq, std::string* error) {
+    auto fail = [&](const std::string& msg) -> std::optional<MetalQueryPlan> {
+        if (error) *error = msg;
+        return std::nullopt;
+    };
+
     if (!aq.hasAggregation()) return std::nullopt;
-    if (aq.hasGroupBy() || aq.having || !aq.orderBy.empty() || aq.limit >= 0) return std::nullopt;
+    if (aq.hasGroupBy()) return fail("Scalar aggregation: GROUP BY not supported in scalar-agg path.");
+    if (aq.having) return fail("Scalar aggregation: HAVING not supported in scalar-agg path.");
+    if (!aq.orderBy.empty()) return fail("Scalar aggregation: ORDER BY not supported in scalar-agg path.");
+    if (aq.limit >= 0) return fail("Scalar aggregation: LIMIT not supported in scalar-agg path.");
 
     std::set<std::string> usedColumns;
     for (const auto& filter : aq.filters) collectColumns(filter, usedColumns);
 
     for (const auto& target : aq.targets) {
-        if (!target.isAgg || !target.agg) return std::nullopt;
+        if (!target.isAgg || !target.agg) return fail("Scalar aggregation: non-aggregate SELECT target.");
         const AggFunc func = target.agg->func;
         if (func != AggFunc::SUM && func != AggFunc::COUNT && func != AggFunc::AVG &&
-            func != AggFunc::MIN && func != AggFunc::MAX) return std::nullopt;
+            func != AggFunc::MIN && func != AggFunc::MAX)
+            return fail("Scalar aggregation: unsupported aggregate function '" + aggName(func) + "'.");
         if (func != AggFunc::COUNT) {
-            if (!target.agg->innerExpr || !exprSupported(target.agg->innerExpr, false))
-                return std::nullopt;
+            if (!target.agg->innerExpr)
+                return fail("Scalar aggregation: aggregate '" + aggName(func) + "' requires an inner expression.");
+            if (!exprSupported(target.agg->innerExpr, false))
+                return fail("Scalar aggregation: inner expression of '" + aggName(func) + "' not supported on GPU.");
             if (!isNumericLike(inferExprDataType(target.agg->innerExpr)))
-                return std::nullopt;
+                return fail("Scalar aggregation: inner expression of '" + aggName(func) + "' must be numeric.");
             collectColumns(target.agg->innerExpr, usedColumns);
         }
     }
@@ -471,8 +483,14 @@ static std::string char1BucketExpr(const ColRef& col, const std::string& idxVar,
     return "";
 }
 
-std::optional<MetalQueryPlan> buildGroupedAggPlan(const AnalyzedQuery& aq) {
-    if (!aq.hasAggregation() || !aq.hasGroupBy()) return std::nullopt;
+std::optional<MetalQueryPlan> buildGroupedAggPlan(const AnalyzedQuery& aq, std::string* error) {
+    auto fail = [&](const std::string& msg) -> std::optional<MetalQueryPlan> {
+        if (error) *error = msg;
+        return std::nullopt;
+    };
+
+    if (!aq.hasAggregation()) return fail("Grouped aggregation: query has no aggregation.");
+    if (!aq.hasGroupBy()) return fail("Grouped aggregation: query has no GROUP BY.");
     // HAVING is allowed; ORDER BY and LIMIT are handled CPU-side.
 
     struct PendingAgg {
@@ -501,15 +519,15 @@ std::optional<MetalQueryPlan> buildGroupedAggPlan(const AnalyzedQuery& aq) {
 
     for (size_t ki = 0; ki < aq.groupBy.size(); ++ki) {
         auto* gc = aq.groupBy[ki] ? std::get_if<ColRef>(&aq.groupBy[ki]->node) : nullptr;
-        if (!gc) return std::nullopt;
+        if (!gc) return fail("Grouped aggregation: GROUP BY expression #" + std::to_string(ki+1) + " must be a column reference.");
 
         GroupKeyDesc kd;
         if (gc->dataType == DataType::CHAR1) {
             kd.keyExpr = char1BucketExpr(*gc, idxVar, kd.numValues);
-            if (kd.numValues == 0) return std::nullopt;
+            if (kd.numValues == 0) return fail("Grouped aggregation: CHAR1 column '" + gc->column + "' has no known domain.");
         } else {
             auto domain = smallIntGroupDomain(*gc);
-            if (!domain || domain->maxValue < domain->minValue) return std::nullopt;
+            if (!domain || domain->maxValue < domain->minValue) return fail("Grouped aggregation: column '" + gc->column + "' has no known integer domain.");
             kd.numValues = domain->maxValue - domain->minValue + 1;
             std::string groupValue = gc->column + "[" + idxVar + "]";
             if (domain->minValue != 0) {
@@ -526,7 +544,7 @@ std::optional<MetalQueryPlan> buildGroupedAggPlan(const AnalyzedQuery& aq) {
     }
 
     // Cap: refuse plans with > 4096 buckets (excessive GPU buffer waste).
-    if (totalBuckets > 4096) return std::nullopt;
+    if (totalBuckets > 4096) return fail("Grouped aggregation: composite bucket count " + std::to_string(totalBuckets) + " exceeds maximum 4096.");
     const int numBuckets = totalBuckets;
 
     // --- Build the flat bucket expression ---
@@ -563,7 +581,7 @@ std::optional<MetalQueryPlan> buildGroupedAggPlan(const AnalyzedQuery& aq) {
     for (size_t targetIndex = 0; targetIndex < aq.targets.size(); ++targetIndex) {
         const auto& target = aq.targets[targetIndex];
         if (!target.isAgg) continue; // group keys already accounted for
-        if (!target.agg) return std::nullopt;
+        if (!target.agg) return fail("Grouped aggregation: malformed aggregate SELECT target #" + std::to_string(targetIndex) + ".");
 
         const AggFunc func = target.agg->func;
 
@@ -588,8 +606,10 @@ std::optional<MetalQueryPlan> buildGroupedAggPlan(const AnalyzedQuery& aq) {
 
         if (func == AggFunc::AVG) {
             // AVG = SUM/COUNT. Allocate two slots: sum (long pair) + count (uint).
-            if (!target.agg->innerExpr || !exprSupported(target.agg->innerExpr, false))
-                return std::nullopt;
+            if (!target.agg->innerExpr)
+                return fail("Grouped aggregation: AVG requires an inner expression.");
+            if (!exprSupported(target.agg->innerExpr, false))
+                return fail("Grouped aggregation: AVG inner expression not supported on GPU.");
             DataType vt = inferExprDataType(target.agg->innerExpr);
             bool isFloat = (vt == DataType::FLOAT);
             collectColumns(target.agg->innerExpr, usedColumns);
@@ -637,8 +657,10 @@ std::optional<MetalQueryPlan> buildGroupedAggPlan(const AnalyzedQuery& aq) {
         }
 
         if (func == AggFunc::MIN || func == AggFunc::MAX) {
-            if (!target.agg->innerExpr || !exprSupported(target.agg->innerExpr, false))
-                return std::nullopt;
+            if (!target.agg->innerExpr)
+                return fail("Grouped aggregation: " + aggName(func) + " requires an inner expression.");
+            if (!exprSupported(target.agg->innerExpr, false))
+                return fail("Grouped aggregation: " + aggName(func) + " inner expression not supported on GPU.");
             DataType vt = inferExprDataType(target.agg->innerExpr);
             bool isFloat = (vt == DataType::FLOAT);
             collectColumns(target.agg->innerExpr, usedColumns);
@@ -661,9 +683,12 @@ std::optional<MetalQueryPlan> buildGroupedAggPlan(const AnalyzedQuery& aq) {
             continue;
         }
 
-        if (func != AggFunc::SUM) return std::nullopt;
-        if (!target.agg->innerExpr || !exprSupported(target.agg->innerExpr, false))
-            return std::nullopt;
+        if (func != AggFunc::SUM)
+            return fail("Grouped aggregation: unsupported aggregate function '" + aggName(func) + "'.");
+        if (!target.agg->innerExpr)
+            return fail("Grouped aggregation: SUM requires an inner expression.");
+        if (!exprSupported(target.agg->innerExpr, false))
+            return fail("Grouped aggregation: SUM inner expression not supported on GPU.");
         DataType vt = inferExprDataType(target.agg->innerExpr);
         collectColumns(target.agg->innerExpr, usedColumns);
 
@@ -690,7 +715,7 @@ std::optional<MetalQueryPlan> buildGroupedAggPlan(const AnalyzedQuery& aq) {
         pending.push_back(std::move(agg));
     }
 
-    if (pending.empty()) return std::nullopt;
+    if (pending.empty()) return fail("Grouped aggregation: no valid aggregate functions found in SELECT targets.");
 
     // --- Build the scan → selection → keyed-agg tree ---
     MetalQueryPlan plan;
@@ -764,29 +789,40 @@ std::optional<MetalQueryPlan> buildGroupedAggPlan(const AnalyzedQuery& aq) {
     return plan;
 }
 
-std::optional<MetalQueryPlan> buildMaterializePlan(const AnalyzedQuery& aq) {
-    if (aq.hasAggregation() || aq.hasGroupBy() || aq.having)
+std::optional<MetalQueryPlan> buildMaterializePlan(const AnalyzedQuery& aq, std::string* error) {
+    auto fail = [&](const std::string& msg) -> std::optional<MetalQueryPlan> {
+        if (error) *error = msg;
         return std::nullopt;
-    if (aq.targets.empty()) return std::nullopt;
+    };
+
+    if (aq.hasAggregation()) return fail("Materialization: query has aggregates; use scalar or grouped aggregation instead.");
+    if (aq.hasGroupBy()) return fail("Materialization: query has GROUP BY; use grouped aggregation instead.");
+    if (aq.having) return fail("Materialization: HAVING requires aggregation.");
+    if (aq.targets.empty()) return fail("Materialization: no SELECT targets.");
 
     MetalQueryPlan::CpuSort cpuSort;
     cpuSort.limit = aq.limit;
     for (const auto& order : aq.orderBy) {
         auto column = orderColumnForExpr(order.expr, aq.targets);
-        if (!column) return std::nullopt;
+        if (!column) {
+            std::string orderStr = order.expr ? "expression" : "?";
+            return fail("Materialization: ORDER BY " + orderStr + " could not be resolved to a SELECT target.");
+        }
         cpuSort.keys.push_back({*column, order.descending});
     }
 
     std::set<std::string> usedColumns;
     for (const auto& filter : aq.filters) collectColumns(filter, usedColumns);
     for (const auto& target : aq.targets) {
-        if (!target.expr || !materializeExprSupported(target.expr)) return std::nullopt;
+        if (!target.expr)
+            return fail("Materialization: SELECT target has no expression.");
+        if (!materializeExprSupported(target.expr))
+            return fail("Materialization: SELECT expression not supported on GPU.");
         collectColumns(target.expr, usedColumns);
     }
 
     MetalQueryPlan plan;
     plan.name = "ADHOC_SINGLE_TABLE_MATERIALIZE";
-    if (!cpuSort.keys.empty() || cpuSort.limit >= 0) plan.cpuSort = cpuSort;
     const std::string idxVar = "i";
     auto filtered = makeFilteredScan(aq, usedColumns, idxVar);
     auto materialize = std::make_unique<MetalMaterialize>(
@@ -807,6 +843,68 @@ std::optional<MetalQueryPlan> buildMaterializePlan(const AnalyzedQuery& aq) {
     }
 
     appendPhase(plan, "ADHOC_single_table_materialize", std::move(materialize));
+
+    // ── GPU Sort (if ORDER BY is on a single numeric column) ──
+    bool useGpuSort = false;
+    std::string sortSourceCol;  // materialized output buffer to sort on
+    std::string sortType;       // "int" or "float"
+    bool sortDesc = false;
+
+    if (!cpuSort.keys.empty() && cpuSort.keys.size() == 1) {
+        const auto& sk = cpuSort.keys[0];
+        for (size_t ti = 0; ti < aq.targets.size(); ++ti) {
+            if (displayNameForTarget(aq.targets[ti], ti) == sk.column) {
+                DataType dt = inferExprDataType(aq.targets[ti].expr);
+                if (dt == DataType::INT || dt == DataType::DATE || dt == DataType::FLOAT) {
+                    sortSourceCol = "d_adhoc_" + std::to_string(ti) + "_" + sanitizeIdentifier(sk.column);
+                    sortType = (dt == DataType::FLOAT) ? "float" : "int";
+                    sortDesc = sk.descending;
+                    useGpuSort = true;
+                }
+                break;
+            }
+        }
+    }
+
+    if (useGpuSort) {
+        // Hook on the materialize phase: read the atomic counter and register
+        // it as a scalar for the sort phases that follow.
+        const std::string cntName = "d_adhoc_result_count";
+        const std::string nSym = "n_sort_results";
+        auto& matPhase = plan.phases.back();
+        matPhase.postDispatchHook = [cntName, nSym](MetalGenericExecutor& executor) {
+            auto* buf = executor.getAllocatedBuffer(cntName);
+            if (buf) {
+                uint32_t n = *static_cast<const uint32_t*>(buf->contents());
+                executor.registerScalarInt(nSym, (int)n);
+            }
+        };
+
+        // Init sort keys phase: encodes materialized output column → sort keys
+        auto initSort = std::make_unique<MetalInitSortKeys>(
+            sortSourceCol, sortType, "d_sortKey", "d_sortIdx", nSym, sortDesc);
+        appendPhase(plan, "ADHOC_sort_init", std::move(initSort));
+
+        // Sort step phase with PostDispatchHook for (k,j) bitonic loop
+        auto sortStep = std::make_unique<MetalBitonicSortStep>("d_sortKey", "d_sortIdx", nSym);
+        const std::string sortPhaseName = "ADHOC_sort_step";
+        auto& sortPhase = appendPhase(plan, sortPhaseName, std::move(sortStep));
+        sortPhase.postDispatchHook = MetalInitSortKeys::makeBitonicHook(
+            sortPhaseName, "d_sortKey", "d_sortIdx", nSym);
+
+        // Tell post-processing to use sorted indices
+        plan.gpuSort = MetalQueryPlan::GpuSort{"d_sortIdx", nSym, sortDesc};
+
+        // CPU sort only for LIMIT (sort order comes from GPU)
+        if (cpuSort.limit >= 0) {
+            MetalQueryPlan::CpuSort cpuLimit;
+            cpuLimit.limit = cpuSort.limit;
+            plan.cpuSort = cpuLimit;
+        }
+    } else if (!cpuSort.keys.empty() || cpuSort.limit >= 0) {
+        plan.cpuSort = cpuSort;
+    }
+
     return plan;
 }
 
@@ -1113,11 +1211,13 @@ std::optional<MetalQueryPlan> buildGenericMultiTableAdhocPlan_impl(
         return std::nullopt;
     };
 
-    if (aq.tables.size() < 2) return std::nullopt;
+    if (aq.tables.size() < 2) return fail("Multi-table planner: query references fewer than 2 tables.");
     for (const auto& t : aq.tables) {
-        if (t == "__subquery__") return std::nullopt;
+        if (t == "__subquery__")
+            return fail("Multi-table planner: subqueries (__subquery__) not supported.");
     }
-    if (aq.joins.empty()) return std::nullopt;
+    if (aq.joins.empty())
+        return fail("Multi-table planner: no join conditions found between tables.");
 
     // HAVING is allowed if GROUP BY is present; validate it references only
     // aggregates and GROUP BY columns (checked when GROUP BY is set up).
@@ -1976,14 +2076,20 @@ std::optional<MetalQueryPlan> buildGenericMultiTableAdhocPlan_impl(
 
 } // namespace
 
-std::optional<MetalQueryPlan> buildGenericSingleTableAdhocPlan(const AnalyzedQuery& aq) {
-    if (!aq.isSingleTable()) return std::nullopt;
-    if (aq.tables.empty() || aq.tables[0] == "__subquery__") return std::nullopt;
-    if (!filtersSupported(aq.filters)) return std::nullopt;
+std::optional<MetalQueryPlan> buildGenericSingleTableAdhocPlan(const AnalyzedQuery& aq, std::string* error) {
+    auto fail = [&](const std::string& msg) -> std::optional<MetalQueryPlan> {
+        if (error) *error = msg;
+        return std::nullopt;
+    };
 
-    if (auto scalar = buildScalarAggPlan(aq)) return scalar;
-    if (auto grouped = buildGroupedAggPlan(aq)) return grouped;
-    return buildMaterializePlan(aq);
+    if (!aq.isSingleTable()) return fail("Single-table planner: query references multiple tables.");
+    if (aq.tables.empty()) return fail("Single-table planner: no tables in FROM clause.");
+    if (aq.tables[0] == "__subquery__") return fail("Single-table planner: subqueries not supported.");
+    if (!filtersSupported(aq.filters)) return fail("Single-table planner: WHERE clause contains expressions not supported on GPU.");
+
+    if (auto scalar = buildScalarAggPlan(aq, error)) return scalar;
+    if (auto grouped = buildGroupedAggPlan(aq, error)) return grouped;
+    return buildMaterializePlan(aq, error);
 }
 
 std::optional<MetalQueryPlan> buildGenericMultiTableAdhocPlan(

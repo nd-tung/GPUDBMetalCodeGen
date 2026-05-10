@@ -67,6 +67,12 @@ MTL::ComputePipelineState* MetalGenericExecutor::findPSO(
     return nullptr;
 }
 
+MTL::ComputePipelineState* MetalGenericExecutor::findPSO(
+    const std::string& name) const {
+    auto it = pipelineStates_.find(name);
+    return it != pipelineStates_.end() ? it->second : nullptr;
+}
+
 // ===================================================================
 // Buffer allocation
 // ===================================================================
@@ -323,6 +329,11 @@ MetalExecutionResult MetalGenericExecutor::execute(
     }
     if (lastPhase < 0) lastPhase = (int)allPhases.size();
     if (firstPhase >= lastPhase) return execResult;
+
+    // Populate pipeline state lookup for PostDispatchHooks
+    pipelineStates_.clear();
+    for (size_t i = 0; i < compiled.kernelNames.size(); ++i)
+        pipelineStates_[compiled.kernelNames[i]] = compiled.pipelines[i];
 
     // Pre-allocate all buffers across all phases (timed)
     auto allocStart = std::chrono::high_resolution_clock::now();

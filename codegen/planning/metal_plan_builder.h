@@ -80,6 +80,16 @@ struct MetalQueryPlan {
     };
     std::optional<CpuGroupBy> cpuGroupBy;
 
+    // GPU bitonic sort info.  When set, a GPU sort was attached to the
+    // query plan.  The post-processing reads `sortedIndexBuffer` to
+    // remap materialized rows into the final ORDER BY sequence.
+    struct GpuSort {
+        std::string sortedIndexBuffer;   // name of int[] buffer with sorted indices
+        std::string nResults;            // symbolic name for the row count (e.g. n_lineitem)
+        bool descending = false;         // column sort direction
+    };
+    std::optional<GpuSort> gpuSort;
+
 };
 
 // Legacy compatibility wrapper. New callers should prefer the explicit APIs in
