@@ -535,7 +535,8 @@ std::optional<MetalQueryPlan> buildGroupedAggPlan(const AnalyzedQuery& aq, std::
 
     std::set<std::string> usedColumns;
     for (const auto& filter : aq.filters) collectColumns(filter, usedColumns);
-    for (const auto& g : aq.groupBy) collectColumns(g, usedColumns);
+    // GROUP BY columns are added during the key descriptor loop below
+    // (derived columns need special handling to not add alias names).
 
     const std::string idxVar = "i";
 
@@ -548,7 +549,14 @@ std::optional<MetalQueryPlan> buildGroupedAggPlan(const AnalyzedQuery& aq, std::
         if (!gc) return fail("Grouped aggregation: GROUP BY expression #" + std::to_string(ki+1) + " must be a column reference.");
 
         GroupKeyDesc kd;
-        if (gc->dataType == DataType::CHAR1) {
+        // For derived columns (empty table), use the source expression from
+        // subqueryExprMap as the key expression directly.
+        if (gc->table.empty() && aq.subqueryExprMap.count(gc->column)) {
+            auto srcExpr = aq.subqueryExprMap.at(gc->column);
+            kd.keyExpr = exprToMetal(srcExpr, idxVar);
+            kd.numValues = 256;  // safe upper bound for derived INT columns
+            collectColumns(srcExpr, usedColumns);
+        } else if (gc->dataType == DataType::CHAR1) {
             kd.keyExpr = char1BucketExpr(*gc, idxVar, kd.numValues);
             if (kd.numValues == 0) return fail("Grouped aggregation: CHAR1 column '" + gc->column + "' has no known domain.");
         } else {
@@ -561,9 +569,10 @@ std::optional<MetalQueryPlan> buildGroupedAggPlan(const AnalyzedQuery& aq, std::
             } else {
                 kd.keyExpr = groupValue;
             }
-            // Add clamp guard for safety
             kd.keyExpr = "clamp(" + kd.keyExpr + ", 0, " + std::to_string(kd.numValues - 1) + ")";
         }
+        // Add column to scan if not derived
+        if (!gc->table.empty()) usedColumns.insert(gc->column);
         kd.stride = totalBuckets;
         totalBuckets *= kd.numValues;
         keyDescriptors.push_back(kd);
