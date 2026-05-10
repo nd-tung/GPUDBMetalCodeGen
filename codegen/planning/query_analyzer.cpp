@@ -704,7 +704,7 @@ AnalyzedQuery analyzeSQL(const std::string& sql) {
     // FROM table and WHERE correlation predicate, and merge into the main query.
     // Then remove the placeholder ExistsPred from filters.
     if (sel.contains("whereClause")) {
-        std::function<void(const json&)> inlineExists = [&](const json& node) {
+        std::function<void(const json&, bool)> inlineExists = [&](const json& node, bool negated) {
             if (node.is_object() && node.contains("SubLink")) {
                 auto& sl = node["SubLink"];
                 std::string subType = sl.value("subLinkType", "");
@@ -716,24 +716,71 @@ AnalyzedQuery analyzeSQL(const std::string& sql) {
                         }
                     }
                     if (sub.contains("whereClause")) {
+                        // Record join count before adding: new joins from NOT EXISTS
+                        // are anti-joins.
+                        size_t joinCountBefore = aq.joins.size();
                         auto innerPred = walkPredicate(sub["whereClause"], aq.tables);
                         separatePredicates(innerPred, aq.tables, aq.joins, aq.filters);
+                        if (negated) {
+                            for (size_t j = joinCountBefore; j < aq.joins.size(); ++j) {
+                                aq.joins[j].anti = true;
+                            }
+                        }
+                    }
+                }
+            }
+            // Track negated context: BoolExpr(NOT_EXPR) toggles the flag.
+            bool innerNegated = negated;
+            if (node.is_object() && node.contains("BoolExpr")) {
+                auto& be = node["BoolExpr"];
+                if (be.value("boolop", "") == "NOT_EXPR") {
+                    innerNegated = !negated;
+                }
+            }
+            // Recurse into RangeSubselect inner WHERE clauses (e.g. Q22's
+            // NOT EXISTS inside a FROM-clause subquery).
+            if (node.is_object() && node.contains("RangeSubselect")) {
+                auto& rs = node["RangeSubselect"];
+                if (rs.contains("subquery") && rs["subquery"].contains("SelectStmt")) {
+                    auto& sub = rs["subquery"]["SelectStmt"];
+                    if (sub.contains("whereClause")) {
+                        inlineExists(sub["whereClause"], innerNegated);
+                    }
+                    if (sub.contains("fromClause")) {
+                        for (auto& item : sub["fromClause"]) {
+                            inlineExists(item, innerNegated);
+                        }
                     }
                 }
             }
             if (node.is_object()) {
-                for (auto& [k, v] : node.items()) inlineExists(v);
+                for (auto& [k, v] : node.items()) inlineExists(v, innerNegated);
             } else if (node.is_array()) {
-                for (auto& i : node) inlineExists(i);
+                for (auto& i : node) inlineExists(i, innerNegated);
             }
         };
-        inlineExists(sel["whereClause"]);
+        inlineExists(sel["whereClause"], false);
 
         // Remove placeholder ExistsPred entries from filters (they've been inlined).
+        // Also handle NOT EXISTS: LogicalNot(ExistsPred) must be removed too since
+        // the negation will be applied as an anti-join or anti-bitmap-probe.
         aq.filters.erase(
             std::remove_if(aq.filters.begin(), aq.filters.end(),
-                [](const PredPtr& p) { return std::holds_alternative<ExistsPred>(p->node); }),
+                [](const PredPtr& p) {
+                    if (std::holds_alternative<ExistsPred>(p->node)) return true;
+                    if (auto* ln = std::get_if<LogicalNot>(&p->node)) {
+                        return ln->child && std::holds_alternative<ExistsPred>(ln->child->node);
+                    }
+                    return false;
+                }),
             aq.filters.end());
+    }
+
+    // Rebuild alias map after inlineExists may have added new tables
+    // with aliases (e.g. Q21's l2, l3 from EXISTS subqueries).
+    g_aliasMap.clear();
+    for (size_t i = 0; i < aq.tables.size() && i < aq.tableAliases.size(); ++i) {
+        g_aliasMap[aq.tableAliases[i]] = aq.tables[i];
     }
 
     // 3. Extract SELECT targets

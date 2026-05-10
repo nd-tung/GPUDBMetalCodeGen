@@ -358,6 +358,8 @@ bool predSupported(const PredPtr& pred) {
             return predSupported(node.child);
         } else if constexpr (std::is_same_v<Node, Like>) {
             return fixedStringLikeSupported(node);
+        } else if constexpr (std::is_same_v<Node, ExistsPred>) {
+            return true;  // EXISTS subqueries handled via inlining; remaining placeholders OK
         } else {
             return false;
         }
@@ -977,6 +979,7 @@ struct MultiTableTreeNode {
     // because keyOnSelf is not the build table's primary key (i.e. not a
     // direct-address key).  Composite-key edges always set this true.
     bool useHashJoin = false;
+    bool anti = false;            // NOT EXISTS → anti-semi-join
     std::vector<int> children;
     bool composite() const { return !keyOnSelf2.empty(); }
 };
@@ -997,6 +1000,7 @@ bool multiTableBuildJoinTree(const AnalyzedQuery& aq, int probeIdx,
     struct Edge {
         std::string a, b;                 // table names
         std::vector<std::pair<std::string, std::string>> cols; // (col_a, col_b)
+        bool anti = false;                // NOT EXISTS → anti-semi-join
     };
     std::vector<Edge> edges;
     auto findEdge = [&](const std::string& l, const std::string& r) -> int {
@@ -1012,6 +1016,7 @@ bool multiTableBuildJoinTree(const AnalyzedQuery& aq, int probeIdx,
             Edge e;
             e.a = jc.leftTable; e.b = jc.rightTable;
             e.cols.emplace_back(jc.leftCol, jc.rightCol);
+            e.anti = jc.anti;
             edges.push_back(std::move(e));
         } else {
             // Normalise column pair to edge orientation.
@@ -1020,6 +1025,7 @@ bool multiTableBuildJoinTree(const AnalyzedQuery& aq, int probeIdx,
             } else {
                 edges[ei].cols.emplace_back(jc.rightCol, jc.leftCol);
             }
+            edges[ei].anti = edges[ei].anti || jc.anti;
         }
     }
     for (const auto& e : edges) {
@@ -1065,6 +1071,7 @@ bool multiTableBuildJoinTree(const AnalyzedQuery& aq, int probeIdx,
             edgeUsed[ei] = true;
             visited[other] = true;
             nodes[other].parent = u;
+            nodes[other].anti = e.anti;
             nodes[other].keyOnSelf   = oriented[0].second;
             nodes[other].keyOnParent = oriented[0].first;
             if (oriented.size() == 2) {
@@ -1450,8 +1457,13 @@ std::optional<MetalQueryPlan> buildGenericMultiTableAdhocPlan_impl(
             // attach only to the probe, so we don't need a HashMapLookup
             // branch here.
             if (subC.empty()) {
-                pipe = std::make_unique<MetalBitmapProbe>(
-                    std::move(pipe), "d_bitmap_" + aq.tables[c], probeKey);
+                if (nodes[c].anti) {
+                    pipe = std::make_unique<MetalAntiBitmapProbe>(
+                        std::move(pipe), "d_bitmap_" + aq.tables[c], probeKey);
+                } else {
+                    pipe = std::make_unique<MetalBitmapProbe>(
+                        std::move(pipe), "d_bitmap_" + aq.tables[c], probeKey);
+                }
             } else {
                 for (const auto& ck : subC) {
                     pipe = std::make_unique<MetalArrayLookup>(
@@ -1574,8 +1586,13 @@ std::optional<MetalQueryPlan> buildGenericMultiTableAdhocPlan_impl(
         }
 
         // Always probe the bitmap for SemiJoin filtering.
-        probePipe = std::make_unique<MetalBitmapProbe>(
-            std::move(probePipe), "d_bitmap_" + aq.tables[c], probeKey);
+        if (nodes[c].anti) {
+            probePipe = std::make_unique<MetalAntiBitmapProbe>(
+                std::move(probePipe), "d_bitmap_" + aq.tables[c], probeKey);
+        } else {
+            probePipe = std::make_unique<MetalBitmapProbe>(
+                std::move(probePipe), "d_bitmap_" + aq.tables[c], probeKey);
+        }
 
         // For non-CHAR_FIXED carries, create ArrayLookups for value propagation.
         for (const auto& ck : subC) {
