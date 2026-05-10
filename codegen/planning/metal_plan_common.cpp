@@ -397,6 +397,13 @@ std::string exprToMetal(const ExprPtr& expr, const std::string& idxVar) {
                 result += ")";
                 return result;
             }
+            // Strip aggregate function calls (sum, count, avg, min, max)
+            // — these are emitted as raw inner expressions for materialize/agg.
+            if (node.name == "sum" || node.name == "count" || node.name == "avg" ||
+                node.name == "min" || node.name == "max") {
+                if (!node.args.empty()) return exprToMetal(node.args[0], idxVar);
+                return "0";
+            }
             std::ostringstream os;
             os << node.name << "(";
             for (size_t i = 0; i < node.args.size(); i++) {
