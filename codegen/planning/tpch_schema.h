@@ -92,9 +92,11 @@ private:
                 {"l_shipmode",      14, DataType::CHAR_FIXED, 2},
                 {"l_comment",       15, DataType::CHAR_FIXED, 44},
             });
+            s.tables["lineitem"].columns[0].domainMin = 0;  s.tables["lineitem"].columns[0].domainMax = 6000000; // l_orderkey
             s.tables["lineitem"].columns[3].domainMin = 1;  s.tables["lineitem"].columns[3].domainMax = 7;   // l_linenumber
             s.tables["lineitem"].columns[8].charDomain = {'A', 'N', 'R'};                                    // l_returnflag
             s.tables["lineitem"].columns[9].charDomain = {'F', 'O'};                                          // l_linestatus
+            s.tables["lineitem"].maxKeySymbol = "maxOrderkey";  // l_orderkey max ≈ maxOrderkey
         }
 
         // orders: 9 columns (0-8)

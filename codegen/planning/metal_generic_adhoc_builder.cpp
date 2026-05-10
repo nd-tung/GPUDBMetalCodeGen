@@ -680,6 +680,62 @@ std::optional<MetalQueryPlan> buildGroupedAggPlan(const AnalyzedQuery& aq, std::
             continue;
         }
 
+        // COUNT(DISTINCT col): allocate a popcount result slot.
+        // The distinct bitmap is set per-row via atomicOr; after the
+        // keyed-agg phase, a bitmap-popcount kernel reads the per-group
+        // bitmaps and stores the distinct count into the output slot.
+        if (func == AggFunc::COUNT_DISTINCT) {
+            if (!target.agg->innerExpr)
+                return fail("Grouped aggregation: COUNT(DISTINCT) requires an inner expression.");
+            auto* innerCol = target.agg->innerExpr ? std::get_if<ColRef>(&target.agg->innerExpr->node) : nullptr;
+            if (!innerCol)
+                return fail("Grouped aggregation: COUNT(DISTINCT) inner expression must be a column reference.");
+            DataType vt = inferExprDataType(target.agg->innerExpr);
+            if (vt != DataType::INT && vt != DataType::DATE)
+                return fail("Grouped aggregation: COUNT(DISTINCT) only supports integer/date columns.");
+
+            // Find max value for bitmap sizing.
+            std::string maxExpr;
+            try {
+                auto& colDef = TPCHSchema::instance().table(innerCol->table).col(innerCol->column);
+                if (colDef.domainMax >= 0)
+                    maxExpr = std::to_string(colDef.domainMax + 1);
+            } catch (const std::runtime_error&) {}
+            if (maxExpr.empty()) {
+                try {
+                    auto& tdef = TPCHSchema::instance().table(innerCol->table);
+                    if (!tdef.maxKeySymbol.empty())
+                        maxExpr = tdef.maxKeySymbol + " + 1";
+                } catch (const std::runtime_error&) {}
+            }
+            if (maxExpr.empty())
+                return fail("Grouped aggregation: COUNT(DISTINCT) on column '" + innerCol->column +
+                           "' — no known max value for bitmap sizing.");
+
+            collectColumns(target.agg->innerExpr, usedColumns);
+            std::string dname = displayNameForTarget(target, targetIndex);
+            std::string valueExpr = innerCol->column + "[" + idxVar + "]";
+
+            // Record a placeholder pending agg for the result offset,
+            // storing the maxExpr in a secondary field (reuse isFloatSum
+            // since it's not used for COUNT_DISTINCT; the pending loop
+            // handles scaleDown == -2 specially).
+            PendingAgg agg;
+            agg.displayName = dname;
+            agg.name = "a" + std::to_string(targetIndex) + "_" + sanitizeIdentifier(dname);
+            agg.offset = valuesPerBucket++;
+            agg.valueExpr = maxExpr;        // stash maxExpr here for the pending loop
+            agg.isFloatSum = false;
+            agg.isMinMax = false;
+            agg.atomicOp = "add";
+            agg.funcName = "COUNT_DISTINCT";
+            agg.innerColumn = innerCol->column;
+            agg.scaleDown = -2;  // sentinel: COUNT_DISTINCT slot
+            agg.isLongPair = false;
+            pending.push_back(std::move(agg));
+            continue;
+        }
+
         if (func != AggFunc::SUM)
             return fail("Grouped aggregation: unsupported aggregate function '" + aggName(func) + "'.");
         if (!target.agg->innerExpr)
@@ -759,11 +815,34 @@ std::optional<MetalQueryPlan> buildGroupedAggPlan(const AnalyzedQuery& aq, std::
     }
     agg->setMultiKeyResult(keyDisplayNames, decodeInfo, numBuckets);
 
+    // Track COUNT(DISTINCT) entries for popcount phases.
+    struct DistinctEntry {
+        std::string displayName;
+        std::string valueExpr;
+        std::string maxValExpr;
+        int offset;
+    };
+    std::vector<DistinctEntry> distinctEntries;
+
     for (const auto& pendingAgg : pending) {
-        agg->addAggregateWithMeta(pendingAgg.displayName, pendingAgg.offset, pendingAgg.valueExpr,
-                                  pendingAgg.atomicOp, pendingAgg.isLongPair, pendingAgg.scaleDown,
-                                  pendingAgg.isFloatSum, pendingAgg.isMinMax,
-                                  pendingAgg.funcName, pendingAgg.innerColumn);
+        if (pendingAgg.scaleDown == -2) {
+            // COUNT(DISTINCT) slot — valueExpr holds the max value expression.
+            std::string bmpOutput = "d_adhoc_distinct_" + std::to_string(distinctEntries.size());
+            std::string maxExpr = pendingAgg.valueExpr;
+            std::string colExpr = pendingAgg.innerColumn + "[" + idxVar + "]";
+            agg->addDistinctBitmap(bmpOutput, colExpr, maxExpr);
+            distinctEntries.push_back({pendingAgg.displayName, colExpr,
+                                       maxExpr, pendingAgg.offset});
+            // Add a zero placeholder aggregate slot.
+            agg->addAggregateWithMeta(pendingAgg.displayName, pendingAgg.offset, "0u",
+                                      "add", false, 0, false, false,
+                                      pendingAgg.funcName, pendingAgg.innerColumn);
+        } else {
+            agg->addAggregateWithMeta(pendingAgg.displayName, pendingAgg.offset, pendingAgg.valueExpr,
+                                      pendingAgg.atomicOp, pendingAgg.isLongPair, pendingAgg.scaleDown,
+                                      pendingAgg.isFloatSum, pendingAgg.isMinMax,
+                                      pendingAgg.funcName, pendingAgg.innerColumn);
+        }
     }
 
     // Set HAVING predicate if present
@@ -774,6 +853,17 @@ std::optional<MetalQueryPlan> buildGroupedAggPlan(const AnalyzedQuery& aq, std::
     }
 
     appendPhase(plan, "ADHOC_single_table_group", std::move(agg));
+
+    // Add bitmap popcount phases for each COUNT(DISTINCT).
+    for (size_t di = 0; di < distinctEntries.size(); ++di) {
+        const auto& de = distinctEntries[di];
+        std::string bmpName = "d_distinct_bmp_d_adhoc_distinct_" + std::to_string(di);
+        std::string bmpOutput = "d_adhoc_distinct_" + std::to_string(di);
+        std::string strideExpr = "((" + de.maxValExpr + " + 32) / 32)";
+        auto popcnt = std::make_unique<MetalBitmapPopcount>(
+            bmpName, bmpOutput, std::to_string(numBuckets), strideExpr);
+        appendPhase(plan, "ADHOC_single_table_popcount_" + std::to_string(di), std::move(popcnt));
+    }
 
     if (!aq.orderBy.empty() || aq.limit >= 0) {
         MetalQueryPlan::CpuSort cpuSort;

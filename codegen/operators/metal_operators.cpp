@@ -741,7 +741,7 @@ void MetalKeyedAgg::produce(MetalCodegen& cg, ConsumerFn consume) {
 
     // Register COUNT(DISTINCT) bitmap buffers.
     for (const auto& db : distinctBitmaps_) {
-        std::string strideExpr = "(" + db.maxValueExpr + " + 32u) / 32u";
+        std::string strideExpr = "(" + db.maxValueExpr + " + 32) / 32";
         std::string bmpSize = std::to_string(numBuckets_) + " * " + strideExpr;
         cg.addAtomicBufferParam(db.bitmapName, "atomic_uint", bmpSize);
     }
@@ -1159,13 +1159,12 @@ void MetalBitmapPopcount::produce(MetalCodegen& cg, ConsumerFn consume) {
     cg.addBufferParam(bitmapName_, "uint", bitmapStrideExpr_ + " * " + numGroupsExpr_, false);
     cg.addAtomicBufferParam(outputName_, "atomic_uint", numGroupsExpr_, 0xFF);
     cg.addScalarParam("n_" + numGroupsExpr_, "uint");
-    cg.addScalarParam("n_" + bitmapStrideExpr_, "uint");
+    cg.addResolvedScalarParam("n_bmp_stride", "uint", bitmapStrideExpr_);
 
     cg.addBlock("for (uint _g = tid; _g < n_" + numGroupsExpr_ + "; _g += tpg)", [&]() {
         cg.addLine("uint _cnt = 0;");
-        cg.addBlock("for (uint _w = 0; _w < n_" + bitmapStrideExpr_ + "; ++_w)", [&]() {
-            cg.addLine("_cnt += popcount(" + bitmapName_ + "[_g * n_" +
-                       bitmapStrideExpr_ + " + _w]);");
+        cg.addBlock("for (uint _w = 0; _w < n_bmp_stride; ++_w)", [&]() {
+            cg.addLine("_cnt += popcount(" + bitmapName_ + "[_g * n_bmp_stride + _w]);");
         });
         cg.addLine("atomic_store_explicit(&" + outputName_ + "[_g], _cnt, memory_order_relaxed);");
     });
