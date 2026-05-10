@@ -340,6 +340,9 @@ std::string exprToMetal(const ExprPtr& expr, const std::string& idxVar) {
             return os.str();
         }
         else if constexpr (std::is_same_v<T, CaseWhen>) {
+            // CASE WHEN conditions are stored as Expr (not Pred), so full
+            // condition evaluation is not yet available.  Return the first
+            // branch's result as a best-effort approximation.
             if (!node.branches.empty())
                 return exprToMetal(node.branches[0].result, idxVar);
             if (node.elseResult)
