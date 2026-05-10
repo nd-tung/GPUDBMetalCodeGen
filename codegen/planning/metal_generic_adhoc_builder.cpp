@@ -250,6 +250,10 @@ bool fixedStringLikeSupported(const Like& like) {
 
 bool exprSupported(const ExprPtr& expr, bool allowChar1Literal);
 bool predSupported(const PredPtr& pred);
+static bool validateHavingPredicate(const PredPtr& having,
+                                     const std::vector<ExprPtr>& groupBy,
+                                     const std::vector<SelectTarget>& targets,
+                                     std::string* error);
 
 bool exprSupported(const ExprPtr& expr, bool allowChar1Literal) {
     if (!expr) return false;
@@ -774,6 +778,8 @@ std::optional<MetalQueryPlan> buildGroupedAggPlan(const AnalyzedQuery& aq, std::
 
     // Set HAVING predicate if present
     if (aq.having) {
+        if (!validateHavingPredicate(aq.having, aq.groupBy, aq.targets, error))
+            return std::nullopt;
         agg->setHaving(aq.having);
     }
 
@@ -1191,23 +1197,134 @@ bool carriedColumnSupported(DataType type) {
            type == DataType::CHAR_FIXED;
 }
 
+// Collect aggregate function references from a predicate tree.
+// Each element is (funcName, isStar, innerColumn).
+namespace {
+// Walk an expression tree inside a HAVING predicate and collect FuncCall references.
+void collectFuncCalls(const ExprPtr& expr,
+                      std::set<std::tuple<std::string, bool, std::string>>& out) {
+    if (!expr) return;
+    std::visit([&](auto&& node) {
+        using T = std::decay_t<decltype(node)>;
+        if constexpr (std::is_same_v<T, FuncCall>) {
+            bool isStar = (node.name == "count" && node.args.empty());
+            std::string innerCol;
+            if (!isStar && !node.args.empty()) {
+                if (auto* cr = node.args[0] ? std::get_if<ColRef>(&node.args[0]->node) : nullptr) {
+                    innerCol = cr->column;
+                }
+            }
+            out.insert({node.name, isStar, innerCol});
+        } else if constexpr (std::is_same_v<T, BinaryExpr>) {
+            collectFuncCalls(node.left, out);
+            collectFuncCalls(node.right, out);
+        } else if constexpr (std::is_same_v<T, CaseWhen>) {
+            for (auto& b : node.branches) {
+                collectFuncCalls(b.result, out);
+            }
+            if (node.elseResult) collectFuncCalls(node.elseResult, out);
+        }
+        // ColRef, Literal — not aggregates, skip
+    }, expr->node);
+}
+} // namespace
+
+// Collect FuncCall references from a HAVING predicate (walk Comparison/Between/InList).
+static void collectAggFuncCalls(const PredPtr& pred,
+                                std::set<std::tuple<std::string, bool, std::string>>& out) {
+    if (!pred) return;
+    std::visit([&](auto&& node) {
+        using T = std::decay_t<decltype(node)>;
+        if constexpr (std::is_same_v<T, Comparison>) {
+            collectFuncCalls(node.left, out);
+            collectFuncCalls(node.right, out);
+        } else if constexpr (std::is_same_v<T, Between>) {
+            collectFuncCalls(node.expr, out);
+            collectFuncCalls(node.low, out);
+            collectFuncCalls(node.high, out);
+        } else if constexpr (std::is_same_v<T, InList>) {
+            collectFuncCalls(node.expr, out);
+            for (auto& v : node.values) collectFuncCalls(v, out);
+        } else if constexpr (std::is_same_v<T, LogicalAnd>) {
+            for (auto& c : node.children) collectAggFuncCalls(c, out);
+        } else if constexpr (std::is_same_v<T, LogicalOr>) {
+            for (auto& c : node.children) collectAggFuncCalls(c, out);
+        } else if constexpr (std::is_same_v<T, LogicalNot>) {
+            collectAggFuncCalls(node.child, out);
+        }
+        // Like, ExistsPred — no aggregate references
+    }, pred->node);
+}
+
 // Validate HAVING predicate: must only reference GROUP BY keys and aggregates.
 // Returns true if valid; sets *error if invalid.
 static bool validateHavingPredicate(const PredPtr& having,
                                      const std::vector<ExprPtr>& groupBy,
                                      const std::vector<SelectTarget>& targets,
                                      std::string* error) {
-    if (!having) return true;  // No HAVING is always valid
+    if (!having) return true;
 
-    // Extract column references in HAVING
-    std::set<std::pair<std::string, std::string>> havingCols; // (table, col)
-    std::set<std::string> havingAggs;                          // agg display names
-    
-    // TODO: Walk HAVING predicate tree to collect references.
-    // For now, trust that the analyzer correctly categorized them.
-    // Future: stricter validation of predicate structure.
-    
-    return true;  // Assume valid; stricter checks can be added later
+    // 1. Collect column references from HAVING
+    std::set<std::string> havingCols;
+    collectColumns(having, havingCols);
+
+    // 2. Collect aggregate function references from HAVING
+    std::set<std::tuple<std::string, bool, std::string>> havingAggs;
+    collectAggFuncCalls(having, havingAggs);
+
+    // 3. Build set of GROUP BY column names
+    std::set<std::string> groupCols;
+    for (const auto& gb : groupBy) {
+        if (auto* cr = gb ? std::get_if<ColRef>(&gb->node) : nullptr) {
+            groupCols.insert(cr->column);
+        }
+    }
+
+    // 4. Verify each HAVING column is a GROUP BY column
+    for (const auto& col : havingCols) {
+        if (!groupCols.count(col)) {
+            if (error) *error = "HAVING clause references column '" + col +
+                                "' which is not a GROUP BY column.";
+            return false;
+        }
+    }
+
+    // 5. Verify each aggregate reference matches a SELECT target
+    for (const auto& [funcName, isStar, innerCol] : havingAggs) {
+        bool found = false;
+        for (const auto& t : targets) {
+            if (!t.isAgg || !t.agg) continue;
+            if (t.agg->func == AggFunc::SUM && funcName == "sum") found = true;
+            if (t.agg->func == AggFunc::COUNT && funcName == "count") {
+                if (isStar && t.agg->isStar) found = true;
+                else if (!isStar && !t.agg->isStar) found = true;
+            }
+            if (t.agg->func == AggFunc::AVG && funcName == "avg") found = true;
+            if (t.agg->func == AggFunc::MIN && funcName == "min") found = true;
+            if (t.agg->func == AggFunc::MAX && funcName == "max") found = true;
+            if (found) {
+                // Verify inner expression if non-star
+                if (!isStar && t.agg->innerExpr) {
+                    if (auto* cr = std::get_if<ColRef>(&t.agg->innerExpr->node)) {
+                        if (cr->column != innerCol) found = false;
+                    }
+                }
+                if (found) break;
+            }
+        }
+        if (!found) {
+            if (error) {
+                std::string desc = funcName;
+                if (isStar) desc += "(*)";
+                else if (!innerCol.empty()) desc += "(" + innerCol + ")";
+                *error = "HAVING clause references aggregate " + desc +
+                         " which does not match any SELECT target.";
+            }
+            return false;
+        }
+    }
+
+    return true;
 }
 
 std::optional<MetalQueryPlan> buildGenericMultiTableAdhocPlan_impl(
@@ -2073,6 +2190,8 @@ std::optional<MetalQueryPlan> buildGenericMultiTableAdhocPlan_impl(
 
     // Set HAVING predicate if present
     if (aq.having) {
+        if (!validateHavingPredicate(aq.having, aq.groupBy, aq.targets, error))
+            return std::nullopt;
         agg->setHaving(aq.having);
     }
 
@@ -2104,8 +2223,14 @@ std::optional<MetalQueryPlan> buildGenericSingleTableAdhocPlan(const AnalyzedQue
     if (aq.tables[0] == "__subquery__") return fail("Single-table planner: subqueries not supported.");
     if (!filtersSupported(aq.filters)) return fail("Single-table planner: WHERE clause contains expressions not supported on GPU.");
 
-    if (auto scalar = buildScalarAggPlan(aq, error)) return scalar;
-    if (auto grouped = buildGroupedAggPlan(aq, error)) return grouped;
+    // Cascade through sub-builders. Each sub-builder may return nullopt
+    // without an error when it simply doesn't match the pattern (e.g.
+    // scalar agg when GROUP BY is present). Only the last builder in the
+    // chain writes the final error.
+    std::string subError;
+    if (auto scalar = buildScalarAggPlan(aq, &subError)) return scalar;
+    if (auto grouped = buildGroupedAggPlan(aq, &subError)) return grouped;
+    if (error && !subError.empty()) { *error = subError; return std::nullopt; }
     return buildMaterializePlan(aq, error);
 }
 
