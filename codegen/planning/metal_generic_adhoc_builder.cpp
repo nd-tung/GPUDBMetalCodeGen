@@ -989,11 +989,21 @@ std::string rewriteForProbe(std::string expr,
         DataType t = TPCHSchema::instance().table(key.table)
                          .col(key.column).type;
         std::string sub = decodeCarryValue(t, var);
+        // Standard column access pattern: col[idxVar]
         const std::string from = key.column + "[" + idxVar + "]";
         size_t pos = 0;
         while ((pos = expr.find(from, pos)) != std::string::npos) {
             expr.replace(pos, from.size(), sub);
             pos += sub.size();
+        }
+        // CHAR1 materialize access pattern: col + idxVar (not col[idxVar])
+        if (t == DataType::CHAR1) {
+            const std::string char1From = key.column + " + " + idxVar;
+            pos = 0;
+            while ((pos = expr.find(char1From, pos)) != std::string::npos) {
+                expr.replace(pos, char1From.size(), sub);
+                pos += sub.size();
+            }
         }
     }
     return expr;
@@ -1013,10 +1023,11 @@ std::string ownerTableForColumn(const AnalyzedQuery& aq, const std::string& c) {
 bool carriedColumnSupported(DataType type) {
     // INT / DATE store directly; FLOAT and CHAR1 reinterpret-cast into
     // a 32-bit int slot at carry time and decode at probe time.
-    // CHAR_FIXED carries would require a per-byte propagation scheme
-    // and are not yet supported (block at validation).
+    // CHAR_FIXED is handled differently: the column buffer is added as a
+    // read-only side buffer in the probe phase and indexed by the join key.
     return type == DataType::INT || type == DataType::DATE ||
-           type == DataType::FLOAT || type == DataType::CHAR1;
+           type == DataType::FLOAT || type == DataType::CHAR1 ||
+           type == DataType::CHAR_FIXED;
 }
 
 // Validate HAVING predicate: must only reference GROUP BY keys and aggregates.
@@ -1331,33 +1342,37 @@ std::optional<MetalQueryPlan> buildGenericMultiTableAdhocPlan_impl(
         const std::string sizeSym = pkU->sizeSym;
 
         const auto& sub = subtreeCarry[u];
-        if (sub.empty()) {
-            // Pure semi-join: bitmap.
-            pipe = std::make_unique<MetalBitmapBuild>(
-                std::move(pipe), "d_bitmap_" + tname, storeKey,
-                "(" + sizeSym + " + 31) / 32");
-        } else {
-            // For each carried column, emit an ArrayStore.  Storage is
-            // a uniform 32-bit int slot; FLOAT/CHAR1 carries are
-            // bit-pattern encoded so a relayed value can be re-stored
-            // by an intermediate node without reinterpretation.
-            for (const auto& ck : sub) {
-                std::string valExpr;
-                if (ck.table == tname) {
-                    DataType origType = TPCHSchema::instance().table(tname)
-                                            .col(ck.column).type;
-                    valExpr = encodeCarryValue(origType,
-                                               ck.column + "[" + idxVar + "]");
-                } else {
-                    valExpr = ck.varName();
-                }
-                pipe = std::make_unique<MetalArrayStore>(
-                    std::move(pipe), ck.storageArray(tname),
-                    storeKey, valExpr, "int", sizeSym);
+        // Always create a bitmap for the SemiJoin filter.
+        pipe = std::make_unique<MetalBitmapBuild>(
+            std::move(pipe), "d_bitmap_" + tname, storeKey,
+            "(" + sizeSym + " + 31) / 32");
+
+        // For non-CHAR_FIXED carries, also create ArrayStores for value propagation.
+        for (const auto& ck : sub) {
+            DataType ckType = TPCHSchema::instance().table(ck.table)
+                                   .col(ck.column).type;
+            if (ckType == DataType::CHAR_FIXED) continue;
+            std::string valExpr;
+            if (ck.table == tname) {
+                DataType origType = TPCHSchema::instance().table(tname)
+                                        .col(ck.column).type;
+                valExpr = encodeCarryValue(origType,
+                                           ck.column + "[" + idxVar + "]");
+            } else {
+                valExpr = ck.varName();
             }
+            pipe = std::make_unique<MetalArrayStore>(
+                std::move(pipe), ck.storageArray(tname),
+                storeKey, valExpr, "int", sizeSym);
         }
 
         appendPhase(plan, "ADHOC_multi_build_" + tname, std::move(pipe));
+    }
+
+    // Build map from build-table to probe-side join key for CHAR_FIXED direct access.
+    std::map<std::string, std::string> charFixedJoinKey;  // tableName → keyOnParent column
+    for (int c : nodes[probeIdx].children) {
+        charFixedJoinKey[aq.tables[c]] = nodes[c].keyOnParent;
     }
 
     // ---------- Probe phase ----------
@@ -1402,16 +1417,18 @@ std::optional<MetalQueryPlan> buildGenericMultiTableAdhocPlan_impl(
             continue;
         }
 
-        if (subC.empty()) {
-            probePipe = std::make_unique<MetalBitmapProbe>(
-                std::move(probePipe), "d_bitmap_" + aq.tables[c], probeKey);
-        } else {
-            for (const auto& ck : subC) {
-                probePipe = std::make_unique<MetalArrayLookup>(
-                    std::move(probePipe), ck.storageArray(aq.tables[c]),
-                    probeKey, ck.varName(), "int", -1);
-                carryVar[ck] = ck.varName();
-            }
+        // Always probe the bitmap for SemiJoin filtering.
+        probePipe = std::make_unique<MetalBitmapProbe>(
+            std::move(probePipe), "d_bitmap_" + aq.tables[c], probeKey);
+
+        // For non-CHAR_FIXED carries, create ArrayLookups for value propagation.
+        for (const auto& ck : subC) {
+            DataType ckType = TPCHSchema::instance().table(ck.table).col(ck.column).type;
+            if (ckType == DataType::CHAR_FIXED) continue;
+            probePipe = std::make_unique<MetalArrayLookup>(
+                std::move(probePipe), ck.storageArray(aq.tables[c]),
+                probeKey, ck.varName(), "int", -1);
+            carryVar[ck] = ck.varName();
         }
     }
 
@@ -1448,12 +1465,52 @@ std::optional<MetalQueryPlan> buildGenericMultiTableAdhocPlan_impl(
             std::string expr = materializeValueExpr(target.expr, idxVar);
             // Rewrite non-probe column references to carried variables
             expr = rewriteForProbe(expr, idxVar, carryVar);
+            // CHAR1 from non-probe tables: after rewrite, the carry variable is a
+            // scalar.  Reset stringLen to 0 so the materialize operator emits a
+            // scalar assignment instead of a pointer-indexed [_ci] loop.
+            if (auto* col = target.expr ? std::get_if<ColRef>(&target.expr->node) : nullptr) {
+                if (col->dataType == DataType::CHAR1) {
+                    std::string owner = ownerTableForColumn(aq, col->column);
+                    if (!owner.empty() && owner != probeTable) {
+                        stringLen = 0;
+                    }
+                }
+                // For CHAR_FIXED columns from build-side tables, rewrite the index from
+                // `colName + i * width` to `colName + joinKey[i] * width` so the column
+                // buffer is accessed by the join key rather than the probe row index.
+                if (col->dataType == DataType::CHAR_FIXED) {
+                    std::string owner = ownerTableForColumn(aq, col->column);
+                    if (!owner.empty() && owner != probeTable) {
+                        auto jkIt = charFixedJoinKey.find(owner);
+                        if (jkIt != charFixedJoinKey.end()) {
+                            int len = fixedStringLenForExpr(target.expr);
+                            std::string from = col->column + " + " + idxVar + " * " + std::to_string(len);
+                            std::string to = col->column + " + " + jkIt->second + "[" + idxVar + "] * " + std::to_string(len);
+                            size_t pos = expr.find(from);
+                            if (pos != std::string::npos)
+                                expr.replace(pos, from.size(), to);
+                        }
+                    }
+                }
+            }
             materialize->addColumn(bufferName, metalTypeForDataType(type),
                                    expr, displayName, sizeExpr, stringLen);
         }
 
         if (!cpuSort.keys.empty() || cpuSort.limit >= 0) plan.cpuSort = cpuSort;
         appendPhase(plan, "ADHOC_multi_materialize", std::move(materialize));
+        // Register build-side CHAR_FIXED column buffers as read-only extra buffers
+        // so they are accessible in the probe phase via join-key-indexed expressions.
+        for (const auto& [tname, cols] : neededByTable) {
+            if (tname == probeTable) continue;
+            for (const auto& c : cols) {
+                const auto& cdef = TPCHSchema::instance().table(tname).col(c);
+                if (cdef.type == DataType::CHAR_FIXED) {
+                    plan.phases.back().extraBuffers.push_back(
+                        {c, "char", true, false});
+                }
+            }
+        }
         return plan;
     }
 
