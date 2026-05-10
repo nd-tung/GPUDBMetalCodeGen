@@ -7,6 +7,20 @@
 
 namespace codegen {
 
+// JSON serialization for operator trees
+nlohmann::json MetalOperator::toJSON() const {
+    nlohmann::json j;
+    j["type"] = describe();
+    return j;
+}
+
+nlohmann::json MetalUnaryOperator::toJSON() const {
+    nlohmann::json j;
+    j["type"] = describe();
+    if (child_) j["child"] = child_->toJSON();
+    return j;
+}
+
 // Ablation: when GPUDB_SCALAR_ATOMIC=1, MetalTGReduce skips the
 // SIMD+threadgroup reduction and has every thread issue a global atomic.
 // This isolates the value of the existing reduction strategy.

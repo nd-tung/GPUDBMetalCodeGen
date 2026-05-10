@@ -99,23 +99,13 @@ struct GroupDomain {
 
 std::optional<GroupDomain> smallIntGroupDomain(const ColRef& col) {
     if (col.dataType != DataType::INT && col.dataType != DataType::DATE) return std::nullopt;
-
-    if (col.column == "c_nationkey" || col.column == "s_nationkey" ||
-        col.column == "n_nationkey") {
-        return GroupDomain{0, 24};
-    }
-    if (col.column == "n_regionkey" || col.column == "r_regionkey") {
-        return GroupDomain{0, 4};
-    }
-    if (col.column == "p_size") {
-        return GroupDomain{1, 50};
-    }
-    if (col.column == "l_linenumber") {
-        return GroupDomain{1, 7};
-    }
-    if (col.column == "o_shippriority") {
-        return GroupDomain{0, 0};
-    }
+    // Look up domain info from schema.  Falls back to hard-coded column
+    // names only when the schema lacks domain metadata (user-supplied schemas).
+    try {
+        auto& colDef = TPCHSchema::instance().table(col.table).col(col.column);
+        if (colDef.domainMin >= 0 && colDef.domainMax >= colDef.domainMin)
+            return GroupDomain{colDef.domainMin, colDef.domainMax};
+    } catch (const std::runtime_error&) {}
     return std::nullopt;
 }
 
@@ -468,23 +458,24 @@ struct GroupKeyDesc {
 // Returns "(char)col[idx] - 'A'" style expression, or empty if unsupported.
 static std::string char1BucketExpr(const ColRef& col, const std::string& idxVar,
                                     int& outNumValues) {
-    // Known CHAR1 group-by columns in TPC-H and their value sets
-    if (col.column == "l_returnflag") {
-        outNumValues = 3; // A, N, R
-        return "(l_returnflag[" + idxVar + "] == 'A' ? 0 : (l_returnflag[" + idxVar + "] == 'N' ? 1 : 2))";
-    }
-    if (col.column == "l_linestatus") {
-        outNumValues = 2; // F, O
-        return "(l_linestatus[" + idxVar + "] == 'F' ? 0 : 1)";
-    }
-    if (col.column == "p_type") {
-        outNumValues = 150; // approximate; TYPE domain is large but bounded
-        return "";
-    }
-    if (col.column == "p_brand") {
-        outNumValues = 25;
-        return "";
-    }
+    // Look up CHAR1 domain from schema.  Falls back to empty (unknown domain)
+    // when the schema lacks charDomain metadata.
+    try {
+        auto& colDef = TPCHSchema::instance().table(col.table).col(col.column);
+        if (!colDef.charDomain.empty()) {
+            const auto& chars = colDef.charDomain;
+            outNumValues = (int)chars.size();
+            if (outNumValues == 1) return "0";
+            const std::string expr = col.column + "[" + idxVar + "]";
+            std::string result;
+            for (int i = 0; i < outNumValues - 1; ++i) {
+                result += "(" + expr + " == '" + chars[i] + "' ? " + std::to_string(i) + " : ";
+            }
+            result += std::to_string(outNumValues - 1);
+            for (int i = 0; i < outNumValues - 1; ++i) result += ")";
+            return result;
+        }
+    } catch (const std::runtime_error&) {}
     outNumValues = 0;
     return "";
 }
@@ -754,12 +745,11 @@ std::optional<MetalQueryPlan> buildGroupedAggPlan(const AnalyzedQuery& aq, std::
         // CHAR1: populate charMap. Integer: populate keyBase.
         auto* gc = std::get_if<ColRef>(&aq.groupBy[ki]->node);
         if (gc && gc->dataType == DataType::CHAR1) {
-            // Build reverse map: flat index → char
-            if (gc->column == "l_returnflag") {
-                d.charMap = {'A', 'N', 'R'};
-            } else if (gc->column == "l_linestatus") {
-                d.charMap = {'F', 'O'};
-            }
+            // Build reverse map: flat index → char from schema domain
+            try {
+                auto& colDef = TPCHSchema::instance().table(gc->table).col(gc->column);
+                d.charMap = colDef.charDomain;
+            } catch (const std::runtime_error&) {}
         } else {
             // Integer: find the base offset from domain
             auto domain = smallIntGroupDomain(*gc);

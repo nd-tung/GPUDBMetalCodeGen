@@ -90,6 +90,9 @@ struct MetalQueryPlan {
     };
     std::optional<GpuSort> gpuSort;
 
+    // Serialize the plan to JSON for debugging / CI integration.
+    nlohmann::json toTreeJSON() const;
+
 };
 
 // Legacy compatibility wrapper. New callers should prefer the explicit APIs in

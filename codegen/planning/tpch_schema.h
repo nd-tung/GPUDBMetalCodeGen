@@ -16,7 +16,10 @@ struct ColumnDef {
     std::string name;
     int         index;
     DataType    type;
-    int         fixedWidth = 0; // for CHAR_FIXED
+    int         fixedWidth = 0;    // for CHAR_FIXED
+    int         domainMin = -1;    // for INT/DATE GROUP BY: -1 means unknown
+    int         domainMax = -1;    // for INT/DATE GROUP BY: -1 means unknown
+    std::vector<char> charDomain;  // for CHAR1 GROUP BY: ordered known values
 };
 
 struct TableDef {
@@ -70,73 +73,90 @@ private:
         TPCHSchema s;
 
         // lineitem: 16 columns (0-15)
-        s.tables["lineitem"] = makeTable("lineitem", {
-            {"l_orderkey",      0,  DataType::INT},
-            {"l_partkey",       1,  DataType::INT},
-            {"l_suppkey",       2,  DataType::INT},
-            {"l_linenumber",    3,  DataType::INT},
-            {"l_quantity",      4,  DataType::FLOAT},
-            {"l_extendedprice", 5,  DataType::FLOAT},
-            {"l_discount",      6,  DataType::FLOAT},
-            {"l_tax",           7,  DataType::FLOAT},
-            {"l_returnflag",    8,  DataType::CHAR1},
-            {"l_linestatus",    9,  DataType::CHAR1},
-            {"l_shipdate",      10, DataType::DATE},
-            {"l_commitdate",    11, DataType::DATE},
-            {"l_receiptdate",   12, DataType::DATE},
-            {"l_shipinstruct",  13, DataType::CHAR_FIXED, 25},
-            {"l_shipmode",      14, DataType::CHAR_FIXED, 2},
-            {"l_comment",       15, DataType::CHAR_FIXED, 44},
-        });
+        {
+            s.tables["lineitem"] = makeTable("lineitem", {
+                {"l_orderkey",      0,  DataType::INT},
+                {"l_partkey",       1,  DataType::INT},
+                {"l_suppkey",       2,  DataType::INT},
+                {"l_linenumber",    3,  DataType::INT},
+                {"l_quantity",      4,  DataType::FLOAT},
+                {"l_extendedprice", 5,  DataType::FLOAT},
+                {"l_discount",      6,  DataType::FLOAT},
+                {"l_tax",           7,  DataType::FLOAT},
+                {"l_returnflag",    8,  DataType::CHAR1},
+                {"l_linestatus",    9,  DataType::CHAR1},
+                {"l_shipdate",      10, DataType::DATE},
+                {"l_commitdate",    11, DataType::DATE},
+                {"l_receiptdate",   12, DataType::DATE},
+                {"l_shipinstruct",  13, DataType::CHAR_FIXED, 25},
+                {"l_shipmode",      14, DataType::CHAR_FIXED, 2},
+                {"l_comment",       15, DataType::CHAR_FIXED, 44},
+            });
+            s.tables["lineitem"].columns[3].domainMin = 1;  s.tables["lineitem"].columns[3].domainMax = 7;   // l_linenumber
+            s.tables["lineitem"].columns[8].charDomain = {'A', 'N', 'R'};                                    // l_returnflag
+            s.tables["lineitem"].columns[9].charDomain = {'F', 'O'};                                          // l_linestatus
+        }
 
         // orders: 9 columns (0-8)
-        s.tables["orders"] = makeTable("orders", {
-            {"o_orderkey",      0, DataType::INT},
-            {"o_custkey",       1, DataType::INT},
-            {"o_orderstatus",   2, DataType::CHAR1},
-            {"o_totalprice",    3, DataType::FLOAT},
-            {"o_orderdate",     4, DataType::DATE},
-            {"o_orderpriority", 5, DataType::CHAR1},
-            {"o_clerk",         6, DataType::CHAR_FIXED, 15},
-            {"o_shippriority",  7, DataType::INT},
-            {"o_comment",       8, DataType::CHAR_FIXED, 79},
-        });
+        {
+            s.tables["orders"] = makeTable("orders", {
+                {"o_orderkey",      0, DataType::INT},
+                {"o_custkey",       1, DataType::INT},
+                {"o_orderstatus",   2, DataType::CHAR1},
+                {"o_totalprice",    3, DataType::FLOAT},
+                {"o_orderdate",     4, DataType::DATE},
+                {"o_orderpriority", 5, DataType::CHAR1},
+                {"o_clerk",         6, DataType::CHAR_FIXED, 15},
+                {"o_shippriority",  7, DataType::INT},
+                {"o_comment",       8, DataType::CHAR_FIXED, 79},
+            });
+            s.tables["orders"].columns[7].domainMin = 0;  s.tables["orders"].columns[7].domainMax = 0;   // o_shippriority
+        }
 
         // customer: 8 columns (0-7)
-        s.tables["customer"] = makeTable("customer", {
-            {"c_custkey",    0, DataType::INT},
-            {"c_name",       1, DataType::CHAR_FIXED, 25},
-            {"c_address",    2, DataType::CHAR_FIXED, 40},
-            {"c_nationkey",  3, DataType::INT},
-            {"c_phone",      4, DataType::CHAR_FIXED, 15},
-            {"c_acctbal",    5, DataType::FLOAT},
-            {"c_mktsegment", 6, DataType::CHAR1},
-            {"c_comment",    7, DataType::CHAR_FIXED, 117},
-        });
+        {
+            s.tables["customer"] = makeTable("customer", {
+                {"c_custkey",    0, DataType::INT},
+                {"c_name",       1, DataType::CHAR_FIXED, 25},
+                {"c_address",    2, DataType::CHAR_FIXED, 40},
+                {"c_nationkey",  3, DataType::INT},
+                {"c_phone",      4, DataType::CHAR_FIXED, 15},
+                {"c_acctbal",    5, DataType::FLOAT},
+                {"c_mktsegment", 6, DataType::CHAR1},
+                {"c_comment",    7, DataType::CHAR_FIXED, 117},
+            });
+            s.tables["customer"].columns[3].domainMin = 0;  s.tables["customer"].columns[3].domainMax = 24;  // c_nationkey
+        }
 
         // supplier: 7 columns (0-6)
-        s.tables["supplier"] = makeTable("supplier", {
-            {"s_suppkey",   0, DataType::INT},
-            {"s_name",      1, DataType::CHAR_FIXED, 25},
-            {"s_address",   2, DataType::CHAR_FIXED, 40},
-            {"s_nationkey", 3, DataType::INT},
-            {"s_phone",     4, DataType::CHAR_FIXED, 15},
-            {"s_acctbal",   5, DataType::FLOAT},
-            {"s_comment",   6, DataType::CHAR_FIXED, 101},
-        });
+        {
+            s.tables["supplier"] = makeTable("supplier", {
+                {"s_suppkey",   0, DataType::INT},
+                {"s_name",      1, DataType::CHAR_FIXED, 25},
+                {"s_address",   2, DataType::CHAR_FIXED, 40},
+                {"s_nationkey", 3, DataType::INT},
+                {"s_phone",     4, DataType::CHAR_FIXED, 15},
+                {"s_acctbal",   5, DataType::FLOAT},
+                {"s_comment",   6, DataType::CHAR_FIXED, 101},
+            });
+            s.tables["supplier"].columns[3].domainMin = 0;  s.tables["supplier"].columns[3].domainMax = 24;  // s_nationkey
+        }
 
         // part: 9 columns (0-8)
-        s.tables["part"] = makeTable("part", {
-            {"p_partkey",    0, DataType::INT},
-            {"p_name",       1, DataType::CHAR_FIXED, 55},
-            {"p_mfgr",       2, DataType::CHAR_FIXED, 25},
-            {"p_brand",      3, DataType::CHAR_FIXED, 10},
-            {"p_type",       4, DataType::CHAR_FIXED, 25},
-            {"p_size",       5, DataType::INT},
-            {"p_container",  6, DataType::CHAR_FIXED, 10},
-            {"p_retailprice",7, DataType::FLOAT},
-            {"p_comment",    8, DataType::CHAR_FIXED, 23},
-        });
+        {
+            s.tables["part"] = makeTable("part", {
+                {"p_partkey",    0, DataType::INT},
+                {"p_name",       1, DataType::CHAR_FIXED, 55},
+                {"p_mfgr",       2, DataType::CHAR_FIXED, 25},
+                {"p_brand",      3, DataType::CHAR_FIXED, 10},
+                {"p_type",       4, DataType::CHAR_FIXED, 25},
+                {"p_size",       5, DataType::INT},
+                {"p_container",  6, DataType::CHAR_FIXED, 10},
+                {"p_retailprice",7, DataType::FLOAT},
+                {"p_comment",    8, DataType::CHAR_FIXED, 23},
+            });
+            s.tables["part"].columns[5].domainMin = 1;  s.tables["part"].columns[5].domainMax = 50;  // p_size
+        }
 
         // partsupp: 5 columns (0-4)
         s.tables["partsupp"] = makeTable("partsupp", {
@@ -148,19 +168,26 @@ private:
         });
 
         // nation: 4 columns (0-3)
-        s.tables["nation"] = makeTable("nation", {
-            {"n_nationkey",  0, DataType::INT},
-            {"n_name",       1, DataType::CHAR_FIXED, 25},
-            {"n_regionkey",  2, DataType::INT},
-            {"n_comment",    3, DataType::CHAR_FIXED, 152},
-        });
+        {
+            s.tables["nation"] = makeTable("nation", {
+                {"n_nationkey",  0, DataType::INT},
+                {"n_name",       1, DataType::CHAR_FIXED, 25},
+                {"n_regionkey",  2, DataType::INT},
+                {"n_comment",    3, DataType::CHAR_FIXED, 152},
+            });
+            s.tables["nation"].columns[0].domainMin = 0;  s.tables["nation"].columns[0].domainMax = 24;  // n_nationkey
+            s.tables["nation"].columns[2].domainMin = 0;  s.tables["nation"].columns[2].domainMax = 4;   // n_regionkey
+        }
 
         // region: 3 columns (0-2)
-        s.tables["region"] = makeTable("region", {
-            {"r_regionkey", 0, DataType::INT},
-            {"r_name",      1, DataType::CHAR_FIXED, 25},
-            {"r_comment",   2, DataType::CHAR_FIXED, 152},
-        });
+        {
+            s.tables["region"] = makeTable("region", {
+                {"r_regionkey", 0, DataType::INT},
+                {"r_name",      1, DataType::CHAR_FIXED, 25},
+                {"r_comment",   2, DataType::CHAR_FIXED, 152},
+            });
+            s.tables["region"].columns[0].domainMin = 0;  s.tables["region"].columns[0].domainMax = 4;   // r_regionkey
+        }
 
         return s;
     }
