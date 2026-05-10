@@ -333,6 +333,62 @@ std::string exprToMetal(const ExprPtr& expr, const std::string& idxVar) {
             return l;
         }
         else if constexpr (std::is_same_v<T, FuncCall>) {
+            if (node.name == "date_part" || node.name == "extract") {
+                // EXTRACT(YEAR/MONTH/DAY FROM date_col)
+                // args[0] = unit string, args[1] = column expression
+                std::string unit;
+                if (!node.args.empty() && node.args[0]) {
+                    if (auto* lit = std::get_if<Literal>(&node.args[0]->node)) {
+                        if (auto* s = std::get_if<std::string>(&lit->value)) unit = *s;
+                    }
+                }
+                std::string col = node.args.size() > 1 ? exprToMetal(node.args[1], idxVar) : "";
+                if (unit == "year")   return "(" + col + " / 10000)";
+                if (unit == "month") return "((" + col + " / 100) % 100)";
+                if (unit == "day")    return "(" + col + " % 100)";
+                return col; // fallback
+            }
+            if (node.name == "substring") {
+                int start = 1, len = 1;
+                if (node.args.size() > 1 && node.args[1]) {
+                    if (auto* lit = std::get_if<Literal>(&node.args[1]->node)) {
+                        if (auto* sv = std::get_if<int>(&lit->value)) start = *sv;
+                    }
+                }
+                if (node.args.size() > 2 && node.args[2]) {
+                    if (auto* lit = std::get_if<Literal>(&node.args[2]->node)) {
+                        if (auto* sv = std::get_if<int>(&lit->value)) len = *sv;
+                    }
+                }
+                // Look up the column's fixed width and name for proper row offset.
+                std::string colName;
+                int fw = 1;
+                if (node.args.size() > 0 && node.args[0]) {
+                    if (auto* cr = std::get_if<ColRef>(&node.args[0]->node)) {
+                        colName = cr->column;
+                        try {
+                            fw = TPCHSchema::instance().table(cr->table).col(cr->column).fixedWidth;
+                        } catch (...) {}
+                    }
+                }
+                if (colName.empty()) return "0";
+                // Emit: ((col[idx*fw + offset] - '0') * weight + ...)
+                std::string result = "(";
+                for (int i = 0; i < len; ++i) {
+                    if (i > 0) result += " + ";
+                    int pos = start - 1 + i;
+                    int weight = 1;
+                    for (int w = 0; w < len - 1 - i; ++w) weight *= 10;
+                    std::string access = colName + "[" + idxVar + " * " + std::to_string(fw) +
+                                        " + " + std::to_string(pos) + "]";
+                    if (weight > 1)
+                        result += "(" + access + " - '0') * " + std::to_string(weight);
+                    else
+                        result += "(" + access + " - '0')";
+                }
+                result += ")";
+                return result;
+            }
             std::ostringstream os;
             os << node.name << "(";
             for (size_t i = 0; i < node.args.size(); i++) {

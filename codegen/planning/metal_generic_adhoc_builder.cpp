@@ -166,6 +166,10 @@ DataType inferExprDataType(const ExprPtr& expr) {
             if (!node.branches.empty()) return inferExprDataType(node.branches[0].result);
             if (node.elseResult) return inferExprDataType(node.elseResult);
             return DataType::INT;
+        } else if constexpr (std::is_same_v<Node, FuncCall>) {
+            if (node.name == "date_part" || node.name == "extract") return DataType::INT;
+            if (node.name == "substring") return DataType::INT;
+            return DataType::INT;
         } else {
             return DataType::INT;
         }
@@ -185,9 +189,14 @@ bool literalMatchesType(const ExprPtr& expr, DataType type) {
     auto* lit = std::get_if<Literal>(&expr->node);
     if (!lit) return false;
     auto* value = std::get_if<std::string>(&lit->value);
-    if (!value) return true;
+    if (!value) return true; // int or float literal always matches
     if (type == DataType::DATE) return isDateLiteralString(*value);
     if (type == DataType::CHAR1) return value->size() == 1;
+    if (type == DataType::INT || type == DataType::FLOAT) {
+        // String literals can match numeric types if they represent numbers
+        try { (void)std::stoi(*value); return true; } catch (...) {}
+        try { (void)std::stof(*value); return true; } catch (...) {}
+    }
     return false;
 }
 
@@ -277,6 +286,11 @@ bool exprSupported(const ExprPtr& expr, bool allowChar1Literal) {
                 if (!exprSupported(node.elseResult, allowChar1Literal)) return false;
             }
             return true;
+        } else if constexpr (std::is_same_v<Node, FuncCall>) {
+            // Known translatable SQL functions
+            if (node.name == "date_part" || node.name == "extract") return true;
+            if (node.name == "substring") return true;
+            return false;
         } else {
             return false;
         }
