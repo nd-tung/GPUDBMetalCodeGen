@@ -240,6 +240,14 @@ std::string exprToMetalForPredicate(const ExprPtr& expr,
                 if (auto charValue = parseChar1StringExpr(expr)) return *charValue;
             }
         }
+        // Handle string literal compared against non-ColRef (e.g. substring
+        // result IN ('13', '31', ...)): convert string to integer literal.
+        if (auto* lit = expr ? std::get_if<Literal>(&expr->node) : nullptr) {
+            if (auto* sv = std::get_if<std::string>(&lit->value)) {
+                try { return std::to_string(std::stoi(*sv)); }
+                catch (...) {}
+            }
+        }
     }
     return exprToMetal(expr, idxVar);
 }
