@@ -93,10 +93,7 @@ ExprPtr walkColumnRef(const json& node, const std::vector<std::string>& tables) 
         if (sqit != g_subqueryAliasMap.end())
             return Expr::col(sqit->second.table, sqit->second.column,
                              sqit->second.colIndex, sqit->second.dataType);
-        // Check subquery expression aliases (e.g. EXTRACT(YEAR FROM ...) AS o_year)
-        auto eqit = g_subqueryExprMap.find(colName);
-        if (eqit != g_subqueryExprMap.end()) return eqit->second;
-        // Unresolvable — SELECT alias or derived column
+        // This is a SELECT alias (e.g., "revenue" in ORDER BY) — return as unresolved ColRef
         return Expr::col("", colName, -1, DataType::INT);
     }
 
@@ -893,26 +890,50 @@ AnalyzedQuery analyzeSQL(const std::string& sql) {
     g_subqueryAliasMap.clear();
     g_subqueryExprMap.clear();
 
-    // Resolve subquery aliases in expressions: replace empty-table ColRefs
-    // with their source expressions from the subquery alias maps.
-    auto resolveExpr = [&](ExprPtr& expr) {
+    // Recursively resolve subquery aliases in an expression tree.
+    auto resolveRecursive = [&](ExprPtr& expr, auto&& self) -> void {
         if (!expr) return;
         if (auto* cr = std::get_if<ColRef>(&expr->node)) {
-            if (!cr->table.empty()) return;
-            auto it = aq.subqueryColMap.find(cr->column);
-            if (it != aq.subqueryColMap.end()) {
-                expr = Expr::col(it->second.table, it->second.column,
-                                 it->second.colIndex, it->second.dataType);
-                return;
+            if (cr->table.empty()) {
+                auto it = aq.subqueryColMap.find(cr->column);
+                if (it != aq.subqueryColMap.end()) {
+                    expr = Expr::col(it->second.table, it->second.column,
+                                     it->second.colIndex, it->second.dataType);
+                    return;
+                }
+                auto eit = aq.subqueryExprMap.find(cr->column);
+                if (eit != aq.subqueryExprMap.end()) {
+                    expr = eit->second;
+                    return;
+                }
             }
-            auto eit = aq.subqueryExprMap.find(cr->column);
-            if (eit != aq.subqueryExprMap.end()) {
-                expr = eit->second;
-                return;
-            }
+            return;
+        }
+        if (auto* bin = std::get_if<BinaryExpr>(&expr->node)) {
+            self(bin->left, self);
+            self(bin->right, self);
+            return;
+        }
+        if (auto* cw = std::get_if<CaseWhen>(&expr->node)) {
+            for (auto& b : cw->branches) { self(b.result, self); }
+            if (cw->elseResult) self(cw->elseResult, self);
+            return;
+        }
+        if (auto* fc = std::get_if<FuncCall>(&expr->node)) {
+            for (auto& a : fc->args) self(a, self);
+            return;
         }
     };
-    for (auto& t : aq.targets) { resolveExpr(t.expr); if (t.agg) resolveExpr(t.agg->innerExpr); }
+    for (auto& t : aq.targets) {
+        std::string origAlias;
+        if (t.expr && std::holds_alternative<ColRef>(t.expr->node) && t.alias.empty()) {
+            origAlias = std::get_if<ColRef>(&t.expr->node)->column;
+        }
+        resolveRecursive(t.expr, resolveRecursive);
+        if (t.agg) resolveRecursive(t.agg->innerExpr, resolveRecursive);
+        if (!origAlias.empty() && t.alias.empty())
+            t.alias = origAlias;
+    }
     // GROUP BY and ORDER BY keep their original ColRef — the subquery alias
     // name is used for display-name matching in orderColumnForExpr and
     // materialize column naming; the resolved expression is used in targets.
