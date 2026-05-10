@@ -452,6 +452,7 @@ std::string predToMetal(const PredPtr& pred, const std::string& idxVar) {
             return "(" + e + " >= " + lo + " && " + e + " <= " + hi + ")";
         }
         else if constexpr (std::is_same_v<T, InList>) {
+            if (node.values.empty()) return "true";  // placeholder for unsupported subquery
             if (auto* col = fixedStringCol(node.expr)) {
                 std::string cond;
                 for (const auto& value : node.values) {
