@@ -7,25 +7,29 @@ namespace codegen {
 std::optional<MetalQueryPlan> buildAdhocSQLPlan(const AnalyzedQuery& aq,
                                                 const std::string& label,
                                                 std::string* error) {
+    std::string singleError, multiError;
     auto dispatch = [&]() -> std::optional<MetalQueryPlan> {
-        // Generic single-table path first (most expressive for supported patterns).
-        if (auto p = buildGenericSingleTableAdhocPlan(aq, error)) return p;
-        // Generic multi-table path: handles tree-shaped equi-join queries.
-        if (auto p = buildGenericMultiTableAdhocPlan(aq, error)) return p;
-        // Simple scalar-agg fallback (Q6 serves as generic scalar dispatcher).
+        if (auto p = buildGenericSingleTableAdhocPlan(aq, &singleError)) return p;
+        if (auto p = buildGenericMultiTableAdhocPlan(aq, &multiError)) return p;
         if (auto p = buildQ6Plan(aq)) return p;
-        // TPC-H-specific recognizers only for queries the generic path can't handle.
         if (auto p = buildQ1Plan(aq)) return p;
         if (auto p = buildQ14Plan(aq)) return p;
         if (auto p = buildQ4Plan(aq)) return p;
         if (auto p = buildQ12Plan(aq)) return p;
         if (auto p = buildQ10Plan(aq)) return p;
         if (auto p = buildQ7Plan(aq)) return p;
-        if (error) *error = "Ad-hoc SQL: query does not match any supported pattern.";
         return std::nullopt;
     };
 
     auto plan = dispatch();
+    if (!plan && error) {
+        if (!singleError.empty())
+            *error = singleError;
+        else if (!multiError.empty())
+            *error = multiError;
+        else
+            *error = "Ad-hoc SQL: query does not match any supported pattern.";
+    }
     if (!plan) return plan;
 
     if (!label.empty()) plan->name = label;
