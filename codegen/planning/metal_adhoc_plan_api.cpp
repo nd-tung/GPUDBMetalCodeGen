@@ -23,10 +23,10 @@ std::optional<MetalQueryPlan> buildAdhocSQLPlan(const AnalyzedQuery& aq,
 
     auto plan = dispatch();
     if (!plan && error) {
-        if (!singleError.empty())
-            *error = singleError;
-        else if (!multiError.empty())
+        if (!multiError.empty())
             *error = multiError;
+        else if (!singleError.empty())
+            *error = singleError;
         else
             *error = "Ad-hoc SQL: query does not match any supported pattern.";
     }

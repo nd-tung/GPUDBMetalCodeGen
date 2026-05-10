@@ -72,6 +72,11 @@ struct AnalyzedQuery {
     };
     std::vector<Subquery> subqueries;
 
+    // FROM-clause subquery column aliases → source column (for simple col refs).
+    std::unordered_map<std::string, ColRef> subqueryColMap;
+    // FROM-clause subquery column aliases → source expression (for computed cols).
+    std::unordered_map<std::string, ExprPtr> subqueryExprMap;
+
     // Helpers
     bool isSingleTable() const { return tables.size() == 1 && joins.empty(); }
     bool hasAggregation() const {
