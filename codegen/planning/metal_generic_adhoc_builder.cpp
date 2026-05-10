@@ -1178,7 +1178,8 @@ bool multiTableBuildJoinTree(const AnalyzedQuery& aq, int probeIdx,
     }
 
     if (order.size() != n) {
-        if (error) *error = "Multi-table planner: join graph is not connected or contains cycles.";
+        if (error) *error = "Multi-table planner: join graph is not connected or contains cycles. "
+                             "(Self-joined tables with identical base names cannot be disambiguated.)";
         return false;
     }
     return true;
