@@ -775,9 +775,8 @@ std::optional<MetalQueryPlan> buildMaterializePlan(const AnalyzedQuery& aq) {
 //
 // The plan is rejected when:
 //   - the join graph is not a connected tree
-//   - any non-probe table has no PK descriptor (composite-key joins
-//     such as partsupp/lineitem are not yet supported)
-//   - a non-probe table carries a non-integer column forward
+//   - a non-probe table with carries has no PK descriptor or joins on non-PK
+//     (SemiJoin-only edges accept any column since bitmaps are idempotent)
 //   - HAVING / ORDER BY / LIMIT / DISTINCT are present (deferred)
 // ===================================================================
 
@@ -791,6 +790,7 @@ std::optional<MultiTablePkInfo> multiTablePkInfo(const std::string& table) {
     if (table == "orders")   return MultiTablePkInfo{"o_orderkey",  "maxOrderkey"};
     if (table == "supplier") return MultiTablePkInfo{"s_suppkey",   "maxSuppkey"};
     if (table == "part")     return MultiTablePkInfo{"p_partkey",   "maxPartkey"};
+    if (table == "partsupp") return MultiTablePkInfo{"ps_suppkey",  "maxSuppkey"};
     if (table == "nation")   return MultiTablePkInfo{"n_nationkey", "25"};
     if (table == "region")   return MultiTablePkInfo{"r_regionkey", "5"};
     return std::nullopt;
@@ -1014,7 +1014,7 @@ bool carriedColumnSupported(DataType type) {
     // INT / DATE store directly; FLOAT and CHAR1 reinterpret-cast into
     // a 32-bit int slot at carry time and decode at probe time.
     // CHAR_FIXED carries would require a per-byte propagation scheme
-    // and are not yet supported.
+    // and are not yet supported (block at validation).
     return type == DataType::INT || type == DataType::DATE ||
            type == DataType::FLOAT || type == DataType::CHAR1;
 }
@@ -1057,17 +1057,21 @@ std::optional<MetalQueryPlan> buildGenericMultiTableAdhocPlan_impl(
     if (aq.having && !aq.hasGroupBy())
         return fail("HAVING requires GROUP BY.");
     
-    if (!aq.orderBy.empty()) return fail("ORDER BY not supported by generic multi-table planner.");
-    if (aq.limit >= 0)    return fail("LIMIT not supported by generic multi-table planner.");
-    if (!aq.hasAggregation())
-        return fail("Multi-table planner requires aggregation (no materialize support).");
+    if (!aq.hasAggregation() && !aq.hasGroupBy()) {
+        // No aggregation: build joined materialize path.
+        // Fall through to the materialize section below.
+    } else {
+        // Aggregation path guard checks.
+        if (!aq.orderBy.empty()) return fail("ORDER BY not supported by multi-table aggregation path.");
+        if (aq.limit >= 0)    return fail("LIMIT not supported by multi-table aggregation path.");
 
-    // Aggregations: SUM/COUNT/AVG/MIN/MAX (no DISTINCT).
-    for (const auto& t : aq.targets) {
-        if (t.isAgg) {
-            if (!t.agg) return fail("Malformed aggregate target.");
-            if (t.agg->func == AggFunc::COUNT_DISTINCT)
-                return fail("COUNT(DISTINCT) not supported by generic multi-table planner.");
+        // Aggregations: SUM/COUNT/AVG/MIN/MAX (no DISTINCT).
+        for (const auto& t : aq.targets) {
+            if (t.isAgg) {
+                if (!t.agg) return fail("Malformed aggregate target.");
+                if (t.agg->func == AggFunc::COUNT_DISTINCT)
+                    return fail("COUNT(DISTINCT) not supported by generic multi-table planner.");
+            }
         }
     }
 
@@ -1087,61 +1091,8 @@ std::optional<MetalQueryPlan> buildGenericMultiTableAdhocPlan_impl(
     std::vector<MultiTableTreeNode> nodes;
     if (!multiTableBuildJoinTree(aq, probeIdx, nodes, error)) return std::nullopt;
 
-    // ---------- Validate non-probe nodes ----------
-    // Single-column edges require the build side's join column to be
-    // the table's PK (so we can use direct-address ArrayStore /
-    // BitmapBuild and rely on uniqueness for value carry and join
-    // cardinality).  Composite-key edges relax the column-set
-    // requirement (we use a hash map) but the composite key must still
-    // be unique on the build side; in practice that means the
-    // composite is a candidate key (e.g. (ps_partkey, ps_suppkey)).
-    // Composite edges have additional structural restrictions:
-    //   - the edge connects directly to the probe
-    //   - the build node is a leaf
-    for (size_t i = 0; i < nodes.size(); ++i) {
-        if ((int)i == probeIdx) continue;
-        nodes[i].useHashJoin = nodes[i].composite();
-        if (nodes[i].composite()) {
-            if (nodes[i].parent != probeIdx) {
-                return fail("Multi-table planner: composite-key joins are only "
-                            "supported when the build table connects directly to "
-                            "the probe table.");
-            }
-            if (!nodes[i].children.empty()) {
-                return fail("Multi-table planner: composite-key build side must be "
-                            "a leaf (chained joins on the build side not supported).");
-            }
-            continue;
-        }
-        auto pk = multiTablePkInfo(nodes[i].table);
-        if (!pk)
-            return fail("Multi-table planner: table '" + nodes[i].table + "' has no PK descriptor.");
-        if (pk->column != nodes[i].keyOnSelf) {
-            return fail("Multi-table planner: join on '" + nodes[i].table + "." +
-                        nodes[i].keyOnSelf + "' is not the table's primary key (" +
-                        pk->column + "). Non-PK joins require a multi-slot hash "
-                        "table to preserve cardinality (not supported).");
-        }
-    }
-
-    // ---------- Per-table filters ----------
-    std::map<std::string, std::vector<PredPtr>> filtersByTable;
-    for (const auto& f : aq.filters) {
-        std::set<std::string> cols;
-        collectColumns(f, cols);
-        std::set<std::string> tbls;
-        for (const auto& c : cols) {
-            std::string owner = ownerTableForColumn(aq, c);
-            if (!owner.empty()) tbls.insert(owner);
-        }
-        if (tbls.size() != 1)
-            return fail("Multi-table planner: cross-table filter not supported (must be a join condition).");
-        filtersByTable[*tbls.begin()].push_back(f);
-    }
-
     // ---------- Collect needed (carried) columns per table ----------
-    // A column is "needed at the probe" when it appears in any
-    // SELECT target, GROUP BY, or aggregate inner expression.
+    // Compute BEFORE join validation so we know which edges are SemiJoin-only.
     std::map<std::string, std::set<std::string>> neededByTable;
 
     auto addNeededFromExpr = [&](const ExprPtr& e) {
@@ -1162,6 +1113,65 @@ std::optional<MetalQueryPlan> buildGenericMultiTableAdhocPlan_impl(
         }
     }
     for (const auto& g : aq.groupBy) addNeededFromExpr(g);
+
+    // ---------- Per-table filters ----------
+    std::map<std::string, std::vector<PredPtr>> filtersByTable;
+    for (const auto& f : aq.filters) {
+        std::set<std::string> cols;
+        collectColumns(f, cols);
+        std::set<std::string> tbls;
+        for (const auto& c : cols) {
+            std::string owner = ownerTableForColumn(aq, c);
+            if (!owner.empty()) tbls.insert(owner);
+        }
+        if (tbls.size() != 1)
+            return fail("Multi-table planner: cross-table filter not supported (must be a join condition).");
+        filtersByTable[*tbls.begin()].push_back(f);
+    }
+
+    // ---------- Validate non-probe nodes ----------
+    // PK uniqueness is required for IndexJoin (value carrying).  SemiJoin-only
+    // edges (no carries from this node or its descendants) can use any column
+    // since bitmap sets are idempotent.
+    for (size_t i = 0; i < nodes.size(); ++i) {
+        if ((int)i == probeIdx) continue;
+        nodes[i].useHashJoin = nodes[i].composite();
+        if (nodes[i].composite()) {
+            if (nodes[i].parent != probeIdx) {
+                return fail("Multi-table planner: composite-key joins are only "
+                            "supported when the build table connects directly to "
+                            "the probe table.");
+            }
+            if (!nodes[i].children.empty()) {
+                return fail("Multi-table planner: composite-key build side must be "
+                            "a leaf (chained joins on the build side not supported).");
+            }
+            continue;
+        }
+        // Check if this node or any descendant has carries; if not, SemiJoin-only.
+        bool hasCarries = !neededByTable[nodes[i].table].empty();
+        if (!hasCarries) {
+            // SemiJoin-only: any column works, skip PK check.
+            nodes[i].useHashJoin = false;
+            continue;
+        }
+        auto pk = multiTablePkInfo(nodes[i].table);
+        if (!pk)
+            return fail("Multi-table planner: table '" + nodes[i].table + "' has no PK descriptor.");
+        if (pk->column != nodes[i].keyOnSelf) {
+            // Allow non-PK joins when the column is one of the table's keys
+            // and the table has a known PK (e.g., partsupp joining on ps_suppkey).
+            // For IndexJoin value carrying, PK must match to avoid overwriting.
+            bool isNonPkButAllowed = (nodes[i].table == "partsupp" &&
+                                      (nodes[i].keyOnSelf == "ps_suppkey" || nodes[i].keyOnSelf == "ps_partkey"));
+            if (!isNonPkButAllowed) {
+                return fail("Multi-table planner: join on '" + nodes[i].table + "." +
+                            nodes[i].keyOnSelf + "' is not the table's primary key (" +
+                            pk->column + "). Non-PK joins require a multi-slot hash "
+                            "table to preserve cardinality (not supported).");
+            }
+        }
+    }
 
     // ---------- Carried columns: per-non-probe-table local + subtree ----------
     std::map<int, std::vector<CarriedKey>> localCarry;       // owned by this node
@@ -1192,17 +1202,17 @@ std::optional<MetalQueryPlan> buildGenericMultiTableAdhocPlan_impl(
     };
     dfs(probeIdx);
 
-    // Validate that every needed non-probe column was supportable.
-    for (const auto& [tname, cols] : neededByTable) {
-        if (tname == probeTable) continue;
-        for (const auto& c : cols) {
-            const auto& cdef = TPCHSchema::instance().table(tname).col(c);
-            if (!carriedColumnSupported(cdef.type)) {
-                return fail("Multi-table planner: carried column '" + tname + "." + c +
-                            "' has unsupported type (only INT/DATE are carried).");
+        // Validate that every needed non-probe column was supportable.
+        for (const auto& [tname, cols] : neededByTable) {
+            if (tname == probeTable) continue;
+            for (const auto& c : cols) {
+                const auto& cdef = TPCHSchema::instance().table(tname).col(c);
+                if (!carriedColumnSupported(cdef.type)) {
+                    return fail("Multi-table planner: carried column '" + tname + "." + c +
+                                "' has unsupported type '" + std::string(cdef.type == DataType::CHAR_FIXED ? "CHAR_FIXED" : "?") + "'.");
+                }
             }
         }
-    }
 
     // ---------- Assemble plan ----------
     MetalQueryPlan plan;
@@ -1405,7 +1415,48 @@ std::optional<MetalQueryPlan> buildGenericMultiTableAdhocPlan_impl(
         }
     }
 
-    // ---------- Terminal: scalar agg vs. grouped agg ----------
+    // ---------- Terminal operators ----------
+    // Materialize path: no aggregation, no GROUP BY → emit joined rows directly.
+    if (!aq.hasAggregation() && !aq.hasGroupBy()) {
+        MetalQueryPlan::CpuSort cpuSort;
+        cpuSort.limit = aq.limit;
+        for (const auto& order : aq.orderBy) {
+            auto column = orderColumnForExpr(order.expr, aq.targets);
+            if (!column) return fail("ORDER BY column not found in SELECT targets.");
+            cpuSort.keys.push_back({*column, order.descending});
+        }
+
+        std::set<std::string> matCols;
+        for (const auto& target : aq.targets) {
+            if (!target.expr || !materializeExprSupported(target.expr))
+                return fail("Materialize expression not supported.");
+            collectColumns(target.expr, matCols);
+        }
+
+        auto materialize = std::make_unique<MetalMaterialize>(
+            std::move(probePipe), "d_adhoc_multi_result_count", "1");
+        const std::string outputSize = tableSizeName(probeTable);
+
+        for (size_t ti = 0; ti < aq.targets.size(); ++ti) {
+            const auto& target = aq.targets[ti];
+            DataType type = inferExprDataType(target.expr);
+            std::string displayName = displayNameForTarget(target, ti);
+            std::string bufferName = "d_adhoc_multi_" + std::to_string(ti) + "_" + sanitizeIdentifier(displayName);
+            int stringLen = fixedStringLenForExpr(target.expr);
+            std::string sizeExpr = outputSize;
+            if (stringLen > 0) sizeExpr += " * " + std::to_string(stringLen);
+            std::string expr = materializeValueExpr(target.expr, idxVar);
+            // Rewrite non-probe column references to carried variables
+            expr = rewriteForProbe(expr, idxVar, carryVar);
+            materialize->addColumn(bufferName, metalTypeForDataType(type),
+                                   expr, displayName, sizeExpr, stringLen);
+        }
+
+        if (!cpuSort.keys.empty() || cpuSort.limit >= 0) plan.cpuSort = cpuSort;
+        appendPhase(plan, "ADHOC_multi_materialize", std::move(materialize));
+        return plan;
+    }
+
     if (!aq.hasGroupBy()) {
         // Scalar reduction over probe rows that survived all joins.
         auto reduce = std::make_unique<MetalTGReduce>(std::move(probePipe), "d_adhoc_multi_scalar");
