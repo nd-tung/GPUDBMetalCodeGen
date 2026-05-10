@@ -127,6 +127,14 @@ public:
     // dict count produced by the previous GPU phase).
     MTL::Device* device() const { return device_; }
 
+    // Look up a compiled pipeline state by kernel name.  Used by
+    // post-dispatch hooks that need to re-dispatch a kernel with
+    // different constant parameters (e.g. GPU bitonic sort).
+    MTL::ComputePipelineState* getPipelineState(const std::string& name) const {
+        auto it = pipelineStates_.find(name);
+        return it != pipelineStates_.end() ? it->second : nullptr;
+    }
+
 private:
     MTL::Device* device_;
     MTL::CommandQueue* cmdQueue_;
@@ -144,6 +152,10 @@ private:
     // Buffers allocated for scratch/output (we own these)
     std::unordered_map<std::string, MTL::Buffer*> allocatedBuffers_;
 
+    // Pipeline states indexed by kernel name.  Populated at the start of
+    // execute() so PostDispatchHook can look up PSOs to re-dispatch.
+    std::unordered_map<std::string, MTL::ComputePipelineState*> pipelineStates_;
+
     // Scalar constant values (set via setBytes during binding)
     std::unordered_map<std::string, int> scalarInts_;
     std::unordered_map<std::string, float> scalarFloats_;
@@ -160,9 +172,10 @@ private:
     void zeroInitBuffers(const MetalCodegen::PhaseInfo& phase,
                          const BufferMap& buffers);
 
-    // Find PSO by kernel name
+    // Find PSO by kernel name (name-only variant uses pipelineStates_)
     MTL::ComputePipelineState* findPSO(const RuntimeCompiler::CompiledQuery& cq,
                                         const std::string& name);
+    MTL::ComputePipelineState* findPSO(const std::string& name) const;
 
     // Encode one phase: set PSO, bind buffers, compute threadgroup config,
     // dispatch. Used by both warmup and measured loops in execute().

@@ -297,6 +297,39 @@ static void applyCpuSortAndLimit(codegen::GenericResult& result,
     }
 }
 
+// Apply GPU-sorted index remapping to materialized rows.
+// Reads d_sortIdx from the executor's allocated buffers and reorders
+// result.rows so that rows appear in the sort-order defined by the GPU.
+static void applyGpuSortRemap(codegen::GenericResult& result,
+                               const codegen::MetalQueryPlan::GpuSort& gpuSort,
+                               codegen::MetalGenericExecutor& executor) {
+    auto* idxBuf = executor.getAllocatedBuffer(gpuSort.sortedIndexBuffer);
+    if (!idxBuf) return;
+
+    size_t n_results = 0;
+    executor.tryGetSymbol(gpuSort.nResults, n_results);
+    if (n_results == 0 || n_results > result.rows.size())
+        n_results = result.rows.size();
+
+    const int* indices = static_cast<const int*>(idxBuf->contents());
+    if (!indices) return;
+
+    // Build remap: position in sorted order → original row index
+    std::vector<size_t> remap(n_results);
+    for (size_t i = 0; i < n_results; ++i) {
+        int src = indices[i];
+        remap[i] = (src >= 0 && static_cast<size_t>(src) < result.rows.size())
+                       ? static_cast<size_t>(src) : i;
+    }
+
+    // Reorder rows according to sorted indices
+    auto sortedRows = result.rows;
+    for (size_t i = 0; i < n_results && i < result.rows.size(); ++i) {
+        sortedRows[i] = std::move(result.rows[remap[i]]);
+    }
+    result.rows = std::move(sortedRows);
+}
+
 // Host-side GROUP BY for MaterializeAgg fallback.
 // Groups raw rows by keyColumns and applies aggregate functions.
 static void applyCpuGroupBy(codegen::GenericResult& result,
@@ -485,23 +518,27 @@ static bool runCodegenQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
         std::optional<codegen::MetalQueryPlan> maybePlan;
         if (apiKind == QueryApiKind::PredefinedTPCH) {
             maybePlan = codegen::buildPredefinedTPCHPlan(queryName);
+            if (!maybePlan) {
+                std::cerr << "Codegen: predefined TPC-H plan not available for "
+                          << queryName << std::endl;
+                return false;
+            }
         } else {
             if (!analyzedOk) {
                 std::cerr << "Codegen: ad-hoc SQL requires successful analysis for "
                           << queryName << std::endl;
                 return false;
             }
-            maybePlan = codegen::buildAdhocSQLPlan(analyzed, queryName);
-        }
-        if (!maybePlan) {
-            if (apiKind == QueryApiKind::PredefinedTPCH) {
-                std::cerr << "Codegen: predefined TPC-H plan not available for "
+            std::string planError;
+            maybePlan = codegen::buildAdhocSQLPlan(analyzed, queryName, &planError);
+            if (!maybePlan) {
+                std::cerr << "Codegen: ad-hoc SQL pattern not supported for "
                           << queryName << std::endl;
-            } else {
-                std::cerr << "Codegen: ad-hoc SQL pattern not yet supported for "
-                          << queryName << std::endl;
+                if (!planError.empty()) {
+                    std::cerr << "  Reason: " << planError << std::endl;
+                }
+                return false;
             }
-            return false;
         }
         auto& plan = *maybePlan;
         plan.name = queryName;
@@ -1282,6 +1319,11 @@ static bool runCodegenQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
 
         if (plan.cpuGroupBy && !result.result.columns.empty()) {
             applyCpuGroupBy(result.result, *plan.cpuGroupBy);
+        }
+
+        // GPU-sorted materialized output: remap rows using sorted index buffer
+        if (plan.gpuSort && !result.result.columns.empty()) {
+            applyGpuSortRemap(result.result, *plan.gpuSort, executor);
         }
 
         if (plan.cpuSort && !result.result.columns.empty()) {

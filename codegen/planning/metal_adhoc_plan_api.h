@@ -12,6 +12,7 @@ namespace codegen {
 // builders. It is intentionally a supported-pattern API, not a full SQL
 // planner.
 std::optional<MetalQueryPlan> buildAdhocSQLPlan(const AnalyzedQuery& aq,
-                                                const std::string& label = "");
+                                                const std::string& label = "",
+                                                std::string* error = nullptr);
 
 } // namespace codegen
