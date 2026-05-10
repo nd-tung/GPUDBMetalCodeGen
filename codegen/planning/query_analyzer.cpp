@@ -691,6 +691,29 @@ AnalyzedQuery analyzeSQL(const std::string& sql) {
         // Extract explicit JOIN ON conditions
         for (auto& item : sel["fromClause"])
             extractJoinOns(item, aq.tables, aq.joins, aq.filters);
+
+        // Extract WHERE conditions from RangeSubselect subqueries
+        // (e.g. Q8/Q9/Q13/Q19 — FROM-clause subqueries whose join
+        //  conditions and filters reside in the inner WHERE clause).
+        std::function<void(const json&)> extractSubWhere = [&](const json& fromItem) {
+            if (fromItem.contains("RangeSubselect")) {
+                auto& rs = fromItem["RangeSubselect"];
+                if (rs.contains("subquery") && rs["subquery"].contains("SelectStmt")) {
+                    auto& sub = rs["subquery"]["SelectStmt"];
+                    if (sub.contains("whereClause")) {
+                        auto pred = walkPredicate(sub["whereClause"], aq.tables);
+                        separatePredicates(pred, aq.tables, aq.joins, aq.filters);
+                    }
+                }
+            }
+            if (fromItem.contains("JoinExpr")) {
+                auto& je = fromItem["JoinExpr"];
+                extractSubWhere(je["larg"]);
+                extractSubWhere(je["rarg"]);
+            }
+        };
+        for (auto& item : sel["fromClause"])
+            extractSubWhere(item);
     }
 
     // 2. Extract WHERE clause predicates

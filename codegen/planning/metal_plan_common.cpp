@@ -44,8 +44,9 @@ std::optional<std::string> parseChar1StringExpr(const ExprPtr& expr) {
     auto* lit = std::get_if<Literal>(&expr->node);
     if (!lit) return std::nullopt;
     auto* s = std::get_if<std::string>(&lit->value);
-    if (!s || s->size() != 1) return std::nullopt;
-    return "'" + *s + "'";
+    if (!s || s->empty()) return std::nullopt;
+    // CHAR1 comparison: use first character of the string literal
+    return std::string("'") + s->front() + "'";
 }
 
 const ColRef* fixedStringCol(const ExprPtr& expr) {
