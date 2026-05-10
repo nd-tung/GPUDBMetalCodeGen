@@ -31,6 +31,9 @@ std::unordered_map<std::string, ColRef> g_subqueryAliasMap;
 // Subquery column alias → source expression (for non-column expressions).
 std::unordered_map<std::string, ExprPtr> g_subqueryExprMap;
 
+// File-scope: view definitions inlined during analysis.
+std::map<std::string, std::pair<json, std::vector<std::string>>> g_views; // name → (selectBody, columnAliases)
+
 const auto& schema() { return TPCHSchema::instance(); }
 
 // Resolve an unqualified column name to (table, column).
@@ -511,6 +514,16 @@ void extractTables(const json& fromItem, std::vector<std::string>& tables,
     if (fromItem.contains("RangeVar")) {
         auto& rv = fromItem["RangeVar"];
         std::string name = rv["relname"].get<std::string>();
+        // Inline CREATE VIEW definitions: extract view's FROM tables.
+        auto vit = g_views.find(name);
+        if (vit != g_views.end()) {
+            auto& [viewBody, viewCols] = vit->second;
+            if (viewBody.contains("fromClause")) {
+                for (auto& item : viewBody["fromClause"])
+                    extractTables(item, tables, aliases);
+            }
+            return;
+        }
         tables.push_back(name);
         if (rv.contains("alias")) {
             auto& a = rv["alias"];
@@ -740,11 +753,38 @@ AnalyzedQuery analyzeSQL(const std::string& sql) {
     g_subqueryAliasMap.clear();
     g_subqueryExprMap.clear();
 
-    // Navigate to the SelectStmt
-    auto& stmt = ast["stmts"][0]["stmt"];
-    if (!stmt.contains("SelectStmt"))
+    // Navigate to the SelectStmt.  Handle CREATE VIEW statements by
+    // inlining the view definition into the main query's FROM clause.
+    // Find the last SelectStmt; also collect ViewStmt definitions.
+    json* selPtr = nullptr;
+    struct ViewDef { std::string name; json selectBody; std::vector<std::string> cols; };
+    std::vector<ViewDef> views;
+    for (auto& s : ast["stmts"]) {
+        if (s["stmt"].contains("ViewStmt")) {
+            auto& vs = s["stmt"]["ViewStmt"];
+            ViewDef vd;
+            if (vs.contains("view") && vs["view"].contains("RangeVar"))
+                vd.name = vs["view"]["RangeVar"].value("relname", "");
+            if (vd.name.empty()) continue;
+            vd.selectBody = vs["query"]["SelectStmt"];
+            if (vs.contains("aliases")) {
+                for (auto& a : vs["aliases"]) {
+                    if (a.contains("String") && a["String"].contains("str"))
+                        vd.cols.push_back(a["String"]["str"].get<std::string>());
+                    else if (a.contains("aliasname"))
+                        vd.cols.push_back(a["aliasname"].get<std::string>());
+                }
+            }
+            views.push_back(std::move(vd));
+            g_views[vd.name] = {vd.selectBody, vd.cols};
+        }
+        if (s["stmt"].contains("SelectStmt")) {
+            selPtr = &s["stmt"]["SelectStmt"];
+        }
+    }
+    if (!selPtr)
         throw std::runtime_error("Expected SELECT statement");
-    auto& sel = stmt["SelectStmt"];
+    auto& sel = *selPtr;
 
     // 1. Extract tables from FROM clause
     if (sel.contains("fromClause")) {
@@ -809,6 +849,35 @@ AnalyzedQuery analyzeSQL(const std::string& sql) {
         };
         for (auto& item : sel["fromClause"])
             extractSubWhere(item);
+    }
+
+    // 1c. Process inlined view definitions: extract view's WHERE clause
+    // and map view column aliases to their source expressions.
+    for (auto& [name, vp] : g_views) {
+        auto& [viewBody, viewCols] = vp;
+        if (viewBody.contains("whereClause")) {
+            auto pred = walkPredicate(viewBody["whereClause"], aq.tables);
+            separatePredicates(pred, aq.tables, aq.joins, aq.filters);
+        }
+        // Map view column aliases to SELECT target expressions.
+        if (viewBody.contains("targetList")) {
+            size_t ci = 0;
+            for (auto& t : viewBody["targetList"]) {
+                if (!t.contains("ResTarget")) continue;
+                auto& rt = t["ResTarget"];
+                std::string alias;
+                if (ci < viewCols.size()) alias = viewCols[ci++];
+                else alias = rt.value("name", "");
+                if (alias.empty()) continue;
+                if (!rt.contains("val")) continue;
+                auto expr = walkExpr(rt["val"], aq.tables);
+                if (!expr) continue;
+                if (auto* cr = std::get_if<ColRef>(&expr->node))
+                    g_subqueryAliasMap[alias] = *cr;
+                else
+                    g_subqueryExprMap[alias] = expr;
+            }
+        }
     }
 
     // 2. Extract WHERE clause predicates
