@@ -23,6 +23,14 @@ namespace {
 // File-scope alias map: alias -> real table name (e.g. "l1" -> "lineitem")
 std::unordered_map<std::string, std::string> g_aliasMap;
 
+// Subquery column alias → source ColRef.  Populated when a RangeSubselect's
+// targetList aliases a column reference (e.g. "n2.n_name AS nation").
+// Used to resolve outer-query column references that don't exist in physical
+// tables but were aliased in a FROM-clause subquery.
+std::unordered_map<std::string, ColRef> g_subqueryAliasMap;
+// Subquery column alias → source expression (for non-column expressions).
+std::unordered_map<std::string, ExprPtr> g_subqueryExprMap;
+
 const auto& schema() { return TPCHSchema::instance(); }
 
 // Resolve an unqualified column name to (table, column).
@@ -80,6 +88,11 @@ ExprPtr walkColumnRef(const json& node, const std::vector<std::string>& tables) 
     }
 
     if (resolvedTable.empty()) {
+        // Check subquery column aliases first (FROM-clause subquery SELECT list).
+        auto sqit = g_subqueryAliasMap.find(colName);
+        if (sqit != g_subqueryAliasMap.end())
+            return Expr::col(sqit->second.table, sqit->second.column,
+                             sqit->second.colIndex, sqit->second.dataType);
         // This is a SELECT alias (e.g., "revenue" in ORDER BY) — return as unresolved ColRef
         return Expr::col("", colName, -1, DataType::INT);
     }
@@ -671,6 +684,9 @@ AnalyzedQuery analyzeSQL(const std::string& sql) {
     pg_query_free_parse_result(result);
 
     AnalyzedQuery aq;
+    g_aliasMap.clear();
+    g_subqueryAliasMap.clear();
+    g_subqueryExprMap.clear();
 
     // Navigate to the SelectStmt
     auto& stmt = ast["stmts"][0]["stmt"];
@@ -703,6 +719,28 @@ AnalyzedQuery analyzeSQL(const std::string& sql) {
                     if (sub.contains("whereClause")) {
                         auto pred = walkPredicate(sub["whereClause"], aq.tables);
                         separatePredicates(pred, aq.tables, aq.joins, aq.filters);
+                    }
+                    // Extract subquery column aliases for outer-query resolution.
+                    // e.g. "n2.n_name AS nation" → g_subqueryAliasMap["nation"] = ColRef(nation, n_name)
+                    if (sub.contains("targetList")) {
+                        for (auto& t : sub["targetList"]) {
+                            if (!t.contains("ResTarget")) continue;
+                            auto& rt = t["ResTarget"];
+                            std::string alias = rt.value("name", "");
+                            if (alias.empty()) continue;
+                            if (!rt.contains("val")) continue;
+                            auto& val = rt["val"];
+                            if (val.contains("ColumnRef")) {
+                                auto cre = walkColumnRef(val["ColumnRef"], aq.tables);
+                                if (auto* cr = cre ? std::get_if<ColRef>(&cre->node) : nullptr) {
+                                    g_subqueryAliasMap[alias] = *cr;
+                                }
+                            } else {
+                                // Non-column expression (FuncCall, BinaryExpr, etc.)
+                                auto expr = walkExpr(val, aq.tables);
+                                if (expr) g_subqueryExprMap[alias] = expr;
+                            }
+                        }
                     }
                 }
             }
@@ -845,6 +883,35 @@ AnalyzedQuery analyzeSQL(const std::string& sql) {
         if (lc.contains("A_Const") && lc["A_Const"].contains("ival"))
             aq.limit = lc["A_Const"]["ival"]["ival"].get<int>();
     }
+
+    // Copy subquery alias maps to AnalyzedQuery for builder access.
+    aq.subqueryColMap = std::move(g_subqueryAliasMap);
+    aq.subqueryExprMap = std::move(g_subqueryExprMap);
+    g_subqueryAliasMap.clear();
+    g_subqueryExprMap.clear();
+
+    // Resolve subquery aliases in expressions: replace empty-table ColRefs
+    // with their source expressions from the subquery alias maps.
+    auto resolveExpr = [&](ExprPtr& expr) {
+        if (!expr) return;
+        if (auto* cr = std::get_if<ColRef>(&expr->node)) {
+            if (!cr->table.empty()) return;
+            auto it = aq.subqueryColMap.find(cr->column);
+            if (it != aq.subqueryColMap.end()) {
+                expr = Expr::col(it->second.table, it->second.column,
+                                 it->second.colIndex, it->second.dataType);
+                return;
+            }
+            auto eit = aq.subqueryExprMap.find(cr->column);
+            if (eit != aq.subqueryExprMap.end()) {
+                expr = eit->second;
+                return;
+            }
+        }
+    };
+    for (auto& t : aq.targets) { resolveExpr(t.expr); if (t.agg) resolveExpr(t.agg->innerExpr); }
+    for (auto& g : aq.groupBy) resolveExpr(g);
+    for (auto& o : aq.orderBy) resolveExpr(o.expr);
 
     return aq;
 }
