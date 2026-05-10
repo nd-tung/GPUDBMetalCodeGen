@@ -584,6 +584,36 @@ void separatePredicates(const PredPtr& pred, const std::vector<std::string>& tab
             separatePredicates(child, tables, joins, filters);
         return;
     }
+    if (auto* lo = std::get_if<LogicalOr>(&pred->node)) {
+        // OR branches: extract join conditions that appear in ALL branches
+        // (e.g. Q19: all branches have p_partkey = l_partkey).
+        std::vector<JoinClause> commonJoins;
+        bool first = true;
+        for (auto& child : lo->children) {
+            std::vector<JoinClause> branchJoins;
+            std::vector<PredPtr> branchFilters;
+            separatePredicates(child, tables, branchJoins, branchFilters);
+            if (first) {
+                commonJoins = std::move(branchJoins);
+                first = false;
+            } else {
+                // Keep only joins present in both
+                commonJoins.erase(
+                    std::remove_if(commonJoins.begin(), commonJoins.end(),
+                        [&](const JoinClause& jc) {
+                            for (auto& bj : branchJoins)
+                                if (jc.leftTable == bj.leftTable && jc.rightTable == bj.rightTable &&
+                                    jc.leftCol == bj.leftCol && jc.rightCol == bj.rightCol)
+                                    return false;
+                            return true;
+                        }),
+                    commonJoins.end());
+            }
+        }
+        for (auto& jc : commonJoins) joins.push_back(jc);
+        filters.push_back(pred);  // OR stays as filter for per-branch conditions
+        return;
+    }
     JoinClause jc;
     if (isJoinCondition(pred, jc))
         joins.push_back(jc);
