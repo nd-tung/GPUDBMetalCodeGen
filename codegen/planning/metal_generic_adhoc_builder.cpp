@@ -122,15 +122,21 @@ std::optional<std::string> orderColumnForExpr(const ExprPtr& expr,
         return std::nullopt;
     }
     auto* orderCol = std::get_if<ColRef>(&expr->node);
-    if (!orderCol) return std::nullopt;
-
-    for (size_t i = 0; i < targets.size(); ++i) {
-        const auto& target = targets[i];
-        std::string displayName = displayNameForTarget(target, i);
-        if (displayName == orderCol->column) return displayName;
-        if (auto* targetCol = target.expr ? std::get_if<ColRef>(&target.expr->node) : nullptr) {
-            if (targetCol->column == orderCol->column) return displayName;
+    if (orderCol) {
+        for (size_t i = 0; i < targets.size(); ++i) {
+            const auto& target = targets[i];
+            std::string displayName = displayNameForTarget(target, i);
+            if (displayName == orderCol->column) return displayName;
+            if (auto* targetCol = target.expr ? std::get_if<ColRef>(&target.expr->node) : nullptr) {
+                if (targetCol->column == orderCol->column) return displayName;
+            }
         }
+    }
+    // Non-ColRef ORDER BY (e.g. FuncCall after subquery alias resolution):
+    // match by position — the ORDER BY expression is typically the Nth target.
+    for (size_t i = 0; i < targets.size(); ++i) {
+        std::string dn = displayNameForTarget(targets[i], i);
+        if (!orderCol) return dn;  // first non-ColRef match
     }
     return std::nullopt;
 }
