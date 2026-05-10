@@ -88,12 +88,15 @@ ExprPtr walkColumnRef(const json& node, const std::vector<std::string>& tables) 
     }
 
     if (resolvedTable.empty()) {
-        // Check subquery column aliases first (FROM-clause subquery SELECT list).
+        // Check subquery column aliases (FROM-clause subquery SELECT list).
         auto sqit = g_subqueryAliasMap.find(colName);
         if (sqit != g_subqueryAliasMap.end())
             return Expr::col(sqit->second.table, sqit->second.column,
                              sqit->second.colIndex, sqit->second.dataType);
-        // This is a SELECT alias (e.g., "revenue" in ORDER BY) — return as unresolved ColRef
+        // Check subquery expression aliases (e.g. EXTRACT(YEAR FROM ...) AS o_year)
+        auto eqit = g_subqueryExprMap.find(colName);
+        if (eqit != g_subqueryExprMap.end()) return eqit->second;
+        // Unresolvable — SELECT alias or derived column
         return Expr::col("", colName, -1, DataType::INT);
     }
 
