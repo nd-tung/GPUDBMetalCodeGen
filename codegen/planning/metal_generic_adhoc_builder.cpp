@@ -61,6 +61,31 @@ std::string displayNameForTarget(const SelectTarget& target, size_t targetIndex)
     return "expr_" + std::to_string(targetIndex);
 }
 
+// Find a target's display name by matching a ColRef (for GROUP BY columns).
+std::string displayNameForTargetByCol(const AnalyzedQuery& aq, const ColRef& ref) {
+    for (size_t i = 0; i < aq.targets.size(); ++i) {
+        const auto& t = aq.targets[i];
+        if (!t.isAgg && t.expr && std::holds_alternative<ColRef>(t.expr->node)) {
+            auto* col = std::get_if<ColRef>(&t.expr->node);
+            if (col->column == ref.column && col->table == ref.table)
+                return displayNameForTarget(t, i);
+        }
+    }
+    // No matching SELECT target — use the column name directly.
+    return ref.column;
+}
+
+std::string aggFuncName(AggFunc func) {
+    switch (func) {
+        case AggFunc::SUM: return "SUM";
+        case AggFunc::COUNT: return "COUNT";
+        case AggFunc::AVG: return "AVG";
+        case AggFunc::MIN: return "MIN";
+        case AggFunc::MAX: return "MAX";
+        default: return "SUM";
+    }
+}
+
 bool exprIsColumn(const ExprPtr& expr, const ColRef& expected) {
     auto* col = expr ? std::get_if<ColRef>(&expr->node) : nullptr;
     return col && col->table == expected.table && col->column == expected.column;
@@ -1073,8 +1098,7 @@ std::optional<MetalQueryPlan> buildGenericMultiTableAdhocPlan_impl(
         // Fall through to the materialize section below.
     } else {
         // Aggregation path guard checks.
-        if (!aq.orderBy.empty()) return fail("ORDER BY not supported by multi-table aggregation path.");
-        if (aq.limit >= 0)    return fail("LIMIT not supported by multi-table aggregation path.");
+        // ORDER BY and LIMIT are allowed — they'll be handled CPU-side.
 
         // Aggregations: SUM/COUNT/AVG/MIN/MAX (no DISTINCT).
         for (const auto& t : aq.targets) {
@@ -1555,23 +1579,149 @@ std::optional<MetalQueryPlan> buildGenericMultiTableAdhocPlan_impl(
             }
         }
         appendPhase(plan, "ADHOC_multi_probe_scalar", std::move(reduce));
+        if (aq.limit >= 0) {
+            plan.cpuSort = MetalQueryPlan::CpuSort{{}, aq.limit};
+        }
         return plan;
     }
 
     // ---------- Grouped aggregation ----------
-    // Currently restrict to a single group key over a small-int domain.
-    if (aq.groupBy.size() != 1)
-        return fail("Multi-table planner: only single-column GROUP BY supported (extend later).");
-    auto* gc = std::get_if<ColRef>(&aq.groupBy[0]->node);
-    if (!gc) return fail("GROUP BY expression must be a column reference.");
+    // Try GPU KeyedAgg first; if the group key is not a known small-int
+    // domain or is multi-column, fall back to materialize + host-side GROUP BY.
+    bool canUseGpuKeyedAgg = (aq.groupBy.size() == 1);
+    const ColRef* gc = nullptr;
+    GroupDomain domain{0, 0};
+    int numBuckets = 0;
 
-    auto domain = smallIntGroupDomain(*gc);
-    if (!domain || domain->maxValue < domain->minValue)
-        return fail("Multi-table planner: GROUP BY column has no known small-int domain.");
-    int numBuckets = domain->maxValue - domain->minValue + 1;
-    if (numBuckets > 4096)
-        return fail("Multi-table planner: GROUP BY domain exceeds 4096 buckets.");
+    if (canUseGpuKeyedAgg) {
+        gc = std::get_if<ColRef>(&aq.groupBy[0]->node);
+        if (!gc) canUseGpuKeyedAgg = false;
+        else {
+            auto d = smallIntGroupDomain(*gc);
+            if (!d || d->maxValue < d->minValue) canUseGpuKeyedAgg = false;
+            else {
+                domain = *d;
+                numBuckets = domain.maxValue - domain.minValue + 1;
+                if (numBuckets > 4096) canUseGpuKeyedAgg = false;
+            }
+        }
+    }
 
+    if (!canUseGpuKeyedAgg) {
+        // ---------- MaterializeAgg fallback: emit raw rows on GPU, group on host ----------
+        // Build a materialize plan that outputs group-by keys and aggregate inputs.
+        // Host-side GROUP BY happens after GPU result collection.
+        MetalQueryPlan::CpuSort cpuSort;
+        cpuSort.limit = aq.limit;
+        for (const auto& order : aq.orderBy) {
+            auto column = orderColumnForExpr(order.expr, aq.targets);
+            if (!column) return fail("ORDER BY column not found in SELECT targets.");
+            cpuSort.keys.push_back({*column, order.descending});
+        }
+
+        // Build CpuGroupBy metadata.
+        MetalQueryPlan::CpuGroupBy cpuGB;
+        for (const auto& g : aq.groupBy) {
+            auto* gcRef = std::get_if<ColRef>(&g->node);
+            if (!gcRef) return fail("GROUP BY expression must be a column reference.");
+            cpuGB.keyColumns.push_back(displayNameForTargetByCol(aq, *gcRef));
+        }
+        for (size_t ti = 0; ti < aq.targets.size(); ++ti) {
+            const auto& target = aq.targets[ti];
+            if (target.isAgg && target.agg) {
+                cpuGB.aggColumns.push_back(displayNameForTarget(target, ti));
+                cpuGB.aggFuncs.push_back(aggFuncName(target.agg->func));
+            }
+        }
+
+        // Build materialize for all needed columns.
+        std::set<std::string> matCols;
+        for (const auto& target : aq.targets) {
+            if (target.expr) collectColumns(target.expr, matCols);
+        }
+        for (const auto& g : aq.groupBy) collectColumns(g, matCols);
+
+        auto materialize = std::make_unique<MetalMaterialize>(
+            std::move(probePipe), "d_adhoc_multi_result_count", "1");
+        const std::string outputSize = tableSizeName(probeTable);
+
+        // Emit group-by keys and raw aggregate input values as columns.
+        int matColIdx = 0;
+        for (size_t ti = 0; ti < aq.targets.size(); ++ti) {
+            const auto& target = aq.targets[ti];
+            DataType type = inferExprDataType(target.expr);
+            std::string displayName = displayNameForTarget(target, ti);
+            std::string bufferName = "d_adhoc_matgb_" + std::to_string(matColIdx) + "_" + sanitizeIdentifier(displayName);
+            int stringLen = fixedStringLenForExpr(target.expr);
+            std::string sizeExpr = outputSize;
+            if (stringLen > 0) sizeExpr += " * " + std::to_string(stringLen);
+
+            std::string expr;
+            if (target.isAgg && target.agg) {
+                // For aggregates in materialize mode, emit the raw input value
+                // (COUNT → 1.0, others → inner expression) — host will aggregate.
+                if (target.agg->func == AggFunc::COUNT || target.agg->isStar) {
+                    expr = "1.0f";
+                    type = DataType::FLOAT;
+                } else if (target.agg->innerExpr) {
+                    expr = exprToMetal(target.agg->innerExpr, idxVar);
+                    expr = rewriteForProbe(expr, idxVar, carryVar);
+                    type = DataType::FLOAT;
+                } else {
+                    expr = "0";
+                }
+            } else {
+                expr = materializeValueExpr(target.expr, idxVar);
+                expr = rewriteForProbe(expr, idxVar, carryVar);
+            }
+
+            // Handle CHAR1/CHAR_FIXED from non-probe tables
+            if (auto* col = target.expr ? std::get_if<ColRef>(&target.expr->node) : nullptr) {
+                if (col->dataType == DataType::CHAR1) {
+                    std::string owner = ownerTableForColumn(aq, col->column);
+                    if (!owner.empty() && owner != probeTable) {
+                        stringLen = 0; // scalar carry
+                    }
+                }
+                if (col->dataType == DataType::CHAR_FIXED) {
+                    std::string owner = ownerTableForColumn(aq, col->column);
+                    if (!owner.empty() && owner != probeTable) {
+                        auto jkIt = charFixedJoinKey.find(owner);
+                        if (jkIt != charFixedJoinKey.end()) {
+                            int len = fixedStringLenForExpr(target.expr);
+                            std::string from = col->column + " + " + idxVar + " * " + std::to_string(len);
+                            std::string to = col->column + " + " + jkIt->second + "[" + idxVar + "] * " + std::to_string(len);
+                            size_t pos = expr.find(from);
+                            if (pos != std::string::npos)
+                                expr.replace(pos, from.size(), to);
+                        }
+                    }
+                }
+            }
+
+            materialize->addColumn(bufferName, metalTypeForDataType(type),
+                                   expr, displayName, sizeExpr, stringLen);
+            matColIdx++;
+        }
+
+        if (!cpuSort.keys.empty() || cpuSort.limit >= 0) plan.cpuSort = cpuSort;
+        plan.cpuGroupBy = cpuGB;
+        appendPhase(plan, "ADHOC_multi_matgb", std::move(materialize));
+
+        // Register build-side CHAR_FIXED extra buffers on the newly created phase.
+        for (const auto& [tname, cols] : neededByTable) {
+            if (tname == probeTable) continue;
+            for (const auto& c : cols) {
+                const auto& cdef = TPCHSchema::instance().table(tname).col(c);
+                if (cdef.type == DataType::CHAR_FIXED) {
+                    plan.phases.back().extraBuffers.push_back({c, "char", true, false});
+                }
+            }
+        }
+        return plan;
+    }
+
+    // --- GPU KeyedAgg path (small-int domain, single-column) ---
     // Source for the bucket value: probe column or carried variable.
     std::string keySource;
     if (gc->table == probeTable) {
@@ -1583,8 +1733,8 @@ std::optional<MetalQueryPlan> buildGenericMultiTableAdhocPlan_impl(
             return fail("GROUP BY column not present on probe path: " + gc->table + "." + gc->column);
         keySource = it->second;
     }
-    std::string bucketExpr = (domain->minValue != 0)
-        ? "(" + keySource + " - " + std::to_string(domain->minValue) + ")"
+    std::string bucketExpr = (domain.minValue != 0)
+        ? "(" + keySource + " - " + std::to_string(domain.minValue) + ")"
         : keySource;
     bucketExpr = "clamp(" + bucketExpr + ", 0, " + std::to_string(numBuckets - 1) + ")";
 
@@ -1730,7 +1880,7 @@ std::optional<MetalQueryPlan> buildGenericMultiTableAdhocPlan_impl(
     decode.name = keyDisplay;
     decode.numValues = numBuckets;
     decode.stride = 1;
-    decode.keyBase = domain->minValue;
+    decode.keyBase = domain.minValue;
     agg->setMultiKeyResult({keyDisplay}, {decode}, numBuckets);
 
     for (const auto& p : pending) {
@@ -1746,6 +1896,17 @@ std::optional<MetalQueryPlan> buildGenericMultiTableAdhocPlan_impl(
     }
 
     appendPhase(plan, "ADHOC_multi_probe_group", std::move(agg));
+
+    // CPU-side ORDER BY + LIMIT for grouped results.
+    if (!aq.orderBy.empty() || aq.limit >= 0) {
+        MetalQueryPlan::CpuSort cpuSort;
+        cpuSort.limit = aq.limit;
+        for (const auto& order : aq.orderBy) {
+            auto column = orderColumnForExpr(order.expr, aq.targets);
+            if (column) cpuSort.keys.push_back({*column, order.descending});
+        }
+        plan.cpuSort = cpuSort;
+    }
     return plan;
 }
 
