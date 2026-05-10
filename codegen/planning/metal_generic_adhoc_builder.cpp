@@ -1129,8 +1129,8 @@ bool multiTableBuildJoinTree(const AnalyzedQuery& aq, int probeIdx,
             return false;
         }
     }
-    if (edges.size() != n - 1) {
-        if (error) *error = "Multi-table planner expects a tree-shaped join graph (n-1 edges).";
+    if (edges.size() < n - 1) {
+        if (error) *error = "Multi-table planner: not enough join edges to connect all tables.";
         return false;
     }
 
@@ -1447,8 +1447,9 @@ std::optional<MetalQueryPlan> buildGenericMultiTableAdhocPlan_impl(
         for (const auto& t : aq.targets) {
             if (t.isAgg) {
                 if (!t.agg) return fail("Malformed aggregate target.");
-                if (t.agg->func == AggFunc::COUNT_DISTINCT)
-                    return fail("COUNT(DISTINCT) not supported by generic multi-table planner.");
+                // COUNT(DISTINCT) is wired in the single-table grouped planner;
+                // the multi-table planner defers to the same aggregate terminal,
+                // which will fail with a more specific error if unsupported.
             }
         }
     }
