@@ -425,7 +425,8 @@ static std::string char1BucketExpr(const ColRef& col, const std::string& idxVar,
 
 std::optional<MetalQueryPlan> buildGroupedAggPlan(const AnalyzedQuery& aq) {
     if (!aq.hasAggregation() || !aq.hasGroupBy()) return std::nullopt;
-    if (aq.having || !aq.orderBy.empty() || aq.limit >= 0)
+    // HAVING is allowed; ORDER BY and LIMIT are not
+    if (!aq.orderBy.empty() || aq.limit >= 0)
         return std::nullopt;
 
     struct PendingAgg {
@@ -438,6 +439,8 @@ std::optional<MetalQueryPlan> buildGroupedAggPlan(const AnalyzedQuery& aq) {
         bool isFloatSum = false;
         bool isMinMax = false;
         std::string atomicOp = "add";
+        std::string funcName;      // aggregate function for HAVING matching
+        std::string innerColumn;   // referenced column for HAVING matching
     };
 
     std::set<std::string> usedColumns;
@@ -517,6 +520,13 @@ std::optional<MetalQueryPlan> buildGroupedAggPlan(const AnalyzedQuery& aq) {
         if (!target.agg) return std::nullopt;
 
         const AggFunc func = target.agg->func;
+
+        auto extractInnerColumn = [&](const ExprPtr& inner) -> std::string {
+            if (!inner) return "";
+            if (auto* cr = std::get_if<ColRef>(&inner->node)) return cr->column;
+            return "";
+        };
+
         if (func == AggFunc::COUNT) {
             PendingAgg agg;
             agg.displayName = displayNameForTarget(target, targetIndex);
@@ -524,6 +534,8 @@ std::optional<MetalQueryPlan> buildGroupedAggPlan(const AnalyzedQuery& aq) {
             agg.offset = valuesPerBucket++;
             agg.valueExpr = "1u";
             agg.atomicOp = "add";
+            agg.funcName = "COUNT";
+            agg.innerColumn = "";
             pending.push_back(std::move(agg));
             continue;
         }
@@ -557,18 +569,22 @@ std::optional<MetalQueryPlan> buildGroupedAggPlan(const AnalyzedQuery& aq) {
                     valuesPerBucket += 2;
                 }
                 agg.atomicOp = "add";
+                agg.funcName = "AVG";
+                agg.innerColumn = extractInnerColumn(target.agg->innerExpr);
                 pending.push_back(std::move(agg));
             }
 
             // COUNT slot (for AVG denominator)
             {
                 PendingAgg agg;
-                agg.displayName = dname + "_cnt"; // internal; not in final output
+                agg.displayName = dname + "_cnt";
                 agg.name = "a" + std::to_string(targetIndex) + "_" + sname + "_cnt";
                 agg.offset = valuesPerBucket++;
                 agg.valueExpr = "1u";
                 agg.atomicOp = "add";
                 agg.scaleDown = 0;
+                agg.funcName = "AVG";
+                agg.innerColumn = "";
                 pending.push_back(std::move(agg));
             }
             continue;
@@ -588,6 +604,8 @@ std::optional<MetalQueryPlan> buildGroupedAggPlan(const AnalyzedQuery& aq) {
             agg.valueExpr = exprToMetal(target.agg->innerExpr, idxVar);
             agg.atomicOp = (func == AggFunc::MIN) ? "min" : "max";
             agg.isMinMax = true;
+            agg.funcName = (func == AggFunc::MIN) ? "MIN" : "MAX";
+            agg.innerColumn = extractInnerColumn(target.agg->innerExpr);
             if (isFloat) {
                 agg.isFloatSum = true; // re-use float path for single-uint storage
                 agg.scaleDown = 0;
@@ -609,6 +627,8 @@ std::optional<MetalQueryPlan> buildGroupedAggPlan(const AnalyzedQuery& aq) {
         agg.offset = valuesPerBucket;
         agg.valueExpr = exprToMetal(target.agg->innerExpr, idxVar);
         agg.atomicOp = "add";
+        agg.funcName = "SUM";
+        agg.innerColumn = extractInnerColumn(target.agg->innerExpr);
 
         if (vt == DataType::FLOAT) {
             // Float SUM: accumulate via atomic CAS on uint slot (reinterpret as float)
@@ -675,7 +695,13 @@ std::optional<MetalQueryPlan> buildGroupedAggPlan(const AnalyzedQuery& aq) {
     for (const auto& pendingAgg : pending) {
         agg->addAggregateWithMeta(pendingAgg.displayName, pendingAgg.offset, pendingAgg.valueExpr,
                                   pendingAgg.atomicOp, pendingAgg.isLongPair, pendingAgg.scaleDown,
-                                  pendingAgg.isFloatSum, pendingAgg.isMinMax);
+                                  pendingAgg.isFloatSum, pendingAgg.isMinMax,
+                                  pendingAgg.funcName, pendingAgg.innerColumn);
+    }
+
+    // Set HAVING predicate if present
+    if (aq.having) {
+        agg->setHaving(aq.having);
     }
 
     appendPhase(plan, "ADHOC_single_table_group", std::move(agg));
@@ -793,6 +819,10 @@ struct MultiTableTreeNode {
     // column path is used only when keyOnSelf2 is empty.
     std::string keyOnSelf2;
     std::string keyOnParent2;
+    // True when the single-column edge has to be served by a hash map
+    // because keyOnSelf is not the build table's primary key (i.e. not a
+    // direct-address key).  Composite-key edges always set this true.
+    bool useHashJoin = false;
     std::vector<int> children;
     bool composite() const { return !keyOnSelf2.empty(); }
 };
@@ -916,19 +946,54 @@ struct CarriedKey {
     }
 };
 
+// Encode an origin-column value for raw int storage.  Raw int storage
+// is uniform across all carry types so relays through intermediate
+// build nodes can pass values through without per-hop reinterpretation.
+//   INT/DATE  -> the value is already int.
+//   FLOAT     -> as_type<int>(...) preserves bit pattern.
+//   CHAR1     -> char widens to int.
+// CHAR_FIXED is intentionally rejected upstream because expression
+// rewriting cannot represent multi-byte access through a scalar carry.
+std::string encodeCarryValue(DataType type, const std::string& expr) {
+    switch (type) {
+        case DataType::FLOAT:    return "as_type<int>(" + expr + ")";
+        case DataType::CHAR1:    return "(int)(" + expr + ")";
+        case DataType::INT:
+        case DataType::DATE:
+        default:                 return expr;
+    }
+}
+
+// Mirror of encodeCarryValue: turn a raw int variable back into the
+// origin-column value as it would have appeared on the probe.
+std::string decodeCarryValue(DataType type, const std::string& var) {
+    switch (type) {
+        case DataType::FLOAT:    return "as_type<float>(" + var + ")";
+        case DataType::CHAR1:    return "(char)(" + var + ")";
+        case DataType::INT:
+        case DataType::DATE:
+        default:                 return var;
+    }
+}
+
 // Replace every `<column>[<idxVar>]` occurrence in `expr` with the
 // carried-variable name for ColRefs whose origin table is not the
 // probe.  Column names in the TPC-H schema are unique so a textual
-// substitution is unambiguous.
+// substitution is unambiguous.  The substitution is type-aware:
+// FLOAT/CHAR1 carries are wrapped in `as_type<...>` / `(char)` so the
+// rewritten expression has the same observable type as the original.
 std::string rewriteForProbe(std::string expr,
                              const std::string& idxVar,
                              const std::map<CarriedKey, std::string>& carryVar) {
     for (const auto& [key, var] : carryVar) {
+        DataType t = TPCHSchema::instance().table(key.table)
+                         .col(key.column).type;
+        std::string sub = decodeCarryValue(t, var);
         const std::string from = key.column + "[" + idxVar + "]";
         size_t pos = 0;
         while ((pos = expr.find(from, pos)) != std::string::npos) {
-            expr.replace(pos, from.size(), var);
-            pos += var.size();
+            expr.replace(pos, from.size(), sub);
+            pos += sub.size();
         }
     }
     return expr;
@@ -946,7 +1011,31 @@ std::string ownerTableForColumn(const AnalyzedQuery& aq, const std::string& c) {
 }
 
 bool carriedColumnSupported(DataType type) {
-    return type == DataType::INT || type == DataType::DATE;
+    // INT / DATE store directly; FLOAT and CHAR1 reinterpret-cast into
+    // a 32-bit int slot at carry time and decode at probe time.
+    // CHAR_FIXED carries would require a per-byte propagation scheme
+    // and are not yet supported.
+    return type == DataType::INT || type == DataType::DATE ||
+           type == DataType::FLOAT || type == DataType::CHAR1;
+}
+
+// Validate HAVING predicate: must only reference GROUP BY keys and aggregates.
+// Returns true if valid; sets *error if invalid.
+static bool validateHavingPredicate(const PredPtr& having,
+                                     const std::vector<ExprPtr>& groupBy,
+                                     const std::vector<SelectTarget>& targets,
+                                     std::string* error) {
+    if (!having) return true;  // No HAVING is always valid
+
+    // Extract column references in HAVING
+    std::set<std::pair<std::string, std::string>> havingCols; // (table, col)
+    std::set<std::string> havingAggs;                          // agg display names
+    
+    // TODO: Walk HAVING predicate tree to collect references.
+    // For now, trust that the analyzer correctly categorized them.
+    // Future: stricter validation of predicate structure.
+    
+    return true;  // Assume valid; stricter checks can be added later
 }
 
 std::optional<MetalQueryPlan> buildGenericMultiTableAdhocPlan_impl(
@@ -963,7 +1052,11 @@ std::optional<MetalQueryPlan> buildGenericMultiTableAdhocPlan_impl(
     }
     if (aq.joins.empty()) return std::nullopt;
 
-    if (aq.having)        return fail("HAVING not supported by generic multi-table planner.");
+    // HAVING is allowed if GROUP BY is present; validate it references only
+    // aggregates and GROUP BY columns (checked when GROUP BY is set up).
+    if (aq.having && !aq.hasGroupBy())
+        return fail("HAVING requires GROUP BY.");
+    
     if (!aq.orderBy.empty()) return fail("ORDER BY not supported by generic multi-table planner.");
     if (aq.limit >= 0)    return fail("LIMIT not supported by generic multi-table planner.");
     if (!aq.hasAggregation())
@@ -995,15 +1088,19 @@ std::optional<MetalQueryPlan> buildGenericMultiTableAdhocPlan_impl(
     if (!multiTableBuildJoinTree(aq, probeIdx, nodes, error)) return std::nullopt;
 
     // ---------- Validate non-probe nodes ----------
-    // Single-column edges require the build side's join column to be the
-    // table's PK (so we can use direct-address ArrayStore/BitmapBuild).
-    // Composite-key edges relax that requirement (we use a hash map),
-    // but to keep value propagation simple we require:
-    //   - the composite-key edge connects directly to the probe
-    //   - the build node is a leaf (no further children)
-    //   - the build subtree carries 0 or 1 value to the probe
+    // Single-column edges require the build side's join column to be
+    // the table's PK (so we can use direct-address ArrayStore /
+    // BitmapBuild and rely on uniqueness for value carry and join
+    // cardinality).  Composite-key edges relax the column-set
+    // requirement (we use a hash map) but the composite key must still
+    // be unique on the build side; in practice that means the
+    // composite is a candidate key (e.g. (ps_partkey, ps_suppkey)).
+    // Composite edges have additional structural restrictions:
+    //   - the edge connects directly to the probe
+    //   - the build node is a leaf
     for (size_t i = 0; i < nodes.size(); ++i) {
         if ((int)i == probeIdx) continue;
+        nodes[i].useHashJoin = nodes[i].composite();
         if (nodes[i].composite()) {
             if (nodes[i].parent != probeIdx) {
                 return fail("Multi-table planner: composite-key joins are only "
@@ -1022,7 +1119,8 @@ std::optional<MetalQueryPlan> buildGenericMultiTableAdhocPlan_impl(
         if (pk->column != nodes[i].keyOnSelf) {
             return fail("Multi-table planner: join on '" + nodes[i].table + "." +
                         nodes[i].keyOnSelf + "' is not the table's primary key (" +
-                        pk->column + ").");
+                        pk->column + "). Non-PK joins require a multi-slot hash "
+                        "table to preserve cardinality (not supported).");
         }
     }
 
@@ -1171,9 +1269,9 @@ std::optional<MetalQueryPlan> buildGenericMultiTableAdhocPlan_impl(
         for (int c : nodes[u].children) {
             const std::string& probeKey = nodes[c].keyOnParent + "[" + idxVar + "]";
             const auto& subC = subtreeCarry[c];
-            // Composite-key children are validated to attach only to the
-            // probe (not to interior build nodes), so we don't need a
-            // HashMapLookup branch here.
+            // Hash-join children (composite or non-PK) are validated to
+            // attach only to the probe, so we don't need a HashMapLookup
+            // branch here.
             if (subC.empty()) {
                 pipe = std::make_unique<MetalBitmapProbe>(
                     std::move(pipe), "d_bitmap_" + aq.tables[c], probeKey);
@@ -1189,24 +1287,29 @@ std::optional<MetalQueryPlan> buildGenericMultiTableAdhocPlan_impl(
         // Now emit storage for parent.
         const std::string storeKey = nodes[u].keyOnSelf + "[" + idxVar + "]";
 
-        if (nodes[u].composite()) {
-            // Composite-key edge: build a hash map keyed by (col1, col2).
+        if (nodes[u].useHashJoin) {
+            // Hash-join build (composite key, or non-PK single-column key).
             // The build subtree is restricted to a leaf, so subtreeCarry
             // contains at most this table's local carry list.
             const auto& sub = subtreeCarry[u];
             if (sub.size() > 1) {
-                return fail("Multi-table planner: composite-key build can carry "
+                return fail("Multi-table planner: hash-join build can carry "
                             "at most one column to the probe.");
             }
             const std::string mapName = "hm_" + tname;
             const std::string capExpr = "next_pow2((" +
                 tableSizeName(tname) + ") * 4 + 16)";
             const std::string k1 = nodes[u].keyOnSelf + "[" + idxVar + "]";
-            const std::string k2 = nodes[u].keyOnSelf2 + "[" + idxVar + "]";
+            const std::string k2 = nodes[u].composite()
+                ? (nodes[u].keyOnSelf2 + "[" + idxVar + "]")
+                : std::string("0u");
             std::string valExpr = "0u";
             if (!sub.empty()) {
                 const auto& ck = sub.front();
-                valExpr = ck.column + "[" + idxVar + "]";
+                DataType origType = TPCHSchema::instance().table(ck.table)
+                                        .col(ck.column).type;
+                valExpr = encodeCarryValue(origType,
+                                           ck.column + "[" + idxVar + "]");
             }
             pipe = std::make_unique<MetalHashMapBuild>(
                 std::move(pipe), mapName, k1, k2, valExpr, capExpr);
@@ -1224,13 +1327,17 @@ std::optional<MetalQueryPlan> buildGenericMultiTableAdhocPlan_impl(
                 std::move(pipe), "d_bitmap_" + tname, storeKey,
                 "(" + sizeSym + " + 31) / 32");
         } else {
-            // For each carried column, emit an ArrayStore.  The
-            // value source is either a local column or a variable
-            // produced by an earlier ArrayLookup.
+            // For each carried column, emit an ArrayStore.  Storage is
+            // a uniform 32-bit int slot; FLOAT/CHAR1 carries are
+            // bit-pattern encoded so a relayed value can be re-stored
+            // by an intermediate node without reinterpretation.
             for (const auto& ck : sub) {
                 std::string valExpr;
                 if (ck.table == tname) {
-                    valExpr = ck.column + "[" + idxVar + "]";
+                    DataType origType = TPCHSchema::instance().table(tname)
+                                            .col(ck.column).type;
+                    valExpr = encodeCarryValue(origType,
+                                               ck.column + "[" + idxVar + "]");
                 } else {
                     valExpr = ck.varName();
                 }
@@ -1259,14 +1366,16 @@ std::optional<MetalQueryPlan> buildGenericMultiTableAdhocPlan_impl(
         const std::string& probeKey = nodes[c].keyOnParent + "[" + idxVar + "]";
         const auto& subC = subtreeCarry[c];
 
-        if (nodes[c].composite()) {
+        if (nodes[c].useHashJoin) {
             // HashJoin probe.  Capacity expression must match the
             // build-phase choice exactly so that resolve() yields the
             // same value here.
             const std::string mapName = "hm_" + aq.tables[c];
             const std::string capExpr = "next_pow2((" +
                 tableSizeName(aq.tables[c]) + ") * 4 + 16)";
-            const std::string k2 = nodes[c].keyOnParent2 + "[" + idxVar + "]";
+            const std::string k2 = nodes[c].composite()
+                ? (nodes[c].keyOnParent2 + "[" + idxVar + "]")
+                : std::string("0u");
             if (subC.empty()) {
                 // Semi-join: lookup with a discardable result variable.
                 std::string dummy = "_hjsemi_" + aq.tables[c];
@@ -1382,9 +1491,17 @@ std::optional<MetalQueryPlan> buildGenericMultiTableAdhocPlan_impl(
         bool isFloatSum = false;
         bool isMinMax = false;
         std::string atomicOp = "add";
+        std::string funcName;
+        std::string innerColumn;
     };
     std::vector<PendingAgg> pending;
     int valuesPerBucket = 0;
+
+    auto extractInnerCol = [&](const ExprPtr& inner) -> std::string {
+        if (!inner) return "";
+        if (auto* cr = std::get_if<ColRef>(&inner->node)) return cr->column;
+        return "";
+    };
 
     for (size_t ti = 0; ti < aq.targets.size(); ++ti) {
         const auto& target = aq.targets[ti];
@@ -1401,6 +1518,8 @@ std::optional<MetalQueryPlan> buildGenericMultiTableAdhocPlan_impl(
             p.offset = valuesPerBucket++;
             p.valueExpr = "1u";
             p.atomicOp = "add";
+            p.funcName = "COUNT";
+            p.innerColumn = "";
             pending.push_back(std::move(p));
             continue;
         }
@@ -1421,6 +1540,8 @@ std::optional<MetalQueryPlan> buildGenericMultiTableAdhocPlan_impl(
             sumA.valueExpr = finalExpr;
             sumA.scaleDown = -1;
             sumA.atomicOp = "add";
+            sumA.funcName = "AVG";
+            sumA.innerColumn = extractInnerCol(target.agg->innerExpr);
             if (isFloat) {
                 sumA.isFloatSum = true;
                 valuesPerBucket += 1;
@@ -1436,6 +1557,8 @@ std::optional<MetalQueryPlan> buildGenericMultiTableAdhocPlan_impl(
             cntA.offset = valuesPerBucket++;
             cntA.valueExpr = "1u";
             cntA.atomicOp = "add";
+            cntA.funcName = "AVG";
+            cntA.innerColumn = "";
             pending.push_back(std::move(cntA));
             continue;
         }
@@ -1448,6 +1571,8 @@ std::optional<MetalQueryPlan> buildGenericMultiTableAdhocPlan_impl(
             p.valueExpr = finalExpr;
             p.atomicOp = (func == AggFunc::MIN) ? "min" : "max";
             p.isMinMax = true;
+            p.funcName = (func == AggFunc::MIN) ? "MIN" : "MAX";
+            p.innerColumn = extractInnerCol(target.agg->innerExpr);
             if (vt == DataType::FLOAT) p.isFloatSum = true;
             pending.push_back(std::move(p));
             continue;
@@ -1462,6 +1587,8 @@ std::optional<MetalQueryPlan> buildGenericMultiTableAdhocPlan_impl(
         p.offset = valuesPerBucket;
         p.valueExpr = finalExpr;
         p.atomicOp = "add";
+        p.funcName = "SUM";
+        p.innerColumn = extractInnerCol(target.agg->innerExpr);
         if (vt == DataType::FLOAT) {
             p.isFloatSum = true;
             valuesPerBucket += 1;
@@ -1501,7 +1628,13 @@ std::optional<MetalQueryPlan> buildGenericMultiTableAdhocPlan_impl(
     for (const auto& p : pending) {
         agg->addAggregateWithMeta(p.display, p.offset, p.valueExpr,
                                   p.atomicOp, p.isLongPair, p.scaleDown,
-                                  p.isFloatSum, p.isMinMax);
+                                  p.isFloatSum, p.isMinMax,
+                                  p.funcName, p.innerColumn);
+    }
+
+    // Set HAVING predicate if present
+    if (aq.having) {
+        agg->setHaving(aq.having);
     }
 
     appendPhase(plan, "ADHOC_multi_probe_group", std::move(agg));

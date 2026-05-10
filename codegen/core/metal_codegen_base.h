@@ -149,6 +149,8 @@ public:
                                 const std::vector<MetalResultSchema::KeyedAggSlot>& slots = {},
                                 const std::string& keyDisplayName = "",
                                 int keyBase = 0);
+    void setKeyedAggHaving(const PredPtr& havingPredicate);
+    void setKeyedAggHavingEvaluatedOnGPU();
     const MetalResultSchema& getResultSchema() const;
     MetalResultSchema& getResultSchemaMutable();
 

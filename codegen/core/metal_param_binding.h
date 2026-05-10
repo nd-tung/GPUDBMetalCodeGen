@@ -14,6 +14,7 @@
 #include <stdexcept>
 #include <cstddef>
 #include <cstdint>
+#include "query_analyzer.h"  // for PredPtr
 
 namespace codegen {
 
@@ -159,6 +160,11 @@ struct MetalResultSchema {
             int keyBase = 0;            // for integer keys (additive constant)
         };
         std::vector<MultiKeyInfo> multiKeys;
+        // Optional HAVING predicate (applied during result collection)
+        PredPtr havingPredicate;
+        // When true, the HAVING predicate was already evaluated on GPU
+        // (inline filter after threadgroup reduction). Skip CPU-side evaluation.
+        bool havingEvaluatedOnGPU = false;
     };
     KeyedAggInfo keyedAgg;
 };
