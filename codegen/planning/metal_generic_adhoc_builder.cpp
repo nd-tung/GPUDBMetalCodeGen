@@ -473,9 +473,7 @@ static std::string char1BucketExpr(const ColRef& col, const std::string& idxVar,
 
 std::optional<MetalQueryPlan> buildGroupedAggPlan(const AnalyzedQuery& aq) {
     if (!aq.hasAggregation() || !aq.hasGroupBy()) return std::nullopt;
-    // HAVING is allowed; ORDER BY and LIMIT are not
-    if (!aq.orderBy.empty() || aq.limit >= 0)
-        return std::nullopt;
+    // HAVING is allowed; ORDER BY and LIMIT are handled CPU-side.
 
     struct PendingAgg {
         std::string displayName;
@@ -753,6 +751,16 @@ std::optional<MetalQueryPlan> buildGroupedAggPlan(const AnalyzedQuery& aq) {
     }
 
     appendPhase(plan, "ADHOC_single_table_group", std::move(agg));
+
+    if (!aq.orderBy.empty() || aq.limit >= 0) {
+        MetalQueryPlan::CpuSort cpuSort;
+        cpuSort.limit = aq.limit;
+        for (const auto& order : aq.orderBy) {
+            auto column = orderColumnForExpr(order.expr, aq.targets);
+            if (column) cpuSort.keys.push_back({*column, order.descending});
+        }
+        plan.cpuSort = cpuSort;
+    }
     return plan;
 }
 
@@ -1217,16 +1225,17 @@ std::optional<MetalQueryPlan> buildGenericMultiTableAdhocPlan_impl(
         if (!pk)
             return fail("Multi-table planner: table '" + nodes[i].table + "' has no PK descriptor.");
         if (pk->column != nodes[i].keyOnSelf) {
-            // Allow non-PK joins when the column is one of the table's keys
-            // and the table has a known PK (e.g., partsupp joining on ps_suppkey).
-            // For IndexJoin value carrying, PK must match to avoid overwriting.
-            bool isNonPkButAllowed = (nodes[i].table == "partsupp" &&
-                                      (nodes[i].keyOnSelf == "ps_suppkey" || nodes[i].keyOnSelf == "ps_partkey"));
-            if (!isNonPkButAllowed) {
-                return fail("Multi-table planner: join on '" + nodes[i].table + "." +
-                            nodes[i].keyOnSelf + "' is not the table's primary key (" +
-                            pk->column + "). Non-PK joins require a multi-slot hash "
-                            "table to preserve cardinality (not supported).");
+            // Non-PK single-column joins use a hash map to preserve
+            // cardinality (unlike direct-address arrays which overwrite).
+            bool isPartSuppCol = (nodes[i].table == "partsupp" &&
+                                  (nodes[i].keyOnSelf == "ps_suppkey" || nodes[i].keyOnSelf == "ps_partkey"));
+            if (isPartSuppCol) {
+                // partsupp has a known small key domain — direct-address ok
+                // (sentinel check limits output cardinality to 1 row per key)
+            } else {
+                // Use hash join for arbitrary non-PK single-column joins.
+                nodes[i].useHashJoin = true;
+                continue;
             }
         }
     }
@@ -1609,26 +1618,52 @@ std::optional<MetalQueryPlan> buildGenericMultiTableAdhocPlan_impl(
     }
 
     // ---------- Grouped aggregation ----------
-    // Try GPU KeyedAgg first; if the group key is not a known small-int
-    // domain or is multi-column, fall back to materialize + host-side GROUP BY.
-    bool canUseGpuKeyedAgg = (aq.groupBy.size() == 1);
-    const ColRef* gc = nullptr;
-    GroupDomain domain{0, 0};
-    int numBuckets = 0;
+    // Try GPU KeyedAgg first; if the group keys are all known small-int or
+    // CHAR1 domains with total buckets ≤ 4096, use GPU. Otherwise fall
+    // back to materialize + host-side GROUP BY.
+    struct GpuKeyDesc { std::string keyExpr; int numValues; int stride; std::string colName; DataType colType; };
+    std::vector<GpuKeyDesc> gpuKeys;
+    int totalBuckets = 1;
+    bool canUseGpuKeyedAgg = true;
 
-    if (canUseGpuKeyedAgg) {
-        gc = std::get_if<ColRef>(&aq.groupBy[0]->node);
-        if (!gc) canUseGpuKeyedAgg = false;
-        else {
+    for (size_t ki = 0; ki < aq.groupBy.size() && canUseGpuKeyedAgg; ++ki) {
+        auto* gc = std::get_if<ColRef>(&aq.groupBy[ki]->node);
+        if (!gc) { canUseGpuKeyedAgg = false; break; }
+
+        GpuKeyDesc kd;
+        kd.colName = gc->column;
+        kd.colType = gc->dataType;
+
+        if (gc->dataType == DataType::CHAR1) {
+            std::string idxVar = "i";
+            kd.keyExpr = char1BucketExpr(*gc, idxVar, kd.numValues);
+            if (kd.numValues == 0) { canUseGpuKeyedAgg = false; break; }
+        } else {
             auto d = smallIntGroupDomain(*gc);
-            if (!d || d->maxValue < d->minValue) canUseGpuKeyedAgg = false;
-            else {
-                domain = *d;
-                numBuckets = domain.maxValue - domain.minValue + 1;
-                if (numBuckets > 4096) canUseGpuKeyedAgg = false;
+            if (!d || d->maxValue < d->minValue) { canUseGpuKeyedAgg = false; break; }
+            kd.numValues = d->maxValue - d->minValue + 1;
+            std::string groupValue = gc->column + "[i]";
+            std::string keySource;
+            if (gc->table == probeTable) {
+                keySource = groupValue;
+            } else {
+                CarriedKey ck{gc->table, gc->column};
+                auto it = carryVar.find(ck);
+                if (it == carryVar.end()) { canUseGpuKeyedAgg = false; break; }
+                keySource = it->second;
             }
+            if (d->minValue != 0)
+                kd.keyExpr = "(" + keySource + " - " + std::to_string(d->minValue) + ")";
+            else
+                kd.keyExpr = keySource;
+            kd.keyExpr = "clamp(" + kd.keyExpr + ", 0, " + std::to_string(kd.numValues - 1) + ")";
         }
+        kd.stride = totalBuckets;
+        totalBuckets *= kd.numValues;
+        gpuKeys.push_back(kd);
     }
+
+    if (totalBuckets > 4096) canUseGpuKeyedAgg = false;
 
     if (!canUseGpuKeyedAgg) {
         // ---------- MaterializeAgg fallback: emit raw rows on GPU, group on host ----------
@@ -1744,22 +1779,42 @@ std::optional<MetalQueryPlan> buildGenericMultiTableAdhocPlan_impl(
         return plan;
     }
 
-    // --- GPU KeyedAgg path (small-int domain, single-column) ---
-    // Source for the bucket value: probe column or carried variable.
-    std::string keySource;
-    if (gc->table == probeTable) {
-        keySource = gc->column + "[" + idxVar + "]";
-    } else {
-        CarriedKey ck{gc->table, gc->column};
-        auto it = carryVar.find(ck);
-        if (it == carryVar.end())
-            return fail("GROUP BY column not present on probe path: " + gc->table + "." + gc->column);
-        keySource = it->second;
+    // --- GPU KeyedAgg path ---
+    // Build flat bucket expression from all group keys.
+    std::string bucketExpr = "(" + gpuKeys[0].keyExpr + ")";
+    for (size_t ki = 1; ki < gpuKeys.size(); ++ki) {
+        bucketExpr = "(" + bucketExpr + " + (" + gpuKeys[ki].keyExpr + ") * " +
+                     std::to_string(gpuKeys[ki].stride) + ")";
     }
-    std::string bucketExpr = (domain.minValue != 0)
-        ? "(" + keySource + " - " + std::to_string(domain.minValue) + ")"
-        : keySource;
-    bucketExpr = "clamp(" + bucketExpr + ", 0, " + std::to_string(numBuckets - 1) + ")";
+    int numBuckets = totalBuckets;
+
+    // Build multi-key decode info for result collection.
+    std::vector<GroupKeyDecode> decodeInfo;
+    std::vector<std::string> keyDisplayNames;
+    for (size_t ki = 0; ki < gpuKeys.size(); ++ki) {
+        GroupKeyDecode d;
+        d.name = gpuKeys[ki].colName;
+        d.numValues = gpuKeys[ki].numValues;
+        d.stride = gpuKeys[ki].stride;
+        auto* gc = std::get_if<ColRef>(&aq.groupBy[ki]->node);
+        if (gc && gc->dataType == DataType::CHAR1) {
+            if (gc->column == "l_returnflag") d.charMap = {'A', 'N', 'R'};
+            else if (gc->column == "l_linestatus") d.charMap = {'F', 'O'};
+        } else {
+            auto sd = smallIntGroupDomain(*gc);
+            d.keyBase = sd ? sd->minValue : 0;
+        }
+        decodeInfo.push_back(d);
+        std::string kn = gpuKeys[ki].colName;
+        for (size_t ti = 0; ti < aq.targets.size(); ++ti) {
+            if (!aq.targets[ti].isAgg && aq.targets[ti].expr &&
+                std::holds_alternative<ColRef>(aq.targets[ti].expr->node)) {
+                auto* tcol = std::get_if<ColRef>(&aq.targets[ti].expr->node);
+                if (tcol->column == kn) { kn = displayNameForTarget(aq.targets[ti], ti); break; }
+            }
+        }
+        keyDisplayNames.push_back(kn);
+    }
 
     // Layout aggregates and slot count.
     struct PendingAgg {
@@ -1889,22 +1944,8 @@ std::optional<MetalQueryPlan> buildGenericMultiTableAdhocPlan_impl(
         numBuckets, valuesPerBucket,
         std::to_string(numBuckets * valuesPerBucket));
 
-    // Decode info for the (single) key.
-    std::string keyDisplay = gc->column;
-    for (size_t ti = 0; ti < aq.targets.size(); ++ti) {
-        const auto& target = aq.targets[ti];
-        if (target.isAgg) continue;
-        if (target.expr && exprIsColumn(target.expr, *gc)) {
-            keyDisplay = displayNameForTarget(target, ti);
-            break;
-        }
-    }
-    GroupKeyDecode decode;
-    decode.name = keyDisplay;
-    decode.numValues = numBuckets;
-    decode.stride = 1;
-    decode.keyBase = domain.minValue;
-    agg->setMultiKeyResult({keyDisplay}, {decode}, numBuckets);
+    // Decode info for group keys (multi-key support).
+    agg->setMultiKeyResult(keyDisplayNames, decodeInfo, numBuckets);
 
     for (const auto& p : pending) {
         agg->addAggregateWithMeta(p.display, p.offset, p.valueExpr,
