@@ -1105,6 +1105,7 @@ struct MultiTableTreeNode {
     // direct-address key).  Composite-key edges always set this true.
     bool useHashJoin = false;
     bool anti = false;            // NOT EXISTS → anti-semi-join
+    bool leftOuter = false;       // LEFT OUTER JOIN
     std::vector<int> children;
     bool composite() const { return !keyOnSelf2.empty(); }
 };
@@ -1129,6 +1130,7 @@ bool multiTableBuildJoinTree(const AnalyzedQuery& aq, int probeIdx,
         std::string a, b;                 // table names
         std::vector<std::pair<std::string, std::string>> cols; // (col_a, col_b)
         bool anti = false;                // NOT EXISTS → anti-semi-join
+        bool leftOuter = false;           // LEFT OUTER JOIN
     };
     std::vector<Edge> edges;
     auto findEdge = [&](const std::string& l, const std::string& r) -> int {
@@ -1145,6 +1147,7 @@ bool multiTableBuildJoinTree(const AnalyzedQuery& aq, int probeIdx,
             e.a = jc.leftTable; e.b = jc.rightTable;
             e.cols.emplace_back(jc.leftCol, jc.rightCol);
             e.anti = jc.anti;
+            e.leftOuter = jc.leftOuter;
             edges.push_back(std::move(e));
         } else {
             // Normalise column pair to edge orientation.
@@ -1154,6 +1157,7 @@ bool multiTableBuildJoinTree(const AnalyzedQuery& aq, int probeIdx,
                 edges[ei].cols.emplace_back(jc.rightCol, jc.leftCol);
             }
             edges[ei].anti = edges[ei].anti || jc.anti;
+            edges[ei].leftOuter = edges[ei].leftOuter || jc.leftOuter;
         }
     }
     for (const auto& e : edges) {
@@ -1202,6 +1206,7 @@ bool multiTableBuildJoinTree(const AnalyzedQuery& aq, int probeIdx,
             visited[other] = true;
             nodes[other].parent = u;
             nodes[other].anti = e.anti;
+            nodes[other].leftOuter = e.leftOuter;
             nodes[other].keyOnSelf   = oriented[0].second;
             nodes[other].keyOnParent = oriented[0].first;
             if (oriented.size() == 2) {

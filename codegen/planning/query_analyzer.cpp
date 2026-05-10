@@ -693,9 +693,19 @@ void extractJoinOns(const json& fromItem, const std::vector<std::string>& tables
                     std::vector<JoinClause>& joins, std::vector<PredPtr>& filters) {
     if (fromItem.contains("JoinExpr")) {
         auto& je = fromItem["JoinExpr"];
+        size_t joinCountBefore = joins.size();
         if (je.contains("quals")) {
             auto pred = walkPredicate(je["quals"], tables);
             separatePredicates(pred, tables, joins, filters);
+        }
+        // Detect LEFT OUTER JOIN: mark newly added join clauses.
+        if (je.contains("jointype")) {
+            try {
+                if (je["jointype"].get<int>() == 1) {
+                    for (size_t j = joinCountBefore; j < joins.size(); ++j)
+                        joins[j].leftOuter = true;
+                }
+            } catch (...) {}
         }
         extractJoinOns(je["larg"], tables, joins, filters);
         extractJoinOns(je["rarg"], tables, joins, filters);
@@ -761,6 +771,11 @@ AnalyzedQuery analyzeSQL(const std::string& sql) {
                     if (sub.contains("whereClause")) {
                         auto pred = walkPredicate(sub["whereClause"], aq.tables);
                         separatePredicates(pred, aq.tables, aq.joins, aq.filters);
+                    }
+                    // Also extract JOIN ON conditions from the subquery's FROM clause.
+                    if (sub.contains("fromClause")) {
+                        for (auto& item : sub["fromClause"])
+                            extractJoinOns(item, aq.tables, aq.joins, aq.filters);
                     }
                     // Extract subquery column aliases for outer-query resolution.
                     // e.g. "n2.n_name AS nation" → g_subqueryAliasMap["nation"] = ColRef(nation, n_name)
