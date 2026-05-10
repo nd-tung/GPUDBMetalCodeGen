@@ -606,13 +606,17 @@ GenericResult MetalResultCollector::collectMaterialize(const MetalResultSchema& 
             } else if (col.elementType == "int" || col.elementType == "uint") {
                 const auto* arr = static_cast<const uint32_t*>(bIt->second->contents());
                 row.push_back(static_cast<int64_t>(arr[r]));
-            } else if (col.stringLen > 0) {
-                const auto* arr = static_cast<const char*>(bIt->second->contents());
-                std::string s(arr + r * col.stringLen, col.stringLen);
-                // Trim trailing spaces/nulls
-                while (!s.empty() && (s.back() == ' ' || s.back() == '\0'))
-                    s.pop_back();
-                row.push_back(std::move(s));
+            } else if (col.elementType == "char") {
+                if (col.stringLen > 0) {
+                    const auto* arr = static_cast<const char*>(bIt->second->contents());
+                    std::string s(arr + r * col.stringLen, col.stringLen);
+                    while (!s.empty() && (s.back() == ' ' || s.back() == '\0'))
+                        s.pop_back();
+                    row.push_back(std::move(s));
+                } else {
+                    const auto* arr = static_cast<const char*>(bIt->second->contents());
+                    row.push_back(std::string(1, arr[r]));
+                }
             } else {
                 const auto* arr = static_cast<const uint32_t*>(bIt->second->contents());
                 row.push_back(static_cast<int64_t>(arr[r]));
