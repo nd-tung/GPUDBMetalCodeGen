@@ -1075,7 +1075,8 @@ int multiTableProbePriority(const std::string& t) {
 }
 
 struct MultiTableTreeNode {
-    std::string table;
+    std::string table;       // alias (unique per table, even self-joins)
+    std::string baseTable;   // base table name for schema lookups
     int parent = -1;
     std::string keyOnSelf;    // column on this table participating in edge to parent
     std::string keyOnParent;  // column on parent participating in edge to this
@@ -1102,7 +1103,10 @@ bool multiTableBuildJoinTree(const AnalyzedQuery& aq, int probeIdx,
                              std::string* error) {
     const size_t n = aq.tables.size();
     nodes.assign(n, MultiTableTreeNode{});
-    for (size_t i = 0; i < n; ++i) nodes[i].table = aq.tables[i];
+    for (size_t i = 0; i < n; ++i) {
+        nodes[i].table = aq.tableAliases[i];  // alias identity (unique per instance)
+        nodes[i].baseTable = aq.tables[i];    // schema base name
+    }
 
     // Coalesce JoinClauses by unordered (table, table) pair.  Each
     // coalesced edge carries 1 or 2 column pairs.
@@ -1148,13 +1152,15 @@ bool multiTableBuildJoinTree(const AnalyzedQuery& aq, int probeIdx,
         if (error) *error = "Multi-table planner: not enough join edges to connect all tables.";
         return false;
     }
+    std::vector<bool> visited(n, false);
 
-    auto findIdx = [&](const std::string& t) -> int {
-        for (size_t k = 0; k < n; ++k) if (aq.tables[k] == t) return (int)k;
+    // findIdx returns the first unvisited node with the given base table name.
+    auto findIdx = [&](const std::string& baseTable) -> int {
+        for (size_t k = 0; k < n; ++k)
+            if (aq.tables[k] == baseTable && !visited[k]) return (int)k;
         return -1;
     };
 
-    std::vector<bool> visited(n, false);
     std::vector<int> order;
     order.push_back(probeIdx);
     visited[probeIdx] = true;
@@ -1573,7 +1579,8 @@ std::optional<MetalQueryPlan> buildGenericMultiTableAdhocPlan_impl(
     std::map<int, std::vector<CarriedKey>> localCarry;       // owned by this node
     std::map<int, std::vector<CarriedKey>> subtreeCarry;     // local + descendants
     std::function<void(int)> dfs = [&](int u) {
-        const std::string& tname = aq.tables[u];
+        const std::string& tname = nodes[u].baseTable;
+        const std::string& tnameAlias = nodes[u].table;
         // Local carries: columns from this table needed at probe, EXCEPT
         // the join key itself when the value is implicitly carried by
         // probe's lookup key.
@@ -1659,7 +1666,8 @@ std::optional<MetalQueryPlan> buildGenericMultiTableAdhocPlan_impl(
         int u = *it;
         if (u == probeIdx) continue;
 
-        const std::string& tname = aq.tables[u];
+        const std::string& tname = nodes[u].baseTable;
+        const std::string& tag = nodes[u].table;  // alias for unique naming
 
         std::set<std::string> scanCols;
         scanColsForTable(u, scanCols);
@@ -1681,15 +1689,15 @@ std::optional<MetalQueryPlan> buildGenericMultiTableAdhocPlan_impl(
             if (subC.empty()) {
                 if (nodes[c].anti) {
                     pipe = std::make_unique<MetalAntiBitmapProbe>(
-                        std::move(pipe), "d_bitmap_" + aq.tables[c], probeKey);
+                        std::move(pipe), "d_bitmap_" + nodes[c].table, probeKey);
                 } else {
                     pipe = std::make_unique<MetalBitmapProbe>(
-                        std::move(pipe), "d_bitmap_" + aq.tables[c], probeKey);
+                        std::move(pipe), "d_bitmap_" + nodes[c].table, probeKey);
                 }
             } else {
                 for (const auto& ck : subC) {
                     pipe = std::make_unique<MetalArrayLookup>(
-                        std::move(pipe), ck.storageArray(aq.tables[c]),
+                        std::move(pipe), ck.storageArray(nodes[c].table),
                         probeKey, ck.varName(), "int", -1);
                 }
             }
@@ -1724,7 +1732,7 @@ std::optional<MetalQueryPlan> buildGenericMultiTableAdhocPlan_impl(
             }
             pipe = std::make_unique<MetalHashMapBuild>(
                 std::move(pipe), mapName, k1, k2, valExpr, capExpr);
-            appendPhase(plan, "ADHOC_multi_build_" + tname, std::move(pipe));
+            appendPhase(plan, "ADHOC_multi_build_" + tag, std::move(pipe));
             continue;
         }
 
@@ -1756,7 +1764,7 @@ std::optional<MetalQueryPlan> buildGenericMultiTableAdhocPlan_impl(
                 storeKey, valExpr, "int", sizeSym);
         }
 
-        appendPhase(plan, "ADHOC_multi_build_" + tname, std::move(pipe));
+        appendPhase(plan, "ADHOC_multi_build_" + tag, std::move(pipe));
     }
 
     // Build map from build-table to probe-side join key for CHAR_FIXED direct access.
@@ -1785,9 +1793,9 @@ std::optional<MetalQueryPlan> buildGenericMultiTableAdhocPlan_impl(
             // HashJoin probe.  Capacity expression must match the
             // build-phase choice exactly so that resolve() yields the
             // same value here.
-            const std::string mapName = "hm_" + aq.tables[c];
+            const std::string mapName = "hm_" + nodes[c].table;
             const std::string capExpr = "next_pow2((" +
-                tableSizeName(aq.tables[c]) + ") * 4 + 16)";
+                tableSizeName(nodes[c].baseTable) + ") * 4 + 16)";
             const std::string k2 = nodes[c].composite()
                 ? (nodes[c].keyOnParent2 + "[" + idxVar + "]")
                 : std::string("0u");
