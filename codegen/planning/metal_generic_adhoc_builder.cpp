@@ -294,9 +294,11 @@ bool exprSupported(const ExprPtr& expr, bool allowChar1Literal) {
             }
             return true;
         } else if constexpr (std::is_same_v<Node, FuncCall>) {
-            // Known translatable SQL functions
+            // Known translatable SQL functions and aggregate wrappers
             if (node.name == "date_part" || node.name == "extract") return true;
             if (node.name == "substring") return true;
+            if (node.name == "sum" || node.name == "count" || node.name == "avg" ||
+                node.name == "min" || node.name == "max") return true;
             return false;
         } else {
             return false;
