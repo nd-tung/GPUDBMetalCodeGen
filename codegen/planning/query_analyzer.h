@@ -14,7 +14,8 @@ namespace codegen {
 struct JoinClause {
     std::string leftTable, rightTable;
     std::string leftCol, rightCol;
-    bool anti = false;  // true for NOT EXISTS → anti-semi-join
+    bool anti = false;       // true for NOT EXISTS → anti-semi-join
+    bool leftOuter = false;  // true for LEFT OUTER JOIN
 };
 
 struct AggTarget {
