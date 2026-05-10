@@ -913,8 +913,9 @@ AnalyzedQuery analyzeSQL(const std::string& sql) {
         }
     };
     for (auto& t : aq.targets) { resolveExpr(t.expr); if (t.agg) resolveExpr(t.agg->innerExpr); }
-    for (auto& g : aq.groupBy) resolveExpr(g);
-    for (auto& o : aq.orderBy) resolveExpr(o.expr);
+    // GROUP BY and ORDER BY keep their original ColRef — the subquery alias
+    // name is used for display-name matching in orderColumnForExpr and
+    // materialize column naming; the resolved expression is used in targets.
 
     return aq;
 }
