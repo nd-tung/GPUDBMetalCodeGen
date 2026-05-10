@@ -1523,6 +1523,7 @@ std::optional<MetalQueryPlan> buildGenericMultiTableAdhocPlan_impl(
 
     // ---------- Per-table filters ----------
     std::map<std::string, std::vector<PredPtr>> filtersByTable;
+    std::vector<PredPtr> crossFilters;  // multi-table filters applied in probe phase
     for (const auto& f : aq.filters) {
         std::set<std::string> cols;
         collectColumns(f, cols);
@@ -1531,8 +1532,10 @@ std::optional<MetalQueryPlan> buildGenericMultiTableAdhocPlan_impl(
             std::string owner = ownerTableForColumn(aq, c);
             if (!owner.empty()) tbls.insert(owner);
         }
-        if (tbls.size() != 1)
-            return fail("Multi-table planner: cross-table filter not supported (must be a join condition).");
+        if (tbls.size() != 1) {
+            crossFilters.push_back(f);
+            continue;
+        }
         filtersByTable[*tbls.begin()].push_back(f);
     }
 
@@ -1779,9 +1782,36 @@ std::optional<MetalQueryPlan> buildGenericMultiTableAdhocPlan_impl(
         charFixedJoinKey[aq.tables[c]] = nodes[c].keyOnParent;
     }
 
+    // Collect build-side CHAR_FIXED columns needed by cross-table filters
+    // so they can be registered as probe-phase extra buffers.
+    std::vector<std::pair<std::string, std::string>> crossExtraCols; // (colName, colType)
+    {
+        std::set<std::string> crossCols;
+        for (auto& cf : crossFilters) collectColumns(cf, crossCols);
+        for (const auto& c : crossCols) {
+            std::string owner = ownerTableForColumn(aq, c);
+            if (!owner.empty() && owner != probeTable) {
+                try {
+                    auto& colDef = TPCHSchema::instance().table(owner).col(c);
+                    if (colDef.type == DataType::CHAR_FIXED || colDef.type == DataType::CHAR1)
+                        crossExtraCols.push_back({c, "char"});
+                } catch (...) {}
+            }
+        }
+    }
+
     // ---------- Probe phase ----------
     std::set<std::string> probeScanCols;
     scanColsForTable(probeIdx, probeScanCols);
+    // Add columns referenced by cross-table filters to the probe scan.
+    {
+        std::set<std::string> cfCols;
+        for (auto& cf : crossFilters) collectColumns(cf, cfCols);
+        for (const auto& c : cfCols) {
+            if (TPCHSchema::instance().table(probeTable).nameToIdx.count(c))
+                probeScanCols.insert(c);
+        }
+    }
     auto probeScan = makeScanForCols(probeTable, idxVar, probeScanCols);
     std::unique_ptr<MetalOperator> probePipe = std::move(probeScan);
 
@@ -1839,6 +1869,25 @@ std::optional<MetalQueryPlan> buildGenericMultiTableAdhocPlan_impl(
                 probeKey, ck.varName(), "int", -1);
             carryVar[ck] = ck.varName();
         }
+    }
+
+    // Apply cross-table filters (e.g. Q19's OR branches) after all probes.
+    // Build-side CHAR_FIXED column references like `p_brand[i * 10]` are
+    // rewritten to use the join key: `p_brand[joinKey[i] * 10]`.
+    if (!crossFilters.empty()) {
+        std::string cond = combineFilters(crossFilters, idxVar);
+        cond = rewriteForProbe(cond, idxVar, carryVar);
+        // Rewrite CHAR_FIXED indices for build-side columns.
+        for (const auto& [tname, jk] : charFixedJoinKey) {
+            std::string fromIdx = idxVar + " *";
+            std::string toIdx = jk + "[" + idxVar + "] *";
+            size_t pos = 0;
+            while ((pos = cond.find(fromIdx, pos)) != std::string::npos) {
+                cond.replace(pos, fromIdx.size(), toIdx);
+                pos += toIdx.size();
+            }
+        }
+        probePipe = maybeSelect(std::move(probePipe), cond);
     }
 
     // ---------- Terminal operators ----------
@@ -1908,17 +1957,19 @@ std::optional<MetalQueryPlan> buildGenericMultiTableAdhocPlan_impl(
 
         if (!cpuSort.keys.empty() || cpuSort.limit >= 0) plan.cpuSort = cpuSort;
         appendPhase(plan, "ADHOC_multi_materialize", std::move(materialize));
-        // Register build-side CHAR_FIXED column buffers as read-only extra buffers
-        // so they are accessible in the probe phase via join-key-indexed expressions.
+        // Register build-side CHAR_FIXED column buffers as read-only extra buffers.
         for (const auto& [tname, cols] : neededByTable) {
             if (tname == probeTable) continue;
             for (const auto& c : cols) {
                 const auto& cdef = TPCHSchema::instance().table(tname).col(c);
                 if (cdef.type == DataType::CHAR_FIXED) {
-                    plan.phases.back().extraBuffers.push_back(
-                        {c, "char", true, false});
+                    plan.phases.back().extraBuffers.push_back({c, "char", true, false});
                 }
             }
+        }
+        // Also add CHAR_FIXED columns needed by cross-table filters.
+        for (auto& [c, t] : crossExtraCols) {
+            plan.phases.back().extraBuffers.push_back({c, "char", true, false});
         }
         return plan;
     }
@@ -1963,7 +2014,10 @@ std::optional<MetalQueryPlan> buildGenericMultiTableAdhocPlan_impl(
                 reduce->setAccumulatorResultAlias(alias, idx, 0);
             }
         }
-        appendPhase(plan, "ADHOC_multi_probe_scalar", std::move(reduce));
+        auto& phaseRef = appendPhase(plan, "ADHOC_multi_probe_scalar", std::move(reduce));
+        for (auto& [c, t] : crossExtraCols) {
+            phaseRef.extraBuffers.push_back({c, "char", true, false});
+        }
         if (aq.limit >= 0) {
             plan.cpuSort = MetalQueryPlan::CpuSort{{}, aq.limit};
         }
