@@ -83,6 +83,7 @@ std::string aggFuncName(AggFunc func) {
         case AggFunc::AVG: return "AVG";
         case AggFunc::MIN: return "MIN";
         case AggFunc::MAX: return "MAX";
+        case AggFunc::COUNT_DISTINCT: return "COUNT_DISTINCT";
         default: return "SUM";
     }
 }
@@ -2171,6 +2172,15 @@ std::optional<MetalQueryPlan> buildGenericMultiTableAdhocPlan_impl(
     std::vector<PendingAgg> pending;
     int valuesPerBucket = 0;
 
+    // COUNT(DISTINCT) tracking for popcount phases.
+    struct DistinctEntry {
+        std::string displayName;
+        std::string colExpr;
+        std::string maxValExpr;
+        int offset;
+    };
+    std::vector<DistinctEntry> distinctEntries;
+
     auto extractInnerCol = [&](const ExprPtr& inner) -> std::string {
         if (!inner) return "";
         if (auto* cr = std::get_if<ColRef>(&inner->node)) return cr->column;
@@ -2252,6 +2262,41 @@ std::optional<MetalQueryPlan> buildGenericMultiTableAdhocPlan_impl(
             continue;
         }
 
+        // COUNT(DISTINCT) — same pattern as single-table grouped builder.
+        if (func == AggFunc::COUNT_DISTINCT) {
+            auto* innerCol = std::get_if<ColRef>(&target.agg->innerExpr->node);
+            if (!innerCol)
+                return fail("COUNT(DISTINCT) inner expression must be a column reference.");
+            DataType ct = inferExprDataType(target.agg->innerExpr);
+            if (ct != DataType::INT && ct != DataType::DATE)
+                return fail("COUNT(DISTINCT) only supports integer/date columns.");
+            std::string maxExpr;
+            try {
+                auto& colDef = TPCHSchema::instance().table(innerCol->table).col(innerCol->column);
+                if (colDef.domainMax >= 0) maxExpr = std::to_string(colDef.domainMax + 1);
+            } catch (...) {}
+            if (maxExpr.empty()) {
+                try {
+                    auto& tdef = TPCHSchema::instance().table(innerCol->table);
+                    if (!tdef.maxKeySymbol.empty()) maxExpr = tdef.maxKeySymbol + " + 1";
+                } catch (...) {}
+            }
+            if (maxExpr.empty())
+                return fail("COUNT(DISTINCT) on column '" + innerCol->column + "' — no known max value for bitmap sizing.");
+
+            PendingAgg p;
+            p.display = display;
+            p.name = "a" + std::to_string(ti) + "_" + sname;
+            p.offset = valuesPerBucket++;
+            // Stash maxExpr in valueExpr for the distinct-entry loop to read.
+            p.valueExpr = finalExpr + "\x01" + maxExpr; // sentinel separator
+            p.scaleDown = -2;  // COUNT(DISTINCT) sentinel
+            p.funcName = "COUNT_DISTINCT";
+            p.innerColumn = innerCol->column;
+            pending.push_back(std::move(p));
+            continue;
+        }
+
         if (func != AggFunc::SUM)
             return fail("Aggregate function not supported by multi-table planner.");
 
@@ -2286,10 +2331,24 @@ std::optional<MetalQueryPlan> buildGenericMultiTableAdhocPlan_impl(
     agg->setMultiKeyResult(keyDisplayNames, decodeInfo, numBuckets);
 
     for (const auto& p : pending) {
-        agg->addAggregateWithMeta(p.display, p.offset, p.valueExpr,
-                                  p.atomicOp, p.isLongPair, p.scaleDown,
-                                  p.isFloatSum, p.isMinMax,
-                                  p.funcName, p.innerColumn);
+        if (p.scaleDown == -2) {
+            // COUNT(DISTINCT): valueExpr contains "colExpr\x01maxExpr"
+            auto sep = p.valueExpr.find('\x01');
+            std::string colExpr = p.valueExpr.substr(0, sep);
+            std::string maxExpr = (sep != std::string::npos) ? p.valueExpr.substr(sep + 1) : "";
+            std::string bmpOutput = "d_adhoc_multi_distinct_" + std::to_string(distinctEntries.size());
+            agg->addDistinctBitmap(bmpOutput, colExpr, maxExpr);
+            distinctEntries.push_back({p.display, colExpr, maxExpr, p.offset});
+            // Also add a zero-valued aggregate slot placeholder.
+            agg->addAggregateWithMeta(p.display, p.offset, "0u",
+                                      "add", false, 0, false, false,
+                                      p.funcName, p.innerColumn);
+        } else {
+            agg->addAggregateWithMeta(p.display, p.offset, p.valueExpr,
+                                      p.atomicOp, p.isLongPair, p.scaleDown,
+                                      p.isFloatSum, p.isMinMax,
+                                      p.funcName, p.innerColumn);
+        }
     }
 
     // Set HAVING predicate if present
@@ -2300,6 +2359,17 @@ std::optional<MetalQueryPlan> buildGenericMultiTableAdhocPlan_impl(
     }
 
     appendPhase(plan, "ADHOC_multi_probe_group", std::move(agg));
+
+    // Add bitmap popcount phases for each COUNT(DISTINCT).
+    for (size_t di = 0; di < distinctEntries.size(); ++di) {
+        const auto& de = distinctEntries[di];
+        std::string bmpName = "d_distinct_bmp_d_adhoc_multi_distinct_" + std::to_string(di);
+        std::string bmpOutput = "d_adhoc_multi_distinct_" + std::to_string(di);
+        std::string strideExpr = "((" + de.maxValExpr + " + 32) / 32)";
+        auto popcnt = std::make_unique<MetalBitmapPopcount>(
+            bmpName, bmpOutput, std::to_string(numBuckets), strideExpr);
+        appendPhase(plan, "ADHOC_multi_popcount_" + std::to_string(di), std::move(popcnt));
+    }
 
     // CPU-side ORDER BY + LIMIT for grouped results.
     if (!aq.orderBy.empty() || aq.limit >= 0) {
