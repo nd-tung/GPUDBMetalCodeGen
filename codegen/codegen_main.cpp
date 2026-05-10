@@ -568,7 +568,8 @@ static bool runCodegenQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
             for (auto& ph : plan.phases) ph.threadgroupSize = g_tgSizeOverride;
         }
 
-        // Experiment introspection: --print-plan dumps phase summary.
+        // Experiment introspection: --print-plan dumps phase summary
+        // and writes operator-tree JSON for CI / debugging.
         if (g_printPlan) {
             printf("\n--- MetalQueryPlan: %s ---\n", plan.name.c_str());
             printf("  helpers           : %zu\n", plan.helpers.size());
@@ -585,6 +586,13 @@ static bool runCodegenQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
                        plan.cpuSort->keys.size(), plan.cpuSort->limit);
             }
             printf("---\n");
+
+            // Also write plan JSON
+            try {
+                std::string planFile = "debug/codegen_debug_" + plan.name + "_plan.json";
+                std::ofstream ofs(planFile);
+                ofs << plan.toTreeJSON().dump(2) << std::endl;
+            } catch (...) {}
         }
 
         // 3. Generate Metal source via producer-consumer operators

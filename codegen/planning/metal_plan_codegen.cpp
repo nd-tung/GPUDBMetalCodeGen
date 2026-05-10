@@ -43,4 +43,54 @@ MetalCodegen generateFromPlan(const MetalQueryPlan& plan) {
     return cg;
 }
 
+nlohmann::json MetalQueryPlan::toTreeJSON() const {
+    nlohmann::json j;
+    j["name"] = name;
+    j["chunkable"] = chunkable;
+    if (cpuSort) {
+        nlohmann::json s;
+        s["limit"] = cpuSort->limit;
+        for (auto& k : cpuSort->keys) {
+            nlohmann::json sk;
+            sk["column"] = k.column;
+            sk["descending"] = k.descending;
+            s["keys"].push_back(sk);
+        }
+        j["cpuSort"] = s;
+    }
+    if (cpuGroupBy) {
+        nlohmann::json g;
+        g["keyColumns"] = cpuGroupBy->keyColumns;
+        g["aggColumns"] = cpuGroupBy->aggColumns;
+        g["aggFuncs"] = cpuGroupBy->aggFuncs;
+        j["cpuGroupBy"] = g;
+    }
+    if (gpuSort) {
+        nlohmann::json gs;
+        gs["sortedIndexBuffer"] = gpuSort->sortedIndexBuffer;
+        gs["nResults"] = gpuSort->nResults;
+        gs["descending"] = gpuSort->descending;
+        j["gpuSort"] = gs;
+    }
+    for (const auto& phase : phases) {
+        nlohmann::json pj;
+        pj["name"] = phase.name;
+        pj["threadgroupSize"] = phase.threadgroupSize;
+        if (phase.singleThread) pj["singleThread"] = true;
+        if (!phase.bitmapReads.empty()) {
+            for (auto& [n, s] : phase.bitmapReads)
+                pj["bitmapReads"].push_back({{"name", n}, {"sizeExpr", s}});
+        }
+        if (!phase.scalarParams.empty()) {
+            for (auto& [n, t] : phase.scalarParams)
+                pj["scalarParams"].push_back({{"name", n}, {"type", t}});
+        }
+        if (phase.root) {
+            pj["operatorTree"] = phase.root->toJSON();
+        }
+        j["phases"].push_back(pj);
+    }
+    return j;
+}
+
 } // namespace codegen

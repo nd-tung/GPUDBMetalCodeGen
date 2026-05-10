@@ -1,21 +1,9 @@
 #pragma once
-// ===================================================================
-// Metal Operators — Composable producer-consumer code generation
-// ===================================================================
-//
-// Each operator has a produce() method that emits Metal shader code
-// into a MetalCodegen instance. Operators form trees where each
-// calls its child's produce() and wraps the consumer callback.
-//
-// Emits Metal Shading Language with Apple GPU-specific optimizations
-// (SIMD group reductions, Metal atomics, [[buffer(N)]] attributes).
-// ===================================================================
-
-#include "metal_codegen_base.h"
+#include "../core/metal_codegen_base.h"
+#include "../../third_party/nlohmann/json.hpp"
 #include <memory>
 #include <string>
 #include <vector>
-#include <functional>
 
 namespace codegen {
 
@@ -28,6 +16,10 @@ public:
     virtual ~MetalOperator() = default;
     virtual void produce(MetalCodegen& cg, ConsumerFn consume) = 0;
     virtual std::string describe() const = 0;
+
+    // Serialize this operator (and children) to JSON for plan visualization.
+    // Returns a json object with at minimum "type" (the describe() string).
+    virtual nlohmann::json toJSON() const;
 };
 
 class MetalUnaryOperator : public MetalOperator {
@@ -36,6 +28,8 @@ protected:
 public:
     explicit MetalUnaryOperator(std::unique_ptr<MetalOperator> child)
         : child_(std::move(child)) {}
+    const MetalOperator* child() const { return child_.get(); }
+    nlohmann::json toJSON() const override;
 };
 
 // ===================================================================
