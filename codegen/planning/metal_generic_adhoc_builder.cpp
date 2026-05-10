@@ -1795,6 +1795,8 @@ std::optional<MetalQueryPlan> buildGenericMultiTableAdhocPlan_impl(
                     auto& colDef = TPCHSchema::instance().table(owner).col(c);
                     if (colDef.type == DataType::CHAR_FIXED || colDef.type == DataType::CHAR1)
                         crossExtraCols.push_back({c, "char"});
+                    else if (colDef.type == DataType::INT || colDef.type == DataType::DATE)
+                        crossExtraCols.push_back({c, "int"});
                 } catch (...) {}
             }
         }
@@ -1872,19 +1874,31 @@ std::optional<MetalQueryPlan> buildGenericMultiTableAdhocPlan_impl(
     }
 
     // Apply cross-table filters (e.g. Q19's OR branches) after all probes.
-    // Build-side CHAR_FIXED column references like `p_brand[i * 10]` are
-    // rewritten to use the join key: `p_brand[joinKey[i] * 10]`.
+    // Build-side column references are rewritten to use the join key index.
     if (!crossFilters.empty()) {
         std::string cond = combineFilters(crossFilters, idxVar);
         cond = rewriteForProbe(cond, idxVar, carryVar);
-        // Rewrite CHAR_FIXED indices for build-side columns.
+        // Rewrite build-side column indices for CHAR_FIXED and INT columns.
         for (const auto& [tname, jk] : charFixedJoinKey) {
+            // CHAR_FIXED: `col[i * width]` → `col[jk[i] * width]`
             std::string fromIdx = idxVar + " *";
             std::string toIdx = jk + "[" + idxVar + "] *";
             size_t pos = 0;
             while ((pos = cond.find(fromIdx, pos)) != std::string::npos) {
                 cond.replace(pos, fromIdx.size(), toIdx);
                 pos += toIdx.size();
+            }
+            // INT/DATE: `col[i]` → `col[jk[i]]`
+            // Collect INT column names from crossExtraCols
+            for (auto& [colName, colType] : crossExtraCols) {
+                if (colType != "int") continue;
+                std::string from = colName + "[" + idxVar + "]";
+                std::string to = colName + "[" + jk + "[" + idxVar + "]]";
+                pos = 0;
+                while ((pos = cond.find(from, pos)) != std::string::npos) {
+                    cond.replace(pos, from.size(), to);
+                    pos += to.size();
+                }
             }
         }
         probePipe = maybeSelect(std::move(probePipe), cond);
@@ -1967,9 +1981,9 @@ std::optional<MetalQueryPlan> buildGenericMultiTableAdhocPlan_impl(
                 }
             }
         }
-        // Also add CHAR_FIXED columns needed by cross-table filters.
+        // Also add columns needed by cross-table filters.
         for (auto& [c, t] : crossExtraCols) {
-            plan.phases.back().extraBuffers.push_back({c, "char", true, false});
+            plan.phases.back().extraBuffers.push_back({c, t, true, false});
         }
         return plan;
     }

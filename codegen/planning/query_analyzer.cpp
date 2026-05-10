@@ -588,16 +588,23 @@ void separatePredicates(const PredPtr& pred, const std::vector<std::string>& tab
         // OR branches: extract join conditions that appear in ALL branches
         // (e.g. Q19: all branches have p_partkey = l_partkey).
         std::vector<JoinClause> commonJoins;
+        std::vector<PredPtr> strippedBranches; // branches with joins removed
         bool first = true;
         for (auto& child : lo->children) {
             std::vector<JoinClause> branchJoins;
             std::vector<PredPtr> branchFilters;
             separatePredicates(child, tables, branchJoins, branchFilters);
+            // Reconstruct branch without extracted joins.
+            if (!branchFilters.empty()) {
+                if (branchFilters.size() == 1)
+                    strippedBranches.push_back(branchFilters[0]);
+                else
+                    strippedBranches.push_back(Predicate::logAnd(branchFilters));
+            }
             if (first) {
                 commonJoins = std::move(branchJoins);
                 first = false;
             } else {
-                // Keep only joins present in both
                 commonJoins.erase(
                     std::remove_if(commonJoins.begin(), commonJoins.end(),
                         [&](const JoinClause& jc) {
@@ -611,7 +618,12 @@ void separatePredicates(const PredPtr& pred, const std::vector<std::string>& tab
             }
         }
         for (auto& jc : commonJoins) joins.push_back(jc);
-        filters.push_back(pred);  // OR stays as filter for per-branch conditions
+        if (!strippedBranches.empty()) {
+            if (strippedBranches.size() == 1)
+                filters.push_back(strippedBranches[0]);
+            else
+                filters.push_back(Predicate::logOr(strippedBranches));
+        }
         return;
     }
     JoinClause jc;
