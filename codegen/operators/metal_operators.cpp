@@ -50,11 +50,8 @@ void MetalOperator::appendIUsFromExpr(const std::string& expr,
     const char* helpers[] = {
         "fixed_like_one_segment(", "fixed_like_two_segment(",
         "fixed_string_segment_eq(", "fixed_string_padding_ok(",
-        // Custom CHAR_FIXED helpers from predefined TPC-H query builders
-        "q2_type_ends_brass(",
-        "q13_comment_match(",
-        "q16_has_complaint(",
-        "brand_eq("
+        "q2_type_ends_brass(", "q13_comment_match(",
+        "q16_has_complaint(", "brand_eq(", "container_match("
     };
     for (const char* hdr : helpers) {
         size_t pos = 0;
