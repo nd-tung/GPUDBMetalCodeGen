@@ -399,9 +399,11 @@ std::unique_ptr<MetalOperator> makeFilteredScan(const AnalyzedQuery& aq,
     std::set<std::string> scanColumns = columns;
     if (scanColumns.empty()) {
         if (aq.schema) {
-            auto pk = aq.schema->pkInfo(aq.tables[0]);
-            if (pk) scanColumns.insert(pk->first);
+            // Schema-driven generic path: trust IU auto-projection.
+            // The scan will deduce required columns at produce time
+            // via the parent chain + ColumnTypeResolver.
         } else {
+            // TPC-H fallback: use the primary key column as a minimum
             const auto& table = TPCHSchema::instance().table(aq.tables[0]);
             if (!table.columns.empty()) scanColumns.insert(table.columns.front().name);
         }
@@ -423,7 +425,10 @@ std::optional<MetalQueryPlan> buildScalarAggPlan(const AnalyzedQuery& aq, std::s
     if (aq.limit >= 0) return fail("Scalar aggregation: LIMIT not supported in scalar-agg path.");
 
     std::set<std::string> usedColumns;
-    for (const auto& filter : aq.filters) collectColumns(filter, usedColumns);
+    if (!aq.schema) {
+        // TPC-H manual path: compute which columns the scan needs.
+        for (const auto& filter : aq.filters) collectColumns(filter, usedColumns);
+    }
 
     for (const auto& target : aq.targets) {
         if (!target.isAgg || !target.agg) return fail("Scalar aggregation: non-aggregate SELECT target.");
@@ -438,7 +443,7 @@ std::optional<MetalQueryPlan> buildScalarAggPlan(const AnalyzedQuery& aq, std::s
                 return fail("Scalar aggregation: inner expression of '" + aggName(func) + "' not supported on GPU.");
             if (!isNumericLike(inferExprDataType(target.agg->innerExpr)))
                 return fail("Scalar aggregation: inner expression of '" + aggName(func) + "' must be numeric.");
-            collectColumns(target.agg->innerExpr, usedColumns);
+            if (!aq.schema) collectColumns(target.agg->innerExpr, usedColumns);
         }
     }
 
@@ -552,7 +557,9 @@ std::optional<MetalQueryPlan> buildGroupedAggPlan(const AnalyzedQuery& aq, std::
     };
 
     std::set<std::string> usedColumns;
-    for (const auto& filter : aq.filters) collectColumns(filter, usedColumns);
+    if (!aq.schema) {
+        for (const auto& filter : aq.filters) collectColumns(filter, usedColumns);
+    }
     // GROUP BY columns are added during the key descriptor loop below
     // (derived columns need special handling to not add alias names).
 
@@ -574,12 +581,12 @@ std::optional<MetalQueryPlan> buildGroupedAggPlan(const AnalyzedQuery& aq, std::
             auto srcExpr = aq.subqueryExprMap.at(gc->column);
             kd.keyExpr = exprToMetal(srcExpr, idxVar);
             kd.numValues = 256;  // safe upper bound for derived INT columns
-            collectColumns(srcExpr, usedColumns);
+            if (!aq.schema) collectColumns(srcExpr, usedColumns);
         } else if (fc) {
             // FuncCall GROUP BY (e.g. extract(year from ...) resolved via subquery alias)
             kd.keyExpr = exprToMetal(aq.groupBy[ki], idxVar);
             kd.numValues = 256;
-            collectColumns(aq.groupBy[ki], usedColumns);
+            if (!aq.schema) collectColumns(aq.groupBy[ki], usedColumns);
         } else if (gc && gc->dataType == DataType::CHAR1) {
             kd.keyExpr = char1BucketExpr(*gc, idxVar, kd.numValues, aq.schema);
         } else {
@@ -595,7 +602,7 @@ std::optional<MetalQueryPlan> buildGroupedAggPlan(const AnalyzedQuery& aq, std::
             kd.keyExpr = "clamp(" + kd.keyExpr + ", 0, " + std::to_string(kd.numValues - 1) + ")";
         }
         // Add column to scan if not derived
-        if (gc && !gc->table.empty()) usedColumns.insert(gc->column);
+        if (!aq.schema && gc && !gc->table.empty()) usedColumns.insert(gc->column);
         kd.stride = totalBuckets;
         totalBuckets *= kd.numValues;
         keyDescriptors.push_back(kd);
@@ -674,7 +681,7 @@ std::optional<MetalQueryPlan> buildGroupedAggPlan(const AnalyzedQuery& aq, std::
                 return fail("Grouped aggregation: AVG inner expression not supported on GPU.");
             DataType vt = inferExprDataType(target.agg->innerExpr);
             bool isFloat = (vt == DataType::FLOAT);
-            collectColumns(target.agg->innerExpr, usedColumns);
+            if (!aq.schema) collectColumns(target.agg->innerExpr, usedColumns);
 
             std::string dname = displayNameForTarget(target, targetIndex);
             std::string sname = sanitizeIdentifier(dname);
@@ -725,7 +732,7 @@ std::optional<MetalQueryPlan> buildGroupedAggPlan(const AnalyzedQuery& aq, std::
                 return fail("Grouped aggregation: " + aggName(func) + " inner expression not supported on GPU.");
             DataType vt = inferExprDataType(target.agg->innerExpr);
             bool isFloat = (vt == DataType::FLOAT);
-            collectColumns(target.agg->innerExpr, usedColumns);
+            if (!aq.schema) collectColumns(target.agg->innerExpr, usedColumns);
 
             PendingAgg agg;
             agg.displayName = displayNameForTarget(target, targetIndex);
@@ -789,7 +796,7 @@ std::optional<MetalQueryPlan> buildGroupedAggPlan(const AnalyzedQuery& aq, std::
                 return fail("Grouped aggregation: COUNT(DISTINCT) on column '" + innerCol->column +
                            "' — no known max value for bitmap sizing.");
 
-            collectColumns(target.agg->innerExpr, usedColumns);
+            if (!aq.schema) collectColumns(target.agg->innerExpr, usedColumns);
             std::string dname = displayNameForTarget(target, targetIndex);
             std::string valueExpr = innerCol->column + "[" + idxVar + "]";
 
@@ -820,7 +827,7 @@ std::optional<MetalQueryPlan> buildGroupedAggPlan(const AnalyzedQuery& aq, std::
         if (!exprSupported(target.agg->innerExpr, false))
             return fail("Grouped aggregation: SUM inner expression not supported on GPU.");
         DataType vt = inferExprDataType(target.agg->innerExpr);
-        collectColumns(target.agg->innerExpr, usedColumns);
+        if (!aq.schema) collectColumns(target.agg->innerExpr, usedColumns);
 
         PendingAgg agg;
         agg.displayName = displayNameForTarget(target, targetIndex);
@@ -982,13 +989,15 @@ std::optional<MetalQueryPlan> buildMaterializePlan(const AnalyzedQuery& aq, std:
     }
 
     std::set<std::string> usedColumns;
-    for (const auto& filter : aq.filters) collectColumns(filter, usedColumns);
+    if (!aq.schema) {
+        for (const auto& filter : aq.filters) collectColumns(filter, usedColumns);
+    }
     for (const auto& target : aq.targets) {
         if (!target.expr)
             return fail("Materialization: SELECT target has no expression.");
         if (!materializeExprSupported(target.expr))
             return fail("Materialization: SELECT expression not supported on GPU.");
-        collectColumns(target.expr, usedColumns);
+        if (!aq.schema) collectColumns(target.expr, usedColumns);
     }
 
     MetalQueryPlan plan;
@@ -1708,31 +1717,10 @@ std::optional<MetalQueryPlan> buildGenericMultiTableAdhocPlan_impl(
         }
     }
 
-    auto scanColsForTable = [&](int u, std::set<std::string>& out) {
-        const std::string& tname = aq.tables[u];
-        for (const auto& f : filtersByTable[tname]) collectColumns(f, out);
-        // Edge to parent: probe key on self
-        if (u != probeIdx) {
-            out.insert(nodes[u].keyOnSelf);
-            if (nodes[u].composite()) out.insert(nodes[u].keyOnSelf2);
-        }
-        // Edges to children: probe keys for child join (column on this table)
-        for (int c : nodes[u].children) {
-            // child's keyOnParent is on `u`
-            out.insert(nodes[c].keyOnParent);
-            if (nodes[c].composite()) out.insert(nodes[c].keyOnParent2);
-        }
-        // Local carried columns (originating here)
-        if (u != probeIdx) {
-            for (const auto& ck : localCarry[u]) out.insert(ck.column);
-        } else {
-            // Probe scan must also bind columns referenced directly by
-            // SELECT/agg/groupBy and probe's filters.
-            for (const auto& c : neededByTable[tname]) out.insert(c);
-        }
-    };
-
     // Build phases for each non-probe node in reverse BFS order (leaves first).
+    // Scans auto-discover filter/probe columns via the IU chain, but join keys
+    // and carried columns must be explicitly loaded (they're referenced in
+    // different phases or via extra buffers).
     for (auto it = bfsOrder.rbegin(); it != bfsOrder.rend(); ++it) {
         int u = *it;
         if (u == probeIdx) continue;
@@ -1741,7 +1729,17 @@ std::optional<MetalQueryPlan> buildGenericMultiTableAdhocPlan_impl(
         const std::string& tag = nodes[u].table;  // alias for unique naming
 
         std::set<std::string> scanCols;
-        scanColsForTable(u, scanCols);
+        // Join key to parent
+        scanCols.insert(nodes[u].keyOnSelf);
+        if (nodes[u].composite()) scanCols.insert(nodes[u].keyOnSelf2);
+        // Keys for children to probe this table
+        for (int c : nodes[u].children) {
+            scanCols.insert(nodes[c].keyOnParent);
+            if (nodes[c].composite()) scanCols.insert(nodes[c].keyOnParent2);
+        }
+        // Carried columns (needed for ArrayStore/HashMapBuild value or extra buffers)
+        for (const auto& ck : localCarry[u]) scanCols.insert(ck.column);
+
         auto scan = makeScanForCols(tname, idxVar, scanCols);
         std::unique_ptr<MetalOperator> pipe = std::move(scan);
 
@@ -1863,18 +1861,11 @@ std::optional<MetalQueryPlan> buildGenericMultiTableAdhocPlan_impl(
     }
 
     // ---------- Probe phase ----------
+    // Probe scan auto-discovers filter/key columns via IU chain, but
+    // columns referenced directly by SELECT/agg/GROUP BY are explicitly
+    // loaded (the IU chain may miss CHAR_FIXED bare-pointer refs).
     std::set<std::string> probeScanCols;
-    scanColsForTable(probeIdx, probeScanCols);
-    // Add columns referenced by cross-table filters to the probe scan.
-    {
-        std::set<std::string> cfCols;
-        for (auto& cf : crossFilters) collectColumns(cf, cfCols);
-        for (const auto& c : cfCols) {
-            bool hasCol = aq.schema ? aq.schema->hasColumn(probeTable, c) : TPCHSchema::instance().table(probeTable).nameToIdx.count(c);
-            if (hasCol)
-                probeScanCols.insert(c);
-        }
-    }
+    for (const auto& c : neededByTable[probeTable]) probeScanCols.insert(c);
     auto probeScan = makeScanForCols(probeTable, idxVar, probeScanCols);
     std::unique_ptr<MetalOperator> probePipe = std::move(probeScan);
 
