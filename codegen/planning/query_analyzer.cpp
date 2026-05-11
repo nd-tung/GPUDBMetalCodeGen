@@ -40,16 +40,25 @@ std::map<std::string, std::pair<json, std::vector<std::string>>> g_views;
 // Schema provider injected by analyzeSQL(); used by AST walkers for column
 // resolution instead of hard-coded TPCHSchema::instance().
 static const SchemaProvider* g_analyzeSchema = nullptr;
+static const Catalog* g_analyzeCatalog = nullptr;
 
 // Resolve an unqualified column name to (table, column).
 // If multiple tables have the column, we need the table list to disambiguate.
 // Returns ("", colName) if not found in any table (could be a SELECT alias).
 std::pair<std::string, std::string> resolveColumn(const std::string& colName,
                                                     const std::vector<std::string>& tables) {
+    // Use the Catalog when available (resolves qualified+unqualified).
+    if (g_analyzeCatalog) {
+        for (auto& t : tables) {
+            if (g_analyzeCatalog->hasColumn(t, colName)) return {t, colName};
+        }
+        return {"", colName};
+    }
+    // Fallback: SchemaProvider
     for (auto& t : tables) {
         if (g_analyzeSchema && g_analyzeSchema->hasColumn(t, colName)) return {t, colName};
     }
-    return {"", colName}; // alias or derived column
+    return {"", colName};
 }
 
 } // anonymous namespace
@@ -773,6 +782,7 @@ AnalyzedQuery analyzeSQL(const std::string& sql, const SchemaProvider* schema) {
     AnalyzedQuery aq;
     aq.schema = schema ? schema : &g_defaultSchema;
     g_analyzeSchema = aq.schema;
+    g_analyzeCatalog = aq.catalog;
 
     // Build a catalog from the schema provider (cached per schema).
     static const SchemaProvider* s_catFor = nullptr;
