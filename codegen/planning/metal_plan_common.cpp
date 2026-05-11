@@ -76,8 +76,9 @@ std::string fixedStringEqMetal(const ColRef& col,
                                 const std::string& literal,
                                 const std::string& idxVar,
                                 const SchemaProvider* schema = nullptr) {
-    int width = schema ? schema->columnFixedWidth(col.table, col.column)
-                       : TPCHSchema::instance().table(col.table).col(col.column).fixedWidth;
+    int width = 0;
+    if (schema) width = schema->columnFixedWidth(col.table, col.column);
+    else try { width = TPCHSchema::instance().table(col.table).col(col.column).fixedWidth; } catch (...) {}
     if (width <= 0 || static_cast<int>(literal.size()) > width) return "false";
 
     std::string base = col.column + "[" + idxVar + " * " + std::to_string(width) + " + ";
@@ -98,8 +99,9 @@ std::string fixedStringPrefixMetal(const ColRef& col,
                                     const std::string& prefix,
                                     const std::string& idxVar,
                                     const SchemaProvider* schema = nullptr) {
-    int width = schema ? schema->columnFixedWidth(col.table, col.column)
-                       : TPCHSchema::instance().table(col.table).col(col.column).fixedWidth;
+    int width = 0;
+    if (schema) width = schema->columnFixedWidth(col.table, col.column);
+    else try { width = TPCHSchema::instance().table(col.table).col(col.column).fixedWidth; } catch (...) {}
     if (width <= 0 || static_cast<int>(prefix.size()) > width) return "false";
 
     std::string base = col.column + "[" + idxVar + " * " + std::to_string(width) + " + ";
@@ -150,22 +152,18 @@ bool likeSegmentsArePackable(const std::vector<std::string>& segments) {
 }
 
 std::optional<std::string> fixedStringLikeMetal(const Like& like,
-                                                const std::string& idxVar) {
+                                                const std::string& idxVar,
+                                                const SchemaProvider* schema = nullptr) {
     const ColRef* col = fixedStringCol(like.expr);
     if (!col || likePatternUsesUnsupportedWildcard(like.pattern)) return std::nullopt;
 
     if (col->table.empty() || col->column.empty()) return std::nullopt;
-    try {
-        auto& tbl = TPCHSchema::instance().table(col->table);
-        auto it = tbl.nameToIdx.find(col->column);
-        if (it == tbl.nameToIdx.end()) return std::nullopt;
-    } catch (const std::exception&) {
-        return std::nullopt;
-    }
-
-    const auto& cdef = TPCHSchema::instance().table(col->table).col(col->column);
-    const int width = cdef.fixedWidth;
+    int width = 0;
+    if (schema) width = schema->columnFixedWidth(col->table, col->column);
+    else try { width = TPCHSchema::instance().table(col->table).col(col->column).fixedWidth; } catch (...) {}
     if (width <= 0) return std::nullopt;
+
+    // Build LIKE Metal expression using column width
 
     if (like.pattern.find('%') == std::string::npos) {
         std::string exact = fixedStringEqMetal(*col, like.pattern, idxVar);
@@ -385,8 +383,8 @@ std::string exprToMetal(const ExprPtr& expr, const std::string& idxVar,
                     if (auto* cr = std::get_if<ColRef>(&node.args[0]->node)) {
                         colName = cr->column;
                     try {
-                        fw = (schema ? schema->columnFixedWidth(cr->table, cr->column)
-                                     : TPCHSchema::instance().table(cr->table).col(cr->column).fixedWidth);
+                        if (schema) fw = schema->columnFixedWidth(cr->table, cr->column);
+                        else try { fw = TPCHSchema::instance().table(cr->table).col(cr->column).fixedWidth; } catch (...) {}
                     } catch (...) {}
                     }
                 }
@@ -518,7 +516,7 @@ std::string predToMetal(const PredPtr& pred, const std::string& idxVar,
             return "!(" + predToMetal(node.child, idxVar) + ")";
         }
         else if constexpr (std::is_same_v<T, Like>) {
-            if (auto fixedStringLike = fixedStringLikeMetal(node, idxVar)) {
+            if (auto fixedStringLike = fixedStringLikeMetal(node, idxVar, schema)) {
                 return *fixedStringLike;
             }
             return "false";
@@ -545,12 +543,16 @@ std::string combineFilters(const std::vector<PredPtr>& filters, const std::strin
     return cond;
 }
 
-// Map column name to Metal type
+// Map column name to Metal type.
+// Falls back to TPCHSchema when schema is null (predefined query builders).
 static std::string colMetalType(const std::string& table, const std::string& colName,
                                 const SchemaProvider* schema = nullptr) {
-    DataType type;
+    DataType type = DataType::INT;
     if (schema) type = schema->columnType(table, colName);
-    else type = TPCHSchema::instance().table(table).col(colName).type;
+    else {
+        try { type = TPCHSchema::instance().table(table).col(colName).type; }
+        catch (...) {}
+    }
     switch (type) {
         case DataType::INT:        return "int";
         case DataType::FLOAT:      return "float";
