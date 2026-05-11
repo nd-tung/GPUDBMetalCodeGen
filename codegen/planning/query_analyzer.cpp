@@ -96,7 +96,10 @@ ExprPtr walkColumnRef(const json& node, const std::vector<std::string>& tables) 
         if (sqit != g_subqueryAliasMap.end())
             return Expr::col(sqit->second.table, sqit->second.column,
                              sqit->second.colIndex, sqit->second.dataType);
-        // This is a SELECT alias (e.g., "revenue" in ORDER BY) — return as unresolved ColRef
+        // Check subquery expression aliases for WHERE/HAVING contexts.
+        auto eqit = g_subqueryExprMap.find(colName);
+        if (eqit != g_subqueryExprMap.end()) return eqit->second;
+        // Unresolvable — SELECT alias or derived column
         return Expr::col("", colName, -1, DataType::INT);
     }
 

@@ -548,17 +548,23 @@ std::optional<MetalQueryPlan> buildGroupedAggPlan(const AnalyzedQuery& aq, std::
 
     for (size_t ki = 0; ki < aq.groupBy.size(); ++ki) {
         auto* gc = aq.groupBy[ki] ? std::get_if<ColRef>(&aq.groupBy[ki]->node) : nullptr;
-        if (!gc) return fail("Grouped aggregation: GROUP BY expression #" + std::to_string(ki+1) + " must be a column reference.");
+        auto* fc = (!gc && aq.groupBy[ki]) ? std::get_if<FuncCall>(&aq.groupBy[ki]->node) : nullptr;
+        if (!gc && !fc) return fail("Grouped aggregation: GROUP BY expression #" + std::to_string(ki+1) + " must be a column reference or translatable function call.");
 
         GroupKeyDesc kd;
         // For derived columns (empty table), use the source expression from
         // subqueryExprMap as the key expression directly.
-        if (gc->table.empty() && aq.subqueryExprMap.count(gc->column)) {
+        if (gc && gc->table.empty() && aq.subqueryExprMap.count(gc->column)) {
             auto srcExpr = aq.subqueryExprMap.at(gc->column);
             kd.keyExpr = exprToMetal(srcExpr, idxVar);
             kd.numValues = 256;  // safe upper bound for derived INT columns
             collectColumns(srcExpr, usedColumns);
-        } else if (gc->dataType == DataType::CHAR1) {
+        } else if (fc) {
+            // FuncCall GROUP BY (e.g. extract(year from ...) resolved via subquery alias)
+            kd.keyExpr = exprToMetal(aq.groupBy[ki], idxVar);
+            kd.numValues = 256;
+            collectColumns(aq.groupBy[ki], usedColumns);
+        } else if (gc && gc->dataType == DataType::CHAR1) {
             kd.keyExpr = char1BucketExpr(*gc, idxVar, kd.numValues);
             if (kd.numValues == 0) return fail("Grouped aggregation: CHAR1 column '" + gc->column + "' has no known domain.");
         } else {
@@ -574,7 +580,7 @@ std::optional<MetalQueryPlan> buildGroupedAggPlan(const AnalyzedQuery& aq, std::
             kd.keyExpr = "clamp(" + kd.keyExpr + ", 0, " + std::to_string(kd.numValues - 1) + ")";
         }
         // Add column to scan if not derived
-        if (!gc->table.empty()) usedColumns.insert(gc->column);
+        if (gc && !gc->table.empty()) usedColumns.insert(gc->column);
         kd.stride = totalBuckets;
         totalBuckets *= kd.numValues;
         keyDescriptors.push_back(kd);
@@ -597,7 +603,8 @@ std::optional<MetalQueryPlan> buildGroupedAggPlan(const AnalyzedQuery& aq, std::
     std::vector<std::string> keyDisplayNames(keyDescriptors.size());
     for (size_t ki = 0; ki < keyDescriptors.size(); ++ki) {
         auto* gc = std::get_if<ColRef>(&aq.groupBy[ki]->node);
-        keyDisplayNames[ki] = gc->column;
+        if (gc) keyDisplayNames[ki] = gc->column;
+        else keyDisplayNames[ki] = "expr_" + std::to_string(ki);
     }
     // Override with aliases from SELECT targets where present
     for (size_t ti = 0; ti < aq.targets.size(); ++ti) {
@@ -606,6 +613,9 @@ std::optional<MetalQueryPlan> buildGroupedAggPlan(const AnalyzedQuery& aq, std::
         for (size_t ki = 0; ki < keyDescriptors.size(); ++ki) {
             auto* gc = std::get_if<ColRef>(&aq.groupBy[ki]->node);
             if (gc && exprIsColumn(target.expr, *gc)) {
+                keyDisplayNames[ki] = displayNameForTarget(target, ti);
+            } else if (!gc && !target.isAgg) {
+                // FuncCall GROUP BY: match position
                 keyDisplayNames[ki] = displayNameForTarget(target, ti);
             }
         }
@@ -846,11 +856,12 @@ std::optional<MetalQueryPlan> buildGroupedAggPlan(const AnalyzedQuery& aq, std::
                 auto& colDef = TPCHSchema::instance().table(gc->table).col(gc->column);
                 d.charMap = colDef.charDomain;
             } catch (const std::runtime_error&) {}
-        } else {
+        } else if (gc) {
             // Integer: find the base offset from domain
             auto domain = smallIntGroupDomain(*gc);
             d.keyBase = domain ? domain->minValue : 0;
         }
+        // FuncCall GROUP BY: no decode needed (keyExpr is raw computed value)
         decodeInfo.push_back(d);
     }
     agg->setMultiKeyResult(keyDisplayNames, decodeInfo, numBuckets);
@@ -2124,8 +2135,18 @@ std::optional<MetalQueryPlan> buildGenericMultiTableAdhocPlan_impl(
         MetalQueryPlan::CpuGroupBy cpuGB;
         for (const auto& g : aq.groupBy) {
             auto* gcRef = std::get_if<ColRef>(&g->node);
-            if (!gcRef) return fail("GROUP BY expression must be a column reference.");
-            cpuGB.keyColumns.push_back(displayNameForTargetByCol(aq, *gcRef));
+            if (gcRef) {
+                cpuGB.keyColumns.push_back(displayNameForTargetByCol(aq, *gcRef));
+            } else {
+                // FuncCall GROUP BY (resolved from subquery alias):
+                // match by position against non-aggregate targets.
+                for (size_t ti = 0; ti < aq.targets.size(); ++ti) {
+                    if (!aq.targets[ti].isAgg) {
+                        cpuGB.keyColumns.push_back(displayNameForTarget(aq.targets[ti], ti));
+                        break;
+                    }
+                }
+            }
         }
         for (size_t ti = 0; ti < aq.targets.size(); ++ti) {
             const auto& target = aq.targets[ti];
