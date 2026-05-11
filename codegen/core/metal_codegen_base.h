@@ -2,16 +2,9 @@
 // ===================================================================
 // MetalCodegen — Base class for composable Metal shader generation
 // ===================================================================
-//
-// Manages code emission, indentation, multi-phase kernel generation,
-// parameter binding with auto-numbered [[buffer(N)]] attributes,
-// and result schema registration.
-//
-// Operators call methods on this class during produce() to emit
-// Metal shader code.
-// ===================================================================
 
 #include "metal_param_binding.h"
+#include "iu.hpp"
 #include <string>
 #include <vector>
 #include <functional>
@@ -175,6 +168,21 @@ public:
     };
     const std::vector<PhaseInfo>& getPhases() const;
 
+    // ---------------------------------------------------------------
+    // Column-type resolver (for IU auto-projection)
+    // ---------------------------------------------------------------
+    // Injected by the schema layer. Given a table name and column name,
+    // returns the Metal element type string ("int", "float", "char")
+    // or empty if the column is unknown.
+    void setColumnTypeResolver(ColumnTypeResolver r) {
+        columnTypeResolver_ = std::move(r);
+    }
+    std::string resolveColumnType(const std::string& table,
+                                  const std::string& col) const {
+        return columnTypeResolver_ ? columnTypeResolver_(table, col)
+                                   : std::string{};
+    }
+
     // Mutable phase access (used by --autotune-tg to change TG size between
     // dispatches without recompiling the kernels).
     std::vector<PhaseInfo>& getPhasesMutable();
@@ -218,6 +226,9 @@ private:
     // repeated in every addXxxParam method.
     void pushBinding(const char* op, MetalParamBinding b, bool dedup);
     void assignBufferIndices(PhaseInfo& phase);
+
+    // Column-type resolver for IU auto-projection
+    ColumnTypeResolver columnTypeResolver_;
 };
 
 // RAII guard for indentation scope — automatically decrements on destruction.

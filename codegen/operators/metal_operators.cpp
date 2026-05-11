@@ -1,11 +1,46 @@
 #include "metal_operators.h"
 #include "metal_plan_common.h"
 #include "metal_generic_executor.h"
+#include "../core/iu.hpp"
 #include <sstream>
 #include <cstdlib>
 #include <cstring>
 
 namespace codegen {
+
+// ===================================================================
+// Static helper: parse colName[idxVar] references from expressions
+// ===================================================================
+
+void MetalOperator::appendIUsFromExpr(const std::string& expr,
+                                       std::vector<IU>& out) {
+    auto isIdent = [](char c) {
+        return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+               (c >= '0' && c <= '9') || c == '_';
+    };
+    size_t n = expr.size();
+    size_t i = 0;
+    while (i < n) {
+        if (!isIdent(expr[i])) { ++i; continue; }
+        size_t s = i;
+        while (i < n && isIdent(expr[i])) ++i;
+        // Need a '[' after the identifier
+        if (i >= n || expr[i] != '[') continue;
+        // Reject if the previous char before identifier is also ident
+        // (middle of a longer qualified name like func.col[i])
+        if (s > 0 && isIdent(expr[s - 1])) continue;
+        size_t lb = i;
+        size_t is = lb + 1;
+        if (is >= n || !isIdent(expr[is])) continue;
+        size_t ie = is;
+        while (ie < n && isIdent(expr[ie])) ++ie;
+        // Need a ']'
+        if (ie >= n || expr[ie] != ']') continue;
+        out.emplace_back(expr.substr(s, lb - s),   // colName
+                         expr.substr(is, ie - is)); // idxVar
+        i = ie + 1;
+    }
+}
 
 // JSON serialization for operator trees
 nlohmann::json MetalOperator::toJSON() const {
@@ -42,16 +77,38 @@ void MetalGridStrideScan::addColumn(const std::string& paramName, const std::str
     columns_.push_back({paramName, metalType});
 }
 
+std::vector<MetalGridStrideScan::ColumnDesc>
+MetalGridStrideScan::deduceRequiredColumns(MetalCodegen& cg) const {
+    std::vector<IU> ius;
+    for (MetalOperator* p = parent(); p; p = p->parent()) {
+        p->iusUsed(ius);
+    }
+    std::vector<ColumnDesc> result;
+    std::unordered_set<std::string> seen;
+    for (const auto& iu : ius) {
+        if (iu.idxVar != idxVar_) continue;
+        if (seen.count(iu.colName)) continue;
+        std::string mt = cg.resolveColumnType(tableName_, iu.colName);
+        if (mt.empty()) continue;
+        result.push_back({iu.colName, mt});
+        seen.insert(iu.colName);
+    }
+    return result;
+}
+
 void MetalGridStrideScan::produce(MetalCodegen& cg, ConsumerFn consume) {
     cg.setPhaseScannedTable(tableName_);
 
-    // All TPC-H scans are columnar (addColumn() called by the planner before
-    // produce()). The legacy AoS struct path was removed — no current query
-    // exercises it.
+    // Auto-discover columns via IU chain when the planner didn't explicitly
+    // set a column list (generic path).
+    if (columns_.empty()) {
+        columns_ = deduceRequiredColumns(cg);
+    }
     if (columns_.empty()) {
         throw std::runtime_error(
             "MetalGridStrideScan(" + tableName_ +
-            "): no columns registered. Call addColumn() before produce().");
+            "): no columns registered. Call addColumn() before produce() "
+            "or set a ColumnTypeResolver for auto-projection.");
     }
     for (const auto& col : columns_) {
         cg.addColumnParam(col.paramName, col.metalType, tableName_);
