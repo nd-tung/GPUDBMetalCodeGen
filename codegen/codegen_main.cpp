@@ -18,6 +18,7 @@
 #include <fstream>
 #include <sstream>
 #include <cmath>
+#include <queue>
 #include <cerrno>
 #include <cstdlib>
 #include <limits>
@@ -1662,8 +1663,13 @@ static bool runCodegenQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
                 size_t okLookupLen = lookupBuf->length() / sizeof(int);
 
                 struct Q18Entry { int orderkey; int custkey; float totalprice; int orderdate; float qty; };
-                std::vector<Q18Entry> results;
-                results.reserve(n);
+                // Min-heap by totalprice (ascending), orderdate (descending) as tiebreaker.
+                // Pops the smallest totalprice when heap exceeds 100 entries.
+                auto cmp = [](const Q18Entry& a, const Q18Entry& b) {
+                    if (a.totalprice != b.totalprice) return a.totalprice > b.totalprice;
+                    return a.orderdate < b.orderdate;
+                };
+                std::priority_queue<Q18Entry, std::vector<Q18Entry>, decltype(cmp)> top100(cmp);
                 for (uint32_t k = 0; k < n; k++) {
                     int ok = (int)oks[k];
                     int idx = (ok >= 0 && (size_t)ok < okLookupLen) ? okLookup[ok] : -1;
@@ -1673,23 +1679,12 @@ static bool runCodegenQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
                         tp = o_totalprice[idx];
                         od = o_orderdate[idx];
                     }
-                    results.push_back({ok, custkey, tp, od, qtys[k]});
+                    top100.push({ok, custkey, tp, od, qtys[k]});
+                    if ((int)top100.size() > 100) top100.pop();
                 }
-                int show = std::min((int)results.size(), 100);
-                if (show < (int)results.size()) {
-                    std::partial_sort(results.begin(), results.begin() + show,
-                                      results.end(),
-                                      [](auto& a, auto& b) {
-                                          if (a.totalprice != b.totalprice) return a.totalprice > b.totalprice;
-                                          return a.orderdate < b.orderdate;
-                                      });
-                } else {
-                    std::sort(results.begin(), results.end(),
-                              [](auto& a, auto& b) {
-                                  if (a.totalprice != b.totalprice) return a.totalprice > b.totalprice;
-                                  return a.orderdate < b.orderdate;
-                              });
-                }
+                int show = top100.size();
+                std::vector<Q18Entry> results(show);
+                for (int j = show - 1; j >= 0; j--) { results[j] = top100.top(); top100.pop(); }
                 result.result.columns = {{"c_custkey","int"},{"o_orderkey","int"},{"o_orderdate","string"},{"o_totalprice","float"},{"sum(l_quantity)","float"}};
                 result.result.rows.clear();
                 for (int j = 0; j < show; j++) {
