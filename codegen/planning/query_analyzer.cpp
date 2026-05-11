@@ -775,14 +775,14 @@ AnalyzedQuery analyzeSQL(const std::string& sql) {
         if (s["stmt"].contains("ViewStmt")) {
             auto& vs = s["stmt"]["ViewStmt"];
             ViewDef vd;
-            if (vs.contains("view") && vs["view"].contains("RangeVar"))
-                vd.name = vs["view"]["RangeVar"].value("relname", "");
+            if (vs.contains("view"))
+                vd.name = vs["view"].value("relname", "");
             if (vd.name.empty()) continue;
             vd.selectBody = vs["query"]["SelectStmt"];
             if (vs.contains("aliases")) {
                 for (auto& a : vs["aliases"]) {
-                    if (a.contains("String") && a["String"].contains("str"))
-                        vd.cols.push_back(a["String"]["str"].get<std::string>());
+                    if (a.contains("String") && a["String"].contains("sval"))
+                        vd.cols.push_back(a["String"]["sval"].get<std::string>());
                     else if (a.contains("aliasname"))
                         vd.cols.push_back(a["aliasname"].get<std::string>());
                 }
