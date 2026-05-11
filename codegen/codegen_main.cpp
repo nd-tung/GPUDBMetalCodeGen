@@ -1847,16 +1847,18 @@ static bool runCodegenQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
 
                 struct Q2Row {
                     float s_acctbal;
-                    std::string s_name, n_name, s_address, s_phone, s_comment, p_mfgr;
+                    const char* s_name_ptr; int s_name_len;
+                    const char* n_name_ptr; int n_name_len;
                     int p_partkey;
+                    int si; // supplier index (for deferred field extraction)
+                    int pi; // part index
                 };
                 std::vector<Q2Row> rows;
                 rows.reserve(n);
 
-                auto extractStr = [](const char* base, int width) {
-                    int len = 0;
+                auto writeStrLen = [](const char* base, int width, int& len) {
+                    len = 0;
                     while (len < width && base[len] != '\0') len++;
-                    return std::string(base, len);
                 };
 
                 for (uint32_t k = 0; k < n; k++) {
@@ -1870,37 +1872,62 @@ static bool runCodegenQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
                     Q2Row row;
                     row.s_acctbal = pd.s_acctbal[si];
                     row.p_partkey = pk;
-                    row.s_name    = extractStr(pd.s_name    + si * 25,  25);
-                    row.s_address = extractStr(pd.s_address + si * 40,  40);
-                    row.s_phone   = extractStr(pd.s_phone   + si * 15,  15);
-                    row.s_comment = extractStr(pd.s_comment + si * 101, 101);
-                    row.p_mfgr    = extractStr(pd.p_mfgr    + pi * 25,  25);
-                    row.n_name = (pd.s_nationkey[si] >= 0 && pd.s_nationkey[si] < (int)pd.nationNames.size())
-                        ? pd.nationNames[pd.s_nationkey[si]] : "?";
+                    row.si = si; row.pi = pi;
+                    row.s_name_ptr = pd.s_name    + si * 25;
+                    row.n_name_ptr = (pd.s_nationkey[si] >= 0 && pd.s_nationkey[si] < (int)pd.nationNames.size())
+                        ? pd.nationNames[pd.s_nationkey[si]].data() : "";
+                    writeStrLen(row.s_name_ptr, 25, row.s_name_len);
+                    row.n_name_len = pd.s_nationkey[si] >= 0 && pd.s_nationkey[si] < (int)pd.nationNames.size()
+                        ? (int)pd.nationNames[pd.s_nationkey[si]].size() : 0;
                     rows.push_back(std::move(row));
                 }
 
+                // Sort using string_view comparisons (no string copies)
                 std::sort(rows.begin(), rows.end(), [](const Q2Row& a, const Q2Row& b) {
                     if (a.s_acctbal != b.s_acctbal) return a.s_acctbal > b.s_acctbal;
-                    if (a.n_name != b.n_name) return a.n_name < b.n_name;
-                    if (a.s_name != b.s_name) return a.s_name < b.s_name;
+                    // n_name compare
+                    { int cmp = strncmp(a.n_name_ptr, b.n_name_ptr, std::min(a.n_name_len, b.n_name_len));
+                      if (cmp != 0) return cmp < 0;
+                      if (a.n_name_len != b.n_name_len) return a.n_name_len < b.n_name_len; }
+                    // s_name compare
+                    { int cmp = strncmp(a.s_name_ptr, b.s_name_ptr, std::min(a.s_name_len, b.s_name_len));
+                      if (cmp != 0) return cmp < 0;
+                      if (a.s_name_len != b.s_name_len) return a.s_name_len < b.s_name_len; }
                     return a.p_partkey < b.p_partkey;
                 });
 
                 int limit = std::min((int)rows.size(), 100);
                 result.result.columns = {{"s_acctbal","float"},{"s_name","string"},{"n_name","string"},{"p_partkey","int"},{"p_mfgr","string"},{"s_address","string"},{"s_phone","string"},{"s_comment","string"}};
                 result.result.rows.clear();
-                for (int j = 0; j < limit; j++)
-                    result.result.rows.push_back({(double)rows[j].s_acctbal, rows[j].s_name, rows[j].n_name, (int64_t)rows[j].p_partkey, rows[j].p_mfgr, rows[j].s_address, rows[j].s_phone, rows[j].s_comment});
+                auto extractStr = [](const char* base, int width) {
+                    int len = 0;
+                    while (len < width && base[len] != '\0') len++;
+                    return std::string(base, len);
+                };
+                for (int j = 0; j < limit; j++) {
+                    auto& r = rows[j];
+                    result.result.rows.push_back({
+                        (double)r.s_acctbal,
+                        std::string(r.s_name_ptr, r.s_name_len),
+                        std::string(r.n_name_ptr, r.n_name_len),
+                        (int64_t)r.p_partkey,
+                        extractStr(pd.p_mfgr    + r.pi * 25,  25),
+                        extractStr(pd.s_address + r.si * 40,  40),
+                        extractStr(pd.s_phone   + r.si * 15,  15),
+                        extractStr(pd.s_comment + r.si * 101, 101)
+                    });
+                }
                 printf("\nQ2 Results:\n");
                 printf("  %-10s | %-25s | %-15s | %-8s | %-25s\n",
                        "s_acctbal", "s_name", "n_name", "p_partkey", "p_mfgr");
                 printf("  ----------+---------------------------+-----------------+----------+---------------------------\n");
                 int show = std::min(limit, 10);
                 for (int j = 0; j < show; j++) {
-                    printf("  %9.2f | %-25s | %-15s | %8d | %-25s\n",
-                           rows[j].s_acctbal, rows[j].s_name.c_str(), rows[j].n_name.c_str(),
-                           rows[j].p_partkey, rows[j].p_mfgr.c_str());
+                    auto& r = result.result.rows[j];
+                    printf("  %9.2f | %-25s | %-15s | %8lld | %-25s\n",
+                           std::get<double>(r[0]), std::get<std::string>(r[1]).c_str(),
+                           std::get<std::string>(r[2]).c_str(), (long long)std::get<int64_t>(r[3]),
+                           std::get<std::string>(r[4]).c_str());
                 }
                 if (limit > 10) printf("  ... (%d more rows)\n", limit - 10);
                 printf("  Total rows: %d\n", limit);
