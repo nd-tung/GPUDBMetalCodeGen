@@ -1,5 +1,6 @@
 #pragma once
 #include "query_plan.h"
+#include "../core/schema_provider.h"
 #include <string>
 #include <vector>
 #include <unordered_map>
@@ -193,6 +194,65 @@ private:
 
         return s;
     }
+};
+
+// ===================================================================
+// TPCH SCHEMA PROVIDER (SchemaProvider implementation)
+// ===================================================================
+
+class TPCHSchemaProvider : public SchemaProvider {
+public:
+    DataType columnType(const std::string& table, const std::string& col) const override {
+        return TPCHSchema::instance().table(table).col(col).type;
+    }
+    int columnFixedWidth(const std::string& table, const std::string& col) const override {
+        return TPCHSchema::instance().table(table).col(col).fixedWidth;
+    }
+    bool hasColumn(const std::string& table, const std::string& col) const override {
+        return TPCHSchema::instance().table(table).nameToIdx.count(col) > 0;
+    }
+    std::string maxKeySymbol(const std::string& table) const override {
+        return TPCHSchema::instance().table(table).maxKeySymbol;
+    }
+    std::vector<std::string> tableNames() const override {
+        std::vector<std::string> names;
+        for (auto& [name, _] : TPCHSchema::instance().tables) names.push_back(name);
+        return names;
+    }
+    std::optional<GroupDomain> groupDomain(const std::string& table,
+                                           const std::string& col) const override {
+        auto& colDef = TPCHSchema::instance().table(table).col(col);
+        if (colDef.domainMin >= 0 && colDef.domainMax >= colDef.domainMin)
+            return GroupDomain{colDef.domainMin, colDef.domainMax};
+        return std::nullopt;
+    }
+    std::vector<char> charDomain(const std::string& table,
+                                 const std::string& col) const override {
+        return TPCHSchema::instance().table(table).col(col).charDomain;
+    }
+    int tableProbePriority(const std::string& table) const override {
+        // TPC-H size ordering: lineitem > orders > partsupp > customer > part > supplier > nation > region
+        if (table == "lineitem") return 100;
+        if (table == "orders")   return 80;
+        if (table == "partsupp") return 70;
+        if (table == "customer") return 50;
+        if (table == "part")     return 40;
+        if (table == "supplier") return 30;
+        if (table == "nation")   return 10;
+        if (table == "region")   return 5;
+        return 0;
+    }
+    std::optional<std::pair<std::string, std::string>> pkInfo(const std::string& table) const override {
+        if (table == "customer") return std::make_pair("c_custkey",   "maxCustkey");
+        if (table == "orders")   return std::make_pair("o_orderkey",  "maxOrderkey");
+        if (table == "supplier") return std::make_pair("s_suppkey",   "maxSuppkey");
+        if (table == "part")     return std::make_pair("p_partkey",   "maxPartkey");
+        if (table == "partsupp") return std::make_pair("ps_suppkey",  "maxSuppkey");
+        if (table == "nation")   return std::make_pair("n_nationkey", "25");
+        if (table == "region")   return std::make_pair("r_regionkey", "5");
+        return std::nullopt;
+    }
+    size_t tableRowCount(const std::string& table) const override { return 0; }
 };
 
 // ===================================================================
