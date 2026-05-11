@@ -894,25 +894,24 @@ void MetalKeyedAgg::produce(MetalCodegen& cg, ConsumerFn consume) {
         else
             cg.setPhaseMaxThreadgroups(1024);
 
-        // Declare thread-local accumulator arrays (before the scan loop)
+        // Declare and initialize thread-local accumulator arrays (merged init)
         for (const auto& agg : aggregates_) {
-            if (agg.isFloatSum) {
+            if (agg.isFloatSum)
                 cg.addLine("float _local_" + agg.name + "[" + std::to_string(numBuckets_) + "];");
-                cg.addBlock("for (int _b = 0; _b < " + std::to_string(numBuckets_) + "; _b++)", [&]() {
-                    cg.addLine("_local_" + agg.name + "[_b] = 0.0f;");
-                });
-            } else if (agg.isLongPair) {
+            else if (agg.isLongPair)
                 cg.addLine("long _local_" + agg.name + "[" + std::to_string(numBuckets_) + "];");
-                cg.addBlock("for (int _b = 0; _b < " + std::to_string(numBuckets_) + "; _b++)", [&]() {
-                    cg.addLine("_local_" + agg.name + "[_b] = 0;");
-                });
-            } else {
+            else
                 cg.addLine("uint _local_" + agg.name + "[" + std::to_string(numBuckets_) + "];");
-                cg.addBlock("for (int _b = 0; _b < " + std::to_string(numBuckets_) + "; _b++)", [&]() {
-                    cg.addLine("_local_" + agg.name + "[_b] = 0;");
-                });
-            }
         }
+        // Single merged init loop for all aggregates
+        cg.addBlock("for (int _b = 0; _b < " + std::to_string(numBuckets_) + "; _b++)", [&]() {
+            for (const auto& agg : aggregates_) {
+                if (agg.isFloatSum)
+                    cg.addLine("_local_" + agg.name + "[_b] = 0.0f;");
+                else
+                    cg.addLine("_local_" + agg.name + "[_b] = 0;");
+            }
+        });
 
         // Child produces rows; inside the loop we accumulate locally (no atomics)
         child_->produce(cg, [&]() {
