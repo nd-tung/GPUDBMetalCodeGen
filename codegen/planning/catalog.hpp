@@ -56,6 +56,26 @@ public:
         ref = std::move(t);
     }
 
+    // Build a Catalog from a SchemaProvider.  Useful when the schema
+    // layer exposes metadata via the provider but the planner/analyzer
+    // needs table/column structural info from a Catalog.
+    static Catalog fromSchemaProvider(const SchemaProvider& sp) {
+        Catalog cat;
+        for (const auto& tn : sp.tableNames()) {
+            CatTable ct;
+            ct.name = tn;
+            auto pk = sp.pkInfo(tn);
+            if (pk) ct.primaryKey = pk->first;
+            ct.maxKeySymbol = sp.maxKeySymbol(tn);
+
+            // We can't enumerate columns from SchemaProvider alone,
+            // so we build a minimal view from known metadata.
+            // Columns are discovered lazily during query analysis.
+            cat.addTable(std::move(ct));
+        }
+        return cat;
+    }
+
     const CatTable* findTable(const std::string& name) const {
         auto it = tables_.find(name);
         return it != tables_.end() ? &it->second : nullptr;
