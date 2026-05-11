@@ -20,6 +20,8 @@
 
 namespace codegen {
 
+class SchemaProvider;  // fwd (for generateFromPlan)
+
 struct MetalQueryPlan {
     std::string name;  // "Q1", "Q6", etc.
 
@@ -102,7 +104,10 @@ std::optional<MetalQueryPlan> buildMetalPlan(const AnalyzedQuery& aq,
                                               const std::string& queryName = "");
 
 // Generate Metal source from a MetalQueryPlan using the operator framework.
+// If `schema` is provided, a ColumnTypeResolver is injected into the
+// MetalCodegen to enable IU auto-projection (deduceRequiredColumns).
 // Returns the configured MetalCodegen (with bindings, result schema, etc.)
-MetalCodegen generateFromPlan(const MetalQueryPlan& plan);
+MetalCodegen generateFromPlan(const MetalQueryPlan& plan,
+                               const SchemaProvider* schema = nullptr);
 
 } // namespace codegen

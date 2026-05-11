@@ -19,26 +19,77 @@ void MetalOperator::appendIUsFromExpr(const std::string& expr,
                (c >= '0' && c <= '9') || c == '_';
     };
     size_t n = expr.size();
+
+    // --- Pass 1: colName[idxVar] patterns ---
     size_t i = 0;
     while (i < n) {
         if (!isIdent(expr[i])) { ++i; continue; }
         size_t s = i;
         while (i < n && isIdent(expr[i])) ++i;
-        // Need a '[' after the identifier
         if (i >= n || expr[i] != '[') continue;
-        // Reject if the previous char before identifier is also ident
-        // (middle of a longer qualified name like func.col[i])
         if (s > 0 && isIdent(expr[s - 1])) continue;
         size_t lb = i;
+        size_t ce = lb + 1;
+        while (ce < n && expr[ce] != ']') ++ce;
+        if (ce >= n) continue;
         size_t is = lb + 1;
-        if (is >= n || !isIdent(expr[is])) continue;
+        while (is < ce && !isIdent(expr[is])) ++is;
+        if (is >= ce) continue;
         size_t ie = is;
-        while (ie < n && isIdent(expr[ie])) ++ie;
-        // Need a ']'
-        if (ie >= n || expr[ie] != ']') continue;
-        out.emplace_back(expr.substr(s, lb - s),   // colName
-                         expr.substr(is, ie - is)); // idxVar
-        i = ie + 1;
+        while (ie < ce && isIdent(expr[ie])) ++ie;
+        out.emplace_back(expr.substr(s, lb - s),
+                         expr.substr(is, ie - is));
+        i = ce + 1;
+    }
+
+    // --- Pass 2: bare column refs in fixed-string helpers ---
+    // These helpers take the column buffer as first arg (bare identifier
+    // without [idx]) and the row index as second arg: (uint)(idxVar).
+    // Pattern: fixed_like_one_segment(COL, (uint)(IDX), ...
+    //          fixed_like_two_segment(COL, (uint)(IDX), ...
+    const char* helpers[] = {
+        "fixed_like_one_segment(", "fixed_like_two_segment(",
+        "fixed_string_segment_eq(", "fixed_string_padding_ok("
+    };
+    for (const char* hdr : helpers) {
+        size_t pos = 0;
+        while ((pos = expr.find(hdr, pos)) != std::string::npos) {
+            pos += strlen(hdr);
+            // Skip whitespace
+            while (pos < n && expr[pos] == ' ') ++pos;
+            if (pos >= n || !isIdent(expr[pos])) { ++pos; continue; }
+            size_t cs = pos;
+            while (pos < n && isIdent(expr[pos])) ++pos;
+            std::string colName = expr.substr(cs, pos - cs);
+            // Find idxVar from second arg: (uint)(i), — skip type casts
+            std::string idxVar;
+            while (pos < n && expr[pos] != ',') ++pos;
+            if (pos < n) {
+                ++pos; // skip ','
+                while (pos < n && expr[pos] == ' ') ++pos;
+                // Skip type-cast: "(uint)" style
+                if (pos < n && expr[pos] == '(') {
+                    while (pos < n && expr[pos] != ')') ++pos;
+                    if (pos < n) ++pos; // skip ')'
+                    while (pos < n && expr[pos] == ' ') ++pos;
+                }
+                // The next token may be wrapped in parens: "(i)" — extract it
+                if (pos < n && expr[pos] == '(') {
+                    ++pos; // skip '('
+                    while (pos < n && expr[pos] == ' ') ++pos;
+                    if (pos < n && isIdent(expr[pos])) {
+                        size_t is = pos;
+                        while (pos < n && isIdent(expr[pos])) ++pos;
+                        idxVar = expr.substr(is, pos - is);
+                    }
+                } else if (pos < n && isIdent(expr[pos])) {
+                    size_t is = pos;
+                    while (pos < n && isIdent(expr[pos])) ++pos;
+                    idxVar = expr.substr(is, pos - is);
+                }
+            }
+            out.emplace_back(colName, idxVar);
+        }
     }
 }
 
@@ -99,11 +150,17 @@ MetalGridStrideScan::deduceRequiredColumns(MetalCodegen& cg) const {
 void MetalGridStrideScan::produce(MetalCodegen& cg, ConsumerFn consume) {
     cg.setPhaseScannedTable(tableName_);
 
-    // Auto-discover columns via IU chain when the planner didn't explicitly
-    // set a column list (generic path).
-    if (columns_.empty()) {
-        columns_ = deduceRequiredColumns(cg);
+    // Auto-discover additional columns via IU chain.
+    auto discovered = deduceRequiredColumns(cg);
+    std::unordered_set<std::string> seen;
+    for (const auto& col : columns_) seen.insert(col.paramName);
+    for (const auto& col : discovered) {
+        if (!seen.count(col.paramName)) {
+            columns_.push_back(col);
+            seen.insert(col.paramName);
+        }
     }
+
     if (columns_.empty()) {
         throw std::runtime_error(
             "MetalGridStrideScan(" + tableName_ +

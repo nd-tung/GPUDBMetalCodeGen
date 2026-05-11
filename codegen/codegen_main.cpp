@@ -597,7 +597,7 @@ static bool runCodegenQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
 
         // 3. Generate Metal source via producer-consumer operators
         auto tCodegen0 = clk::now();
-        auto cg = codegen::generateFromPlan(plan);
+        auto cg = codegen::generateFromPlan(plan, analyzed.schema);
         std::string metalSource = cg.print();
         timing.codegenMs = elapsedMs(tCodegen0, clk::now());
 

@@ -1,9 +1,27 @@
 #include "metal_plan_builder.h"
+#include "../core/schema_provider.h"
 
 namespace codegen {
 
-MetalCodegen generateFromPlan(const MetalQueryPlan& plan) {
+MetalCodegen generateFromPlan(const MetalQueryPlan& plan,
+                               const SchemaProvider* schema) {
     MetalCodegen cg;
+
+    if (schema) {
+        cg.setColumnTypeResolver([schema](const std::string& table,
+                                          const std::string& col) -> std::string {
+            DataType dt = schema->columnType(table, col);
+            switch (dt) {
+                case DataType::INT:  case DataType::DATE:
+                    return "int";
+                case DataType::FLOAT:
+                    return "float";
+                case DataType::CHAR1: case DataType::CHAR_FIXED:
+                    return "char";
+            }
+            return {};
+        });
+    }
 
     for (const auto& h : plan.helpers) {
         cg.addHelper(h);
