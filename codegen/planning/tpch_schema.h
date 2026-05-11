@@ -5,9 +5,14 @@
 #include <vector>
 #include <unordered_map>
 #include <stdexcept>
+#include <string>
+#include <vector>
+#include <unordered_map>
 
 namespace codegen {
 
+// ===================================================================
+// DATA TYPE ENUM
 // ===================================================================
 // TPC-H SCHEMA CATALOG
 // ===================================================================

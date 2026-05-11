@@ -43,7 +43,7 @@ const auto& schema() { return TPCHSchema::instance(); }
 // If multiple tables have the column, we need the table list to disambiguate.
 // Returns ("", colName) if not found in any table (could be a SELECT alias).
 std::pair<std::string, std::string> resolveColumn(const std::string& colName,
-                                                   const std::vector<std::string>& tables) {
+                                                    const std::vector<std::string>& tables) {
     for (auto& t : tables) {
         auto it = schema().tables.find(t);
         if (it == schema().tables.end()) continue;
@@ -338,8 +338,9 @@ ExprPtr walkExpr(const json& node, const std::vector<std::string>& tables) {
         return walkConst(node["A_Const"]);
     if (node.contains("TypeCast"))
         return walkTypeCast(node["TypeCast"], tables);
-    if (node.contains("FuncCall"))
+    if (node.contains("FuncCall")) {
         return walkFuncCall(node["FuncCall"], tables);
+    }
     if (node.contains("A_Expr"))
         return walkAExpr(node["A_Expr"], tables);
     if (node.contains("SubLink")) {

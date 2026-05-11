@@ -154,6 +154,15 @@ std::optional<std::string> fixedStringLikeMetal(const Like& like,
     const ColRef* col = fixedStringCol(like.expr);
     if (!col || likePatternUsesUnsupportedWildcard(like.pattern)) return std::nullopt;
 
+    if (col->table.empty() || col->column.empty()) return std::nullopt;
+    try {
+        auto& tbl = TPCHSchema::instance().table(col->table);
+        auto it = tbl.nameToIdx.find(col->column);
+        if (it == tbl.nameToIdx.end()) return std::nullopt;
+    } catch (const std::exception&) {
+        return std::nullopt;
+    }
+
     const auto& cdef = TPCHSchema::instance().table(col->table).col(col->column);
     const int width = cdef.fixedWidth;
     if (width <= 0) return std::nullopt;
@@ -423,8 +432,8 @@ std::string exprToMetal(const ExprPtr& expr, const std::string& idxVar,
             std::string result = "(";
             for (size_t i = 0; i < node.branches.size(); ++i) {
                 if (i > 0) result += " : ";
-                std::string cond = predToMetal(node.branches[i].condition, idxVar);
-                std::string val = exprToMetal(node.branches[i].result, idxVar);
+                std::string cond = predToMetal(node.branches[i].condition, idxVar, schema);
+                std::string val = exprToMetal(node.branches[i].result, idxVar, schema);
                 result += cond + " ? " + val;
             }
             if (node.elseResult)
