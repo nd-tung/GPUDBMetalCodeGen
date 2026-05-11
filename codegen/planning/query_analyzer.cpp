@@ -99,12 +99,22 @@ ExprPtr walkColumnRef(const json& node, const std::vector<std::string>& tables) 
         colName = fields[1]["String"]["sval"].get<std::string>();
     }
 
+    // Try Catalog-based resolution (handles qualified + unqualified + ambiguity).
     std::string resolvedTable;
-    if (!tblQualifier.empty()) {
-        // Resolve alias to real table name if needed
+    DataType resolvedType = DataType::INT;
+    if (g_analyzeCatalog && !colName.empty()) {
+        auto r = g_analyzeCatalog->resolve(colName, tblQualifier, g_aliasMap);
+        if (!r.table.empty()) {
+            resolvedTable = r.table;
+            resolvedType = r.type;
+        }
+    }
+
+    // Fallback: SchemaProvider-based resolution (no Catalog loaded).
+    if (resolvedTable.empty() && !tblQualifier.empty()) {
         auto ait = g_aliasMap.find(tblQualifier);
         resolvedTable = (ait != g_aliasMap.end()) ? ait->second : tblQualifier;
-    } else {
+    } else if (resolvedTable.empty()) {
         auto [t, c] = resolveColumn(colName, tables);
         resolvedTable = t;
     }
@@ -122,7 +132,10 @@ ExprPtr walkColumnRef(const json& node, const std::vector<std::string>& tables) 
         return Expr::col("", colName, -1, DataType::INT);
     }
 
-    DataType dt = g_analyzeSchema ? g_analyzeSchema->columnType(resolvedTable, colName) : DataType::INT;
+    // Prefer the Catalog-provided type; fall back to SchemaProvider.
+    DataType dt = resolvedType;
+    if (dt == DataType::INT && g_analyzeSchema)
+        dt = g_analyzeSchema->columnType(resolvedTable, colName);
     return Expr::col(resolvedTable, colName, -1, dt);
 }
 
