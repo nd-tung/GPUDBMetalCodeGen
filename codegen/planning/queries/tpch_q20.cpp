@@ -66,7 +66,7 @@ static void q20_ht_insert(device atomic_int* ht_psidx, device ulong* ht_keys,
 
     // Phase 0: forest% bitmap from `part`.
     {
-        auto scan = makeScan("part", idx, {{"p_partkey", "int"}, {"p_name", "char"}});
+        auto scan = makeAutoScan("part", idx);
         // p_name is fixed-width 55 chars; "forest" check at offset 0 of each row.
         std::string base = "p_name[" + idx + "*55";
         std::string pred =
@@ -82,7 +82,7 @@ static void q20_ht_insert(device atomic_int* ht_psidx, device ulong* ht_keys,
 
     // Phase 1: build (pk,sk)→ps_idx HT from partsupp gated by bitmap.
     {
-        auto scan = makeScan("partsupp", idx, {{"ps_partkey", "int"}, {"ps_suppkey", "int"}});
+        auto scan = makeAutoScan("partsupp", idx);
         auto gated = std::make_unique<MetalSelection>(std::move(scan),
             "bitmap_test(d_q20_part_bitmap, ps_partkey[" + idx + "])");
         auto computeKey = std::make_unique<MetalComputeExpr>(
@@ -120,10 +120,7 @@ static void q20_ht_insert(device atomic_int* ht_psidx, device ulong* ht_keys,
 
     // Phase 2: lineitem aggregation (existing logic).
     {
-        auto scan = makeScan("lineitem", idx, {
-            {"l_partkey", "int"}, {"l_suppkey", "int"},
-            {"l_quantity", "float"}, {"l_shipdate", "int"}
-        });
+        auto scan = makeAutoScan("lineitem", idx);
 
         // Date filter: 1994-01-01 to 1994-12-31
         auto dateFilter = std::make_unique<MetalSelection>(

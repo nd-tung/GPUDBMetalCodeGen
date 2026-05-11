@@ -11,9 +11,7 @@ std::optional<MetalQueryPlan> buildQ4PlanForDateFilter(const std::string& filter
     std::string idxVar = "i";
 
     {
-        auto scan = makeScan("lineitem", idxVar, {
-            {"l_orderkey", "int"}, {"l_commitdate", "int"}, {"l_receiptdate", "int"}
-        });
+        auto scan = makeAutoScan("lineitem", idxVar);
 
         auto filter = std::make_unique<MetalSelection>(std::move(scan),
             "l_commitdate[" + idxVar + "] < l_receiptdate[" + idxVar + "]");
@@ -26,9 +24,7 @@ std::optional<MetalQueryPlan> buildQ4PlanForDateFilter(const std::string& filter
     }
 
     {
-        auto scan = makeScan("orders", idxVar, {
-            {"o_orderkey", "int"}, {"o_orderdate", "int"}, {"o_orderpriority", "char"}
-        });
+        auto scan = makeAutoScan("orders", idxVar);
 
         auto filtered = maybeSelect(std::move(scan), filterCond);
         auto probed = std::make_unique<MetalBitmapProbe>(

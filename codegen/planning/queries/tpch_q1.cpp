@@ -5,13 +5,12 @@ namespace codegen {
 
 namespace {
 
-std::optional<MetalQueryPlan> buildQ1PlanForShape(const std::string& filterCond,
-                                                  const std::set<std::string>& usedCols) {
+std::optional<MetalQueryPlan> buildQ1PlanForShape(const std::string& filterCond) {
     MetalQueryPlan plan;
     plan.name = "Q1";
 
     std::string idxVar = "i";
-    auto filtered = maybeSelect(makeScanForCols("lineitem", idxVar, usedCols), filterCond);
+    auto filtered = maybeSelect(makeAutoScan("lineitem", idxVar), filterCond);
 
     std::string bucketExpr = "((l_returnflag[" + idxVar + "] == 'A' ? 0 : (l_returnflag[" + idxVar + "] == 'N' ? 2 : 4)) + (l_linestatus[" + idxVar + "] == 'F' ? 0 : 1))";
 
@@ -50,22 +49,11 @@ std::optional<MetalQueryPlan> buildQ1Plan(const AnalyzedQuery& aq) {
     std::string idxVar = "i";
     std::string filterCond = combineFilters(aq.filters, idxVar);
 
-    // Collect all columns used in filters, group by, and aggregates
-    std::set<std::string> usedCols;
-    for (const auto& f : aq.filters) collectColumns(f, usedCols);
-    for (const auto& g : aq.groupBy) collectColumns(g, usedCols);
-    for (const auto& t : aq.targets) {
-        if (t.agg && t.agg->innerExpr) collectColumns(t.agg->innerExpr, usedCols);
-    }
-
-    return buildQ1PlanForShape(filterCond, usedCols);
+    return buildQ1PlanForShape(filterCond);
 }
 
 std::optional<MetalQueryPlan> buildQ1Plan_byName() {
-    return buildQ1PlanForShape(
-        "l_shipdate[i] <= 19980902",
-        {"l_shipdate", "l_returnflag", "l_linestatus", "l_quantity",
-         "l_extendedprice", "l_discount", "l_tax"});
+    return buildQ1PlanForShape("l_shipdate[i] <= 19980902");
 }
 
 } // namespace codegen

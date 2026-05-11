@@ -19,7 +19,7 @@ std::optional<MetalQueryPlan> buildQ22Plan_byName() {
     // `avg_bal` as a scalar for the final aggregate phase. Replaces the
     // CPU-side scan formerly in query_preprocessing.cpp (Q22 block).
     {
-        auto scan = makeScan("customer", idx, {{"c_phone", "char"}, {"c_acctbal", "float"}});
+        auto scan = makeAutoScan("customer", idx);
 
         auto computePrefix = std::make_unique<MetalComputeExpr>(
             std::move(scan), "_prefix", "int",
@@ -55,7 +55,7 @@ std::optional<MetalQueryPlan> buildQ22Plan_byName() {
 
     // Phase 1: Build orders bitmap
     {
-        auto scan = makeScan("orders", idx, {{"o_custkey", "int"}});
+        auto scan = makeAutoScan("orders", idx);
 
         auto bitmap = std::make_unique<MetalBitmapBuild>(
             std::move(scan), "d_cust_order_bitmap",
@@ -66,9 +66,7 @@ std::optional<MetalQueryPlan> buildQ22Plan_byName() {
 
     // Phase 2: Scan customer, filter, anti-bitmap, dual aggregate
     {
-        auto scan = makeScan("customer", idx, {
-            {"c_custkey", "int"}, {"c_phone", "char"}, {"c_acctbal", "float"}
-        });
+        auto scan = makeAutoScan("customer", idx);
 
         auto computePrefix = std::make_unique<MetalComputeExpr>(
             std::move(scan), "_prefix", "int",

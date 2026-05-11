@@ -11,9 +11,7 @@ std::optional<MetalQueryPlan> buildQ10PlanForDateFilter(const std::string& filte
     std::string idxVar = "i";
 
     {
-        auto scan = makeScan("orders", idxVar, {
-            {"o_orderkey", "int"}, {"o_custkey", "int"}, {"o_orderdate", "int"}
-        });
+        auto scan = makeAutoScan("orders", idxVar);
 
         auto filtered = maybeSelect(std::move(scan), filterCond);
         auto store = std::make_unique<MetalArrayStore>(
@@ -26,10 +24,7 @@ std::optional<MetalQueryPlan> buildQ10PlanForDateFilter(const std::string& filte
     }
 
     {
-        auto scan = makeScan("lineitem", idxVar, {
-            {"l_orderkey", "int"}, {"l_returnflag", "char"},
-            {"l_extendedprice", "float"}, {"l_discount", "float"}
-        });
+        auto scan = makeAutoScan("lineitem", idxVar);
 
         auto filtered = std::make_unique<MetalSelection>(std::move(scan),
             "l_returnflag[" + idxVar + "] == 'R'");

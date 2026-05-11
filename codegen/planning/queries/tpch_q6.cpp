@@ -13,7 +13,7 @@ std::optional<MetalQueryPlan> buildQ6PlanForShape(const std::set<std::string>& u
     plan.name = "Q6";
 
     std::string idxVar = "i";
-    auto filtered = maybeSelect(makeScanForCols("lineitem", idxVar, usedCols), filterCond);
+    auto filtered = maybeSelect(makeAutoScan("lineitem", idxVar), filterCond);
 
     auto reduce = std::make_unique<MetalTGReduce>(std::move(filtered), tableDataName(alias));
     reduce->addAccumulator(alias, "(long)(" + aggExpr + " * 100.0f)", "long");

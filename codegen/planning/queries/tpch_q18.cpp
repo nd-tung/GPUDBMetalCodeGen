@@ -35,7 +35,7 @@ static void q18_compact_emit(device atomic_uint* counter,
     // Q18 preprocessing). fillByte = 0xFF gives -1 sentinel for missing
     // orderkeys; orderkeys are unique by FK so no atomics needed.
     {
-        auto scan = makeScan("orders", idx, {{"o_orderkey", "int"}});
+        auto scan = makeAutoScan("orders", idx);
         auto store = std::make_unique<MetalArrayStore>(
             std::move(scan), "d_q18_ok_lookup",
             "o_orderkey[" + idx + "]", "(int)" + idx,
@@ -45,7 +45,7 @@ static void q18_compact_emit(device atomic_uint* counter,
 
     // Phase 2: per-orderkey sum(l_quantity)
     {
-        auto scan = makeScan("lineitem", idx, {{"l_orderkey", "int"}, {"l_quantity", "float"}});
+        auto scan = makeAutoScan("lineitem", idx);
 
         auto agg = std::make_unique<MetalAtomicAgg>(
             std::move(scan), "d_order_qty",

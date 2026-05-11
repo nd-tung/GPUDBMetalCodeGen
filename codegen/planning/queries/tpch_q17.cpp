@@ -18,9 +18,7 @@ std::optional<MetalQueryPlan> buildQ17Plan_byName() {
     // Phase 1: build d_q17_bitmap from `part` (Brand#23 + MED BOX).
     // Inline char compare matches the original CPU predicate byte-for-byte.
     {
-        auto scan = makeScan("part", idx, {
-            {"p_partkey", "int"}, {"p_brand", "char"}, {"p_container", "char"}
-        });
+        auto scan = makeAutoScan("part", idx);
 
         std::string pred =
             "p_brand[" + idx + "*10]=='B' && p_brand[" + idx + "*10+5]=='#' && "
@@ -41,9 +39,7 @@ std::optional<MetalQueryPlan> buildQ17Plan_byName() {
     // l_quantity per partkey into d_q17_sumQty (atomic_float) and
     // d_q17_cntQty (atomic_uint).
     {
-        auto scan = makeScan("lineitem", idx, {
-            {"l_partkey", "int"}, {"l_quantity", "float"}
-        });
+        auto scan = makeAutoScan("lineitem", idx);
         auto gated = std::make_unique<MetalSelection>(std::move(scan),
             "bitmap_test(d_q17_bitmap, l_partkey[" + idx + "])");
         auto cnt = std::make_unique<MetalAtomicCount>(
@@ -62,9 +58,7 @@ std::optional<MetalQueryPlan> buildQ17Plan_byName() {
     // l_quantity * cnt < 0.2 * sum (mathematically equivalent to the
     // original l_quantity < 0.2 * sum / cnt; avoids a divide).
     {
-        auto scan = makeScan("lineitem", idx, {
-            {"l_partkey", "int"}, {"l_quantity", "float"}, {"l_extendedprice", "float"}
-        });
+        auto scan = makeAutoScan("lineitem", idx);
 
         auto bitmapFilter = std::make_unique<MetalSelection>(
             std::move(scan),

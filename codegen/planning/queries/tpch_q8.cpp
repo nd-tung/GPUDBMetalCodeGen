@@ -21,7 +21,7 @@ std::optional<MetalQueryPlan> buildQ8Plan_byName() {
 
     // Phase 0: Build nation bitmap for AMERICA region
     {
-        auto scan = makeScan("nation", idx, {{"n_nationkey", "int"}, {"n_regionkey", "int"}});
+        auto scan = makeAutoScan("nation", idx);
 
         auto filtered = std::make_unique<MetalSelection>(std::move(scan),
             "n_regionkey[" + idx + "] == america_rk");
@@ -36,7 +36,7 @@ std::optional<MetalQueryPlan> buildQ8Plan_byName() {
 
     // Phase 1: Build part bitmap for 'ECONOMY ANODIZED STEEL'
     {
-        auto scan = makeScan("part", idx, {{"p_partkey", "int"}, {"p_type", "char"}});
+        auto scan = makeAutoScan("part", idx);
 
         // Compare 22 chars of p_type (CHAR_FIXED stride 25)
         std::string cond =
@@ -74,7 +74,7 @@ std::optional<MetalQueryPlan> buildQ8Plan_byName() {
 
     // Phase 2: Build customer nation map (only AMERICA customers)
     {
-        auto scan = makeScan("customer", idx, {{"c_custkey", "int"}, {"c_nationkey", "int"}});
+        auto scan = makeAutoScan("customer", idx);
 
         auto probed = std::make_unique<MetalBitmapProbe>(std::move(scan),
             "d_america_bitmap", "c_nationkey[" + idx + "]");
@@ -89,7 +89,7 @@ std::optional<MetalQueryPlan> buildQ8Plan_byName() {
 
     // Phase 3: Build supplier nation map (all suppliers)
     {
-        auto scan = makeScan("supplier", idx, {{"s_suppkey", "int"}, {"s_nationkey", "int"}});
+        auto scan = makeAutoScan("supplier", idx);
 
         auto store = std::make_unique<MetalArrayStore>(
             std::move(scan), "d_supp_nation_map",
@@ -101,9 +101,7 @@ std::optional<MetalQueryPlan> buildQ8Plan_byName() {
 
     // Phase 4: Build orders year map (date-filtered, AMERICA customer)
     {
-        auto scan = makeScan("orders", idx, {
-            {"o_orderkey", "int"}, {"o_custkey", "int"}, {"o_orderdate", "int"}
-        });
+        auto scan = makeAutoScan("orders", idx);
 
         auto dateFiltered = std::make_unique<MetalSelection>(std::move(scan),
             "o_orderdate[" + idx + "] >= 19950101 && o_orderdate[" + idx + "] <= 19961231");
@@ -124,10 +122,7 @@ std::optional<MetalQueryPlan> buildQ8Plan_byName() {
     // Phase 5: Probe lineitem — dual aggregation into result_bins
     // [0]=brazil_95, [1]=brazil_96, [2]=total_95, [3]=total_96
     {
-        auto scan = makeScan("lineitem", idx, {
-            {"l_orderkey", "int"}, {"l_partkey", "int"}, {"l_suppkey", "int"},
-            {"l_extendedprice", "float"}, {"l_discount", "float"}
-        });
+        auto scan = makeAutoScan("lineitem", idx);
 
         auto partProbed = std::make_unique<MetalBitmapProbe>(std::move(scan),
             "d_part_bitmap", "l_partkey[" + idx + "]");

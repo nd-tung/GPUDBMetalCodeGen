@@ -11,10 +11,7 @@ std::optional<MetalQueryPlan> buildQ15Plan_byName() {
     MetalQueryPlan plan;
 
     {
-        auto scan = makeScan("lineitem", idx, {
-            {"l_suppkey", "int"}, {"l_shipdate", "int"},
-            {"l_extendedprice", "float"}, {"l_discount", "float"}
-        });
+        auto scan = makeAutoScan("lineitem", idx);
 
         auto filtered = std::make_unique<MetalSelection>(std::move(scan),
             "l_shipdate[" + idx + "] >= 19960101 && l_shipdate[" + idx + "] < 19960401");
