@@ -260,8 +260,6 @@ std::string exprToMetalForPredicate(const ExprPtr& expr,
 // Helper: expression to Metal code string (columnar access: col[idx])
 // ===================================================================
 
-std::string predToMetal(const PredPtr& pred, const std::string& idxVar);
-
 // Collect all column references in an expression
 void collectColumns(const ExprPtr& expr, std::set<std::string>& cols) {
     if (!expr) return;
