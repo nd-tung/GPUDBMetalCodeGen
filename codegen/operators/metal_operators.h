@@ -1,5 +1,6 @@
 #pragma once
 #include "../core/metal_codegen_base.h"
+#include "../core/iu.hpp"
 #include "../../third_party/nlohmann/json.hpp"
 #include <memory>
 #include <string>
@@ -21,6 +22,17 @@ public:
     // auto-deduce required columns from downstream operators (IU chain).
     void setParent(MetalOperator* p) { parent_ = p; }
     MetalOperator* parent() const { return parent_; }
+
+    // Collect all column references (IUs) consumed by this operator.
+    // Operators override this to report which columns they reference.
+    virtual void iusUsed(std::vector<IU>& out) const {}
+
+    // Extract every colName[idxVar] reference from a kernel-side
+    // expression string (e.g. "l_shipdate[i]", "o_orderkey[j] + 1").
+    // The IUs returned have tableName and metalType empty — the
+    // consuming scan fills them in via ColumnTypeResolver.
+    static void appendIUsFromExpr(const std::string& expr,
+                                  std::vector<IU>& out);
 
     // Serialize this operator (and children) to JSON for plan visualization.
     // Returns a json object with at minimum "type" (the describe() string).
@@ -69,6 +81,12 @@ public:
                         const std::string& idxVar = "i");
     void produce(MetalCodegen& cg, ConsumerFn consume) override;
     std::string describe() const override;
+
+    // Auto-discover required columns by walking the parent chain and
+    // collecting IUs from downstream operators. Returns a vector of
+    // ColumnDesc with resolved metalType (caller must have set a
+    // ColumnTypeResolver on the codegen).
+    std::vector<ColumnDesc> deduceRequiredColumns(MetalCodegen& cg) const;
 
     // Add a column for columnar scan
     void addColumn(const std::string& paramName, const std::string& metalType);
@@ -127,6 +145,9 @@ public:
                    const std::string& predicate);
     void produce(MetalCodegen& cg, ConsumerFn consume) override;
     std::string describe() const override;
+    void iusUsed(std::vector<IU>& out) const override {
+        appendIUsFromExpr(predicate_, out);
+    }
 
 private:
     std::string predicate_;
@@ -141,6 +162,9 @@ public:
                      const std::string& expression);
     void produce(MetalCodegen& cg, ConsumerFn consume) override;
     std::string describe() const override;
+    void iusUsed(std::vector<IU>& out) const override {
+        appendIUsFromExpr(expression_, out);
+    }
 
 private:
     std::string varName_;
@@ -161,6 +185,9 @@ public:
                      const std::string& sizeExpr);
     void produce(MetalCodegen& cg, ConsumerFn consume) override;
     std::string describe() const override;
+    void iusUsed(std::vector<IU>& out) const override {
+        appendIUsFromExpr(keyExpr_, out);
+    }
 
 private:
     std::string bitmapName_;
@@ -176,6 +203,9 @@ public:
                      const std::string& keyExpr);
     void produce(MetalCodegen& cg, ConsumerFn consume) override;
     std::string describe() const override;
+    void iusUsed(std::vector<IU>& out) const override {
+        appendIUsFromExpr(keyExpr_, out);
+    }
 
 private:
     std::string bitmapName_;
@@ -190,6 +220,9 @@ public:
                          const std::string& keyExpr);
     void produce(MetalCodegen& cg, ConsumerFn consume) override;
     std::string describe() const override;
+    void iusUsed(std::vector<IU>& out) const override {
+        appendIUsFromExpr(keyExpr_, out);
+    }
 
 private:
     std::string bitmapName_;
@@ -212,6 +245,10 @@ public:
                     int fillByte = 0xFF);
     void produce(MetalCodegen& cg, ConsumerFn consume) override;
     std::string describe() const override;
+    void iusUsed(std::vector<IU>& out) const override {
+        appendIUsFromExpr(keyExpr_, out);
+        appendIUsFromExpr(valueExpr_, out);
+    }
 
 private:
     std::string arrayName_;
@@ -233,6 +270,9 @@ public:
                      int sentinel = -1);
     void produce(MetalCodegen& cg, ConsumerFn consume) override;
     std::string describe() const override;
+    void iusUsed(std::vector<IU>& out) const override {
+        appendIUsFromExpr(keyExpr_, out);
+    }
 
 private:
     std::string arrayName_;
@@ -271,6 +311,11 @@ public:
                       const std::string& capacityExpr);
     void produce(MetalCodegen& cg, ConsumerFn consume) override;
     std::string describe() const override;
+    void iusUsed(std::vector<IU>& out) const override {
+        appendIUsFromExpr(key1Expr_, out);
+        appendIUsFromExpr(key2Expr_, out);
+        appendIUsFromExpr(valueExpr_, out);
+    }
 
 private:
     std::string mapName_;
@@ -292,6 +337,11 @@ public:
                     bool valueIsFloat = false);
     void produce(MetalCodegen& cg, ConsumerFn consume) override;
     std::string describe() const override;
+    void iusUsed(std::vector<IU>& out) const override {
+        appendIUsFromExpr(key1Expr_, out);
+        appendIUsFromExpr(key2Expr_, out);
+        appendIUsFromExpr(valueExpr_, out);
+    }
 
 private:
     std::string mapName_;
@@ -315,6 +365,10 @@ public:
                        const std::string& resultType = "uint");
     void produce(MetalCodegen& cg, ConsumerFn consume) override;
     std::string describe() const override;
+    void iusUsed(std::vector<IU>& out) const override {
+        appendIUsFromExpr(key1Expr_, out);
+        appendIUsFromExpr(key2Expr_, out);
+    }
 
 private:
     std::string mapName_;
@@ -360,12 +414,17 @@ public:
                                    int accumulatorIndex,
                                    int scaleDown = 0);
     void setAverageResultAlias(const std::string& displayName,
-                               int numeratorIndex,
-                               int denominatorIndex,
-                               int scaleDown = 0);
+                                int numeratorIndex,
+                                int denominatorIndex,
+                                int scaleDown = 0);
 
     void produce(MetalCodegen& cg, ConsumerFn consume) override;
     std::string describe() const override;
+    void iusUsed(std::vector<IU>& out) const override {
+        for (const auto& acc : accumulators_) {
+            appendIUsFromExpr(acc.valueExpr, out);
+        }
+    }
 
 private:
     std::string outputPrefix_;
@@ -453,6 +512,15 @@ public:
     void setHaving(const PredPtr& havingPredicate) { havingPredicate_ = havingPredicate; }
     void produce(MetalCodegen& cg, ConsumerFn consume) override;
     std::string describe() const override;
+    void iusUsed(std::vector<IU>& out) const override {
+        appendIUsFromExpr(bucketExpr_, out);
+        for (const auto& agg : aggregates_) {
+            appendIUsFromExpr(agg.valueExpr, out);
+        }
+        for (const auto& db : distinctBitmaps_) {
+            appendIUsFromExpr(db.valueExpr, out);
+        }
+    }
 
 private:
     std::string outputArrayName_;
@@ -487,6 +555,10 @@ public:
                    const std::string& castType = "uint");
     void produce(MetalCodegen& cg, ConsumerFn consume) override;
     std::string describe() const override;
+    void iusUsed(std::vector<IU>& out) const override {
+        appendIUsFromExpr(bucketExpr_, out);
+        appendIUsFromExpr(valueExpr_, out);
+    }
 
 private:
     std::string arrayName_;
@@ -506,6 +578,9 @@ public:
                      const std::string& sizeExpr = "");
     void produce(MetalCodegen& cg, ConsumerFn consume) override;
     std::string describe() const override;
+    void iusUsed(std::vector<IU>& out) const override {
+        appendIUsFromExpr(bucketExpr_, out);
+    }
 
 private:
     std::string arrayName_;
@@ -537,6 +612,11 @@ public:
                    const std::string& sizeExpr = "", int stringLen = 0);
     void produce(MetalCodegen& cg, ConsumerFn consume) override;
     std::string describe() const override;
+    void iusUsed(std::vector<IU>& out) const override {
+        for (const auto& col : columns_) {
+            appendIUsFromExpr(col.valueExpr, out);
+        }
+    }
 
 private:
     std::string counterName_;
