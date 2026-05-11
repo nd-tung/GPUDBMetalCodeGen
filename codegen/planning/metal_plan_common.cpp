@@ -73,10 +73,11 @@ std::string metalCharLiteral(char ch) {
 }
 
 std::string fixedStringEqMetal(const ColRef& col,
-                               const std::string& literal,
-                               const std::string& idxVar) {
-    const auto& cdef = TPCHSchema::instance().table(col.table).col(col.column);
-    int width = cdef.fixedWidth;
+                                const std::string& literal,
+                                const std::string& idxVar,
+                                const SchemaProvider* schema = nullptr) {
+    int width = schema ? schema->columnFixedWidth(col.table, col.column)
+                       : TPCHSchema::instance().table(col.table).col(col.column).fixedWidth;
     if (width <= 0 || static_cast<int>(literal.size()) > width) return "false";
 
     std::string base = col.column + "[" + idxVar + " * " + std::to_string(width) + " + ";
@@ -94,10 +95,11 @@ std::string fixedStringEqMetal(const ColRef& col,
 }
 
 std::string fixedStringPrefixMetal(const ColRef& col,
-                                   const std::string& prefix,
-                                   const std::string& idxVar) {
-    const auto& cdef = TPCHSchema::instance().table(col.table).col(col.column);
-    int width = cdef.fixedWidth;
+                                    const std::string& prefix,
+                                    const std::string& idxVar,
+                                    const SchemaProvider* schema = nullptr) {
+    int width = schema ? schema->columnFixedWidth(col.table, col.column)
+                       : TPCHSchema::instance().table(col.table).col(col.column).fixedWidth;
     if (width <= 0 || static_cast<int>(prefix.size()) > width) return "false";
 
     std::string base = col.column + "[" + idxVar + " * " + std::to_string(width) + " + ";
@@ -308,7 +310,8 @@ void collectColumns(const PredPtr& pred, std::set<std::string>& cols) {
     }, pred->node);
 }
 
-std::string exprToMetal(const ExprPtr& expr, const std::string& idxVar) {
+std::string exprToMetal(const ExprPtr& expr, const std::string& idxVar,
+                        const SchemaProvider* schema) {
     if (!expr) return "";
 
     return std::visit([&](auto&& node) -> std::string {
@@ -374,9 +377,10 @@ std::string exprToMetal(const ExprPtr& expr, const std::string& idxVar) {
                 if (node.args.size() > 0 && node.args[0]) {
                     if (auto* cr = std::get_if<ColRef>(&node.args[0]->node)) {
                         colName = cr->column;
-                        try {
-                            fw = TPCHSchema::instance().table(cr->table).col(cr->column).fixedWidth;
-                        } catch (...) {}
+                    try {
+                        fw = (schema ? schema->columnFixedWidth(cr->table, cr->column)
+                                     : TPCHSchema::instance().table(cr->table).col(cr->column).fixedWidth);
+                    } catch (...) {}
                     }
                 }
                 if (colName.empty()) return "0";
@@ -438,7 +442,8 @@ std::string exprToMetal(const ExprPtr& expr, const std::string& idxVar) {
     }, expr->node);
 }
 
-std::string predToMetal(const PredPtr& pred, const std::string& idxVar) {
+std::string predToMetal(const PredPtr& pred, const std::string& idxVar,
+                        const SchemaProvider* schema) {
     if (!pred) return "true";
 
     return std::visit([&](auto&& node) -> std::string {
@@ -533,12 +538,13 @@ std::string combineFilters(const std::vector<PredPtr>& filters, const std::strin
     return cond;
 }
 
-// Map column name to Metal type using TPC-H schema
-static std::string colMetalType(const std::string& table, const std::string& colName) {
-    const auto& schema = TPCHSchema::instance();
-    auto& tdef = schema.table(table);
-    auto& cdef = tdef.col(colName);
-    switch (cdef.type) {
+// Map column name to Metal type
+static std::string colMetalType(const std::string& table, const std::string& colName,
+                                const SchemaProvider* schema = nullptr) {
+    DataType type;
+    if (schema) type = schema->columnType(table, colName);
+    else type = TPCHSchema::instance().table(table).col(colName).type;
+    switch (type) {
         case DataType::INT:        return "int";
         case DataType::FLOAT:      return "float";
         case DataType::DATE:       return "int";

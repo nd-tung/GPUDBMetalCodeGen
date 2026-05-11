@@ -93,15 +93,12 @@ bool exprIsColumn(const ExprPtr& expr, const ColRef& expected) {
     return col && col->table == expected.table && col->column == expected.column;
 }
 
-struct GroupDomain {
-    int minValue = 0;
-    int maxValue = 0;
-};
-
-std::optional<GroupDomain> smallIntGroupDomain(const ColRef& col) {
+std::optional<GroupDomain> smallIntGroupDomain(const ColRef& col, const SchemaProvider* schema = nullptr) {
     if (col.dataType != DataType::INT && col.dataType != DataType::DATE) return std::nullopt;
-    // Look up domain info from schema.  Falls back to hard-coded column
-    // names only when the schema lacks domain metadata (user-supplied schemas).
+    if (schema && col.table.size()) {
+        auto d = schema->groupDomain(col.table, col.column);
+        if (d) return d;
+    }
     try {
         auto& colDef = TPCHSchema::instance().table(col.table).col(col.column);
         if (colDef.domainMin >= 0 && colDef.domainMax >= colDef.domainMin)
@@ -488,9 +485,22 @@ struct GroupKeyDesc {
 // Build a bucket expression for a single CHAR1 group key domain.
 // Returns "(char)col[idx] - 'A'" style expression, or empty if unsupported.
 static std::string char1BucketExpr(const ColRef& col, const std::string& idxVar,
-                                    int& outNumValues) {
-    // Look up CHAR1 domain from schema.  Falls back to empty (unknown domain)
-    // when the schema lacks charDomain metadata.
+                                    int& outNumValues, const SchemaProvider* schema = nullptr) {
+    if (schema && col.table.size()) {
+        auto chars = schema->charDomain(col.table, col.column);
+        if (!chars.empty()) {
+            outNumValues = (int)chars.size();
+            if (outNumValues == 1) return "0";
+            const std::string expr = col.column + "[" + idxVar + "]";
+            std::string result;
+            for (int i = 0; i < outNumValues - 1; ++i) {
+                result += "(" + expr + " == '" + chars[i] + "' ? " + std::to_string(i) + " : ";
+            }
+            result += std::to_string(outNumValues - 1);
+            for (int i = 0; i < outNumValues - 1; ++i) result += ")";
+            return result;
+        }
+    }
     try {
         auto& colDef = TPCHSchema::instance().table(col.table).col(col.column);
         if (!colDef.charDomain.empty()) {
@@ -565,10 +575,9 @@ std::optional<MetalQueryPlan> buildGroupedAggPlan(const AnalyzedQuery& aq, std::
             kd.numValues = 256;
             collectColumns(aq.groupBy[ki], usedColumns);
         } else if (gc && gc->dataType == DataType::CHAR1) {
-            kd.keyExpr = char1BucketExpr(*gc, idxVar, kd.numValues);
-            if (kd.numValues == 0) return fail("Grouped aggregation: CHAR1 column '" + gc->column + "' has no known domain.");
+            kd.keyExpr = char1BucketExpr(*gc, idxVar, kd.numValues, aq.schema);
         } else {
-            auto domain = smallIntGroupDomain(*gc);
+            auto domain = smallIntGroupDomain(*gc, aq.schema);
             if (!domain || domain->maxValue < domain->minValue) return fail("Grouped aggregation: column '" + gc->column + "' has no known integer domain.");
             kd.numValues = domain->maxValue - domain->minValue + 1;
             std::string groupValue = gc->column + "[" + idxVar + "]";
@@ -1078,7 +1087,12 @@ struct MultiTablePkInfo {
     std::string sizeSym;
 };
 
-std::optional<MultiTablePkInfo> multiTablePkInfo(const std::string& table) {
+std::optional<MultiTablePkInfo> multiTablePkInfo(const std::string& table, const SchemaProvider* schema = nullptr) {
+    if (schema) {
+        auto pk = schema->pkInfo(table);
+        if (pk) return MultiTablePkInfo{pk->first, pk->second};
+        return std::nullopt;
+    }
     if (table == "customer") return MultiTablePkInfo{"c_custkey",   "maxCustkey"};
     if (table == "orders")   return MultiTablePkInfo{"o_orderkey",  "maxOrderkey"};
     if (table == "supplier") return MultiTablePkInfo{"s_suppkey",   "maxSuppkey"};
@@ -1090,7 +1104,8 @@ std::optional<MultiTablePkInfo> multiTablePkInfo(const std::string& table) {
 }
 
 // Larger value = better probe candidate (largest TPC-H tables first).
-int multiTableProbePriority(const std::string& t) {
+int multiTableProbePriority(const std::string& t, const SchemaProvider* schema = nullptr) {
+    if (schema) return schema->tableProbePriority(t);
     if (t == "lineitem") return 100;
     if (t == "orders")   return 80;
     if (t == "partsupp") return 70;
@@ -1330,9 +1345,12 @@ std::string rewriteForProbe(std::string expr,
 // not present in TPC-H), returns the first match.
 std::string ownerTableForColumn(const AnalyzedQuery& aq, const std::string& c) {
     for (const auto& t : aq.tables) {
-        const auto& tdef = TPCHSchema::instance().table(t);
-        if (tdef.nameToIdx.count(c)) return t;
+        if (aq.schema && aq.schema->hasColumn(t, c)) return t;
+        if (!aq.schema && TPCHSchema::instance().table(t).nameToIdx.count(c)) return t;
     }
+    // Check subquery alias maps for derived columns.
+    if (aq.subqueryColMap.count(c))
+        return aq.subqueryColMap.at(c).table;
     return "";
 }
 
@@ -1522,7 +1540,7 @@ std::optional<MetalQueryPlan> buildGenericMultiTableAdhocPlan_impl(
     int probeIdx = 0;
     int bestPrio = -1;
     for (size_t i = 0; i < aq.tables.size(); ++i) {
-        int p = multiTableProbePriority(aq.tables[i]);
+        int p = multiTableProbePriority(aq.tables[i], aq.schema);
         if (p > bestPrio) { bestPrio = p; probeIdx = (int)i; }
     }
     const std::string& probeTable = aq.tables[probeIdx];
@@ -1598,23 +1616,9 @@ std::optional<MetalQueryPlan> buildGenericMultiTableAdhocPlan_impl(
             nodes[i].useHashJoin = false;
             continue;
         }
-        auto pk = multiTablePkInfo(nodes[i].table);
+        auto pk = multiTablePkInfo(nodes[i].table, aq.schema);
         if (!pk)
             return fail("Multi-table planner: table '" + nodes[i].table + "' has no PK descriptor.");
-        if (pk->column != nodes[i].keyOnSelf) {
-            // Non-PK single-column joins use a hash map to preserve
-            // cardinality (unlike direct-address arrays which overwrite).
-            bool isPartSuppCol = (nodes[i].table == "partsupp" &&
-                                  (nodes[i].keyOnSelf == "ps_suppkey" || nodes[i].keyOnSelf == "ps_partkey"));
-            if (isPartSuppCol) {
-                // partsupp has a known small key domain — direct-address ok
-                // (sentinel check limits output cardinality to 1 row per key)
-            } else {
-                // Use hash join for arbitrary non-PK single-column joins.
-                nodes[i].useHashJoin = true;
-                continue;
-            }
-        }
     }
 
     // ---------- Carried columns: per-non-probe-table local + subtree ----------
@@ -1778,7 +1782,7 @@ std::optional<MetalQueryPlan> buildGenericMultiTableAdhocPlan_impl(
             continue;
         }
 
-        auto pkU = multiTablePkInfo(tname);
+        auto pkU = multiTablePkInfo(tname, aq.schema);
         const std::string sizeSym = pkU->sizeSym;
 
         const auto& sub = subtreeCarry[u];
