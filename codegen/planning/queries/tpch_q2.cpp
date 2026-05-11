@@ -41,9 +41,7 @@ static void q2_atomic_min(device atomic_uint* min_cost, uint partkey, float cost
 
     // Phase 1: Build part bitmap on GPU (size=15, type ends BRASS)
     {
-        auto scan = makeScan("part", idx, {
-            {"p_partkey", "int"}, {"p_size", "int"}, {"p_type", "char"}
-        });
+        auto scan = makeAutoScan("part", idx);
 
         auto sizeFilter = std::make_unique<MetalSelection>(
             std::move(scan), "p_size[" + idx + "] == 15");
@@ -60,9 +58,7 @@ static void q2_atomic_min(device atomic_uint* min_cost, uint partkey, float cost
 
     // Phase 2: Find min cost (existing logic)
     {
-        auto scan = makeScan("partsupp", idx, {
-            {"ps_partkey", "int"}, {"ps_suppkey", "int"}, {"ps_supplycost", "float"}
-        });
+        auto scan = makeAutoScan("partsupp", idx);
 
         // BitmapProbe: qualifying parts (size=15, type ends BRASS)
         auto partProbe = std::make_unique<MetalBitmapProbe>(
@@ -104,9 +100,7 @@ static void q2_compact_emit(device atomic_uint* counter,
 }
 )");
     {
-        auto scan = makeScan("partsupp", idx, {
-            {"ps_partkey", "int"}, {"ps_suppkey", "int"}, {"ps_supplycost", "float"}
-        });
+        auto scan = makeAutoScan("partsupp", idx);
         auto partProbe = std::make_unique<MetalBitmapProbe>(
             std::move(scan), "d_q2_part_bitmap", "ps_partkey[" + idx + "]");
         auto suppProbe = std::make_unique<MetalBitmapProbe>(

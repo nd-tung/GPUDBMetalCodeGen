@@ -32,7 +32,7 @@ static bool q13_comment_match(const device char* comment, uint idx) {
 
     // Phase 1: Scan orders, filter NOT LIKE, count per custkey
     {
-        auto scan = makeScan("orders", idx, {{"o_custkey", "int"}, {"o_comment", "char"}});
+        auto scan = makeAutoScan("orders", idx);
 
         auto filtered = std::make_unique<MetalSelection>(std::move(scan),
             "!q13_comment_match(o_comment, " + idx + ")");
@@ -46,7 +46,7 @@ static bool q13_comment_match(const device char* comment, uint idx) {
 
     // Phase 2: Scan customers, read order count, build histogram
     {
-        auto scan = makeScan("customer", idx, {{"c_custkey", "int"}});
+        auto scan = makeAutoScan("customer", idx);
 
         auto lookup = std::make_unique<MetalArrayLookup>(
             std::move(scan), "d_order_counts",
