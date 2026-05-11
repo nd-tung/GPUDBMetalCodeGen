@@ -18,6 +18,9 @@ using ColumnList = std::initializer_list<std::pair<const char*, const char*>>;
 
 void collectColumns(const ExprPtr& expr, std::set<std::string>& cols);
 void collectColumns(const PredPtr& pred, std::set<std::string>& cols);
+// Collect column→table mapping directly from AST ColRef nodes.
+void collectColumnTables(const ExprPtr& expr, std::map<std::string, std::string>& colToTable);
+void collectColumnTables(const PredPtr& pred, std::map<std::string, std::string>& colToTable);
 
 // `schema` is optional; TPC-H singleton used as fallback when nullptr.
 std::string exprToMetal(const ExprPtr& expr, const std::string& idxVar,
