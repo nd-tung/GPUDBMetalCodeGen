@@ -1524,7 +1524,10 @@ std::optional<MetalQueryPlan> buildGenericMultiTableAdhocPlan_impl(
 
     for (const auto& t : aq.targets) {
         if (t.isAgg) {
-            if (t.agg && !t.agg->isStar) addNeededFromExpr(t.agg->innerExpr);
+            if (t.agg && !t.agg->isStar) {
+                if (t.agg->innerExpr) addNeededFromExpr(t.agg->innerExpr);
+                else if (t.expr) addNeededFromExpr(t.expr); // complex agg (e.g. SUM(...)/SUM(...))
+            }
         } else {
             addNeededFromExpr(t.expr);
         }
@@ -1985,6 +1988,76 @@ std::optional<MetalQueryPlan> buildGenericMultiTableAdhocPlan_impl(
                 continue;
             }
 
+            // Complex aggregate with nested aggregates (e.g. const * SUM(a) / SUM(b)).
+            // Decompose into individual accumulators, combine with setAverageResultAlias.
+            if (!target.agg->innerExpr && target.expr && func == AggFunc::SUM) {
+                std::vector<const FuncCall*> aggCalls;
+                bool isDivision = false;
+
+                // Walk the expression tree to find aggregate FuncCalls.
+                // Use a raw function pointer to avoid std::function recursive capture.
+                struct Walker {
+                    static void walk(const ExprPtr& e, std::vector<const FuncCall*>& out, bool& div) {
+                        if (!e) return;
+                        if (auto* fc = std::get_if<FuncCall>(&e->node)) {
+                            if (fc->name == "sum" || fc->name == "avg" || fc->name == "count") {
+                                out.push_back(fc); return;
+                            }
+                            for (auto& a : fc->args) walk(a, out, div);
+                            return;
+                        }
+                        if (auto* be = std::get_if<BinaryExpr>(&e->node)) {
+                            walk(be->left, out, div);
+                            walk(be->right, out, div);
+                            if (be->op == ExprOp::DIV) div = true;
+                        } else if (auto* cw = std::get_if<CaseWhen>(&e->node)) {
+                            for (auto& br : cw->branches) {
+                                walk(br.result, out, div);
+                            }
+                            if (cw->elseResult) walk(cw->elseResult, out, div);
+                        }
+                    }
+                };
+                Walker::walk(target.expr, aggCalls, isDivision);
+
+                if (aggCalls.size() == 2 && isDivision) {
+                    double outerConst = 1.0;
+                    // Pattern: const * SUM(a) / SUM(b) → two accumulators + AVG alias
+                    // Try to extract the constant multiplier from the expression tree
+                    if (auto* be = std::get_if<BinaryExpr>(&target.expr->node)) {
+                        if (be->op == ExprOp::DIV) {
+                            // Left side might be `const * SUM(a)` or just `SUM(a)`
+                            auto leftCall = aggCalls[0];
+                            auto rightCall = aggCalls[1];
+                            if (!leftCall->args.empty() && !rightCall->args.empty()) {
+                                auto numExpr = leftCall->args[0];
+                                auto denExpr = rightCall->args[0];
+                                std::string numRaw = exprToMetal(numExpr, idxVar, aq.schema);
+                                std::string denRaw = exprToMetal(denExpr, idxVar, aq.schema);
+                                // If the left binary is MUL with a constant, include it
+                                if (auto* leftBe = std::get_if<BinaryExpr>(&numExpr->node)) {
+                                    if (leftBe->op == ExprOp::MUL) {
+                                        if (auto* lit = std::get_if<Literal>(&leftBe->left->node)) {
+                                            if (auto* iv = std::get_if<int>(&lit->value)) outerConst = (double)*iv;
+                                            else if (auto* fv = std::get_if<float>(&lit->value)) outerConst = (double)*fv;
+                                        }
+                                    }
+                                }
+                                std::string numFinal = rewriteForProbe(numRaw, idxVar, carryVar, aq.schema);
+                                std::string denFinal = rewriteForProbe(denRaw, idxVar, carryVar, aq.schema);
+                                int numIdx = reduce->addAccumulator(accName + "_num", numFinal, "float");
+                                int denIdx = reduce->addAccumulator(accName + "_den", denFinal, "float");
+                                reduce->setAverageResultAlias(alias, numIdx, denIdx,
+                                    outerConst != 1.0 ? (int)(1.0 / outerConst) : 0);
+                                continue;
+                            }
+                        }
+                    }
+                }
+                // Fall through: unhandled complex pattern → fail (will use predefined builder)
+                return fail("Complex aggregate expression not decomposable.");
+            }
+
             if (!target.agg->innerExpr || !exprSupported(target.agg->innerExpr, false))
                 return fail("Aggregate expression not supported on GPU.");
             if (!isNumericLike(inferExprDataType(target.agg->innerExpr)))
@@ -2009,6 +2082,16 @@ std::optional<MetalQueryPlan> buildGenericMultiTableAdhocPlan_impl(
             }
         }
         auto& phaseRef = appendPhase(plan, "ADHOC_multi_probe_scalar", std::move(reduce));
+        // Register build-side CHAR_FIXED columns as extra buffers
+        for (const auto& [tname, cols] : neededByTable) {
+            if (tname == probeTable) continue;
+            for (const auto& c : cols) {
+                DataType cdType = aq.schema->columnType(tname, c);
+                if (cdType == DataType::CHAR_FIXED) {
+                    phaseRef.extraBuffers.push_back({c, "char", true, false});
+                }
+            }
+        }
         for (auto& [c, t] : crossExtraCols) {
             phaseRef.extraBuffers.push_back({c, "char", true, false});
         }
