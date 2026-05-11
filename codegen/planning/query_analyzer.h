@@ -87,6 +87,9 @@ struct AnalyzedQuery {
     // FROM-clause subquery column aliases → source expression (for computed cols).
     std::unordered_map<std::string, ExprPtr> subqueryExprMap;
 
+    // Table alias → real table name mapping (e.g. "n1" → "nation").
+    std::unordered_map<std::string, std::string> aliasMap;
+
     // Helpers
     bool isSingleTable() const { return tables.size() == 1 && joins.empty(); }
     bool hasAggregation() const {
