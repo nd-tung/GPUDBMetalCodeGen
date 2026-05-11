@@ -1143,7 +1143,8 @@ bool multiTableBuildJoinTree(const AnalyzedQuery& aq, int probeIdx,
         return -1;
     };
     for (const auto& jc : aq.joins) {
-        int ei = findEdge(jc.leftTable, jc.rightTable);
+        int ei = (jc.leftTable == jc.rightTable) ? -1 : findEdge(jc.leftTable, jc.rightTable);
+        // Self-joins (e.g. l1↔l2, l1↔l3) always get separate edges.
         if (ei < 0) {
             Edge e;
             e.a = jc.leftTable; e.b = jc.rightTable;
@@ -1767,7 +1768,7 @@ std::optional<MetalQueryPlan> buildGenericMultiTableAdhocPlan_impl(
         const auto& sub = subtreeCarry[u];
         // Always create a bitmap for the SemiJoin filter.
         pipe = std::make_unique<MetalBitmapBuild>(
-            std::move(pipe), "d_bitmap_" + tname, storeKey,
+            std::move(pipe), "d_bitmap_" + tag, storeKey,
             "(" + sizeSym + " + 31) / 32");
 
         // For non-CHAR_FIXED carries, also create ArrayStores for value propagation.
@@ -1872,10 +1873,10 @@ std::optional<MetalQueryPlan> buildGenericMultiTableAdhocPlan_impl(
         // Always probe the bitmap for SemiJoin filtering.
         if (nodes[c].anti) {
             probePipe = std::make_unique<MetalAntiBitmapProbe>(
-                std::move(probePipe), "d_bitmap_" + aq.tables[c], probeKey);
-        } else {
-            probePipe = std::make_unique<MetalBitmapProbe>(
-                std::move(probePipe), "d_bitmap_" + aq.tables[c], probeKey);
+                std::move(probePipe), "d_bitmap_" + nodes[c].table, probeKey);
+            } else {
+                probePipe = std::make_unique<MetalBitmapProbe>(
+                std::move(probePipe), "d_bitmap_" + nodes[c].table, probeKey);
         }
 
         // For non-CHAR_FIXED carries, create ArrayLookups for value propagation.
