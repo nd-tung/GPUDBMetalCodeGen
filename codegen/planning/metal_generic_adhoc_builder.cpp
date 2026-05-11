@@ -391,9 +391,10 @@ std::unique_ptr<MetalOperator> makeFilteredScan(const AnalyzedQuery& aq,
                                                 const std::string& idxVar) {
     std::set<std::string> scanColumns = columns;
     if (scanColumns.empty()) {
-        // Schema-driven generic path: trust IU auto-projection.
-        // The scan will deduce required columns at produce time
-        // via the parent chain + ColumnTypeResolver.
+        if (aq.schema) {
+            auto pk = aq.schema->pkInfo(aq.tables[0]);
+            if (pk) scanColumns.insert(pk->first);
+        }
     }
     auto scan = makeScanForCols(aq.tables[0], idxVar, scanColumns);
     return maybeSelect(std::move(scan), combineFilters(aq.filters, idxVar));
@@ -2495,7 +2496,6 @@ std::optional<MetalQueryPlan> buildGenericSingleTableAdhocPlan(const AnalyzedQue
     std::string subError;
     if (auto scalar = buildScalarAggPlan(aq, &subError)) return scalar;
     if (auto grouped = buildGroupedAggPlan(aq, &subError)) return grouped;
-    if (error && !subError.empty()) { *error = subError; return std::nullopt; }
     return buildMaterializePlan(aq, error);
 }
 
