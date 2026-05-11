@@ -1,7 +1,6 @@
 #include "metal_generic_adhoc_builder.h"
 #include "metal_plan_common.h"
 #include "metal_generic_executor.h"
-#include "tpch_schema.h"
 
 #include <algorithm>
 #include <cctype>

@@ -1,5 +1,4 @@
 #include "metal_plan_common.h"
-#include "tpch_schema.h"
 
 #include <sstream>
 #include <optional>
@@ -78,7 +77,6 @@ std::string fixedStringEqMetal(const ColRef& col,
                                 const SchemaProvider* schema = nullptr) {
     int width = 0;
     if (schema) width = schema->columnFixedWidth(col.table, col.column);
-    else try { width = TPCHSchema::instance().table(col.table).col(col.column).fixedWidth; } catch (...) {}
     if (width <= 0 || static_cast<int>(literal.size()) > width) return "false";
 
     std::string base = col.column + "[" + idxVar + " * " + std::to_string(width) + " + ";
@@ -101,7 +99,6 @@ std::string fixedStringPrefixMetal(const ColRef& col,
                                     const SchemaProvider* schema = nullptr) {
     int width = 0;
     if (schema) width = schema->columnFixedWidth(col.table, col.column);
-    else try { width = TPCHSchema::instance().table(col.table).col(col.column).fixedWidth; } catch (...) {}
     if (width <= 0 || static_cast<int>(prefix.size()) > width) return "false";
 
     std::string base = col.column + "[" + idxVar + " * " + std::to_string(width) + " + ";
@@ -160,7 +157,6 @@ std::optional<std::string> fixedStringLikeMetal(const Like& like,
     if (col->table.empty() || col->column.empty()) return std::nullopt;
     int width = 0;
     if (schema) width = schema->columnFixedWidth(col->table, col->column);
-    else try { width = TPCHSchema::instance().table(col->table).col(col->column).fixedWidth; } catch (...) {}
     if (width <= 0) return std::nullopt;
 
     // Build LIKE Metal expression using column width
@@ -384,7 +380,6 @@ std::string exprToMetal(const ExprPtr& expr, const std::string& idxVar,
                         colName = cr->column;
                     try {
                         if (schema) fw = schema->columnFixedWidth(cr->table, cr->column);
-                        else try { fw = TPCHSchema::instance().table(cr->table).col(cr->column).fixedWidth; } catch (...) {}
                     } catch (...) {}
                     }
                 }
@@ -544,15 +539,10 @@ std::string combineFilters(const std::vector<PredPtr>& filters, const std::strin
 }
 
 // Map column name to Metal type.
-// Falls back to TPCHSchema when schema is null (predefined query builders).
 static std::string colMetalType(const std::string& table, const std::string& colName,
                                 const SchemaProvider* schema = nullptr) {
     DataType type = DataType::INT;
     if (schema) type = schema->columnType(table, colName);
-    else {
-        try { type = TPCHSchema::instance().table(table).col(colName).type; }
-        catch (...) {}
-    }
     switch (type) {
         case DataType::INT:        return "int";
         case DataType::FLOAT:      return "float";
