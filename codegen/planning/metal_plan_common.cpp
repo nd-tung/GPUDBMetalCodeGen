@@ -579,6 +579,11 @@ std::unique_ptr<MetalGridStrideScan> makeScanForCols(const std::string& table,
     return scan;
 }
 
+std::unique_ptr<MetalGridStrideScan> makeAutoScan(const std::string& table,
+                                                   const std::string& idxVar) {
+    return std::make_unique<MetalGridStrideScan>(table, "row", idxVar);
+}
+
 std::unique_ptr<MetalOperator> maybeSelect(std::unique_ptr<MetalOperator> input,
                                            const std::string& filterCond) {
     if (filterCond.empty()) return input;

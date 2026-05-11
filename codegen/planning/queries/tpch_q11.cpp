@@ -12,7 +12,7 @@ std::optional<MetalQueryPlan> buildQ11Plan_byName() {
 
     // Phase 1: Build supplier bitmap for GERMANY
     {
-        auto scan = makeScan("supplier", idx, {{"s_suppkey", "int"}, {"s_nationkey", "int"}});
+        auto scan = makeAutoScan("supplier", idx);
 
         auto filtered = std::make_unique<MetalSelection>(std::move(scan),
             "s_nationkey[" + idx + "] == germany_nk");
@@ -27,10 +27,7 @@ std::optional<MetalQueryPlan> buildQ11Plan_byName() {
 
     // Phase 2: Scan partsupp → bitmap probe → per-part value aggregation
     {
-        auto scan = makeScan("partsupp", idx, {
-            {"ps_partkey", "int"}, {"ps_suppkey", "int"},
-            {"ps_supplycost", "float"}, {"ps_availqty", "int"}
-        });
+        auto scan = makeAutoScan("partsupp", idx);
 
         auto probed = std::make_unique<MetalBitmapProbe>(std::move(scan),
             "d_supp_bitmap", "ps_suppkey[" + idx + "]");

@@ -12,7 +12,7 @@ std::optional<MetalQueryPlan> buildQ3Plan_byName() {
 
     // Phase 1: Build customer bitmap (BUILDING segment)
     {
-        auto scan = makeScan("customer", idx, {{"c_custkey", "int"}, {"c_mktsegment", "char"}});
+        auto scan = makeAutoScan("customer", idx);
 
         auto filtered = std::make_unique<MetalSelection>(std::move(scan),
             "c_mktsegment[" + idx + "] == 'B'");
@@ -26,10 +26,7 @@ std::optional<MetalQueryPlan> buildQ3Plan_byName() {
 
     // Phase 2: Build orders maps (date + priority, dual ArrayStore)
     {
-        auto scan = makeScan("orders", idx, {
-            {"o_orderkey", "int"}, {"o_custkey", "int"},
-            {"o_orderdate", "int"}, {"o_shippriority", "int"}
-        });
+        auto scan = makeAutoScan("orders", idx);
 
         auto dateFiltered = std::make_unique<MetalSelection>(std::move(scan),
             "o_orderdate[" + idx + "] < 19950315");
@@ -52,10 +49,7 @@ std::optional<MetalQueryPlan> buildQ3Plan_byName() {
 
     // Phase 3: Probe lineitem → aggregate revenue per orderkey
     {
-        auto scan = makeScan("lineitem", idx, {
-            {"l_orderkey", "int"}, {"l_shipdate", "int"},
-            {"l_extendedprice", "float"}, {"l_discount", "float"}
-        });
+        auto scan = makeAutoScan("lineitem", idx);
 
         auto dateFiltered = std::make_unique<MetalSelection>(std::move(scan),
             "l_shipdate[" + idx + "] > 19950315");

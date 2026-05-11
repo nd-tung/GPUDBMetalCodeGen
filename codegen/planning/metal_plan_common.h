@@ -40,11 +40,15 @@ std::string predToMetalForHaving(const PredPtr& pred,
                                  const std::vector<MetalKeyedAggSlotForHaving>& slots);
 
 std::unique_ptr<MetalGridStrideScan> makeScan(const std::string& table,
-                                              const std::string& idxVar,
-                                              ColumnList columns);
+                                               const std::string& idxVar,
+                                               ColumnList columns);
 std::unique_ptr<MetalGridStrideScan> makeScanForCols(const std::string& table,
-                                                     const std::string& idxVar,
-                                                     const std::set<std::string>& cols);
+                                                      const std::string& idxVar,
+                                                      const std::set<std::string>& cols);
+// Create a scan with no explicit columns — columns are auto-discovered
+// at produce time via the IU chain (requires ColumnTypeResolver on codegen).
+std::unique_ptr<MetalGridStrideScan> makeAutoScan(const std::string& table,
+                                                   const std::string& idxVar = "i");
 
 std::unique_ptr<MetalOperator> maybeSelect(std::unique_ptr<MetalOperator> input,
                                            const std::string& filterCond);

@@ -11,7 +11,7 @@ std::optional<MetalQueryPlan> buildQ12PlanForDateFilter(const std::string& dateC
     std::string idxVar = "i";
 
     {
-        auto scan = makeScan("orders", idxVar, {{"o_orderkey", "int"}, {"o_orderpriority", "char"}});
+        auto scan = makeAutoScan("orders", idxVar);
         auto filter = std::make_unique<MetalSelection>(std::move(scan),
             "o_orderpriority[" + idxVar + "] == '1' || o_orderpriority[" + idxVar + "] == '2'");
         auto bitmapBuild = std::make_unique<MetalBitmapBuild>(
@@ -21,10 +21,7 @@ std::optional<MetalQueryPlan> buildQ12PlanForDateFilter(const std::string& dateC
     }
 
     {
-        auto scan = makeScan("lineitem", idxVar, {
-            {"l_orderkey", "int"}, {"l_shipmode", "char"}, {"l_shipdate", "int"},
-            {"l_commitdate", "int"}, {"l_receiptdate", "int"}
-        });
+        auto scan = makeAutoScan("lineitem", idxVar);
 
         std::string filterCond =
             "(l_shipmode[" + idxVar + " * 2] == 'M' || l_shipmode[" + idxVar + " * 2] == 'S') && "

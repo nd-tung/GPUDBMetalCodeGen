@@ -28,14 +28,12 @@ static TPCHSchemaProvider g_defaultSchema;
 
 // Subquery column alias → source ColRef.  Populated when a RangeSubselect's
 // targetList aliases a column reference (e.g. "n2.n_name AS nation").
-// Used to resolve outer-query column references that don't exist in physical
-// tables but were aliased in a FROM-clause subquery.
 std::unordered_map<std::string, ColRef> g_subqueryAliasMap;
 // Subquery column alias → source expression (for non-column expressions).
 std::unordered_map<std::string, ExprPtr> g_subqueryExprMap;
 
 // File-scope: view definitions inlined during analysis.
-std::map<std::string, std::pair<json, std::vector<std::string>>> g_views; // name → (selectBody, columnAliases)
+std::map<std::string, std::pair<json, std::vector<std::string>>> g_views;
 
 // Schema provider injected by analyzeSQL(); used by AST walkers for column
 // resolution instead of hard-coded TPCHSchema::instance().
@@ -50,6 +48,13 @@ std::pair<std::string, std::string> resolveColumn(const std::string& colName,
         if (g_analyzeSchema && g_analyzeSchema->hasColumn(t, colName)) return {t, colName};
     }
     return {"", colName}; // alias or derived column
+}
+
+} // anonymous namespace
+
+SchemaProvider& defaultSchemaProvider() {
+    static TPCHSchemaProvider s;
+    return s;
 }
 
 // Parse a date string like "1994-01-01" to YYYYMMDD integer
@@ -741,8 +746,6 @@ void extractJoinOns(const json& fromItem, const std::vector<std::string>& tables
         extractJoinOns(je["rarg"], tables, joins, filters);
     }
 }
-
-} // anonymous namespace
 
 // ===================================================================
 // PUBLIC: analyzeSQL

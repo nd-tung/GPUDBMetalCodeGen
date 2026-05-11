@@ -102,4 +102,7 @@ struct AnalyzedQuery {
 AnalyzedQuery analyzeSQL(const std::string& sql,
                          const SchemaProvider* schema = nullptr);
 
+// Default schema provider used when no schema is specified.
+extern SchemaProvider& defaultSchemaProvider();
+
 } // namespace codegen

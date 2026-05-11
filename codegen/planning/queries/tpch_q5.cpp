@@ -20,7 +20,7 @@ std::optional<MetalQueryPlan> buildQ5Plan_byName() {
 
     // Phase 0: Build nation bitmap (ASIA nations only)
     {
-        auto scan = makeScan("nation", idx, {{"n_nationkey", "int"}, {"n_regionkey", "int"}});
+        auto scan = makeAutoScan("nation", idx);
 
         auto filtered = std::make_unique<MetalSelection>(std::move(scan),
             "n_regionkey[" + idx + "] == asia_rk");
@@ -35,7 +35,7 @@ std::optional<MetalQueryPlan> buildQ5Plan_byName() {
 
     // Phase 1: Build customer nation map (ASIA customers only)
     {
-        auto scan = makeScan("customer", idx, {{"c_custkey", "int"}, {"c_nationkey", "int"}});
+        auto scan = makeAutoScan("customer", idx);
 
         auto probed = std::make_unique<MetalBitmapProbe>(std::move(scan),
             "d_nation_bitmap", "c_nationkey[" + idx + "]");
@@ -50,7 +50,7 @@ std::optional<MetalQueryPlan> buildQ5Plan_byName() {
 
     // Phase 2: Build supplier nation map (ASIA suppliers only)
     {
-        auto scan = makeScan("supplier", idx, {{"s_suppkey", "int"}, {"s_nationkey", "int"}});
+        auto scan = makeAutoScan("supplier", idx);
 
         auto probed = std::make_unique<MetalBitmapProbe>(std::move(scan),
             "d_nation_bitmap", "s_nationkey[" + idx + "]");
@@ -65,9 +65,7 @@ std::optional<MetalQueryPlan> buildQ5Plan_byName() {
 
     // Phase 3: Build orders nation map (date-filtered, customer-in-ASIA)
     {
-        auto scan = makeScan("orders", idx, {
-            {"o_orderkey", "int"}, {"o_custkey", "int"}, {"o_orderdate", "int"}
-        });
+        auto scan = makeAutoScan("orders", idx);
 
         // Date filter: 1994-01-01 to 1994-12-31
         auto dateFiltered = std::make_unique<MetalSelection>(std::move(scan),
@@ -90,10 +88,7 @@ std::optional<MetalQueryPlan> buildQ5Plan_byName() {
 
     // Phase 4: Probe lineitem → same-nation check → aggregate
     {
-        auto scan = makeScan("lineitem", idx, {
-            {"l_orderkey", "int"}, {"l_suppkey", "int"},
-            {"l_extendedprice", "float"}, {"l_discount", "float"}
-        });
+        auto scan = makeAutoScan("lineitem", idx);
 
         // Lookup: cust_nk = orders_nation_map[l_orderkey]
         auto lookupOrders = std::make_unique<MetalArrayLookup>(

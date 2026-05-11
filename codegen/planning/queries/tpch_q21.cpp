@@ -21,8 +21,7 @@ std::optional<MetalQueryPlan> buildQ21Plan_byName() {
     // the host's tiny nation lookup (registerNameKey) — keeping the lookup
     // on CPU is cheaper than a 25-row dispatch.
     {
-        auto scan = makeScan("supplier", idx,
-                             {{"s_suppkey", "int"}, {"s_nationkey", "int"}});
+        auto scan = makeAutoScan("supplier", idx);
         auto filter = std::make_unique<MetalSelection>(
             std::move(scan), "s_nationkey[" + idx + "] == sa_nk");
         auto bitmapBuild = std::make_unique<MetalBitmapBuild>(
@@ -60,7 +59,7 @@ static void q21_track_supplier(device atomic_int* first_supp,
 
     // Phase 1: Build F-orders bitmap on GPU
     {
-        auto scan = makeScan("orders", idx, {{"o_orderkey", "int"}, {"o_orderstatus", "char"}});
+        auto scan = makeAutoScan("orders", idx);
 
         auto filter = std::make_unique<MetalSelection>(
             std::move(scan), "o_orderstatus[" + idx + "] == 'F'");
@@ -73,10 +72,7 @@ static void q21_track_supplier(device atomic_int* first_supp,
 
     // Phase 2: Build multi_supp and multi_late bitmaps on GPU
     {
-        auto scan = makeScan("lineitem", idx, {
-            {"l_orderkey", "int"}, {"l_suppkey", "int"},
-            {"l_receiptdate", "int"}, {"l_commitdate", "int"}
-        });
+        auto scan = makeAutoScan("lineitem", idx);
 
         // BitmapProbe: only process F-orders
         auto fOrderProbe = std::make_unique<MetalBitmapProbe>(
@@ -99,10 +95,7 @@ static void q21_track_supplier(device atomic_int* first_supp,
 
     // Phase 3: Count qualifying suppliers
     {
-        auto scan = makeScan("lineitem", idx, {
-            {"l_orderkey", "int"}, {"l_suppkey", "int"},
-            {"l_receiptdate", "int"}, {"l_commitdate", "int"}
-        });
+        auto scan = makeAutoScan("lineitem", idx);
 
         // BitmapProbe: F-order
         auto fOrderProbe = std::make_unique<MetalBitmapProbe>(

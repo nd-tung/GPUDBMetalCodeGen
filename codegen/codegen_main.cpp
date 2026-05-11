@@ -597,7 +597,9 @@ static bool runCodegenQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
 
         // 3. Generate Metal source via producer-consumer operators
         auto tCodegen0 = clk::now();
-        auto cg = codegen::generateFromPlan(plan, analyzed.schema);
+        // Predefined TPC-H queries don't go through analyzeSQL — provide
+        // the default schema so IU auto-projection works for them too.
+        auto cg = codegen::generateFromPlan(plan, analyzed.schema ? analyzed.schema : &codegen::defaultSchemaProvider());
         std::string metalSource = cg.print();
         timing.codegenMs = elapsedMs(tCodegen0, clk::now());
 

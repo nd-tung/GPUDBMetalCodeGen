@@ -44,7 +44,7 @@ std::optional<MetalQueryPlan> buildQ7Plan_byName() {
 
     // Phase 1: Build supplier nation map
     {
-        auto scan = makeScan("supplier", idx, {{"s_suppkey", "int"}, {"s_nationkey", "int"}});
+        auto scan = makeAutoScan("supplier", idx);
 
         auto filtered = std::make_unique<MetalSelection>(std::move(scan),
             "s_nationkey[" + idx + "] == france_nk || s_nationkey[" + idx + "] == germany_nk");
@@ -61,7 +61,7 @@ std::optional<MetalQueryPlan> buildQ7Plan_byName() {
 
     // Phase 2: Build customer nation map
     {
-        auto scan = makeScan("customer", idx, {{"c_custkey", "int"}, {"c_nationkey", "int"}});
+        auto scan = makeAutoScan("customer", idx);
 
         auto filtered = std::make_unique<MetalSelection>(std::move(scan),
             "c_nationkey[" + idx + "] == france_nk || c_nationkey[" + idx + "] == germany_nk");
@@ -78,7 +78,7 @@ std::optional<MetalQueryPlan> buildQ7Plan_byName() {
 
     // Phase 3: Build orders map (orderkey → custkey)
     {
-        auto scan = makeScan("orders", idx, {{"o_orderkey", "int"}, {"o_custkey", "int"}});
+        auto scan = makeAutoScan("orders", idx);
 
         // ArrayStore: orders_map[orderkey] = custkey
         auto store = std::make_unique<MetalArrayStore>(
@@ -91,10 +91,7 @@ std::optional<MetalQueryPlan> buildQ7Plan_byName() {
 
     // Phase 4: Probe lineitem → cascaded lookups → aggregate into 4 bins
     {
-        auto scan = makeScan("lineitem", idx, {
-            {"l_orderkey", "int"}, {"l_suppkey", "int"}, {"l_shipdate", "int"},
-            {"l_extendedprice", "float"}, {"l_discount", "float"}
-        });
+        auto scan = makeAutoScan("lineitem", idx);
 
         // Date filter: 1995-01-01 to 1996-12-31
         auto dateFiltered = std::make_unique<MetalSelection>(std::move(scan),

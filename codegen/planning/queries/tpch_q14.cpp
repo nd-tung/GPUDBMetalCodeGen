@@ -11,7 +11,7 @@ std::optional<MetalQueryPlan> buildQ14PlanForDateFilter(const std::string& filte
     std::string idxVar = "i";
 
     {
-        auto scan = makeScan("part", idxVar, {{"p_partkey", "int"}, {"p_type", "char"}});
+        auto scan = makeAutoScan("part", idxVar);
         std::string promoFilter =
             "p_type[" + idxVar + " * 25] == 'P' && "
             "p_type[" + idxVar + " * 25 + 1] == 'R' && "
@@ -28,10 +28,7 @@ std::optional<MetalQueryPlan> buildQ14PlanForDateFilter(const std::string& filte
     }
 
     {
-        auto scan = makeScan("lineitem", idxVar, {
-            {"l_partkey", "int"}, {"l_shipdate", "int"},
-            {"l_extendedprice", "float"}, {"l_discount", "float"}
-        });
+        auto scan = makeAutoScan("lineitem", idxVar);
 
         auto filtered = maybeSelect(std::move(scan), filterCond);
         std::string revenue = "l_extendedprice[" + idxVar + "] * (1.0f - l_discount[" + idxVar + "] * 0.01f)";
