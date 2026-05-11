@@ -590,7 +590,8 @@ bool isJoinCondition(const PredPtr& pred, JoinClause& jc) {
     auto* leftCol = std::get_if<ColRef>(&cmp->left->node);
     auto* rightCol = std::get_if<ColRef>(&cmp->right->node);
     if (!leftCol || !rightCol) return false;
-    if (leftCol->table == rightCol->table) return false;
+    // Self-joins are valid (e.g. l1.l_orderkey = l2.l_orderkey in EXISTS subqueries).
+    // The multi-table builder disambiguates via the visited-node BFS.
 
     jc.leftTable = leftCol->table;
     jc.leftCol = leftCol->column;
@@ -910,6 +911,12 @@ AnalyzedQuery analyzeSQL(const std::string& sql) {
                     if (sub.contains("fromClause")) {
                         for (auto& item : sub["fromClause"]) {
                             extractTables(item, aq.tables, aq.tableAliases);
+                        }
+                        // Rebuild alias map so column refs in the inner WHERE
+                        // can resolve qualified names (e.g. l2.l_orderkey).
+                        g_aliasMap.clear();
+                        for (size_t i = 0; i < aq.tables.size() && i < aq.tableAliases.size(); ++i) {
+                            g_aliasMap[aq.tableAliases[i]] = aq.tables[i];
                         }
                     }
                     if (sub.contains("whereClause")) {
