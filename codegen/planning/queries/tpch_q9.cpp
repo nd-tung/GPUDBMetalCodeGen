@@ -56,7 +56,7 @@ static void q9_ht_insert(device atomic_uint* ht_keys, device float* ht_vals,
     // Phase 0: build d_q9_part_bitmap from `part` (p_name contains "green").
     // Mirrors the CPU substring scan byte-for-byte over the 55-byte field.
     {
-        auto scan = makeScan("part", idx, {{"p_partkey", "int"}, {"p_name", "char"}});
+        auto scan = makeAutoScan("part", idx);
         std::string pred;
         for (int c = 0; c <= 50; c++) {
             std::string base = "p_name[" + idx + "*55+" + std::to_string(c);
@@ -76,7 +76,7 @@ static void q9_ht_insert(device atomic_uint* ht_keys, device float* ht_vals,
 
     // Phase 1: build d_q9_s_nationkey lookup from supplier (sentinel -1).
     {
-        auto scan = makeScan("supplier", idx, {{"s_suppkey", "int"}, {"s_nationkey", "int"}});
+        auto scan = makeAutoScan("supplier", idx);
         auto store = std::make_unique<MetalArrayStore>(
             std::move(scan), "d_q9_s_nationkey",
             "s_suppkey[" + idx + "]", "s_nationkey[" + idx + "]",
@@ -87,7 +87,7 @@ static void q9_ht_insert(device atomic_uint* ht_keys, device float* ht_vals,
     // Phase 2: build d_q9_o_year lookup from orders (sentinel 0).
     // Reduce phase later guards against 0 via MetalArrayLookup(sentinel=0).
     {
-        auto scan = makeScan("orders", idx, {{"o_orderkey", "int"}, {"o_orderdate", "int"}});
+        auto scan = makeAutoScan("orders", idx);
         auto store = std::make_unique<MetalArrayStore>(
             std::move(scan), "d_q9_o_year",
             "o_orderkey[" + idx + "]", "o_orderdate[" + idx + "] / 10000",
@@ -98,9 +98,7 @@ static void q9_ht_insert(device atomic_uint* ht_keys, device float* ht_vals,
     // Phase 3: build (pk,sk)→supplycost HT from partsupp gated by green bitmap.
     // Hand-emitted: needs CAS write semantics not provided by MetalArrayStore.
     {
-        auto scan = makeScan("partsupp", idx, {
-            {"ps_partkey", "int"}, {"ps_suppkey", "int"}, {"ps_supplycost", "float"}
-        });
+        auto scan = makeAutoScan("partsupp", idx);
         auto gated = std::make_unique<MetalSelection>(std::move(scan),
             "bitmap_test(d_q9_part_bitmap, ps_partkey[" + idx + "])");
         auto computeKey = std::make_unique<MetalComputeExpr>(
@@ -115,6 +113,9 @@ static void q9_ht_insert(device atomic_uint* ht_keys, device float* ht_vals,
             std::string idx_;
             HtInsertTerminal(std::unique_ptr<MetalOperator> c, std::string i)
                 : MetalUnaryOperator(std::move(c)), idx_(std::move(i)) {}
+            void iusUsed(std::vector<IU>& out) const override {
+                MetalOperator::appendIUsFromExpr("ps_supplycost[" + idx_ + "]", out);
+            }
             void produce(MetalCodegen& cg, ConsumerFn) override {
                 // Build phase outputs.
                 cg.addBufferParam("d_ps_ht_keys", "atomic_uint", "q9HtSize",
@@ -140,10 +141,7 @@ static void q9_ht_insert(device atomic_uint* ht_keys, device float* ht_vals,
     // Phase 4 (existing reduce): scan lineitem, probe HT, accumulate profit
     // per (nation, year) bucket.
     {
-        auto scan = makeScan("lineitem", idx, {
-            {"l_partkey", "int"}, {"l_suppkey", "int"}, {"l_orderkey", "int"},
-            {"l_quantity", "float"}, {"l_extendedprice", "float"}, {"l_discount", "float"}
-        });
+        auto scan = makeAutoScan("lineitem", idx);
 
         // BitmapProbe: filter to green parts
         auto bmpProbe = std::make_unique<MetalBitmapProbe>(

@@ -41,10 +41,7 @@ static int container_match(const device char* cont, uint idx) {
 
     // Phase 1: Build part condition bitmask map
     {
-        auto scan = makeScan("part", idx, {
-            {"p_partkey", "int"}, {"p_brand", "char"},
-            {"p_container", "char"}, {"p_size", "int"}
-        });
+        auto scan = makeAutoScan("part", idx);
 
         auto computeCond = std::make_unique<MetalComputeExpr>(
             std::move(scan), "_cond", "int",
@@ -66,11 +63,7 @@ static int container_match(const device char* cont, uint idx) {
 
     // Phase 2: Scan lineitem, lookup part condition, check quantity, reduce revenue
     {
-        auto scan = makeScan("lineitem", idx, {
-            {"l_partkey", "int"}, {"l_quantity", "float"},
-            {"l_extendedprice", "float"}, {"l_discount", "float"},
-            {"l_shipmode", "char"}, {"l_shipinstruct", "char"}
-        });
+        auto scan = makeAutoScan("lineitem", idx);
 
         // l_shipmode IN ('AIR', 'REG AIR') — 'A..' or 'RE..'
         // l_shipinstruct = 'DELIVER IN PERSON' — first char 'D'

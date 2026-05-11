@@ -69,9 +69,11 @@ static void q16_filter_emit(device atomic_uint* counter,
     // Phase 0: GPU filter + compact. The ComputeExpr's value isn't used;
     // the helper performs the atomic-append side-effect.
     {
-        auto scan = makeScan("part", idx, {
-            {"p_partkey", "int"}, {"p_brand", "char"},
-            {"p_type", "char"}, {"p_size", "int"}});
+        auto scan = makeAutoScan("part", idx);
+        // Bare-pointer columns used by q16_filter_emit helper
+        scan->addColumn("p_brand", "char");
+        scan->addColumn("p_type", "char");
+        scan->addColumn("p_size", "int");
         auto sideEffect = std::make_unique<MetalComputeExpr>(
             std::move(scan), "_q16_unused", "int",
             "(q16_filter_emit(d_q16_filt_count, d_q16_filt_idx, d_q16_filt_key, "
@@ -187,7 +189,7 @@ static void q16_bitmap_set(device atomic_uint* group_bitmaps, uint bv_ints,
 
     // Phase 1: Build complaint bitmap on GPU
     {
-        auto scan = makeScan("supplier", idx, {{"s_suppkey", "int"}, {"s_comment", "char"}});
+        auto scan = makeAutoScan("supplier", idx);
 
         auto filter = std::make_unique<MetalSelection>(
             std::move(scan),
@@ -201,7 +203,7 @@ static void q16_bitmap_set(device atomic_uint* group_bitmaps, uint bv_ints,
 
     // Phase 2: partsupp scan with bitmap ops
     {
-        auto scan = makeScan("partsupp", idx, {{"ps_partkey", "int"}, {"ps_suppkey", "int"}});
+        auto scan = makeAutoScan("partsupp", idx);
 
         // ArrayLookup: part_group_map[ps_partkey] → group_id
         auto groupLookup = std::make_unique<MetalArrayLookup>(
