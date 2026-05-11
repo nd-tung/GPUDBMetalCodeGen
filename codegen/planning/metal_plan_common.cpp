@@ -572,14 +572,16 @@ std::string predToMetal(const PredPtr& pred, const std::string& idxVar,
     }, pred->node);
 }
 
-// Combine all filter predicates into a single Metal condition string
+// Combine all filter predicates into a single Metal condition string.
+// For readability and Metal compiler efficiency, use line breaks with multiple filters.
 std::string combineFilters(const std::vector<PredPtr>& filters, const std::string& idxVar) {
     if (filters.empty()) return "";
     if (filters.size() == 1) return predToMetal(filters[0], idxVar);
 
     std::string cond;
+    const char* sep = filters.size() > 2 ? "\n               && " : " && ";
     for (size_t i = 0; i < filters.size(); i++) {
-        if (i) cond += " && ";
+        if (i) cond += sep;
         cond += "(" + predToMetal(filters[i], idxVar) + ")";
     }
     return cond;
