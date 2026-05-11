@@ -705,6 +705,39 @@ AggFunc parseAggFunc(const std::string& name) {
     throw std::runtime_error("Unknown aggregate: " + name);
 }
 
+// Check if a JSON value node contains aggregate functions (recursive).
+static bool containsAggregateJson(const json& node) {
+    if (node.contains("FuncCall")) {
+        auto& fc = node["FuncCall"];
+        std::string fn;
+        if (fc.contains("funcname"))
+            for (auto& n : fc["funcname"])
+                if (n.contains("String")) fn = n["String"]["sval"].get<std::string>();
+        std::transform(fn.begin(), fn.end(), fn.begin(), ::tolower);
+        if (fn == "sum" || fn == "count" || fn == "avg" || fn == "min" || fn == "max")
+            return true;
+    }
+    if (node.contains("A_Expr")) {
+        auto& ae = node["A_Expr"];
+        return containsAggregateJson(ae.value("lexpr", json{})) ||
+               containsAggregateJson(ae.value("rexpr", json{}));
+    }
+    if (node.contains("CaseExpr")) {
+        auto& ce = node["CaseExpr"];
+        if (ce.contains("args"))
+            for (auto& a : ce["args"])
+                if (a.contains("CaseWhen")) {
+                    auto& cw = a["CaseWhen"];
+                    if (containsAggregateJson(cw.value("expr", json{}))) return true;
+                    if (containsAggregateJson(cw.value("result", json{}))) return true;
+                }
+        if (containsAggregateJson(ce.value("defresult", json{}))) return true;
+    }
+    if (node.contains("TypeCast"))
+        return containsAggregateJson(node["TypeCast"].value("arg", json{}));
+    return false;
+}
+
 SelectTarget extractTarget(const json& resTarget, const std::vector<std::string>& tables) {
     SelectTarget st;
     st.alias = resTarget.value("name", "");
@@ -739,6 +772,16 @@ SelectTarget extractTarget(const json& resTarget, const std::vector<std::string>
             st.expr = walkExpr(val, tables);
         }
     } else {
+        // A_Expr or other non-FuncCall top-level — check for nested aggregates
+        if (containsAggregateJson(val)) {
+            st.isAgg = true;
+            // Tag this as a complex aggregate expression (GPU computes inner aggs, CPU computes outer expr)
+            AggTarget at;
+            at.func = AggFunc::SUM; // placeholder — outer expression combines aggregates
+            at.alias = st.alias;
+            at.isStar = false;
+            st.agg = at;
+        }
         st.expr = walkExpr(val, tables);
     }
     return st;
