@@ -313,12 +313,13 @@ bool materializeExprSupported(const ExprPtr& expr) {
     return exprSupported(expr, false);
 }
 
-int fixedStringLenForExpr(const ExprPtr& expr) {
+int fixedStringLenForExpr(const ExprPtr& expr, const SchemaProvider* schema = nullptr) {
     if (!expr) return 0;
     auto* col = std::get_if<ColRef>(&expr->node);
     if (!col) return 0;
     if (col->dataType == DataType::CHAR1) return 1;
     if (col->dataType != DataType::CHAR_FIXED) return 0;
+    if (schema) return schema->columnFixedWidth(col->table, col->column);
     const auto& cdef = TPCHSchema::instance().table(col->table).col(col->column);
     return cdef.fixedWidth;
 }
@@ -397,8 +398,13 @@ std::unique_ptr<MetalOperator> makeFilteredScan(const AnalyzedQuery& aq,
                                                 const std::string& idxVar) {
     std::set<std::string> scanColumns = columns;
     if (scanColumns.empty()) {
-        const auto& table = TPCHSchema::instance().table(aq.tables[0]);
-        if (!table.columns.empty()) scanColumns.insert(table.columns.front().name);
+        if (aq.schema) {
+            auto pk = aq.schema->pkInfo(aq.tables[0]);
+            if (pk) scanColumns.insert(pk->first);
+        } else {
+            const auto& table = TPCHSchema::instance().table(aq.tables[0]);
+            if (!table.columns.empty()) scanColumns.insert(table.columns.front().name);
+        }
     }
     auto scan = makeScanForCols(aq.tables[0], idxVar, scanColumns);
     return maybeSelect(std::move(scan), combineFilters(aq.filters, idxVar));
@@ -755,17 +761,29 @@ std::optional<MetalQueryPlan> buildGroupedAggPlan(const AnalyzedQuery& aq, std::
 
             // Find max value for bitmap sizing.
             std::string maxExpr;
-            try {
-                auto& colDef = TPCHSchema::instance().table(innerCol->table).col(innerCol->column);
-                if (colDef.domainMax >= 0)
-                    maxExpr = std::to_string(colDef.domainMax + 1);
-            } catch (const std::runtime_error&) {}
-            if (maxExpr.empty()) {
+            if (aq.schema) {
+                auto gd = aq.schema->groupDomain(innerCol->table, innerCol->column);
+                if (gd && gd->maxValue >= 0)
+                    maxExpr = std::to_string(gd->maxValue + 1);
+            } else {
                 try {
-                    auto& tdef = TPCHSchema::instance().table(innerCol->table);
-                    if (!tdef.maxKeySymbol.empty())
-                        maxExpr = tdef.maxKeySymbol + " + 1";
+                    auto& colDef = TPCHSchema::instance().table(innerCol->table).col(innerCol->column);
+                    if (colDef.domainMax >= 0)
+                        maxExpr = std::to_string(colDef.domainMax + 1);
                 } catch (const std::runtime_error&) {}
+            }
+            if (maxExpr.empty()) {
+                if (aq.schema) {
+                    auto ms = aq.schema->maxKeySymbol(innerCol->table);
+                    if (!ms.empty())
+                        maxExpr = ms + " + 1";
+                } else {
+                    try {
+                        auto& tdef = TPCHSchema::instance().table(innerCol->table);
+                        if (!tdef.maxKeySymbol.empty())
+                            maxExpr = tdef.maxKeySymbol + " + 1";
+                    } catch (const std::runtime_error&) {}
+                }
             }
             if (maxExpr.empty())
                 return fail("Grouped aggregation: COUNT(DISTINCT) on column '" + innerCol->column +
@@ -861,13 +879,17 @@ std::optional<MetalQueryPlan> buildGroupedAggPlan(const AnalyzedQuery& aq, std::
         auto* gc = std::get_if<ColRef>(&aq.groupBy[ki]->node);
         if (gc && gc->dataType == DataType::CHAR1) {
             // Build reverse map: flat index → char from schema domain
-            try {
-                auto& colDef = TPCHSchema::instance().table(gc->table).col(gc->column);
-                d.charMap = colDef.charDomain;
-            } catch (const std::runtime_error&) {}
+            if (aq.schema) {
+                d.charMap = aq.schema->charDomain(gc->table, gc->column);
+            } else {
+                try {
+                    auto& colDef = TPCHSchema::instance().table(gc->table).col(gc->column);
+                    d.charMap = colDef.charDomain;
+                } catch (const std::runtime_error&) {}
+            }
         } else if (gc) {
             // Integer: find the base offset from domain
-            auto domain = smallIntGroupDomain(*gc);
+            auto domain = smallIntGroupDomain(*gc, aq.schema);
             d.keyBase = domain ? domain->minValue : 0;
         }
         // FuncCall GROUP BY: no decode needed (keyExpr is raw computed value)
@@ -982,7 +1004,7 @@ std::optional<MetalQueryPlan> buildMaterializePlan(const AnalyzedQuery& aq, std:
         DataType type = inferExprDataType(target.expr);
         std::string displayName = displayNameForTarget(target, targetIndex);
         std::string bufferName = "d_adhoc_" + std::to_string(targetIndex) + "_" + sanitizeIdentifier(displayName);
-        int stringLen = fixedStringLenForExpr(target.expr);
+        int stringLen = fixedStringLenForExpr(target.expr, aq.schema);
         std::string sizeExpr = outputSize;
         if (stringLen > 0) sizeExpr += " * " + std::to_string(stringLen);
         materialize->addColumn(bufferName, metalTypeForDataType(type),
@@ -1315,10 +1337,12 @@ std::string decodeCarryValue(DataType type, const std::string& var) {
 // rewritten expression has the same observable type as the original.
 std::string rewriteForProbe(std::string expr,
                              const std::string& idxVar,
-                             const std::map<CarriedKey, std::string>& carryVar) {
+                             const std::map<CarriedKey, std::string>& carryVar,
+                             const SchemaProvider* schema = nullptr) {
     for (const auto& [key, var] : carryVar) {
-        DataType t = TPCHSchema::instance().table(key.table)
-                         .col(key.column).type;
+        DataType t = schema ? schema->columnType(key.table, key.column)
+                            : TPCHSchema::instance().table(key.table)
+                                 .col(key.column).type;
         std::string sub = decodeCarryValue(t, var);
         // Standard column access pattern: col[idxVar]
         const std::string from = key.column + "[" + idxVar + "]";
@@ -1634,7 +1658,8 @@ std::optional<MetalQueryPlan> buildGenericMultiTableAdhocPlan_impl(
             const auto& need = neededByTable[tname];
             for (const auto& c : need) {
                 CarriedKey ck{tname, c};
-                if (!carriedColumnSupported(TPCHSchema::instance().table(tname).col(c).type)) {
+                DataType ct = aq.schema ? aq.schema->columnType(tname, c) : TPCHSchema::instance().table(tname).col(c).type;
+                if (!carriedColumnSupported(ct)) {
                     // Defer: only int/date carried columns.
                     // We'll fail later if such a column is actually required.
                     continue;
@@ -1655,10 +1680,10 @@ std::optional<MetalQueryPlan> buildGenericMultiTableAdhocPlan_impl(
         for (const auto& [tname, cols] : neededByTable) {
             if (tname == probeTable) continue;
             for (const auto& c : cols) {
-                const auto& cdef = TPCHSchema::instance().table(tname).col(c);
-                if (!carriedColumnSupported(cdef.type)) {
+                DataType ctype = aq.schema ? aq.schema->columnType(tname, c) : TPCHSchema::instance().table(tname).col(c).type;
+                if (!carriedColumnSupported(ctype)) {
                     return fail("Multi-table planner: carried column '" + tname + "." + c +
-                                "' has unsupported type '" + std::string(cdef.type == DataType::CHAR_FIXED ? "CHAR_FIXED" : "?") + "'.");
+                                "' has unsupported type '" + std::string(ctype == DataType::CHAR_FIXED ? "CHAR_FIXED" : "?") + "'.");
                 }
             }
         }
@@ -1771,7 +1796,7 @@ std::optional<MetalQueryPlan> buildGenericMultiTableAdhocPlan_impl(
             std::string valExpr = "0u";
             if (!sub.empty()) {
                 const auto& ck = sub.front();
-                DataType origType = TPCHSchema::instance().table(ck.table)
+                DataType origType = aq.schema ? aq.schema->columnType(ck.table, ck.column) : TPCHSchema::instance().table(ck.table)
                                         .col(ck.column).type;
                 valExpr = encodeCarryValue(origType,
                                            ck.column + "[" + idxVar + "]");
@@ -1793,12 +1818,12 @@ std::optional<MetalQueryPlan> buildGenericMultiTableAdhocPlan_impl(
 
         // For non-CHAR_FIXED carries, also create ArrayStores for value propagation.
         for (const auto& ck : sub) {
-            DataType ckType = TPCHSchema::instance().table(ck.table)
+            DataType ckType = aq.schema ? aq.schema->columnType(ck.table, ck.column) : TPCHSchema::instance().table(ck.table)
                                    .col(ck.column).type;
             if (ckType == DataType::CHAR_FIXED) continue;
             std::string valExpr;
             if (ck.table == tname) {
-                DataType origType = TPCHSchema::instance().table(tname)
+                DataType origType = aq.schema ? aq.schema->columnType(tname, ck.column) : TPCHSchema::instance().table(tname)
                                         .col(ck.column).type;
                 valExpr = encodeCarryValue(origType,
                                            ck.column + "[" + idxVar + "]");
@@ -1828,13 +1853,11 @@ std::optional<MetalQueryPlan> buildGenericMultiTableAdhocPlan_impl(
         for (const auto& c : crossCols) {
             std::string owner = ownerTableForColumn(aq, c);
             if (!owner.empty() && owner != probeTable) {
-                try {
-                    auto& colDef = TPCHSchema::instance().table(owner).col(c);
-                    if (colDef.type == DataType::CHAR_FIXED || colDef.type == DataType::CHAR1)
-                        crossExtraCols.push_back({c, "char"});
-                    else if (colDef.type == DataType::INT || colDef.type == DataType::DATE)
-                        crossExtraCols.push_back({c, "int"});
-                } catch (...) {}
+                DataType colDt = aq.schema ? aq.schema->columnType(owner, c) : TPCHSchema::instance().table(owner).col(c).type;
+                if (colDt == DataType::CHAR_FIXED || colDt == DataType::CHAR1)
+                    crossExtraCols.push_back({c, "char"});
+                else if (colDt == DataType::INT || colDt == DataType::DATE)
+                    crossExtraCols.push_back({c, "int"});
             }
         }
     }
@@ -1847,7 +1870,8 @@ std::optional<MetalQueryPlan> buildGenericMultiTableAdhocPlan_impl(
         std::set<std::string> cfCols;
         for (auto& cf : crossFilters) collectColumns(cf, cfCols);
         for (const auto& c : cfCols) {
-            if (TPCHSchema::instance().table(probeTable).nameToIdx.count(c))
+            bool hasCol = aq.schema ? aq.schema->hasColumn(probeTable, c) : TPCHSchema::instance().table(probeTable).nameToIdx.count(c);
+            if (hasCol)
                 probeScanCols.insert(c);
         }
     }
@@ -1901,7 +1925,7 @@ std::optional<MetalQueryPlan> buildGenericMultiTableAdhocPlan_impl(
 
         // For non-CHAR_FIXED carries, create ArrayLookups for value propagation.
         for (const auto& ck : subC) {
-            DataType ckType = TPCHSchema::instance().table(ck.table).col(ck.column).type;
+            DataType ckType = aq.schema ? aq.schema->columnType(ck.table, ck.column) : TPCHSchema::instance().table(ck.table).col(ck.column).type;
             if (ckType == DataType::CHAR_FIXED) continue;
             probePipe = std::make_unique<MetalArrayLookup>(
                 std::move(probePipe), ck.storageArray(aq.tables[c]),
@@ -1914,7 +1938,7 @@ std::optional<MetalQueryPlan> buildGenericMultiTableAdhocPlan_impl(
     // Build-side column references are rewritten to use the join key index.
     if (!crossFilters.empty()) {
         std::string cond = combineFilters(crossFilters, idxVar);
-        cond = rewriteForProbe(cond, idxVar, carryVar);
+        cond = rewriteForProbe(cond, idxVar, carryVar, aq.schema);
         // Rewrite build-side column indices for CHAR_FIXED and INT columns.
         for (const auto& [tname, jk] : charFixedJoinKey) {
             // CHAR_FIXED: `col[i * width]` → `col[jk[i] * width]`
@@ -1968,12 +1992,12 @@ std::optional<MetalQueryPlan> buildGenericMultiTableAdhocPlan_impl(
             DataType type = inferExprDataType(target.expr);
             std::string displayName = displayNameForTarget(target, ti);
             std::string bufferName = "d_adhoc_multi_" + std::to_string(ti) + "_" + sanitizeIdentifier(displayName);
-            int stringLen = fixedStringLenForExpr(target.expr);
+            int stringLen = fixedStringLenForExpr(target.expr, aq.schema);
             std::string sizeExpr = outputSize;
             if (stringLen > 0) sizeExpr += " * " + std::to_string(stringLen);
             std::string expr = materializeValueExpr(target.expr, idxVar);
             // Rewrite non-probe column references to carried variables
-            expr = rewriteForProbe(expr, idxVar, carryVar);
+            expr = rewriteForProbe(expr, idxVar, carryVar, aq.schema);
             // CHAR1 from non-probe tables: after rewrite, the carry variable is a
             // scalar.  Reset stringLen to 0 so the materialize operator emits a
             // scalar assignment instead of a pointer-indexed [_ci] loop.
@@ -1992,7 +2016,7 @@ std::optional<MetalQueryPlan> buildGenericMultiTableAdhocPlan_impl(
                     if (!owner.empty() && owner != probeTable) {
                         auto jkIt = charFixedJoinKey.find(owner);
                         if (jkIt != charFixedJoinKey.end()) {
-                            int len = fixedStringLenForExpr(target.expr);
+                            int len = fixedStringLenForExpr(target.expr, aq.schema);
                             std::string from = col->column + " + " + idxVar + " * " + std::to_string(len);
                             std::string to = col->column + " + " + jkIt->second + "[" + idxVar + "] * " + std::to_string(len);
                             size_t pos = expr.find(from);
@@ -2012,8 +2036,8 @@ std::optional<MetalQueryPlan> buildGenericMultiTableAdhocPlan_impl(
         for (const auto& [tname, cols] : neededByTable) {
             if (tname == probeTable) continue;
             for (const auto& c : cols) {
-                const auto& cdef = TPCHSchema::instance().table(tname).col(c);
-                if (cdef.type == DataType::CHAR_FIXED) {
+                DataType cdType = aq.schema ? aq.schema->columnType(tname, c) : TPCHSchema::instance().table(tname).col(c).type;
+                if (cdType == DataType::CHAR_FIXED) {
                     plan.phases.back().extraBuffers.push_back({c, "char", true, false});
                 }
             }
@@ -2048,7 +2072,7 @@ std::optional<MetalQueryPlan> buildGenericMultiTableAdhocPlan_impl(
                 return fail("Aggregate expression must be numeric.");
 
             std::string raw = exprToMetal(target.agg->innerExpr, idxVar);
-            std::string finalExpr = rewriteForProbe(raw, idxVar, carryVar);
+            std::string finalExpr = rewriteForProbe(raw, idxVar, carryVar, aq.schema);
 
             if (func == AggFunc::AVG) {
                 int sumIdx = reduce->addAccumulator(accName + "_sum", finalExpr, "float");
@@ -2178,7 +2202,7 @@ std::optional<MetalQueryPlan> buildGenericMultiTableAdhocPlan_impl(
             DataType type = inferExprDataType(target.expr);
             std::string displayName = displayNameForTarget(target, ti);
             std::string bufferName = "d_adhoc_matgb_" + std::to_string(matColIdx) + "_" + sanitizeIdentifier(displayName);
-            int stringLen = fixedStringLenForExpr(target.expr);
+            int stringLen = fixedStringLenForExpr(target.expr, aq.schema);
             std::string sizeExpr = outputSize;
             if (stringLen > 0) sizeExpr += " * " + std::to_string(stringLen);
 
@@ -2191,14 +2215,14 @@ std::optional<MetalQueryPlan> buildGenericMultiTableAdhocPlan_impl(
                     type = DataType::FLOAT;
                 } else if (target.agg->innerExpr) {
                     expr = exprToMetal(target.agg->innerExpr, idxVar);
-                    expr = rewriteForProbe(expr, idxVar, carryVar);
+                    expr = rewriteForProbe(expr, idxVar, carryVar, aq.schema);
                     type = DataType::FLOAT;
                 } else {
                     expr = "0";
                 }
             } else {
                 expr = materializeValueExpr(target.expr, idxVar);
-                expr = rewriteForProbe(expr, idxVar, carryVar);
+                expr = rewriteForProbe(expr, idxVar, carryVar, aq.schema);
             }
 
             // Handle CHAR1/CHAR_FIXED from non-probe tables
@@ -2214,7 +2238,7 @@ std::optional<MetalQueryPlan> buildGenericMultiTableAdhocPlan_impl(
                     if (!owner.empty() && owner != probeTable) {
                         auto jkIt = charFixedJoinKey.find(owner);
                         if (jkIt != charFixedJoinKey.end()) {
-                            int len = fixedStringLenForExpr(target.expr);
+                            int len = fixedStringLenForExpr(target.expr, aq.schema);
                             std::string from = col->column + " + " + idxVar + " * " + std::to_string(len);
                             std::string to = col->column + " + " + jkIt->second + "[" + idxVar + "] * " + std::to_string(len);
                             size_t pos = expr.find(from);
@@ -2238,8 +2262,8 @@ std::optional<MetalQueryPlan> buildGenericMultiTableAdhocPlan_impl(
         for (const auto& [tname, cols] : neededByTable) {
             if (tname == probeTable) continue;
             for (const auto& c : cols) {
-                const auto& cdef = TPCHSchema::instance().table(tname).col(c);
-                if (cdef.type == DataType::CHAR_FIXED) {
+                DataType cdType = aq.schema ? aq.schema->columnType(tname, c) : TPCHSchema::instance().table(tname).col(c).type;
+                if (cdType == DataType::CHAR_FIXED) {
                     plan.phases.back().extraBuffers.push_back({c, "char", true, false});
                 }
             }
@@ -2342,7 +2366,7 @@ std::optional<MetalQueryPlan> buildGenericMultiTableAdhocPlan_impl(
         DataType vt = inferExprDataType(target.agg->innerExpr);
 
         std::string raw = exprToMetal(target.agg->innerExpr, idxVar);
-        std::string finalExpr = rewriteForProbe(raw, idxVar, carryVar);
+        std::string finalExpr = rewriteForProbe(raw, idxVar, carryVar, aq.schema);
 
         if (func == AggFunc::AVG) {
             bool isFloat = (vt == DataType::FLOAT);
@@ -2400,15 +2424,25 @@ std::optional<MetalQueryPlan> buildGenericMultiTableAdhocPlan_impl(
             if (ct != DataType::INT && ct != DataType::DATE)
                 return fail("COUNT(DISTINCT) only supports integer/date columns.");
             std::string maxExpr;
-            try {
-                auto& colDef = TPCHSchema::instance().table(innerCol->table).col(innerCol->column);
-                if (colDef.domainMax >= 0) maxExpr = std::to_string(colDef.domainMax + 1);
-            } catch (...) {}
-            if (maxExpr.empty()) {
+            if (aq.schema) {
+                auto gd = aq.schema->groupDomain(innerCol->table, innerCol->column);
+                if (gd && gd->maxValue >= 0) maxExpr = std::to_string(gd->maxValue + 1);
+            } else {
                 try {
-                    auto& tdef = TPCHSchema::instance().table(innerCol->table);
-                    if (!tdef.maxKeySymbol.empty()) maxExpr = tdef.maxKeySymbol + " + 1";
+                    auto& colDef = TPCHSchema::instance().table(innerCol->table).col(innerCol->column);
+                    if (colDef.domainMax >= 0) maxExpr = std::to_string(colDef.domainMax + 1);
                 } catch (...) {}
+            }
+            if (maxExpr.empty()) {
+                if (aq.schema) {
+                    auto ms = aq.schema->maxKeySymbol(innerCol->table);
+                    if (!ms.empty()) maxExpr = ms + " + 1";
+                } else {
+                    try {
+                        auto& tdef = TPCHSchema::instance().table(innerCol->table);
+                        if (!tdef.maxKeySymbol.empty()) maxExpr = tdef.maxKeySymbol + " + 1";
+                    } catch (...) {}
+                }
             }
             if (maxExpr.empty())
                 return fail("COUNT(DISTINCT) on column '" + innerCol->column + "' — no known max value for bitmap sizing.");
