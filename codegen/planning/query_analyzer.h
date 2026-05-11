@@ -7,6 +7,8 @@
 
 namespace codegen {
 
+class SchemaProvider;  // fwd
+
 // ===================================================================
 // ANALYZED QUERY — Extracted from SQL AST
 // ===================================================================
@@ -73,6 +75,9 @@ struct AnalyzedQuery {
     };
     std::vector<Subquery> subqueries;
 
+    // Schema provider (injected — defaults to TPCHSchemaProvider).
+    const SchemaProvider* schema = nullptr;
+
     // FROM-clause subquery column aliases → source column (for simple col refs).
     std::unordered_map<std::string, ColRef> subqueryColMap;
     // FROM-clause subquery column aliases → source expression (for computed cols).
@@ -93,6 +98,8 @@ struct AnalyzedQuery {
 
 // Parse a SQL string and extract structural information.
 // Returns an AnalyzedQuery, or throws std::runtime_error on parse failure.
-AnalyzedQuery analyzeSQL(const std::string& sql);
+// `schema` selects the schema provider; defaults to TPCHSchemaProvider.
+AnalyzedQuery analyzeSQL(const std::string& sql,
+                         const SchemaProvider* schema = nullptr);
 
 } // namespace codegen

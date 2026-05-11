@@ -23,6 +23,9 @@ namespace {
 // File-scope alias map: alias -> real table name (e.g. "l1" -> "lineitem")
 std::unordered_map<std::string, std::string> g_aliasMap;
 
+// Default schema provider (TPC-H).
+static TPCHSchemaProvider g_defaultSchema;
+
 // Subquery column alias → source ColRef.  Populated when a RangeSubselect's
 // targetList aliases a column reference (e.g. "n2.n_name AS nation").
 // Used to resolve outer-query column references that don't exist in physical
@@ -745,7 +748,7 @@ void extractJoinOns(const json& fromItem, const std::vector<std::string>& tables
 // PUBLIC: analyzeSQL
 // ===================================================================
 
-AnalyzedQuery analyzeSQL(const std::string& sql) {
+AnalyzedQuery analyzeSQL(const std::string& sql, const SchemaProvider* schema) {
     PgQueryParseResult result = pg_query_parse(sql.c_str());
     if (result.error) {
         std::string msg = result.error->message;
@@ -763,6 +766,7 @@ AnalyzedQuery analyzeSQL(const std::string& sql) {
     pg_query_free_parse_result(result);
 
     AnalyzedQuery aq;
+    aq.schema = schema ? schema : &g_defaultSchema;
     g_aliasMap.clear();
     g_subqueryAliasMap.clear();
     g_subqueryExprMap.clear();

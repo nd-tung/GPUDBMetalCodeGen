@@ -9,6 +9,7 @@ namespace codegen {
 
 // Returns nullopt + writes diagnostics to `error` when the query cannot be
 // planned.  The error parameter may be nullptr.
+// `schema` selects the schema provider; defaults to TPCHSchemaProvider.
 std::optional<MetalQueryPlan> buildGenericSingleTableAdhocPlan(const AnalyzedQuery& aq,
                                                                 std::string* error = nullptr);
 
