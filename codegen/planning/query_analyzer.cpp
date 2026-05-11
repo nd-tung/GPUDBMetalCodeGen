@@ -37,7 +37,9 @@ std::unordered_map<std::string, ExprPtr> g_subqueryExprMap;
 // File-scope: view definitions inlined during analysis.
 std::map<std::string, std::pair<json, std::vector<std::string>>> g_views; // name → (selectBody, columnAliases)
 
-const auto& schema() { return TPCHSchema::instance(); }
+// Schema provider injected by analyzeSQL(); used by AST walkers for column
+// resolution instead of hard-coded TPCHSchema::instance().
+static const SchemaProvider* g_analyzeSchema = nullptr;
 
 // Resolve an unqualified column name to (table, column).
 // If multiple tables have the column, we need the table list to disambiguate.
@@ -45,9 +47,7 @@ const auto& schema() { return TPCHSchema::instance(); }
 std::pair<std::string, std::string> resolveColumn(const std::string& colName,
                                                     const std::vector<std::string>& tables) {
     for (auto& t : tables) {
-        auto it = schema().tables.find(t);
-        if (it == schema().tables.end()) continue;
-        if (it->second.nameToIdx.count(colName)) return {t, colName};
+        if (g_analyzeSchema && g_analyzeSchema->hasColumn(t, colName)) return {t, colName};
     }
     return {"", colName}; // alias or derived column
 }
@@ -106,9 +106,8 @@ ExprPtr walkColumnRef(const json& node, const std::vector<std::string>& tables) 
         return Expr::col("", colName, -1, DataType::INT);
     }
 
-    auto& tbl = schema().table(resolvedTable);
-    auto& col = tbl.col(colName);
-    return Expr::col(resolvedTable, colName, col.index, col.type);
+    DataType dt = g_analyzeSchema ? g_analyzeSchema->columnType(resolvedTable, colName) : DataType::INT;
+    return Expr::col(resolvedTable, colName, -1, dt);
 }
 
 ExprPtr walkConst(const json& node) {
@@ -768,6 +767,7 @@ AnalyzedQuery analyzeSQL(const std::string& sql, const SchemaProvider* schema) {
 
     AnalyzedQuery aq;
     aq.schema = schema ? schema : &g_defaultSchema;
+    g_analyzeSchema = aq.schema;
     g_aliasMap.clear();
     g_subqueryAliasMap.clear();
     g_subqueryExprMap.clear();
