@@ -1,6 +1,7 @@
 #pragma once
 
 #include "metal_plan_builder.h"
+#include "../core/schema_provider.h"
 
 #include <initializer_list>
 #include <memory>
@@ -11,13 +12,18 @@
 
 namespace codegen {
 
+class SchemaProvider;  // fwd (already included)
+
 using ColumnList = std::initializer_list<std::pair<const char*, const char*>>;
 
 void collectColumns(const ExprPtr& expr, std::set<std::string>& cols);
 void collectColumns(const PredPtr& pred, std::set<std::string>& cols);
 
-std::string exprToMetal(const ExprPtr& expr, const std::string& idxVar);
-std::string predToMetal(const PredPtr& pred, const std::string& idxVar);
+// `schema` is optional; TPC-H singleton used as fallback when nullptr.
+std::string exprToMetal(const ExprPtr& expr, const std::string& idxVar,
+                        const SchemaProvider* schema = nullptr);
+std::string predToMetal(const PredPtr& pred, const std::string& idxVar,
+                        const SchemaProvider* schema = nullptr);
 std::string combineFilters(const std::vector<PredPtr>& filters, const std::string& idxVar);
 
 struct MetalKeyedAggSlotForHaving {
