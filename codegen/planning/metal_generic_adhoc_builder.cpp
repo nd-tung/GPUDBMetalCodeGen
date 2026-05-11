@@ -413,10 +413,6 @@ std::optional<MetalQueryPlan> buildScalarAggPlan(const AnalyzedQuery& aq, std::s
     if (aq.limit >= 0) return fail("Scalar aggregation: LIMIT not supported in scalar-agg path.");
 
     std::set<std::string> usedColumns;
-    if (!aq.schema) {
-        // TPC-H manual path: compute which columns the scan needs.
-        for (const auto& filter : aq.filters) collectColumns(filter, usedColumns);
-    }
 
     for (const auto& target : aq.targets) {
         if (!target.isAgg || !target.agg) return fail("Scalar aggregation: non-aggregate SELECT target.");
@@ -431,7 +427,6 @@ std::optional<MetalQueryPlan> buildScalarAggPlan(const AnalyzedQuery& aq, std::s
                 return fail("Scalar aggregation: inner expression of '" + aggName(func) + "' not supported on GPU.");
             if (!isNumericLike(inferExprDataType(target.agg->innerExpr)))
                 return fail("Scalar aggregation: inner expression of '" + aggName(func) + "' must be numeric.");
-            if (!aq.schema) collectColumns(target.agg->innerExpr, usedColumns);
         }
     }
 
@@ -529,9 +524,6 @@ std::optional<MetalQueryPlan> buildGroupedAggPlan(const AnalyzedQuery& aq, std::
     };
 
     std::set<std::string> usedColumns;
-    if (!aq.schema) {
-        for (const auto& filter : aq.filters) collectColumns(filter, usedColumns);
-    }
     // GROUP BY columns are added during the key descriptor loop below
     // (derived columns need special handling to not add alias names).
 
@@ -553,12 +545,10 @@ std::optional<MetalQueryPlan> buildGroupedAggPlan(const AnalyzedQuery& aq, std::
             auto srcExpr = aq.subqueryExprMap.at(gc->column);
             kd.keyExpr = exprToMetal(srcExpr, idxVar);
             kd.numValues = 256;  // safe upper bound for derived INT columns
-            if (!aq.schema) collectColumns(srcExpr, usedColumns);
         } else if (fc) {
             // FuncCall GROUP BY (e.g. extract(year from ...) resolved via subquery alias)
             kd.keyExpr = exprToMetal(aq.groupBy[ki], idxVar);
             kd.numValues = 256;
-            if (!aq.schema) collectColumns(aq.groupBy[ki], usedColumns);
         } else if (gc && gc->dataType == DataType::CHAR1) {
             kd.keyExpr = char1BucketExpr(*gc, idxVar, kd.numValues, aq.schema);
         } else {
@@ -653,7 +643,6 @@ std::optional<MetalQueryPlan> buildGroupedAggPlan(const AnalyzedQuery& aq, std::
                 return fail("Grouped aggregation: AVG inner expression not supported on GPU.");
             DataType vt = inferExprDataType(target.agg->innerExpr);
             bool isFloat = (vt == DataType::FLOAT);
-            if (!aq.schema) collectColumns(target.agg->innerExpr, usedColumns);
 
             std::string dname = displayNameForTarget(target, targetIndex);
             std::string sname = sanitizeIdentifier(dname);
@@ -704,7 +693,6 @@ std::optional<MetalQueryPlan> buildGroupedAggPlan(const AnalyzedQuery& aq, std::
                 return fail("Grouped aggregation: " + aggName(func) + " inner expression not supported on GPU.");
             DataType vt = inferExprDataType(target.agg->innerExpr);
             bool isFloat = (vt == DataType::FLOAT);
-            if (!aq.schema) collectColumns(target.agg->innerExpr, usedColumns);
 
             PendingAgg agg;
             agg.displayName = displayNameForTarget(target, targetIndex);
@@ -752,7 +740,6 @@ std::optional<MetalQueryPlan> buildGroupedAggPlan(const AnalyzedQuery& aq, std::
                 return fail("Grouped aggregation: COUNT(DISTINCT) on column '" + innerCol->column +
                            "' — no known max value for bitmap sizing.");
 
-            if (!aq.schema) collectColumns(target.agg->innerExpr, usedColumns);
             std::string dname = displayNameForTarget(target, targetIndex);
             std::string valueExpr = innerCol->column + "[" + idxVar + "]";
 
@@ -783,7 +770,6 @@ std::optional<MetalQueryPlan> buildGroupedAggPlan(const AnalyzedQuery& aq, std::
         if (!exprSupported(target.agg->innerExpr, false))
             return fail("Grouped aggregation: SUM inner expression not supported on GPU.");
         DataType vt = inferExprDataType(target.agg->innerExpr);
-        if (!aq.schema) collectColumns(target.agg->innerExpr, usedColumns);
 
         PendingAgg agg;
         agg.displayName = displayNameForTarget(target, targetIndex);
@@ -938,15 +924,11 @@ std::optional<MetalQueryPlan> buildMaterializePlan(const AnalyzedQuery& aq, std:
     }
 
     std::set<std::string> usedColumns;
-    if (!aq.schema) {
-        for (const auto& filter : aq.filters) collectColumns(filter, usedColumns);
-    }
     for (const auto& target : aq.targets) {
         if (!target.expr)
             return fail("Materialization: SELECT target has no expression.");
         if (!materializeExprSupported(target.expr))
             return fail("Materialization: SELECT expression not supported on GPU.");
-        if (!aq.schema) collectColumns(target.expr, usedColumns);
     }
 
     MetalQueryPlan plan;
@@ -1534,12 +1516,10 @@ std::optional<MetalQueryPlan> buildGenericMultiTableAdhocPlan_impl(
 
     auto addNeededFromExpr = [&](const ExprPtr& e) {
         if (!e) return;
-        std::set<std::string> cols;
-        collectColumns(e, cols);
-        for (const auto& c : cols) {
-            std::string owner = ownerTableForColumn(aq, c);
-            if (!owner.empty()) neededByTable[owner].insert(c);
-        }
+        std::map<std::string, std::string> colToTable;
+        collectColumnTables(e, colToTable);
+        for (const auto& [col, owner] : colToTable)
+            neededByTable[owner].insert(col);
     };
 
     for (const auto& t : aq.targets) {
@@ -1555,13 +1535,11 @@ std::optional<MetalQueryPlan> buildGenericMultiTableAdhocPlan_impl(
     std::map<std::string, std::vector<PredPtr>> filtersByTable;
     std::vector<PredPtr> crossFilters;  // multi-table filters applied in probe phase
     for (const auto& f : aq.filters) {
-        std::set<std::string> cols;
-        collectColumns(f, cols);
+        std::map<std::string, std::string> colToTable;
+        collectColumnTables(f, colToTable);
         std::set<std::string> tbls;
-        for (const auto& c : cols) {
-            std::string owner = ownerTableForColumn(aq, c);
-            if (!owner.empty()) tbls.insert(owner);
-        }
+        for (const auto& [col, owner] : colToTable)
+            tbls.insert(owner);
         if (tbls.size() != 1) {
             crossFilters.push_back(f);
             continue;
@@ -1789,11 +1767,10 @@ std::optional<MetalQueryPlan> buildGenericMultiTableAdhocPlan_impl(
     // so they can be registered as probe-phase extra buffers.
     std::vector<std::pair<std::string, std::string>> crossExtraCols; // (colName, colType)
     {
-        std::set<std::string> crossCols;
-        for (auto& cf : crossFilters) collectColumns(cf, crossCols);
-        for (const auto& c : crossCols) {
-            std::string owner = ownerTableForColumn(aq, c);
-            if (!owner.empty() && owner != probeTable) {
+        std::map<std::string, std::string> colToTable;
+        for (auto& cf : crossFilters) collectColumnTables(cf, colToTable);
+        for (const auto& [c, owner] : colToTable) {
+            if (owner != probeTable) {
                 DataType colDt = aq.schema->columnType(owner, c);
                 if (colDt == DataType::CHAR_FIXED || colDt == DataType::CHAR1)
                     crossExtraCols.push_back({c, "char"});
@@ -1811,10 +1788,9 @@ std::optional<MetalQueryPlan> buildGenericMultiTableAdhocPlan_impl(
     std::set<std::string> probeScanCols;
     for (const auto& c : neededByTable[probeTable]) probeScanCols.insert(c);
     {
-        std::set<std::string> cfCols;
-        for (auto& cf : crossFilters) collectColumns(cf, cfCols);
-        for (const auto& c : cfCols) {
-            std::string owner = ownerTableForColumn(aq, c);
+        std::map<std::string, std::string> colToTable;
+        for (auto& cf : crossFilters) collectColumnTables(cf, colToTable);
+        for (const auto& [c, owner] : colToTable) {
             if (owner == probeTable) probeScanCols.insert(c);
         }
     }

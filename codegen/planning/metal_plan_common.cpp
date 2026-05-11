@@ -311,6 +311,53 @@ void collectColumns(const PredPtr& pred, std::set<std::string>& cols) {
     }, pred->node);
 }
 
+void collectColumnTables(const ExprPtr& expr, std::map<std::string, std::string>& colToTable) {
+    if (!expr) return;
+    std::visit([&](auto&& node) {
+        using T = std::decay_t<decltype(node)>;
+        if constexpr (std::is_same_v<T, ColRef>) {
+            if (!node.table.empty()) colToTable[node.column] = node.table;
+        } else if constexpr (std::is_same_v<T, BinaryExpr>) {
+            collectColumnTables(node.left, colToTable);
+            collectColumnTables(node.right, colToTable);
+        } else if constexpr (std::is_same_v<T, FuncCall>) {
+            for (auto& a : node.args) collectColumnTables(a, colToTable);
+        } else if constexpr (std::is_same_v<T, CaseWhen>) {
+            for (auto& b : node.branches) {
+                collectColumnTables(b.condition, colToTable);
+                collectColumnTables(b.result, colToTable);
+            }
+            if (node.elseResult) collectColumnTables(node.elseResult, colToTable);
+        }
+    }, expr->node);
+}
+
+void collectColumnTables(const PredPtr& pred, std::map<std::string, std::string>& colToTable) {
+    if (!pred) return;
+    std::visit([&](auto&& node) {
+        using T = std::decay_t<decltype(node)>;
+        if constexpr (std::is_same_v<T, Comparison>) {
+            collectColumnTables(node.left, colToTable);
+            collectColumnTables(node.right, colToTable);
+        } else if constexpr (std::is_same_v<T, Between>) {
+            collectColumnTables(node.expr, colToTable);
+            collectColumnTables(node.low, colToTable);
+            collectColumnTables(node.high, colToTable);
+        } else if constexpr (std::is_same_v<T, InList>) {
+            collectColumnTables(node.expr, colToTable);
+            for (auto& v : node.values) collectColumnTables(v, colToTable);
+        } else if constexpr (std::is_same_v<T, LogicalAnd>) {
+            for (auto& c : node.children) collectColumnTables(c, colToTable);
+        } else if constexpr (std::is_same_v<T, LogicalOr>) {
+            for (auto& c : node.children) collectColumnTables(c, colToTable);
+        } else if constexpr (std::is_same_v<T, LogicalNot>) {
+            collectColumnTables(node.child, colToTable);
+        } else if constexpr (std::is_same_v<T, Like>) {
+            collectColumnTables(node.expr, colToTable);
+        }
+    }, pred->node);
+}
+
 std::string exprToMetal(const ExprPtr& expr, const std::string& idxVar,
                         const SchemaProvider* schema) {
     if (!expr) return "";
