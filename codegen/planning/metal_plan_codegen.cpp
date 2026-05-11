@@ -10,6 +10,7 @@ MetalCodegen generateFromPlan(const MetalQueryPlan& plan,
     if (schema) {
         cg.setColumnTypeResolver([schema](const std::string& table,
                                           const std::string& col) -> std::string {
+            if (!schema->hasColumn(table, col)) return {};
             DataType dt = schema->columnType(table, col);
             switch (dt) {
                 case DataType::INT:  case DataType::DATE:

@@ -1345,9 +1345,9 @@ std::string decodeCarryValue(DataType type, const std::string& var) {
 // FLOAT/CHAR1 carries are wrapped in `as_type<...>` / `(char)` so the
 // rewritten expression has the same observable type as the original.
 std::string rewriteForProbe(std::string expr,
-                             const std::string& idxVar,
-                             const std::map<CarriedKey, std::string>& carryVar,
-                             const SchemaProvider* schema = nullptr) {
+                              const std::string& idxVar,
+                              const std::map<CarriedKey, std::string>& carryVar,
+                              const SchemaProvider* schema = nullptr) {
     for (const auto& [key, var] : carryVar) {
         DataType t = schema ? schema->columnType(key.table, key.column)
                             : TPCHSchema::instance().table(key.table)
@@ -1861,11 +1861,20 @@ std::optional<MetalQueryPlan> buildGenericMultiTableAdhocPlan_impl(
     }
 
     // ---------- Probe phase ----------
-    // Probe scan auto-discovers filter/key columns via IU chain, but
-    // columns referenced directly by SELECT/agg/GROUP BY are explicitly
-    // loaded (the IU chain may miss CHAR_FIXED bare-pointer refs).
+    // Probe scan loads neededByTable columns explicitly and auto-discovers
+    // filter/key columns via IU chain. Also add any probe-table CHAR_FIXED
+    // columns from cross-filters that the IU chain may miss (OR-branch rewrites
+    // change their index expression).
     std::set<std::string> probeScanCols;
     for (const auto& c : neededByTable[probeTable]) probeScanCols.insert(c);
+    {
+        std::set<std::string> cfCols;
+        for (auto& cf : crossFilters) collectColumns(cf, cfCols);
+        for (const auto& c : cfCols) {
+            std::string owner = ownerTableForColumn(aq, c);
+            if (owner == probeTable) probeScanCols.insert(c);
+        }
+    }
     auto probeScan = makeScanForCols(probeTable, idxVar, probeScanCols);
     std::unique_ptr<MetalOperator> probePipe = std::move(probeScan);
 
@@ -2062,7 +2071,7 @@ std::optional<MetalQueryPlan> buildGenericMultiTableAdhocPlan_impl(
             if (!isNumericLike(inferExprDataType(target.agg->innerExpr)))
                 return fail("Aggregate expression must be numeric.");
 
-            std::string raw = exprToMetal(target.agg->innerExpr, idxVar);
+            std::string raw = exprToMetal(target.agg->innerExpr, idxVar, aq.schema);
             std::string finalExpr = rewriteForProbe(raw, idxVar, carryVar, aq.schema);
 
             if (func == AggFunc::AVG) {
