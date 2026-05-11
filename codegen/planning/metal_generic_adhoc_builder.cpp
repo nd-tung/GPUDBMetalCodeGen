@@ -1222,8 +1222,13 @@ bool multiTableBuildJoinTree(const AnalyzedQuery& aq, int probeIdx,
     }
 
     if (order.size() != n) {
-        if (error) *error = "Multi-table planner: join graph is not connected or contains cycles. "
-                             "(Self-joined tables with identical base names cannot be disambiguated.)";
+        if (error) {
+            std::string dbg = std::to_string(order.size()) + "/" + std::to_string(n) + " reachable, tables: ";
+            for (auto& t : aq.tables) dbg += t + " ";
+            dbg += "joins: ";
+            for (auto& j : aq.joins) dbg += j.leftTable + "." + j.leftCol + "=" + j.rightTable + "." + j.rightCol + " ";
+            *error = "Join graph not connected (" + dbg + ").";
+        }
         return false;
     }
     return true;
