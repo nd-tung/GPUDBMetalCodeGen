@@ -1,13 +1,14 @@
 #pragma once
 #include "query_plan.h"
-#include "tpch_schema.h"
 #include <string>
 #include <vector>
 #include <optional>
+#include <unordered_map>
 
 namespace codegen {
 
 class SchemaProvider;  // fwd
+class Catalog;          // fwd
 
 // ===================================================================
 // ANALYZED QUERY — Extracted from SQL AST
@@ -77,6 +78,9 @@ struct AnalyzedQuery {
 
     // Schema provider (injected — defaults to TPCHSchemaProvider).
     const SchemaProvider* schema = nullptr;
+
+    // Catalog built from the schema provider (provides table/column metadata).
+    const Catalog* catalog = nullptr;
 
     // FROM-clause subquery column aliases → source column (for simple col refs).
     std::unordered_map<std::string, ColRef> subqueryColMap;

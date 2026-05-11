@@ -1,4 +1,6 @@
 #include "query_analyzer.h"
+#include "tpch_schema.h"
+#include "catalog.hpp"
 
 extern "C" {
 #include "pg_query.h"
@@ -771,6 +773,16 @@ AnalyzedQuery analyzeSQL(const std::string& sql, const SchemaProvider* schema) {
     AnalyzedQuery aq;
     aq.schema = schema ? schema : &g_defaultSchema;
     g_analyzeSchema = aq.schema;
+
+    // Build a catalog from the schema provider (cached per schema).
+    static const SchemaProvider* s_catFor = nullptr;
+    static Catalog s_catalog;
+    if (s_catFor != aq.schema) {
+        s_catalog = Catalog::fromSchemaProvider(*aq.schema);
+        s_catFor = aq.schema;
+    }
+    aq.catalog = &s_catalog;
+
     g_aliasMap.clear();
     g_subqueryAliasMap.clear();
     g_subqueryExprMap.clear();
