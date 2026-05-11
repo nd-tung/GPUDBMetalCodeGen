@@ -763,6 +763,7 @@ AnalyzedQuery analyzeSQL(const std::string& sql) {
     g_aliasMap.clear();
     g_subqueryAliasMap.clear();
     g_subqueryExprMap.clear();
+    g_views.clear();
 
     // Navigate to the SelectStmt.  Handle CREATE VIEW statements by
     // inlining the view definition into the main query's FROM clause.
@@ -786,8 +787,8 @@ AnalyzedQuery analyzeSQL(const std::string& sql) {
                         vd.cols.push_back(a["aliasname"].get<std::string>());
                 }
             }
-            views.push_back(std::move(vd));
             g_views[vd.name] = {vd.selectBody, vd.cols};
+            views.push_back(std::move(vd));
         }
         if (s["stmt"].contains("SelectStmt")) {
             selPtr = &s["stmt"]["SelectStmt"];
