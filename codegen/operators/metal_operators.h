@@ -17,9 +17,17 @@ public:
     virtual void produce(MetalCodegen& cg, ConsumerFn consume) = 0;
     virtual std::string describe() const = 0;
 
+    // Parent chain for upward traversal — enables scan operators to
+    // auto-deduce required columns from downstream operators (IU chain).
+    void setParent(MetalOperator* p) { parent_ = p; }
+    MetalOperator* parent() const { return parent_; }
+
     // Serialize this operator (and children) to JSON for plan visualization.
     // Returns a json object with at minimum "type" (the describe() string).
     virtual nlohmann::json toJSON() const;
+
+protected:
+    MetalOperator* parent_ = nullptr;
 };
 
 class MetalUnaryOperator : public MetalOperator {
@@ -27,7 +35,14 @@ protected:
     std::unique_ptr<MetalOperator> child_;
 public:
     explicit MetalUnaryOperator(std::unique_ptr<MetalOperator> child)
-        : child_(std::move(child)) {}
+        : child_(std::move(child)) {
+        if (child_) {
+            // Inherit the child's previous parent so the parent-walk
+            // can climb past temporary wrappers created during produce().
+            this->parent_ = child_->parent();
+            child_->setParent(this);
+        }
+    }
     const MetalOperator* child() const { return child_.get(); }
     nlohmann::json toJSON() const override;
 };
