@@ -129,7 +129,8 @@ struct MetalResultSchema {
         bool isLongPair = false;
         bool denomIsLongPair = false;
         bool divideByDenominator = false;
-        int scaleDown = 0;          // divide by 10^scaleDown (e.g. 2 for cents→dollars)
+        int scaleDown = 0;          // optional display divisor (e.g. 100 for cents→dollars)
+        ExprPtr projectionExpr;     // optional SELECT expression over this aggregate
     };
     std::vector<ScalarAggEntry> scalarAggs;
 

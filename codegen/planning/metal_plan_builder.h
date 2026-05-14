@@ -37,6 +37,14 @@ struct MetalQueryPlan {
         std::vector<std::pair<std::string, std::string>> bitmapReads;
         // Scalar constant params (name, type) — registered before operator production
         std::vector<std::pair<std::string, std::string>> scalarParams;
+        // Scalar constants whose host values are resolved from a size expression
+        // at dispatch time (name, type, sizeExpr).
+        struct ResolvedScalarParam {
+            std::string name;
+            std::string type;
+            std::string sizeExpr;
+        };
+        std::vector<ResolvedScalarParam> resolvedScalarParams;
         // Extra buffer params not added by operators (e.g., pre-built hash tables)
         struct ExtraBuffer { std::string name; std::string type; bool readOnly = true; bool zeroInit = false; };
         std::vector<ExtraBuffer> extraBuffers;

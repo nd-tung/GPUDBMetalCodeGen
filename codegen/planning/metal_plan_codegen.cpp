@@ -41,6 +41,10 @@ MetalCodegen generateFromPlan(const MetalQueryPlan& plan,
             cg.addScalarParam(scName, scType);
         }
 
+        for (const auto& sp : phase.resolvedScalarParams) {
+            cg.addResolvedScalarParam(sp.name, sp.type, sp.sizeExpr);
+        }
+
         for (const auto& eb : phase.extraBuffers) {
             if (eb.readOnly)
                 cg.addBufferParam(eb.name, "const " + eb.type, "", false);
@@ -103,6 +107,15 @@ nlohmann::json MetalQueryPlan::toTreeJSON() const {
         if (!phase.scalarParams.empty()) {
             for (auto& [n, t] : phase.scalarParams)
                 pj["scalarParams"].push_back({{"name", n}, {"type", t}});
+        }
+        if (!phase.resolvedScalarParams.empty()) {
+            for (const auto& sp : phase.resolvedScalarParams) {
+                pj["resolvedScalarParams"].push_back({
+                    {"name", sp.name},
+                    {"type", sp.type},
+                    {"sizeExpr", sp.sizeExpr}
+                });
+            }
         }
         if (phase.root) {
             pj["operatorTree"] = phase.root->toJSON();
