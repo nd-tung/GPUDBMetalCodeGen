@@ -918,15 +918,15 @@ std::string rangeSubselectAlias(const json& rs) {
     return "";
 }
 
-std::optional<FromSubqueryAggInfo> extractGroupedFromSubqueryInfo(const json& rs) {
-    if (!rs.contains("subquery") || !rs["subquery"].contains("SelectStmt"))
-        return std::nullopt;
-    const auto& sub = rs["subquery"]["SelectStmt"];
+std::optional<FromSubqueryAggInfo> extractGroupedSelectAggInfo(
+        const json& sub,
+        const std::string& alias,
+        const std::vector<std::string>& targetAliases = {}) {
     if (!sub.contains("groupClause") || !sub.contains("fromClause"))
         return std::nullopt;
 
     FromSubqueryAggInfo info;
-    info.alias = rangeSubselectAlias(rs);
+    info.alias = alias;
 
     for (const auto& item : sub["fromClause"])
         extractTables(item, info.tables, info.tableAliases);
@@ -942,9 +942,17 @@ std::optional<FromSubqueryAggInfo> extractGroupedFromSubqueryInfo(const json& rs
     }
 
     if (sub.contains("targetList")) {
+        size_t targetIndex = 0;
         for (const auto& t : sub["targetList"]) {
-            if (t.contains("ResTarget"))
-                info.targets.push_back(extractTarget(t["ResTarget"], info.tables));
+            if (t.contains("ResTarget")) {
+                auto target = extractTarget(t["ResTarget"], info.tables);
+                if (targetIndex < targetAliases.size() && !targetAliases[targetIndex].empty()) {
+                    target.alias = targetAliases[targetIndex];
+                    if (target.agg) target.agg->alias = target.alias;
+                }
+                info.targets.push_back(std::move(target));
+                targetIndex++;
+            }
         }
     }
 
@@ -962,6 +970,35 @@ std::optional<FromSubqueryAggInfo> extractGroupedFromSubqueryInfo(const json& rs
         info.groupBy.push_back(walkExpr(g, info.tables));
 
     return info;
+}
+
+std::optional<FromSubqueryAggInfo> extractGroupedFromSubqueryInfo(const json& rs) {
+    if (!rs.contains("subquery") || !rs["subquery"].contains("SelectStmt"))
+        return std::nullopt;
+    return extractGroupedSelectAggInfo(rs["subquery"]["SelectStmt"], rangeSubselectAlias(rs));
+}
+
+void collectReferencedViews(const json& fromItem, std::set<std::string>& views) {
+    if (fromItem.contains("RangeVar")) {
+        const auto& rv = fromItem["RangeVar"];
+        std::string name = rv.value("relname", "");
+        if (!name.empty() && g_views.find(name) != g_views.end())
+            views.insert(name);
+    }
+    if (fromItem.contains("RangeSubselect")) {
+        const auto& rs = fromItem["RangeSubselect"];
+        if (rs.contains("subquery") && rs["subquery"].contains("SelectStmt")) {
+            const auto& sub = rs["subquery"]["SelectStmt"];
+            if (sub.contains("fromClause"))
+                for (const auto& item : sub["fromClause"])
+                    collectReferencedViews(item, views);
+        }
+    }
+    if (fromItem.contains("JoinExpr")) {
+        const auto& je = fromItem["JoinExpr"];
+        collectReferencedViews(je["larg"], views);
+        collectReferencedViews(je["rarg"], views);
+    }
 }
 
 // ===================================================================
@@ -1003,6 +1040,7 @@ AnalyzedQuery analyzeSQL(const std::string& sql, const SchemaProvider* schema) {
     g_subqueryAliasMap.clear();
     g_subqueryExprMap.clear();
     g_views.clear();
+    g_scalarSubqueries.clear();
 
     // Navigate to the SelectStmt.  Handle CREATE VIEW statements by
     // inlining the view definition into the main query's FROM clause.
@@ -1097,6 +1135,17 @@ AnalyzedQuery analyzeSQL(const std::string& sql, const SchemaProvider* schema) {
         };
         for (auto& item : sel["fromClause"])
             extractSubWhere(item);
+
+        std::set<std::string> referencedViews;
+        for (auto& item : sel["fromClause"])
+            collectReferencedViews(item, referencedViews);
+        for (const auto& viewName : referencedViews) {
+            auto vit = g_views.find(viewName);
+            if (vit == g_views.end()) continue;
+            auto& [viewBody, viewCols] = vit->second;
+            if (auto groupedInfo = extractGroupedSelectAggInfo(viewBody, viewName, viewCols))
+                aq.fromSubqueryAggs.push_back(std::move(*groupedInfo));
+        }
     }
 
     // 1c. Process inlined view definitions: extract view's WHERE clause
