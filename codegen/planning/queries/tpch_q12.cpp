@@ -32,7 +32,7 @@ std::optional<MetalQueryPlan> buildQ12PlanForDateFilter(const std::string& dateC
         auto filtered = std::make_unique<MetalSelection>(std::move(scan), filterCond);
         std::string bucketExpr =
             "((l_shipmode[" + idxVar + " * 2] == 'S' ? 2 : 0) + "
-            "(bitmap_test(d_priority_bitmap, l_orderkey[" + idxVar + "]) ? 0 : 1))";
+            "(bitmap_test_atomic(d_priority_bitmap, l_orderkey[" + idxVar + "]) ? 0 : 1))";
 
         auto agg = std::make_unique<MetalKeyedAgg>(
             std::move(filtered), "d_q12_counts", bucketExpr,

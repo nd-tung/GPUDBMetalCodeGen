@@ -100,7 +100,7 @@ static void q9_ht_insert(device atomic_uint* ht_keys, device float* ht_vals,
     {
         auto scan = makeAutoScan("partsupp", idx);
         auto gated = std::make_unique<MetalSelection>(std::move(scan),
-            "bitmap_test(d_q9_part_bitmap, ps_partkey[" + idx + "])");
+            "bitmap_test_atomic(d_q9_part_bitmap, ps_partkey[" + idx + "])");
         auto computeKey = std::make_unique<MetalComputeExpr>(
             std::move(gated), "_psk", "uint",
             "(uint)ps_partkey[" + idx + "] * supp_mul + (uint)ps_suppkey[" + idx + "]");

@@ -41,7 +41,7 @@ std::optional<MetalQueryPlan> buildQ17Plan_byName() {
     {
         auto scan = makeAutoScan("lineitem", idx);
         auto gated = std::make_unique<MetalSelection>(std::move(scan),
-            "bitmap_test(d_q17_bitmap, l_partkey[" + idx + "])");
+            "bitmap_test_atomic(d_q17_bitmap, l_partkey[" + idx + "])");
         auto cnt = std::make_unique<MetalAtomicCount>(
             std::move(gated), "d_q17_cntQty",
             "l_partkey[" + idx + "]", "maxPartkey");
@@ -62,7 +62,7 @@ std::optional<MetalQueryPlan> buildQ17Plan_byName() {
 
         auto bitmapFilter = std::make_unique<MetalSelection>(
             std::move(scan),
-            "bitmap_test(d_q17_bitmap, l_partkey[" + idx + "])");
+            "bitmap_test_atomic(d_q17_bitmap, l_partkey[" + idx + "])");
 
         auto loadCnt = std::make_unique<MetalComputeExpr>(
             std::move(bitmapFilter), "_cnt", "uint",

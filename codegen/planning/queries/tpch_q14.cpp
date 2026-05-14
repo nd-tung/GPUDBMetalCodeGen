@@ -34,7 +34,7 @@ std::optional<MetalQueryPlan> buildQ14PlanForDateFilter(const std::string& filte
         std::string revenue = "l_extendedprice[" + idxVar + "] * (1.0f - l_discount[" + idxVar + "] * 0.01f)";
         auto reduce = std::make_unique<MetalTGReduce>(std::move(filtered), "d_q14");
         reduce->addAccumulator("promo",
-            "bitmap_test(d_promo_bitmap, l_partkey[" + idxVar + "]) ? " + revenue + " : 0.0f", "float");
+            "bitmap_test_atomic(d_promo_bitmap, l_partkey[" + idxVar + "]) ? " + revenue + " : 0.0f", "float");
         reduce->addAccumulator("total", revenue, "float");
         reduce->setResultAlias("promo_revenue", 0);
         reduce->setResultAlias("total_revenue", 0);

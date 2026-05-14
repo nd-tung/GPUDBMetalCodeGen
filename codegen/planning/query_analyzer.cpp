@@ -853,6 +853,16 @@ SelectTarget extractTarget(const json& resTarget, const std::vector<std::string>
 
 void extractJoinOns(const json& fromItem, const std::vector<std::string>& tables,
                     std::vector<JoinClause>& joins, std::vector<PredPtr>& filters) {
+    if (fromItem.contains("RangeSubselect")) {
+        auto& rs = fromItem["RangeSubselect"];
+        if (rs.contains("subquery") && rs["subquery"].contains("SelectStmt")) {
+            auto& sub = rs["subquery"]["SelectStmt"];
+            if (sub.contains("fromClause")) {
+                for (auto& item : sub["fromClause"])
+                    extractJoinOns(item, tables, joins, filters);
+            }
+        }
+    }
     if (fromItem.contains("JoinExpr")) {
         auto& je = fromItem["JoinExpr"];
         size_t joinCountBefore = joins.size();
@@ -863,7 +873,13 @@ void extractJoinOns(const json& fromItem, const std::vector<std::string>& tables
         // Detect LEFT OUTER JOIN: mark newly added join clauses.
         if (je.contains("jointype")) {
             try {
-                if (je["jointype"].get<int>() == 1) {
+                bool isLeftJoin = false;
+                if (je["jointype"].is_number_integer()) {
+                    isLeftJoin = (je["jointype"].get<int>() == 2);
+                } else if (je["jointype"].is_string()) {
+                    isLeftJoin = (je["jointype"].get<std::string>() == "JOIN_LEFT");
+                }
+                if (isLeftJoin) {
                     for (size_t j = joinCountBefore; j < joins.size(); ++j)
                         joins[j].leftOuter = true;
                 }
@@ -972,11 +988,6 @@ AnalyzedQuery analyzeSQL(const std::string& sql, const SchemaProvider* schema) {
                     if (sub.contains("whereClause")) {
                         auto pred = walkPredicate(sub["whereClause"], aq.tables);
                         separatePredicates(pred, aq.tables, aq.joins, aq.filters);
-                    }
-                    // Also extract JOIN ON conditions from the subquery's FROM clause.
-                    if (sub.contains("fromClause")) {
-                        for (auto& item : sub["fromClause"])
-                            extractJoinOns(item, aq.tables, aq.joins, aq.filters);
                     }
                     // Extract subquery column aliases for outer-query resolution.
                     // e.g. "n2.n_name AS nation" → g_subqueryAliasMap["nation"] = ColRef(nation, n_name)
@@ -1198,6 +1209,8 @@ AnalyzedQuery analyzeSQL(const std::string& sql, const SchemaProvider* schema) {
                         jc.rightTable = innerCol.table;
                         jc.rightCol = innerCol.column;
                         jc.anti = negated;
+                        jc.semi = true;
+                        jc.innerTable = innerCol.table;
                         aq.joins.push_back(jc);
                     }
                     // Extract inner WHERE conditions as joins/filters

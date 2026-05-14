@@ -84,7 +84,7 @@ static void q20_ht_insert(device atomic_int* ht_psidx, device ulong* ht_keys,
     {
         auto scan = makeAutoScan("partsupp", idx);
         auto gated = std::make_unique<MetalSelection>(std::move(scan),
-            "bitmap_test(d_q20_part_bitmap, ps_partkey[" + idx + "])");
+            "bitmap_test_atomic(d_q20_part_bitmap, ps_partkey[" + idx + "])");
         auto computeKey = std::make_unique<MetalComputeExpr>(
             std::move(gated), "_psk", "ulong",
             "(ulong)ps_partkey[" + idx + "] * (ulong)supp_mul + "
