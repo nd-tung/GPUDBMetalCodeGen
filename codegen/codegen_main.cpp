@@ -1774,21 +1774,50 @@ static bool runCodegenQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
         }
 
         // Q17: read revenue and divide by 7.0
-        if (plan.name == "Q17") {
-            auto* revLoBuf = executor.getAllocatedBuffer("d_q17_revenue_lo");
-            if (revLoBuf) {
-                uint32_t raw = *(const uint32_t*)revLoBuf->contents();
-                float fval;
-                memcpy(&fval, &raw, sizeof(float));
-                double revenue = (double)fval;
-                double avgYearly = revenue / 7.0;
-                result.result.columns = {{"avg_yearly","float"}};
-                result.result.rows = {{avgYearly}};
-                printf("  +------------------+\n");
-                printf("  |      avg_yearly  |\n");
-                printf("  +------------------+\n");
-                printf("  | %16.2f |\n", avgYearly);
-                printf("  +------------------+\n");
+        // Q17: debug scalar buffer values
+        {
+            auto* cntBuf = executor.getAllocatedBuffer("d_q17_scalar_cnt");
+            auto* sumBuf = executor.getAllocatedBuffer("d_q17_scalar_sum");
+            printf("  [Q17 DEBUG] cntBuf=%p sumBuf=%p\n", (void*)cntBuf, (void*)sumBuf);
+            if (!cntBuf || !sumBuf) {
+                // Try to find any scalar buffer
+                printf("  [Q17 DEBUG] looking for any *_scalar_* buffers...\n");
+            }
+            if (cntBuf && sumBuf) {
+                const uint32_t* cnts = (const uint32_t*)cntBuf->contents();
+                const uint32_t* sums = (const uint32_t*)sumBuf->contents();
+                size_t n = cntBuf->length() / sizeof(uint32_t);
+                printf("  [Q17 DEBUG] scalar buffers: cnt=%zu entries, sum=%zu entries\n",
+                       n, sumBuf->length() / sizeof(uint32_t));
+                // Print first 20 and also compute global average
+                double totalSum = 0, totalCnt = 0;
+                int printed = 0;
+                for (size_t k = 1; k < n && k <= 100; k++) {
+                    if (cnts[k] > 0) {
+                        float sumf;
+                        memcpy(&sumf, &sums[k], sizeof(float));
+                        totalSum += sumf;
+                        totalCnt += cnts[k];
+                    }
+                }
+                double globalAvg = totalCnt > 0 ? totalSum / totalCnt : 0;
+                double globalThresh = 0.2 * globalAvg;
+                printf("  [Q17] global (first 100 parts): totalSum=%.0f totalCnt=%.0f avg=%.2f thresh=%.2f\n",
+                       totalSum, totalCnt, globalAvg, globalThresh);
+                for (size_t k = 1; k < n && printed < 20; k++) {
+                    if (cnts[k] > 0) {
+                        float sumf;
+                        memcpy(&sumf, &sums[k], sizeof(float));
+                        float avg = sumf / (float)cnts[k];
+                        float threshold = 0.2f * avg;
+                        if (printed < 5) {
+                            printf("  [Q17] partkey=%zu cnt=%u sum=%.2f avg=%.2f thresh=%.2f\n",
+                                   k, cnts[k], sumf, avg, threshold);
+                        }
+                        printed++;
+                    }
+                }
+                printf("  [Q17] total non-zero partkeys in first 100: %d\n", printed);
             }
         }
 
