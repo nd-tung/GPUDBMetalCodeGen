@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <cctype>
 #include <climits>
+#include <cmath>
 #include <functional>
 #include <map>
 #include <optional>
@@ -113,6 +114,34 @@ std::string aggFuncName(AggFunc func) {
         case AggFunc::COUNT_DISTINCT: return "COUNT_DISTINCT";
         default: return "SUM";
     }
+}
+
+std::optional<double> numericLiteralValue(const ExprPtr& expr) {
+    auto* lit = expr ? std::get_if<Literal>(&expr->node) : nullptr;
+    if (!lit) return std::nullopt;
+    if (auto* i = std::get_if<int>(&lit->value)) return static_cast<double>(*i);
+    if (auto* f = std::get_if<float>(&lit->value)) return static_cast<double>(*f);
+    return std::nullopt;
+}
+
+std::optional<int> scalarAggResultScaleDown(const SelectTarget& target) {
+    if (!target.expr || !target.agg) return std::nullopt;
+    auto* be = std::get_if<BinaryExpr>(&target.expr->node);
+    if (!be || be->op != ExprOp::DIV) return std::nullopt;
+
+    auto* fc = be->left ? std::get_if<FuncCall>(&be->left->node) : nullptr;
+    if (!fc || fc->name != aggName(target.agg->func)) return std::nullopt;
+
+    auto denom = numericLiteralValue(be->right);
+    if (!denom || *denom <= 0.0) return std::nullopt;
+
+    double rounded = std::round(*denom);
+    if (std::fabs(*denom - rounded) > 1e-6 ||
+        rounded <= 0.0 ||
+        rounded > static_cast<double>(INT_MAX)) {
+        return std::nullopt;
+    }
+    return static_cast<int>(rounded);
 }
 
 bool exprIsColumn(const ExprPtr& expr, const ColRef& expected) {
@@ -492,15 +521,16 @@ std::optional<MetalQueryPlan> buildScalarAggPlan(const AnalyzedQuery& aq, std::s
         std::string alias = displayNameForTarget(target, targetIndex);
         std::string accName = "a" + std::to_string(targetIndex) + "_" + sanitizeIdentifier(alias);
         AggFunc func = target.agg->func;
+        int resultScaleDown = scalarAggResultScaleDown(target).value_or(0);
         if (func == AggFunc::COUNT) {
             int accIndex = reduce->addAccumulator(accName, "1", "long");
-            reduce->setAccumulatorResultAlias(alias, accIndex, 0);
+            reduce->setAccumulatorResultAlias(alias, accIndex, resultScaleDown);
         } else if (func == AggFunc::AVG) {
             int sumIndex = reduce->addAccumulator(accName + "_sum",
                                                   exprToMetal(target.agg->innerExpr, idxVar),
                                                   "float");
             int countIndex = reduce->addAccumulator(accName + "_count", "1.0f", "float");
-            reduce->setAverageResultAlias(alias, sumIndex, countIndex, 0);
+            reduce->setAverageResultAlias(alias, sumIndex, countIndex, resultScaleDown);
         } else {
             DataType valueType = inferExprDataType(target.agg->innerExpr);
             std::string outputType = (valueType == DataType::FLOAT) ? "float" : "long";
@@ -512,7 +542,7 @@ std::optional<MetalQueryPlan> buildScalarAggPlan(const AnalyzedQuery& aq, std::s
             }
             int accIndex = reduce->addAccumulator(accName, exprToMetal(target.agg->innerExpr, idxVar),
                                                   outputType, "", "", op);
-            reduce->setAccumulatorResultAlias(alias, accIndex, 0);
+            reduce->setAccumulatorResultAlias(alias, accIndex, resultScaleDown);
         }
     }
 
@@ -2979,10 +3009,11 @@ std::optional<MetalQueryPlan> buildGenericMultiTableAdhocPlan_impl(
             std::string alias = displayNameForTarget(target, ti);
             std::string accName = "a" + std::to_string(ti) + "_" + sanitizeIdentifier(alias);
             AggFunc func = target.agg->func;
+            int resultScaleDown = scalarAggResultScaleDown(target).value_or(0);
 
             if (func == AggFunc::COUNT) {
                 int idx = reduce->addAccumulator(accName, "1", "long");
-                reduce->setAccumulatorResultAlias(alias, idx, 0);
+                reduce->setAccumulatorResultAlias(alias, idx, resultScaleDown);
                 continue;
             }
 
@@ -3062,7 +3093,7 @@ std::optional<MetalQueryPlan> buildGenericMultiTableAdhocPlan_impl(
             if (func == AggFunc::AVG) {
                 int sumIdx = reduce->addAccumulator(accName + "_sum", finalExpr, "float");
                 int cntIdx = reduce->addAccumulator(accName + "_count", "1.0f", "float");
-                reduce->setAverageResultAlias(alias, sumIdx, cntIdx, 0);
+                reduce->setAverageResultAlias(alias, sumIdx, cntIdx, resultScaleDown);
             } else {
                 DataType vt = inferExprDataType(target.agg->innerExpr);
                 std::string outType = (vt == DataType::FLOAT) ? "float" : "long";
@@ -3071,7 +3102,7 @@ std::optional<MetalQueryPlan> buildGenericMultiTableAdhocPlan_impl(
                 else if (func == AggFunc::MAX) op = MetalTGReduce::ReduceOp::MAX;
                 if (op != MetalTGReduce::ReduceOp::SUM && vt != DataType::FLOAT) outType = "int";
                 int idx = reduce->addAccumulator(accName, finalExpr, outType, "", "", op);
-                reduce->setAccumulatorResultAlias(alias, idx, 0);
+                reduce->setAccumulatorResultAlias(alias, idx, resultScaleDown);
             }
         }
         auto& phaseRef = appendPhase(plan, "ADHOC_multi_probe_scalar", std::move(reduce));
