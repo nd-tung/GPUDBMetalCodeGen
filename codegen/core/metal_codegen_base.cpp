@@ -252,9 +252,9 @@ void MetalCodegen::addConstantDataParam(const std::string& name, const std::stri
 void MetalCodegen::addBitmapReadParam(const std::string& name, const std::string& sizeExpr) {
     MetalParamBinding b;
     b.name = name;
-    b.metalTypeDecl = "device const uint*";
+    b.metalTypeDecl = "device const atomic_uint*";
     b.kind = MetalParamKind::DeviceBuffer;
-    b.elementType = "uint";
+    b.elementType = "atomic_uint";
     b.sizeExpr = sizeExpr;
     b.readOnly = true;
     pushBinding("addBitmapReadParam", std::move(b), /*dedup=*/false);

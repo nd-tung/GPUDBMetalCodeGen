@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <climits>
 #include <functional>
 #include <map>
 #include <optional>
@@ -14,9 +15,33 @@
 #include <variant>
 #include <vector>
 
+#include "../../third_party/nlohmann/json.hpp"
+
 namespace codegen {
 
 namespace {
+
+// Walk expression tree to collect aggregate FuncCall nodes and check for division.
+struct AggCallWalker {
+    static void walk(const ExprPtr& e, std::vector<const FuncCall*>& out, bool& div) {
+        if (!e) return;
+        if (auto* fc = std::get_if<FuncCall>(&e->node)) {
+            if (fc->name == "sum" || fc->name == "avg" || fc->name == "count") {
+                out.push_back(fc); return;
+            }
+            for (auto& a : fc->args) walk(a, out, div);
+            return;
+        }
+        if (auto* be = std::get_if<BinaryExpr>(&e->node)) {
+            walk(be->left, out, div);
+            walk(be->right, out, div);
+            if (be->op == ExprOp::DIV) div = true;
+        } else if (auto* cw = std::get_if<CaseWhen>(&e->node)) {
+            for (auto& br : cw->branches) walk(br.result, out, div);
+            if (cw->elseResult) walk(cw->elseResult, out, div);
+        }
+    }
+};
 
 std::string sanitizeIdentifier(std::string name) {
     if (name.empty()) name = "expr";
@@ -67,8 +92,11 @@ std::string displayNameForTargetByCol(const AnalyzedQuery& aq, const ColRef& ref
         const auto& t = aq.targets[i];
         if (!t.isAgg && t.expr && std::holds_alternative<ColRef>(t.expr->node)) {
             auto* col = std::get_if<ColRef>(&t.expr->node);
-            if (col->column == ref.column && col->table == ref.table)
+            if (col->column == ref.column && col->table == ref.table) {
+                // For multi-instance tables, also match on table alias
+                if (!ref.tableAlias.empty() && col->tableAlias != ref.tableAlias) continue;
                 return displayNameForTarget(t, i);
+            }
         }
     }
     // No matching SELECT target — use the column name directly.
@@ -124,11 +152,26 @@ std::optional<std::string> orderColumnForExpr(const ExprPtr& expr,
         }
     }
     // Non-ColRef ORDER BY (e.g. FuncCall after subquery alias resolution):
-    // match by position — the ORDER BY expression is typically the Nth target.
-    for (size_t i = 0; i < targets.size(); ++i) {
-        std::string dn = displayNameForTarget(targets[i], i);
-        if (!orderCol) return dn;  // first non-ColRef match
-    }
+    // match by position — the Nth non-ColRef ORDER BY item maps to the
+    // Nth non-aggregate target.  The caller must pass the position.
+    return std::nullopt; // caller must handle via position
+}
+
+// Resolve an ORDER BY expression to a SELECT target display name.
+// For non-ColRef expressions (FuncCall, BinaryExpr after subquery alias
+// resolution), uses positional matching: the Nth non-ColRef ORDER BY item
+// maps to the Nth non-aggregate SELECT target.
+static std::optional<std::string> resolveOrderColumn(const ExprPtr& expr,
+                                                     int orderIdx,
+                                                     const std::vector<OrderByItem>& orderBy,
+                                                     const std::vector<SelectTarget>& targets) {
+    auto col = orderColumnForExpr(expr, targets);
+    if (col) return col;
+    // Positional fallback: the Nth ORDER BY item maps to the Nth SELECT target
+    // (ColRef items are matched via the column name above; non-ColRef items
+    //  and unresolved ColRefs fall through here).
+    if (orderIdx >= 0 && orderIdx < (int)targets.size())
+        return displayNameForTarget(targets[orderIdx], orderIdx);
     return std::nullopt;
 }
 
@@ -324,7 +367,9 @@ std::string materializeValueExpr(const ExprPtr& expr, const std::string& idxVar,
         }
         if (col->dataType == DataType::CHAR_FIXED) {
             int len = fixedStringLenForExpr(expr, schema);
-            return col->column + " + " + idxVar + " * " + std::to_string(len);
+            std::string aliasPrefix;
+            if (!col->tableAlias.empty()) aliasPrefix = "/*" + col->tableAlias + "*/";
+            return aliasPrefix + col->column + " + " + idxVar + " * " + std::to_string(len);
         }
     }
     return exprToMetal(expr, idxVar, schema);
@@ -355,13 +400,19 @@ bool predSupported(const PredPtr& pred) {
                    (exprSupported(node.high, false) || literalMatchesType(node.high, exprType));
         } else if constexpr (std::is_same_v<Node, InList>) {
             auto* inCol = node.expr ? std::get_if<ColRef>(&node.expr->node) : nullptr;
-            if (inCol && inCol->dataType == DataType::CHAR_FIXED) {
+            if (inCol && (inCol->dataType == DataType::CHAR_FIXED || inCol->dataType == DataType::CHAR1)) {
                 return std::all_of(node.values.begin(), node.values.end(), [](const ExprPtr& value) {
                     auto* lit = value ? std::get_if<Literal>(&value->node) : nullptr;
                     return lit && std::holds_alternative<std::string>(lit->value);
                 });
             }
-            if (!exprSupported(node.expr, false)) return false;
+            if (!exprSupported(node.expr, false)) {
+                // expr may be CHAR_FIXED which exprSupported rejects in
+                // expression context, but InList with string values is
+                // handled via fixedStringCol downstream.
+                if (!inCol || inCol->dataType != DataType::CHAR_FIXED)
+                    return false;
+            }
             DataType exprType = inferExprDataType(node.expr);
             return std::all_of(node.values.begin(), node.values.end(), [exprType](const ExprPtr& value) {
                 return exprSupported(value, false) || literalMatchesType(value, exprType);
@@ -396,8 +447,8 @@ std::unique_ptr<MetalOperator> makeFilteredScan(const AnalyzedQuery& aq,
             if (pk) scanColumns.insert(pk->first);
         }
     }
-    auto scan = makeScanForCols(aq.tables[0], idxVar, scanColumns);
-    return maybeSelect(std::move(scan), combineFilters(aq.filters, idxVar));
+    auto scan = makeScanForCols(aq.tables[0], idxVar, scanColumns, aq.schema);
+    return maybeSelect(std::move(scan), combineFilters(aq.filters, idxVar, aq.schema));
 }
 
 std::optional<MetalQueryPlan> buildScalarAggPlan(const AnalyzedQuery& aq, std::string* error) {
@@ -551,6 +602,7 @@ std::optional<MetalQueryPlan> buildGroupedAggPlan(const AnalyzedQuery& aq, std::
             kd.numValues = 256;
         } else if (gc && gc->dataType == DataType::CHAR1) {
             kd.keyExpr = char1BucketExpr(*gc, idxVar, kd.numValues, aq.schema);
+            if (kd.numValues == 0) return fail("Grouped aggregation: CHAR1 column '" + gc->column + "' has no known charDomain; use CPU group-by fallback.");
         } else {
             auto domain = smallIntGroupDomain(*gc, aq.schema);
             if (!domain || domain->maxValue < domain->minValue) return fail("Grouped aggregation: column '" + gc->column + "' has no known integer domain.");
@@ -892,9 +944,9 @@ std::optional<MetalQueryPlan> buildGroupedAggPlan(const AnalyzedQuery& aq, std::
     if (!aq.orderBy.empty() || aq.limit >= 0) {
         MetalQueryPlan::CpuSort cpuSort;
         cpuSort.limit = aq.limit;
-        for (const auto& order : aq.orderBy) {
-            auto column = orderColumnForExpr(order.expr, aq.targets);
-            if (column) cpuSort.keys.push_back({*column, order.descending});
+        for (int oi = 0; oi < (int)aq.orderBy.size(); ++oi) {
+            auto column = resolveOrderColumn(aq.orderBy[oi].expr, oi, aq.orderBy, aq.targets);
+            if (column) cpuSort.keys.push_back({*column, aq.orderBy[oi].descending});
         }
         plan.cpuSort = cpuSort;
     }
@@ -907,10 +959,28 @@ std::optional<MetalQueryPlan> buildMaterializePlan(const AnalyzedQuery& aq, std:
         return std::nullopt;
     };
 
-    if (aq.hasAggregation()) return fail("Materialization: query has aggregates; use scalar or grouped aggregation instead.");
-    if (aq.hasGroupBy()) return fail("Materialization: query has GROUP BY; use grouped aggregation instead.");
     if (aq.having) return fail("Materialization: HAVING requires aggregation.");
     if (aq.targets.empty()) return fail("Materialization: no SELECT targets.");
+
+    bool needsCpuGroupBy = aq.hasGroupBy() && aq.hasAggregation();
+    MetalQueryPlan::CpuGroupBy cpuGB;
+    if (needsCpuGroupBy) {
+        for (const auto& g : aq.groupBy) {
+            auto* gcRef = std::get_if<ColRef>(&g->node);
+            if (gcRef) cpuGB.keyColumns.push_back(displayNameForTargetByCol(aq, *gcRef));
+        }
+        for (size_t ti = 0; ti < aq.targets.size(); ++ti) {
+            const auto& target = aq.targets[ti];
+            if (target.isAgg && target.agg) {
+                cpuGB.aggColumns.push_back(displayNameForTarget(target, ti));
+                cpuGB.aggFuncs.push_back(aggFuncName(target.agg->func));
+            }
+        }
+    } else if (aq.hasAggregation()) {
+        return fail("Materialization: scalar aggregates use scalar aggregation path.");
+    } else if (aq.hasGroupBy()) {
+        return fail("Materialization: GROUP BY without aggregates not supported.");
+    }
 
     MetalQueryPlan::CpuSort cpuSort;
     cpuSort.limit = aq.limit;
@@ -929,6 +999,7 @@ std::optional<MetalQueryPlan> buildMaterializePlan(const AnalyzedQuery& aq, std:
             return fail("Materialization: SELECT target has no expression.");
         if (!materializeExprSupported(target.expr))
             return fail("Materialization: SELECT expression not supported on GPU.");
+        collectColumns(target.expr, usedColumns);
     }
 
     MetalQueryPlan plan;
@@ -947,9 +1018,28 @@ std::optional<MetalQueryPlan> buildMaterializePlan(const AnalyzedQuery& aq, std:
         int stringLen = fixedStringLenForExpr(target.expr, aq.schema);
         std::string sizeExpr = outputSize;
         if (stringLen > 0) sizeExpr += " * " + std::to_string(stringLen);
+
+        std::string expr;
+        if (needsCpuGroupBy && target.isAgg && target.agg) {
+            if (target.agg->func == AggFunc::COUNT || target.agg->isStar) {
+                expr = "1.0f";
+                type = DataType::FLOAT;
+            } else if (target.agg->innerExpr) {
+                expr = exprToMetal(target.agg->innerExpr, idxVar, aq.schema);
+                type = DataType::FLOAT;
+            } else {
+                expr = "0";
+            }
+        } else {
+            expr = materializeValueExpr(target.expr, idxVar, aq.schema);
+        }
+
         materialize->addColumn(bufferName, metalTypeForDataType(type),
-                       materializeValueExpr(target.expr, idxVar, aq.schema), displayName,
-                       sizeExpr, stringLen);
+                               expr, displayName, sizeExpr, stringLen);
+    }
+
+    if (needsCpuGroupBy) {
+        plan.cpuGroupBy = cpuGB;
     }
 
     appendPhase(plan, "ADHOC_single_table_materialize", std::move(materialize));
@@ -1057,6 +1147,7 @@ std::optional<MultiTablePkInfo> multiTablePkInfo(const std::string& table, const
     }
     if (table == "customer") return MultiTablePkInfo{"c_custkey",   "maxCustkey"};
     if (table == "orders")   return MultiTablePkInfo{"o_orderkey",  "maxOrderkey"};
+    if (table == "lineitem") return MultiTablePkInfo{"l_orderkey",  "maxOrderkey"};
     if (table == "supplier") return MultiTablePkInfo{"s_suppkey",   "maxSuppkey"};
     if (table == "part")     return MultiTablePkInfo{"p_partkey",   "maxPartkey"};
     if (table == "partsupp") return MultiTablePkInfo{"ps_suppkey",  "maxSuppkey"};
@@ -1096,6 +1187,7 @@ struct MultiTableTreeNode {
     bool useHashJoin = false;
     bool anti = false;            // NOT EXISTS → anti-semi-join
     bool leftOuter = false;       // LEFT OUTER JOIN
+    bool semi = false;            // EXISTS → semi-join (inner table goes to child)
     std::vector<int> children;
     bool composite() const { return !keyOnSelf2.empty(); }
 };
@@ -1121,6 +1213,8 @@ bool multiTableBuildJoinTree(const AnalyzedQuery& aq, int probeIdx,
         std::vector<std::pair<std::string, std::string>> cols; // (col_a, col_b)
         bool anti = false;                // NOT EXISTS → anti-semi-join
         bool leftOuter = false;           // LEFT OUTER JOIN
+        bool semi = false;                // EXISTS → semi-join
+        std::string innerTable;           // for semi joins: EXISTS inner table
     };
     std::vector<Edge> edges;
     auto findEdge = [&](const std::string& l, const std::string& r) -> int {
@@ -1130,8 +1224,32 @@ bool multiTableBuildJoinTree(const AnalyzedQuery& aq, int probeIdx,
         }
         return -1;
     };
+    std::vector<int> tableToIdx; // baseTable → canonical node index mapping
     for (const auto& jc : aq.joins) {
-        int ei = (jc.leftTable == jc.rightTable) ? -1 : findEdge(jc.leftTable, jc.rightTable);
+        // Resolve left/right table to specific node indices.
+        // For duplicate base tables (e.g., nation x2), the join clause's
+        // column references were qualified with the alias (n1, n2), but
+        // the query analyzer only preserves the base name ("nation").
+        // We disambiguate by: the column's owner must be the CORRECT
+        // instance.  Since the Sql analyzer loses the alias, we scan
+        // all matching indices.  For a simple join graph the first
+        // unvisited index is the correct one, but for duplicate-tbl
+        // graphs we pick greedily during BFS (see findIdxAlts below).
+        
+        // Don't coalesce edges when either table has multiple instances
+        // (e.g. lineitem x2 from IN subquery). Each instance needs its own edge.
+        bool multiL = false, multiR = false;
+        {
+            int cntL = 0, cntR = 0;
+            for (const auto& t : aq.tables) {
+                if (t == jc.leftTable) cntL++;
+                if (t == jc.rightTable) cntR++;
+            }
+            multiL = cntL > 1;
+            multiR = cntR > 1;
+        }
+        int ei = (jc.leftTable == jc.rightTable) ? -1 : 
+                 (multiL || multiR) ? -1 : findEdge(jc.leftTable, jc.rightTable);
         // Self-joins (e.g. l1↔l2, l1↔l3) always get separate edges.
         if (ei < 0) {
             Edge e;
@@ -1139,6 +1257,8 @@ bool multiTableBuildJoinTree(const AnalyzedQuery& aq, int probeIdx,
             e.cols.emplace_back(jc.leftCol, jc.rightCol);
             e.anti = jc.anti;
             e.leftOuter = jc.leftOuter;
+            e.semi = jc.semi;
+            e.innerTable = jc.innerTable;
             edges.push_back(std::move(e));
         } else {
             // Normalise column pair to edge orientation.
@@ -1149,6 +1269,8 @@ bool multiTableBuildJoinTree(const AnalyzedQuery& aq, int probeIdx,
             }
             edges[ei].anti = edges[ei].anti || jc.anti;
             edges[ei].leftOuter = edges[ei].leftOuter || jc.leftOuter;
+            edges[ei].semi = edges[ei].semi || jc.semi;
+            if (jc.semi && !jc.innerTable.empty()) edges[ei].innerTable = jc.innerTable;
         }
     }
     for (const auto& e : edges) {
@@ -1164,10 +1286,12 @@ bool multiTableBuildJoinTree(const AnalyzedQuery& aq, int probeIdx,
     }
     std::vector<bool> visited(n, false);
 
-    // findIdx returns the first unvisited node with the given base table name.
-    auto findIdx = [&](const std::string& baseTable) -> int {
+    // findIdx returns the first unvisited node with the given
+    // table name or alias (e.g. "n1" → index of n1 node).
+    auto findIdx = [&](const std::string& ident) -> int {
         for (size_t k = 0; k < n; ++k)
-            if (aq.tables[k] == baseTable && !visited[k]) return (int)k;
+            if (!visited[k] && (aq.tables[k] == ident || aq.tableAliases[k] == ident))
+                return (int)k;
         return -1;
     };
 
@@ -1178,17 +1302,18 @@ bool multiTableBuildJoinTree(const AnalyzedQuery& aq, int probeIdx,
 
     for (size_t qhead = 0; qhead < order.size(); ++qhead) {
         int u = order[qhead];
-        const std::string& uTable = aq.tables[u];
+        const std::string& uBase = aq.tables[u];
+        const std::string& uAlias = aq.tableAliases[u];
         for (size_t ei = 0; ei < edges.size(); ++ei) {
             if (edgeUsed[ei]) continue;
             const auto& e = edges[ei];
             int other = -1;
             // Determine which side is `u` and pick column orientations.
             std::vector<std::pair<std::string, std::string>> oriented; // (col_on_u, col_on_other)
-            if (e.a == uTable) {
+            if (e.a == uBase || e.a == uAlias) {
                 other = findIdx(e.b);
                 for (const auto& c : e.cols) oriented.emplace_back(c.first, c.second);
-            } else if (e.b == uTable) {
+            } else if (e.b == uBase || e.b == uAlias) {
                 other = findIdx(e.a);
                 for (const auto& c : e.cols) oriented.emplace_back(c.second, c.first);
             }
@@ -1198,6 +1323,7 @@ bool multiTableBuildJoinTree(const AnalyzedQuery& aq, int probeIdx,
             nodes[other].parent = u;
             nodes[other].anti = e.anti;
             nodes[other].leftOuter = e.leftOuter;
+            nodes[other].semi = e.semi;
             nodes[other].keyOnSelf   = oriented[0].second;
             nodes[other].keyOnParent = oriented[0].first;
             if (oriented.size() == 2) {
@@ -1224,8 +1350,9 @@ bool multiTableBuildJoinTree(const AnalyzedQuery& aq, int probeIdx,
 
 // Identifier for a column to be carried forward toward the probe.
 struct CarriedKey {
-    std::string table;
+    std::string table;      // alias for unique naming (e.g., "l2")
     std::string column;
+    std::string baseTable;  // base table for schema lookups (e.g., "lineitem")
     bool operator<(const CarriedKey& o) const {
         if (table != o.table) return table < o.table;
         return column < o.column;
@@ -1275,19 +1402,48 @@ std::string decodeCarryValue(DataType type, const std::string& var) {
 // substitution is unambiguous.  The substitution is type-aware:
 // FLOAT/CHAR1 carries are wrapped in `as_type<...>` / `(char)` so the
 // rewritten expression has the same observable type as the original.
+
+// CHAR_FIXED access descriptor: records how a build-side CHAR_FIXED
+// column is indexed in probe-phase expressions.
+struct CharFixedAccess {
+    std::string expr;    // column name or scalar carry variable
+    bool isArray = true; // true → expr[idxVar] (direct child), false → scalar carried var
+    int indexOffset = 0; // -1 for 1-based PK tables (customer, orders, etc.), 0 for 0-based (nation, region)
+    std::string baseTable; // base table name for schema lookups (alias is the map key)
+};
+
 std::string rewriteForProbe(std::string expr,
                               const std::string& idxVar,
                               const std::map<CarriedKey, std::string>& carryVar,
+                              const std::map<std::string, CharFixedAccess>& charFixedKeys,
                               const SchemaProvider* schema = nullptr) {
     for (const auto& [key, var] : carryVar) {
-        DataType t = schema->columnType(key.table, key.column);
+        std::string schemaTable = key.baseTable.empty() ? key.table : key.baseTable;
+        DataType t = schema->columnType(schemaTable, key.column);
         std::string sub = decodeCarryValue(t, var);
         // Standard column access pattern: col[idxVar]
         const std::string from = key.column + "[" + idxVar + "]";
         size_t pos = 0;
         while ((pos = expr.find(from, pos)) != std::string::npos) {
-            expr.replace(pos, from.size(), sub);
-            pos += sub.size();
+            // Check for alias comment: /*alias*/col[i] 
+            bool match = true;
+            if (pos >= 6 && expr[pos - 2] == '*' && expr[pos - 1] == '/') {
+                // Scan back to find "/*"
+                size_t cmtStart = pos - 2;
+                while (cmtStart > 0 && !(expr[cmtStart] == '/' && expr[cmtStart + 1] == '*'))
+                    cmtStart--;
+                if (expr[cmtStart] == '/' && expr[cmtStart + 1] == '*') {
+                    std::string aliasInExpr = expr.substr(cmtStart + 2, pos - cmtStart - 4);
+                    if (!aliasInExpr.empty() && aliasInExpr != key.table)
+                        match = false;
+                }
+            }
+            if (match) {
+                expr.replace(pos, from.size(), sub);
+                pos += sub.size();
+            } else {
+                pos += from.size();
+            }
         }
         // CHAR1 materialize access pattern: col + idxVar (not col[idxVar])
         if (t == DataType::CHAR1) {
@@ -1297,6 +1453,90 @@ std::string rewriteForProbe(std::string expr,
                 expr.replace(pos, char1From.size(), sub);
                 pos += sub.size();
             }
+        }
+    }
+    // CHAR_FIXED index rewrite: `i * width` → `jk[i] * width` or `jkVar * width`
+    // Patterns: `col + i * width` or `col[i * width + offset]`
+    std::string fromIdx = idxVar + " *";
+    size_t pos = 0;
+    while ((pos = expr.find(fromIdx, pos)) != std::string::npos) {
+        // Find the column name before the index. It may be `col + ` or `col[`
+        size_t colEnd = pos;
+        while (colEnd > 0 && (expr[colEnd-1] == ' ' || expr[colEnd-1] == '+'))
+            colEnd--;
+        if (colEnd > 0 && expr[colEnd-1] == '[') colEnd--; // bracket access: col[i*...]
+        while (colEnd > 0 && expr[colEnd-1] == ' ') colEnd--;
+        size_t colStart = colEnd;
+        while (colStart > 0 && (isalnum(expr[colStart-1]) || expr[colStart-1] == '_'))
+            colStart--;
+        // Check for alias comment marker: /*alias*/colname
+        std::string colAlias;
+        if (colStart >= 4 && colStart >= 2 && expr.substr(colStart - 2, 2) == "*/") {
+            // Scan back to find "/*"
+            size_t commentStart = colStart - 3;
+            while (commentStart > 0 && expr.substr(commentStart, 2) != "/*")
+                commentStart--;
+            if (commentStart < expr.size() && expr.substr(commentStart, 2) == "/*") {
+                colAlias = expr.substr(commentStart + 2, colStart - commentStart - 4);
+                colStart = commentStart;
+            }
+        }
+        std::string colName = expr.substr(colStart, colEnd - colStart);
+        if (colName.empty()) { pos += fromIdx.size(); continue; }
+        std::string actualCol = colName;
+        if (!colAlias.empty() && colName.size() > colAlias.size() + 4)
+            actualCol = colName.substr(colAlias.size() + 4);
+        if (getenv("GEN_DEBUG") && !colAlias.empty()) {
+            fprintf(stderr, "[Q7_REWRITE] alias=%s colName=%s actualCol=%s\n",
+                    colAlias.c_str(), colName.c_str(), actualCol.c_str());
+        }
+        bool rewritten = false;
+        for (const auto& [tname, jk] : charFixedKeys) {
+            if (!colAlias.empty() && tname != colAlias) continue;
+            if (schema && !schema->hasColumn(tname, actualCol) &&
+                !schema->hasColumn(jk.baseTable, actualCol)) continue;
+            std::string idxExpr = jk.expr + (jk.isArray ? ("[" + idxVar + "]") : "");
+            if (jk.indexOffset != 0)
+                idxExpr = "(" + idxExpr + " " + (jk.indexOffset < 0 ? "-" : "+") + " " + std::to_string(std::abs(jk.indexOffset)) + ")";
+            expr.replace(pos, fromIdx.size(), idxExpr + " *");
+            pos += idxExpr.size() + 2; // idxExpr + " *"
+            rewritten = true;
+            break;
+        }
+        if (!rewritten) pos += fromIdx.size();
+    }
+    // Pass 2: function-call index patterns — `fixed_like_one_segment(col, (uint)(i), w, ...)`
+    // Replace `(uint)(idxVar)` with `(uint)(jkExpr)` for build-side columns.
+    const char* funcPatterns[] = {
+        "fixed_like_one_segment(", "fixed_like_two_segment(",
+        "fixed_string_segment_eq(", "fixed_string_padding_ok("
+    };
+    for (const char* fp : funcPatterns) {
+        size_t fpPos = 0;
+        while ((fpPos = expr.find(fp, fpPos)) != std::string::npos) {
+            fpPos += strlen(fp);
+            // Extract column name (first arg before comma)
+            while (fpPos < expr.size() && expr[fpPos] == ' ') fpPos++;
+            size_t colEnd = fpPos;
+            while (colEnd < expr.size() && expr[colEnd] != ',' && expr[colEnd] != ' ') colEnd++;
+            std::string colName = expr.substr(fpPos, colEnd - fpPos);
+            if (colName.empty()) { fpPos++; continue; }
+            // Find `(uint)(idxVar)` pattern after the first comma
+            std::string idxPattern = "(uint)(" + idxVar + ")";
+            size_t idxPos = expr.find(idxPattern, colEnd);
+            if (idxPos == std::string::npos) { fpPos++; continue; }
+            // Check if this column belongs to a build-side table (has charFixedJoinKey entry)
+            for (const auto& [tname, jk] : charFixedKeys) {
+                if (schema && !schema->hasColumn(tname, colName) &&
+                    !schema->hasColumn(jk.baseTable, colName)) continue;
+                std::string idxExpr = jk.expr + (jk.isArray ? ("[" + idxVar + "]") : "");
+                if (jk.indexOffset != 0)
+                    idxExpr = "(" + idxExpr + " " + (jk.indexOffset < 0 ? "-" : "+") + " " + std::to_string(std::abs(jk.indexOffset)) + ")";
+                std::string repl = "(uint)(" + idxExpr + ")";
+                expr.replace(idxPos, idxPattern.size(), repl);
+                break;
+            }
+            fpPos++; // advance past this match
         }
     }
     return expr;
@@ -1498,9 +1738,28 @@ std::optional<MetalQueryPlan> buildGenericMultiTableAdhocPlan_impl(
         return fail("WHERE clause contains expressions not supported on GPU.");
 
     // ---------- Pick probe table ----------
+    // EXISTS inner tables should never be the probe — they are semi-join filters.
+    std::set<std::string> existsInnerTables;
+    for (const auto& jc : aq.joins) {
+        if (jc.semi && !jc.innerTable.empty())
+            existsInnerTables.insert(jc.innerTable);
+    }
+    if (getenv("GEN_DEBUG")) {
+        fprintf(stderr, "[Q22_PROBE] existsInnerTables:");
+        for (auto& t : existsInnerTables) fprintf(stderr, " [%s]", t.c_str());
+        fprintf(stderr, "\n");
+    }
     int probeIdx = 0;
     int bestPrio = -1;
+    // LEFT OUTER JOIN: the left table must be the probe root.
+    bool hasLeftOuter = false;
+    std::string leftOuterTable;
+    for (const auto& jc : aq.joins) {
+        if (jc.leftOuter) { hasLeftOuter = true; leftOuterTable = jc.leftTable; break; }
+    }
     for (size_t i = 0; i < aq.tables.size(); ++i) {
+        if (existsInnerTables.count(aq.tables[i])) continue;
+        if (hasLeftOuter && aq.tables[i] == leftOuterTable) { probeIdx = (int)i; bestPrio = INT_MAX; break; }
         int p = multiTableProbePriority(aq.tables[i], aq.schema);
         if (p > bestPrio) { bestPrio = p; probeIdx = (int)i; }
     }
@@ -1509,6 +1768,26 @@ std::optional<MetalQueryPlan> buildGenericMultiTableAdhocPlan_impl(
     // ---------- Build join tree ----------
     std::vector<MultiTableTreeNode> nodes;
     if (!multiTableBuildJoinTree(aq, probeIdx, nodes, error)) return std::nullopt;
+
+    // Build column equivalence map from all join edges for diamond-edge
+    // probe resolution.  If cols (A, B) join, A and B are in the same
+    // equivalence class.  The canonical representative is the column
+    // that appears as a bitmap key (keyOnSelf) of some node.
+    std::unordered_map<std::string, std::string> colEquiv; // "table.col" → "canonical_table.canonical_col"
+    auto canonicalCol = [&](const std::string& table, const std::string& col) -> std::string {
+        std::string key = table + "." + col;
+        std::string cur = key;
+        int steps = 0;
+        while (colEquiv.count(cur) && colEquiv[cur] != key && steps++ < 20)
+            cur = colEquiv[cur];
+        return cur;
+    };
+    for (const auto& jc : aq.joins) {
+        std::string leftCanon = canonicalCol(jc.leftTable, jc.leftCol);
+        std::string rightCanon = canonicalCol(jc.rightTable, jc.rightCol);
+        colEquiv[jc.leftTable + "." + jc.leftCol] = rightCanon;
+        colEquiv[jc.rightTable + "." + jc.rightCol] = leftCanon;
+    }
 
     // ---------- Collect needed (carried) columns per table ----------
     // Compute BEFORE join validation so we know which edges are SemiJoin-only.
@@ -1534,20 +1813,99 @@ std::optional<MetalQueryPlan> buildGenericMultiTableAdhocPlan_impl(
     }
     for (const auto& g : aq.groupBy) addNeededFromExpr(g);
 
+    // For diamond edges, add join columns to neededByTable if they differ
+    // from the node's bitmap key — they need to be carried to the probe
+    // for per-row constraint checking.  Skip hash-join nodes (composite
+    // key) which can only carry one column.
+    for (const auto& jc : aq.joins) {
+        int idxL = -1, idxR = -1;
+        for (int k = 0; k < (int)nodes.size(); ++k) {
+            if (aq.tables[k] == jc.leftTable) idxL = k;
+            if (aq.tables[k] == jc.rightTable) idxR = k;
+        }
+        if (idxL < 0 || idxR < 0) continue;
+        if (nodes[idxL].keyOnSelf != jc.leftCol && !nodes[idxL].composite())
+            neededByTable[jc.leftTable].insert(jc.leftCol);
+        if (nodes[idxR].keyOnSelf != jc.rightCol && !nodes[idxR].composite())
+            neededByTable[jc.rightTable].insert(jc.rightCol);
+    }
+
     // ---------- Per-table filters ----------
     std::map<std::string, std::vector<PredPtr>> filtersByTable;
     std::vector<PredPtr> crossFilters;  // multi-table filters applied in probe phase
+    // Detect multi-instance tables (same base name, different aliases)
+    std::set<std::string> multiInstanceTables;
+    {
+        std::map<std::string, int> baseCount;
+        for (const auto& t : aq.tables) baseCount[t]++;
+        for (const auto& [t, cnt] : baseCount)
+            if (cnt >= 2) multiInstanceTables.insert(t);
+    }
     for (const auto& f : aq.filters) {
         std::map<std::string, std::string> colToTable;
         collectColumnTables(f, colToTable);
         std::set<std::string> tbls;
         for (const auto& [col, owner] : colToTable)
             tbls.insert(owner);
-        if (tbls.size() != 1) {
+        bool isCross = (tbls.size() != 1);
+        std::set<std::string> aliases;
+        // For single-table filters on multi-instance tables, check if the
+        // predicate actually references multiple instances via column aliases.
+        if (!isCross && tbls.size() == 1) {
+            std::string singleTable = *tbls.begin();
+            if (multiInstanceTables.count(singleTable)) {
+                // Walk the predicate to count distinct table aliases
+                std::function<void(const PredPtr&)> collectPredAliases;
+                collectPredAliases = [&](const PredPtr& p) {
+                    if (!p) return;
+                    std::visit([&](auto&& node) {
+                        using T = std::decay_t<decltype(node)>;
+                        if constexpr (std::is_same_v<T, Comparison>) {
+                            std::function<void(const ExprPtr&)> collectExprAliases;
+                            collectExprAliases = [&](const ExprPtr& e) {
+                                if (!e) return;
+                                if (auto* cr = std::get_if<ColRef>(&e->node)) {
+                                    if (!cr->tableAlias.empty())
+                                        aliases.insert(cr->tableAlias);
+                                } else if (auto* be = std::get_if<BinaryExpr>(&e->node)) {
+                                    collectExprAliases(be->left);
+                                    collectExprAliases(be->right);
+                                }
+                            };
+                            collectExprAliases(node.left);
+                            collectExprAliases(node.right);
+                        } else if constexpr (std::is_same_v<T, LogicalAnd> || std::is_same_v<T, LogicalOr>) {
+                            for (auto& c : node.children) collectPredAliases(c);
+                        } else if constexpr (std::is_same_v<T, LogicalNot>) {
+                            collectPredAliases(node.child);
+                        }
+                    }, p->node);
+                };
+                collectPredAliases(f);
+                if (aliases.size() >= 2) isCross = true;
+            }
+        }
+        if (isCross) {
             crossFilters.push_back(f);
+            if (getenv("GEN_DEBUG")) fprintf(stderr, "[Q7_DEBUG] filter -> crossFilter\n");
             continue;
         }
-        filtersByTable[*tbls.begin()].push_back(f);
+        // For single-table filters on multi-instance tables, key by alias so
+        // the filter only applies to the correct instance (e.g. l1, not l2/l3).
+        std::string filterKey = *tbls.begin();
+        if (multiInstanceTables.count(filterKey) && aliases.size() == 1)
+            filterKey = *aliases.begin();
+        if (getenv("GEN_DEBUG")) fprintf(stderr, "[Q7_DEBUG] filter -> filtersByTable[%s]\n", filterKey.c_str());
+        filtersByTable[filterKey].push_back(f);
+    }
+
+    // Add cross-filter columns to neededByTable so carries are created
+    // for cross-table comparisons (e.g. l2.l_suppkey <> l1.l_suppkey in Q21).
+    for (const auto& cf : crossFilters) {
+        std::map<std::string, std::string> colToTable;
+        collectColumnTables(cf, colToTable);
+        for (const auto& [col, owner] : colToTable)
+            neededByTable[owner].insert(col);
     }
 
     // ---------- Validate non-probe nodes ----------
@@ -1576,7 +1934,7 @@ std::optional<MetalQueryPlan> buildGenericMultiTableAdhocPlan_impl(
             nodes[i].useHashJoin = false;
             continue;
         }
-        auto pk = multiTablePkInfo(nodes[i].table, aq.schema);
+        auto pk = multiTablePkInfo(nodes[i].baseTable, aq.schema);
         if (!pk)
             return fail("Multi-table planner: table '" + nodes[i].table + "' has no PK descriptor.");
     }
@@ -1593,7 +1951,7 @@ std::optional<MetalQueryPlan> buildGenericMultiTableAdhocPlan_impl(
         if (u != probeIdx) {
             const auto& need = neededByTable[tname];
             for (const auto& c : need) {
-                CarriedKey ck{tname, c};
+                CarriedKey ck{nodes[u].table, c, tname};
                 DataType ct = aq.schema->columnType(tname, c);
                 if (!carriedColumnSupported(ct)) {
                     // Defer: only int/date carried columns.
@@ -1610,6 +1968,31 @@ std::optional<MetalQueryPlan> buildGenericMultiTableAdhocPlan_impl(
             subtreeCarry[u].insert(subtreeCarry[u].end(), subC.begin(), subC.end());
         }
     };
+    // Add intermediate join keys for grandchild CHAR_FIXED carries
+    // BEFORE DFS so localCarry and subtreeCarry pick them up.
+    // For each node that has CHAR_FIXED needed columns, walk up its
+    // parent chain and add the join keys at each intermediate level.
+    for (int i = 0; i < (int)nodes.size(); ++i) {
+        if (i == probeIdx) continue;
+        if (nodes[i].parent < 0) continue;
+        const std::string& tname = nodes[i].baseTable;
+        auto nit = neededByTable.find(tname);
+        if (nit == neededByTable.end()) continue;
+        bool hasCharFixed = false;
+        for (const auto& c : nit->second) {
+            if (aq.schema->columnType(tname, c) == DataType::CHAR_FIXED) {
+                hasCharFixed = true; break;
+            }
+        }
+        if (!hasCharFixed) continue;
+        int cur = i;
+        while (cur >= 0 && nodes[cur].parent != probeIdx && nodes[cur].parent >= 0) {
+            int parent = nodes[cur].parent;
+            std::string keyOnParent = nodes[cur].keyOnParent;
+            neededByTable[aq.tables[parent]].insert(keyOnParent);
+            cur = parent;
+        }
+    }
     dfs(probeIdx);
 
         // Validate that every needed non-probe column was supportable.
@@ -1648,6 +2031,7 @@ std::optional<MetalQueryPlan> buildGenericMultiTableAdhocPlan_impl(
     // Scans auto-discover filter/probe columns via the IU chain, but join keys
     // and carried columns must be explicitly loaded (they're referenced in
     // different phases or via extra buffers).
+    std::set<int> builtBitmaps;
     for (auto it = bfsOrder.rbegin(); it != bfsOrder.rend(); ++it) {
         int u = *it;
         if (u == probeIdx) continue;
@@ -1667,11 +2051,33 @@ std::optional<MetalQueryPlan> buildGenericMultiTableAdhocPlan_impl(
         // Carried columns (needed for ArrayStore/HashMapBuild value or extra buffers)
         for (const auto& ck : localCarry[u]) scanCols.insert(ck.column);
 
-        auto scan = makeScanForCols(tname, idxVar, scanCols);
+        // Collect columns from per-table filters (needed for EXISTS inner WHERE)
+        for (const auto& f : filtersByTable[tname])
+            collectColumns(f, scanCols);
+        if (tag != tname) {
+            auto itFi = filtersByTable.find(tag);
+            if (itFi != filtersByTable.end())
+                for (const auto& f : itFi->second)
+                    collectColumns(f, scanCols);
+        }
+        auto itInst = aq.instanceFilters.find(tag);
+        if (itInst != aq.instanceFilters.end())
+            for (const auto& f : itInst->second)
+                collectColumns(f, scanCols);
+
+        auto scan = makeScanForCols(tname, idxVar, scanCols, aq.schema);
         std::unique_ptr<MetalOperator> pipe = std::move(scan);
 
-        // Per-table filters
-        std::string filterCond = combineFilters(filtersByTable[tname], idxVar);
+        // Per-table filters + alias-specific + instance-specific (EXISTS inner WHERE)
+        auto buildFilters = filtersByTable[tname];
+        if (tag != tname) {
+            auto itFi = filtersByTable.find(tag);
+            if (itFi != filtersByTable.end())
+                buildFilters.insert(buildFilters.end(), itFi->second.begin(), itFi->second.end());
+        }
+        if (itInst != aq.instanceFilters.end())
+            buildFilters.insert(buildFilters.end(), itInst->second.begin(), itInst->second.end());
+        std::string filterCond = combineFilters(buildFilters, idxVar, aq.schema);
         pipe = maybeSelect(std::move(pipe), filterCond);
 
         // For each child of u, attach probe (BitmapProbe or ArrayLookup
@@ -1682,25 +2088,135 @@ std::optional<MetalQueryPlan> buildGenericMultiTableAdhocPlan_impl(
             // Hash-join children (composite or non-PK) are validated to
             // attach only to the probe, so we don't need a HashMapLookup
             // branch here.
-            if (subC.empty()) {
-                if (nodes[c].anti) {
-                    pipe = std::make_unique<MetalAntiBitmapProbe>(
-                        std::move(pipe), "d_bitmap_" + nodes[c].table, probeKey);
-                } else {
-                    pipe = std::make_unique<MetalBitmapProbe>(
-                        std::move(pipe), "d_bitmap_" + nodes[c].table, probeKey);
-                }
+            // Always add bitmap probe for semi-join filtering.
+            // Left-outer: skip the probe (rows always survive).
+            if (nodes[c].leftOuter) {
+                // No bitmap probe — row always passes. Carries default to fill value.
+            } else if (nodes[c].anti) {
+                pipe = std::make_unique<MetalAntiBitmapProbe>(
+                    std::move(pipe), "d_bitmap_" + nodes[c].table, probeKey);
             } else {
-                for (const auto& ck : subC) {
-                    pipe = std::make_unique<MetalArrayLookup>(
-                        std::move(pipe), ck.storageArray(nodes[c].table),
-                        probeKey, ck.varName(), "int", -1);
-                }
+                pipe = std::make_unique<MetalBitmapProbe>(
+                    std::move(pipe), "d_bitmap_" + nodes[c].table, probeKey);
             }
+            // ArrayLookup for non-CHAR_FIXED carries.
+            // Anti-join / left-outer: rows survive even when no carry stored,
+            // so sentinel must differ from ArrayStore fill value (0xFF = -1 for int).
+            int carrSentinel = (nodes[c].anti || nodes[c].leftOuter) ? -2 : -1;
+            for (const auto& ck : subC) {
+                DataType ckType = aq.schema->columnType(ck.baseTable.empty() ? ck.table : ck.baseTable, ck.column);
+                if (ckType == DataType::CHAR_FIXED) continue;
+                pipe = std::make_unique<MetalArrayLookup>(
+                    std::move(pipe), ck.storageArray(nodes[c].table),
+                    probeKey, ck.varName(), "int", carrSentinel);
+            }
+        }
+
+        // Diamond-edge probes: for each join edge where this table
+        // participates, check if the join column differs from keyOnSelf
+        // and probe an already-built bitmap with the equivalent key.
+        // Skip if a child already probes the same bitmap (avoid duplicate params).
+        std::set<std::string> childProbeBits; // bitmaps already probed by children
+        for (int c : nodes[u].children) childProbeBits.insert("d_bitmap_" + nodes[c].table);
+         for (const auto& jc : aq.joins) {
+            std::string colOnThis, colOnOther;
+            std::string otherTable;
+            if (jc.leftTable == tname) { colOnThis = jc.leftCol; colOnOther = jc.rightCol; otherTable = jc.rightTable; }
+            else if (jc.rightTable == tname) { colOnThis = jc.rightCol; colOnOther = jc.leftCol; otherTable = jc.leftTable; }
+            else continue;
+            if (colOnThis == nodes[u].keyOnSelf) continue; // already handled by bitmap
+            std::string canonOther = canonicalCol(otherTable, colOnOther);
+            // Find a built node whose base table matches and keyOnSelf matches
+            // the canonical other column (unqualified).
+            int probeNode = -1;
+            std::string canonColName = canonOther.substr(canonOther.find('.') + 1);
+            for (int nb : builtBitmaps) {
+                if (nodes[nb].keyOnSelf == canonColName) { probeNode = nb; break; }
+            }
+            if (probeNode < 0) continue;
+            std::string probeBitmap = "d_bitmap_" + nodes[probeNode].table;
+            if (childProbeBits.count(probeBitmap)) continue;
+            scanCols.insert(colOnThis);
+            std::string probeKey = colOnThis + "[" + idxVar + "]";
+            pipe = std::make_unique<MetalBitmapProbe>(
+                std::move(pipe), probeBitmap, probeKey);
         }
 
         // Now emit storage for parent.
         const std::string storeKey = nodes[u].keyOnSelf + "[" + idxVar + "]";
+
+        // Check if this table is an IN subquery with GROUP BY + HAVING (e.g. Q18).
+        // If so, use MetalAtomicAgg + a bitmap-conversion phase instead of
+        // a simple bitmap build.
+        const AnalyzedQuery::InSubqueryAggInfo* subAgg = nullptr;
+        for (auto& sa : aq.inSubAggs) {
+            if (sa.tableIndex >= 0 && sa.tableIndex == u) { subAgg = &sa; break; }
+            if ((sa.alias == tag || sa.baseTable == tname) && sa.tableIndex < 0) { subAgg = &sa; break; }
+        }
+        if (subAgg && !subAgg->groupCol.empty()) {
+            const std::string aggArrayName = "d_" + tag + "_agg";
+            auto pkOpt = multiTablePkInfo(tname, aq.schema);
+            const std::string sizeSym = pkOpt ? pkOpt->sizeSym : tableSizeName(tname);
+            const std::string bucketExpr = subAgg->groupCol + "[" + idxVar + "]";
+            const std::string valExpr = subAgg->aggExpr + "[" + idxVar + "]";
+
+            // Phase A: atomic aggregation
+            auto aggPipe = std::make_unique<MetalAtomicAgg>(
+                std::move(pipe), aggArrayName, bucketExpr, valExpr,
+                sizeSym, "atomic_float", "float");
+            appendPhase(plan, "ADHOC_multi_agg_" + tag, std::move(aggPipe));
+
+            // Phase B: range scan + HAVING filter + bitmap build
+            auto rscan = std::make_unique<MetalRangeScan>(sizeSym, idxVar);
+            std::string havingCond;
+            if (subAgg->havingPred) {
+                // Extract threshold from HAVING comparison: agg > literal
+                if (auto* cmp = std::get_if<Comparison>(&subAgg->havingPred->node)) {
+                    if (auto* lit = cmp->right ? std::get_if<Literal>(&cmp->right->node) : nullptr) {
+                        char buf[64];
+                        std::string aggRef = aggArrayName + "[" + idxVar + "]";
+                        std::visit([&](auto&& v) {
+                            using T = std::decay_t<decltype(v)>;
+                            if constexpr (std::is_same_v<T, int>)
+                                snprintf(buf, sizeof(buf), "%s > %d", aggRef.c_str(), v);
+                            else if constexpr (std::is_same_v<T, float>)
+                                snprintf(buf, sizeof(buf), "%s > %.4ff", aggRef.c_str(), v);
+                        }, lit->value);
+                        havingCond = buf;
+                    }
+                }
+            }
+            if (havingCond.empty()) havingCond = aggArrayName + "[" + idxVar + "] > 0";
+
+            auto filterPipe = std::make_unique<MetalSelection>(
+                std::move(rscan), havingCond);
+            std::unique_ptr<MetalOperator> bmpBuild = std::make_unique<MetalBitmapBuild>(
+                std::move(filterPipe), "d_bitmap_" + tag, idxVar,
+                "(" + sizeSym + " + 31) / 32");
+
+            // Also store aggregation result as carry for parent to access.
+            // Reinterpret float as int to match the int carry type.
+            const auto& sub = subtreeCarry[u];
+            for (const auto& ck : sub) {
+                DataType ckType = aq.schema->columnType(ck.baseTable.empty() ? ck.table : ck.baseTable, ck.column);
+                if (ckType == DataType::CHAR_FIXED) continue;
+                bmpBuild = std::make_unique<MetalArrayStore>(
+                    std::move(bmpBuild), ck.storageArray(tag),
+                    idxVar, "as_type<int>(" + aggArrayName + "[" + idxVar + "])",
+                    "int", sizeSym);
+            }
+
+            appendPhase(plan, "ADHOC_multi_build_" + tag, std::move(bmpBuild));
+
+            // The bitmap-conversion phase reads the agg array. Register it as
+            // a side buffer since MetalSelection doesn't auto-register params.
+            {   auto& ph = plan.phases.back();
+                ph.extraBuffers.push_back({aggArrayName, "float", true, false});
+            }
+
+            builtBitmaps.insert(u);
+            continue;
+        }
 
         if (nodes[u].useHashJoin) {
             // Hash-join build (composite key, or non-PK single-column key).
@@ -1721,13 +2237,14 @@ std::optional<MetalQueryPlan> buildGenericMultiTableAdhocPlan_impl(
             std::string valExpr = "0u";
             if (!sub.empty()) {
                 const auto& ck = sub.front();
-                DataType origType = aq.schema->columnType(ck.table, ck.column);
+                DataType origType = aq.schema->columnType(ck.baseTable.empty() ? ck.table : ck.baseTable, ck.column);
                 valExpr = encodeCarryValue(origType,
                                            ck.column + "[" + idxVar + "]");
             }
             pipe = std::make_unique<MetalHashMapBuild>(
                 std::move(pipe), mapName, k1, k2, valExpr, capExpr);
             appendPhase(plan, "ADHOC_multi_build_" + tag, std::move(pipe));
+            builtBitmaps.insert(u);
             continue;
         }
 
@@ -1742,10 +2259,10 @@ std::optional<MetalQueryPlan> buildGenericMultiTableAdhocPlan_impl(
 
         // For non-CHAR_FIXED carries, also create ArrayStores for value propagation.
         for (const auto& ck : sub) {
-            DataType ckType = aq.schema->columnType(ck.table, ck.column);
+            DataType ckType = aq.schema->columnType(ck.baseTable.empty() ? ck.table : ck.baseTable, ck.column);
             if (ckType == DataType::CHAR_FIXED) continue;
             std::string valExpr;
-            if (ck.table == tname) {
+            if (ck.table == tname || ck.table == tag) {
                 DataType origType = aq.schema->columnType(tname, ck.column);
                 valExpr = encodeCarryValue(origType,
                                            ck.column + "[" + idxVar + "]");
@@ -1753,17 +2270,64 @@ std::optional<MetalQueryPlan> buildGenericMultiTableAdhocPlan_impl(
                 valExpr = ck.varName();
             }
             pipe = std::make_unique<MetalArrayStore>(
-                std::move(pipe), ck.storageArray(tname),
+                std::move(pipe), ck.storageArray(tag),
                 storeKey, valExpr, "int", sizeSym);
         }
 
         appendPhase(plan, "ADHOC_multi_build_" + tag, std::move(pipe));
+        builtBitmaps.insert(u);
     }
 
     // Build map from build-table to probe-side join key for CHAR_FIXED direct access.
-    std::map<std::string, std::string> charFixedJoinKey;  // tableName → keyOnParent column
+    std::map<std::string, CharFixedAccess> charFixedJoinKey;  // tableName → access descriptor
     for (int c : nodes[probeIdx].children) {
-        charFixedJoinKey[aq.tables[c]] = nodes[c].keyOnParent;
+        int offset = 0;
+        auto pkInfo = multiTablePkInfo(aq.tables[c], aq.schema);
+        if (pkInfo) {
+            // If sizeSym starts with "max", it's a 1-based PK table.
+            // "25", "5" etc. are 0-based dimension tables.
+            offset = pkInfo->sizeSym.find("max") == 0 ? -1 : 0;
+        }
+        charFixedJoinKey[nodes[c].table] = {nodes[c].keyOnParent, true, offset, nodes[c].baseTable};
+    }
+    // Grandchild CHAR_FIXED columns: add carry-variable based access.
+    // For duplicate base tables (e.g. nation n1/n2), add an entry per instance
+    // keyed by the node's alias so rewriteForProbe can disambiguate.
+    for (int i = 0; i < (int)nodes.size(); ++i) {
+        if (i == probeIdx) continue;
+        if (nodes[i].parent < 0) continue;
+        // For direct children, already handled above.
+        bool isDirectChild = false;
+        for (int c : nodes[probeIdx].children)
+            if (c == i) { isDirectChild = true; break; }
+        if (isDirectChild) continue;
+        const std::string& alias = nodes[i].table;
+        if (charFixedJoinKey.count(alias)) continue;
+        const std::string& baseTbl = nodes[i].baseTable;
+        // Check if this table has any CHAR_FIXED columns needed by the probe
+        auto nit = neededByTable.find(baseTbl);
+        if (nit == neededByTable.end()) {
+            // Also check under alias (for duplicated tables with alias-aware neededByTable)
+            nit = neededByTable.find(alias);
+            if (nit == neededByTable.end()) continue;
+        }
+        bool hasCharFixed = false;
+        for (const auto& c : nit->second) {
+            if (aq.schema->columnType(baseTbl, c) == DataType::CHAR_FIXED) {
+                hasCharFixed = true; break;
+            }
+        }
+        if (!hasCharFixed) continue;
+        int intermIdx = nodes[i].parent;
+        std::string intermTable = aq.tables[intermIdx];
+        std::string intermKeyCol = nodes[i].keyOnParent;
+        CarriedKey ck{intermTable, intermKeyCol};
+        int goffset = 0;
+        auto goPkInfo = multiTablePkInfo(baseTbl, aq.schema);
+        if (goPkInfo) {
+            goffset = goPkInfo->sizeSym.find("max") == 0 ? -1 : 0;
+        }
+        charFixedJoinKey[alias] = {ck.varName(), false, goffset, baseTbl};
     }
 
     // Collect build-side CHAR_FIXED columns needed by cross-table filters
@@ -1797,12 +2361,37 @@ std::optional<MetalQueryPlan> buildGenericMultiTableAdhocPlan_impl(
             if (owner == probeTable) probeScanCols.insert(c);
         }
     }
-    auto probeScan = makeScanForCols(probeTable, idxVar, probeScanCols);
+    {
+        const std::string& probeAlias = nodes[probeIdx].table;
+        if (probeAlias != probeTable) {
+            auto itFi = filtersByTable.find(probeAlias);
+            if (itFi != filtersByTable.end())
+                for (const auto& f : itFi->second)
+                    collectColumns(f, probeScanCols);
+        }
+        auto itInst = aq.instanceFilters.find(probeAlias);
+        if (itInst != aq.instanceFilters.end())
+            for (const auto& f : itInst->second)
+                collectColumns(f, probeScanCols);
+    }
+    auto probeScan = makeScanForCols(probeTable, idxVar, probeScanCols, aq.schema);
     std::unique_ptr<MetalOperator> probePipe = std::move(probeScan);
 
-    // Probe's own filters.
+    // Probe's own filters + alias-specific + instance-specific filters.
+    auto probeFilters = filtersByTable[probeTable];
+    {
+        const std::string& probeAlias = nodes[probeIdx].table;
+        if (probeAlias != probeTable) {
+            auto itFi = filtersByTable.find(probeAlias);
+            if (itFi != filtersByTable.end())
+                probeFilters.insert(probeFilters.end(), itFi->second.begin(), itFi->second.end());
+        }
+        auto itInst = aq.instanceFilters.find(probeAlias);
+        if (itInst != aq.instanceFilters.end())
+            probeFilters.insert(probeFilters.end(), itInst->second.begin(), itInst->second.end());
+    }
     probePipe = maybeSelect(std::move(probePipe),
-                            combineFilters(filtersByTable[probeTable], idxVar));
+                            combineFilters(probeFilters, idxVar, aq.schema));
 
     // Probe each direct child.
     std::map<CarriedKey, std::string> carryVar; // for expression rewrite
@@ -1837,7 +2426,10 @@ std::optional<MetalQueryPlan> buildGenericMultiTableAdhocPlan_impl(
         }
 
         // Always probe the bitmap for SemiJoin filtering.
-        if (nodes[c].anti) {
+        // Left-outer: skip the probe (rows always survive).
+        if (nodes[c].leftOuter) {
+            // No bitmap probe — row always passes. Carries default to fill value.
+        } else if (nodes[c].anti) {
             probePipe = std::make_unique<MetalAntiBitmapProbe>(
                 std::move(probePipe), "d_bitmap_" + nodes[c].table, probeKey);
             } else {
@@ -1846,12 +2438,13 @@ std::optional<MetalQueryPlan> buildGenericMultiTableAdhocPlan_impl(
         }
 
         // For non-CHAR_FIXED carries, create ArrayLookups for value propagation.
+        int carrSentinel = (nodes[c].anti || nodes[c].leftOuter) ? -2 : -1;
         for (const auto& ck : subC) {
-            DataType ckType = aq.schema->columnType(ck.table, ck.column);
+            DataType ckType = aq.schema->columnType(ck.baseTable.empty() ? ck.table : ck.baseTable, ck.column);
             if (ckType == DataType::CHAR_FIXED) continue;
             probePipe = std::make_unique<MetalArrayLookup>(
-                std::move(probePipe), ck.storageArray(aq.tables[c]),
-                probeKey, ck.varName(), "int", -1);
+                std::move(probePipe), ck.storageArray(nodes[c].table),
+                probeKey, ck.varName(), "int", carrSentinel);
             carryVar[ck] = ck.varName();
         }
     }
@@ -1859,32 +2452,79 @@ std::optional<MetalQueryPlan> buildGenericMultiTableAdhocPlan_impl(
     // Apply cross-table filters (e.g. Q19's OR branches) after all probes.
     // Build-side column references are rewritten to use the join key index.
     if (!crossFilters.empty()) {
-        std::string cond = combineFilters(crossFilters, idxVar);
-        cond = rewriteForProbe(cond, idxVar, carryVar, aq.schema);
-        // Rewrite build-side column indices for CHAR_FIXED and INT columns.
+        if (getenv("GEN_DEBUG")) fprintf(stderr, "[Q7_DEBUG] applying %zu crossFilters\n", crossFilters.size());
+        // Collect CHAR_FIXED aliases from cross-filter predicates for alias-priority rewrite
+        std::set<std::string> cfAliases;
+        {
+            std::function<void(const PredPtr&)> collectPredAliases;
+            collectPredAliases = [&](const PredPtr& p) {
+                if (!p) return;
+                std::visit([&](auto&& node) {
+                    using T = std::decay_t<decltype(node)>;
+                    if constexpr (std::is_same_v<T, Comparison>) {
+                        std::function<void(const ExprPtr&)> collectExprAliases;
+                        collectExprAliases = [&](const ExprPtr& e) {
+                            if (!e) return;
+                            if (auto* cr = std::get_if<ColRef>(&e->node)) {
+                                if (cr->dataType == DataType::CHAR_FIXED && !cr->tableAlias.empty())
+                                    cfAliases.insert(cr->tableAlias);
+                            } else if (auto* be = std::get_if<BinaryExpr>(&e->node)) {
+                                collectExprAliases(be->left);
+                                collectExprAliases(be->right);
+                            }
+                        };
+                        collectExprAliases(node.left);
+                        collectExprAliases(node.right);
+                    } else if constexpr (std::is_same_v<T, LogicalAnd> || std::is_same_v<T, LogicalOr>) {
+                        for (auto& c : node.children) collectPredAliases(c);
+                    } else if constexpr (std::is_same_v<T, LogicalNot>) {
+                        collectPredAliases(node.child);
+                    }
+                }, p->node);
+            };
+            for (const auto& f : crossFilters) collectPredAliases(f);
+        }
+        auto cfKeys = charFixedJoinKey;
+        std::string cond = combineFilters(crossFilters, idxVar, aq.schema);
+        cond = rewriteForProbe(cond, idxVar, carryVar, cfKeys, aq.schema);
+        // Rewrite build-side INT/DATE column indices.
         for (const auto& [tname, jk] : charFixedJoinKey) {
-            // CHAR_FIXED: `col[i * width]` → `col[jk[i] * width]`
-            std::string fromIdx = idxVar + " *";
-            std::string toIdx = jk + "[" + idxVar + "] *";
-            size_t pos = 0;
-            while ((pos = cond.find(fromIdx, pos)) != std::string::npos) {
-                cond.replace(pos, fromIdx.size(), toIdx);
-                pos += toIdx.size();
-            }
-            // INT/DATE: `col[i]` → `col[jk[i]]`
-            // Collect INT column names from crossExtraCols
-            for (auto& [colName, colType] : crossExtraCols) {
-                if (colType != "int") continue;
-                std::string from = colName + "[" + idxVar + "]";
-                std::string to = colName + "[" + jk + "[" + idxVar + "]]";
-                pos = 0;
-                while ((pos = cond.find(from, pos)) != std::string::npos) {
-                    cond.replace(pos, from.size(), to);
-                    pos += to.size();
+            // INT/DATE: `col[i]` → `col[jk[i]]` (only for array access)
+            if (jk.isArray) {
+                for (auto& [colName, colType] : crossExtraCols) {
+                    if (colType != "int") continue;
+                    std::string from = colName + "[" + idxVar + "]";
+                    std::string to = colName + "[" + jk.expr + "[" + idxVar + "]]";
+                    size_t pos = 0;
+                    while ((pos = cond.find(from, pos)) != std::string::npos) {
+                        cond.replace(pos, from.size(), to);
+                        pos += to.size();
+                    }
                 }
             }
         }
         probePipe = maybeSelect(std::move(probePipe), cond);
+    }
+
+    // Per-row diamond-edge constraints: for skipped join edges where
+    // both columns were carried to the probe, add an equality check.
+    for (const auto& jc : aq.joins) {
+        int idxL = -1, idxR = -1;
+        for (int k = 0; k < (int)nodes.size(); ++k) {
+            if (aq.tables[k] == jc.leftTable) idxL = k;
+            if (aq.tables[k] == jc.rightTable) idxR = k;
+        }
+        if (idxL < 0 || idxR < 0) continue;
+        // Skip if this edge is already handled by the tree structure
+        if (nodes[idxL].parent == idxR || nodes[idxR].parent == idxL) continue;
+        // Check if both columns were carried (in carryVar)
+        CarriedKey ckL{jc.leftTable, jc.leftCol};
+        CarriedKey ckR{jc.rightTable, jc.rightCol};
+        auto itL = carryVar.find(ckL);
+        auto itR = carryVar.find(ckR);
+        if (itL == carryVar.end() || itR == carryVar.end()) continue;
+        std::string eqCond = itL->second + " == " + itR->second;
+        probePipe = maybeSelect(std::move(probePipe), eqCond);
     }
 
     // ---------- Terminal operators ----------
@@ -1892,10 +2532,10 @@ std::optional<MetalQueryPlan> buildGenericMultiTableAdhocPlan_impl(
     if (!aq.hasAggregation() && !aq.hasGroupBy()) {
         MetalQueryPlan::CpuSort cpuSort;
         cpuSort.limit = aq.limit;
-        for (const auto& order : aq.orderBy) {
-            auto column = orderColumnForExpr(order.expr, aq.targets);
+        for (int oi = 0; oi < (int)aq.orderBy.size(); ++oi) {
+            auto column = resolveOrderColumn(aq.orderBy[oi].expr, oi, aq.orderBy, aq.targets);
             if (!column) return fail("ORDER BY column not found in SELECT targets.");
-            cpuSort.keys.push_back({*column, order.descending});
+            cpuSort.keys.push_back({*column, aq.orderBy[oi].descending});
         }
 
         std::set<std::string> matCols;
@@ -1919,7 +2559,7 @@ std::optional<MetalQueryPlan> buildGenericMultiTableAdhocPlan_impl(
             if (stringLen > 0) sizeExpr += " * " + std::to_string(stringLen);
             std::string expr = materializeValueExpr(target.expr, idxVar, aq.schema);
             // Rewrite non-probe column references to carried variables
-            expr = rewriteForProbe(expr, idxVar, carryVar, aq.schema);
+            expr = rewriteForProbe(expr, idxVar, carryVar, charFixedJoinKey, aq.schema);
             // CHAR1 from non-probe tables: after rewrite, the carry variable is a
             // scalar.  Reset stringLen to 0 so the materialize operator emits a
             // scalar assignment instead of a pointer-indexed [_ci] loop.
@@ -1940,7 +2580,10 @@ std::optional<MetalQueryPlan> buildGenericMultiTableAdhocPlan_impl(
                         if (jkIt != charFixedJoinKey.end()) {
                             int len = fixedStringLenForExpr(target.expr, aq.schema);
                             std::string from = col->column + " + " + idxVar + " * " + std::to_string(len);
-                            std::string to = col->column + " + " + jkIt->second + "[" + idxVar + "] * " + std::to_string(len);
+                            const auto& jk = jkIt->second;
+                            std::string to = col->column + " + " + jk.expr +
+                                (jk.isArray ? ("[" + idxVar + "]") : "") +
+                                " * " + std::to_string(len);
                             size_t pos = expr.find(from);
                             if (pos != std::string::npos)
                                 expr.replace(pos, from.size(), to);
@@ -1972,6 +2615,7 @@ std::optional<MetalQueryPlan> buildGenericMultiTableAdhocPlan_impl(
     }
 
     if (!aq.hasGroupBy()) {
+        if (getenv("GEN_DEBUG")) fprintf(stderr, "[GEN_DEBUG] multi-table: -> scalar reduction\n");
         // Scalar reduction over probe rows that survived all joins.
         auto reduce = std::make_unique<MetalTGReduce>(std::move(probePipe), "d_adhoc_multi_scalar");
         for (size_t ti = 0; ti < aq.targets.size(); ++ti) {
@@ -1990,43 +2634,40 @@ std::optional<MetalQueryPlan> buildGenericMultiTableAdhocPlan_impl(
 
             // Complex aggregate with nested aggregates (e.g. const * SUM(a) / SUM(b)).
             // Decompose into individual accumulators, combine with setAverageResultAlias.
-            if (!target.agg->innerExpr && target.expr && func == AggFunc::SUM) {
+            if (target.expr && func == AggFunc::SUM) {
+                // Only enter if the expression tree contains multiple aggregate calls;
+                // simple SUM(x) is handled by the single-accumulator path below.
                 std::vector<const FuncCall*> aggCalls;
                 bool isDivision = false;
-
-                // Walk the expression tree to find aggregate FuncCalls.
-                // Use a raw function pointer to avoid std::function recursive capture.
-                struct Walker {
-                    static void walk(const ExprPtr& e, std::vector<const FuncCall*>& out, bool& div) {
-                        if (!e) return;
-                        if (auto* fc = std::get_if<FuncCall>(&e->node)) {
-                            if (fc->name == "sum" || fc->name == "avg" || fc->name == "count") {
-                                out.push_back(fc); return;
-                            }
-                            for (auto& a : fc->args) walk(a, out, div);
-                            return;
-                        }
-                        if (auto* be = std::get_if<BinaryExpr>(&e->node)) {
-                            walk(be->left, out, div);
-                            walk(be->right, out, div);
-                            if (be->op == ExprOp::DIV) div = true;
-                        } else if (auto* cw = std::get_if<CaseWhen>(&e->node)) {
-                            for (auto& br : cw->branches) {
-                                walk(br.result, out, div);
-                            }
-                            if (cw->elseResult) walk(cw->elseResult, out, div);
-                        }
-                    }
-                };
-                Walker::walk(target.expr, aggCalls, isDivision);
-
-                if (aggCalls.size() == 2 && isDivision) {
+                AggCallWalker::walk(target.expr, aggCalls, isDivision);
+                if (aggCalls.size() >= 2 && isDivision) {
                     double outerConst = 1.0;
                     // Pattern: const * SUM(a) / SUM(b) → two accumulators + AVG alias
-                    // Try to extract the constant multiplier from the expression tree
+                    // Extract the constant multiplier from the expression tree.
                     if (auto* be = std::get_if<BinaryExpr>(&target.expr->node)) {
                         if (be->op == ExprOp::DIV) {
-                            // Left side might be `const * SUM(a)` or just `SUM(a)`
+                            // Check left side: may be MUL(const, SUM(a)) or just SUM(a)
+                            if (auto* leftBe = std::get_if<BinaryExpr>(&be->left->node)) {
+                                if (leftBe->op == ExprOp::MUL) {
+                                    if (auto* litL = std::get_if<Literal>(&leftBe->left->node)) {
+                                        if (auto* iv = std::get_if<int>(&litL->value)) outerConst = (double)*iv;
+                                        else if (auto* fv = std::get_if<float>(&litL->value)) outerConst = (double)*fv;
+                                    }
+                                    if (auto* litR = std::get_if<Literal>(&leftBe->right->node)) {
+                                        if (auto* iv = std::get_if<int>(&litR->value)) outerConst *= (double)*iv;
+                                        else if (auto* fv = std::get_if<float>(&litR->value)) outerConst *= (double)*fv;
+                                    }
+                                }
+                            }
+                            // Also check right side for MUL pattern
+                            if (auto* rightBe = std::get_if<BinaryExpr>(&be->right->node)) {
+                                if (rightBe->op == ExprOp::MUL) {
+                                    if (auto* litL = std::get_if<Literal>(&rightBe->left->node)) {
+                                        if (auto* iv = std::get_if<int>(&litL->value)) outerConst /= (double)*iv;
+                                        else if (auto* fv = std::get_if<float>(&litL->value)) outerConst /= (double)*fv;
+                                    }
+                                }
+                            }
                             auto leftCall = aggCalls[0];
                             auto rightCall = aggCalls[1];
                             if (!leftCall->args.empty() && !rightCall->args.empty()) {
@@ -2034,28 +2675,26 @@ std::optional<MetalQueryPlan> buildGenericMultiTableAdhocPlan_impl(
                                 auto denExpr = rightCall->args[0];
                                 std::string numRaw = exprToMetal(numExpr, idxVar, aq.schema);
                                 std::string denRaw = exprToMetal(denExpr, idxVar, aq.schema);
-                                // If the left binary is MUL with a constant, include it
-                                if (auto* leftBe = std::get_if<BinaryExpr>(&numExpr->node)) {
-                                    if (leftBe->op == ExprOp::MUL) {
-                                        if (auto* lit = std::get_if<Literal>(&leftBe->left->node)) {
-                                            if (auto* iv = std::get_if<int>(&lit->value)) outerConst = (double)*iv;
-                                            else if (auto* fv = std::get_if<float>(&lit->value)) outerConst = (double)*fv;
-                                        }
-                                    }
-                                }
-                                std::string numFinal = rewriteForProbe(numRaw, idxVar, carryVar, aq.schema);
-                                std::string denFinal = rewriteForProbe(denRaw, idxVar, carryVar, aq.schema);
+                                if (outerConst != 1.0)
+                                    numRaw = "(" + numRaw + " * " + std::to_string(outerConst) + "f)";
+                                std::string numFinal = rewriteForProbe(numRaw, idxVar, carryVar, charFixedJoinKey, aq.schema);
+                                std::string denFinal = rewriteForProbe(denRaw, idxVar, carryVar, charFixedJoinKey, aq.schema);
                                 int numIdx = reduce->addAccumulator(accName + "_num", numFinal, "float");
                                 int denIdx = reduce->addAccumulator(accName + "_den", denFinal, "float");
-                                reduce->setAverageResultAlias(alias, numIdx, denIdx,
-                                    outerConst != 1.0 ? (int)(1.0 / outerConst) : 0);
+                                reduce->setAverageResultAlias(alias, numIdx, denIdx, 0);
                                 continue;
                             }
                         }
                     }
                 }
-                // Fall through: unhandled complex pattern → fail (will use predefined builder)
-                return fail("Complex aggregate expression not decomposable.");
+                // Simple aggregate (single FuncCall): fall through to single-accum path.
+                // Complex unhandled pattern (multiple FuncCalls without division): fail.
+                if (aggCalls.size() >= 2) {
+                    if (getenv("GEN_DEBUG"))
+                        fprintf(stderr, "[GEN_DEBUG] complex agg: %zu FuncCalls, isDivision=%d -> fail\n",
+                                aggCalls.size(), (int)isDivision);
+                    return fail("Complex aggregate expression not decomposable.");
+                }
             }
 
             if (!target.agg->innerExpr || !exprSupported(target.agg->innerExpr, false))
@@ -2064,7 +2703,7 @@ std::optional<MetalQueryPlan> buildGenericMultiTableAdhocPlan_impl(
                 return fail("Aggregate expression must be numeric.");
 
             std::string raw = exprToMetal(target.agg->innerExpr, idxVar, aq.schema);
-            std::string finalExpr = rewriteForProbe(raw, idxVar, carryVar, aq.schema);
+            std::string finalExpr = rewriteForProbe(raw, idxVar, carryVar, charFixedJoinKey, aq.schema);
 
             if (func == AggFunc::AVG) {
                 int sumIdx = reduce->addAccumulator(accName + "_sum", finalExpr, "float");
@@ -2155,25 +2794,38 @@ std::optional<MetalQueryPlan> buildGenericMultiTableAdhocPlan_impl(
         // Host-side GROUP BY happens after GPU result collection.
         MetalQueryPlan::CpuSort cpuSort;
         cpuSort.limit = aq.limit;
-        for (const auto& order : aq.orderBy) {
-            auto column = orderColumnForExpr(order.expr, aq.targets);
+        for (int oi = 0; oi < (int)aq.orderBy.size(); ++oi) {
+            auto column = resolveOrderColumn(aq.orderBy[oi].expr, oi, aq.orderBy, aq.targets);
             if (!column) return fail("ORDER BY column not found in SELECT targets.");
-            cpuSort.keys.push_back({*column, order.descending});
+            cpuSort.keys.push_back({*column, aq.orderBy[oi].descending});
         }
 
         // Build CpuGroupBy metadata.
         MetalQueryPlan::CpuGroupBy cpuGB;
         for (const auto& g : aq.groupBy) {
             auto* gcRef = std::get_if<ColRef>(&g->node);
+            if (getenv("GEN_DEBUG") && gcRef) {
+                fprintf(stderr, "[Q7_KEY] gb col=%s table=%s alias=%s\n", gcRef->column.c_str(), gcRef->table.c_str(), gcRef->tableAlias.c_str());
+            }
             if (gcRef) {
                 cpuGB.keyColumns.push_back(displayNameForTargetByCol(aq, *gcRef));
             } else {
-                // FuncCall GROUP BY (resolved from subquery alias):
+                // Non-ColRef GROUP BY (FuncCall, BinaryExpr, etc.):
                 // match by position against non-aggregate targets.
+                // Count how many GROUP BY items (ColRef + non) precede this one;
+                // that's the index into the non-aggregate SELECT targets.
+                int preceding = 0;
+                for (auto& gbItem : aq.groupBy) {
+                    if (&gbItem == &g) break;
+                    preceding++;
+                }
                 for (size_t ti = 0; ti < aq.targets.size(); ++ti) {
                     if (!aq.targets[ti].isAgg) {
-                        cpuGB.keyColumns.push_back(displayNameForTarget(aq.targets[ti], ti));
-                        break;
+                        if (preceding == 0) {
+                            cpuGB.keyColumns.push_back(displayNameForTarget(aq.targets[ti], ti));
+                            break;
+                        }
+                        preceding--;
                     }
                 }
             }
@@ -2181,8 +2833,93 @@ std::optional<MetalQueryPlan> buildGenericMultiTableAdhocPlan_impl(
         for (size_t ti = 0; ti < aq.targets.size(); ++ti) {
             const auto& target = aq.targets[ti];
             if (target.isAgg && target.agg) {
-                cpuGB.aggColumns.push_back(displayNameForTarget(target, ti));
-                cpuGB.aggFuncs.push_back(aggFuncName(target.agg->func));
+                bool complex = false;
+                if (target.agg->func == AggFunc::SUM && target.expr) {
+                    std::vector<const FuncCall*> aggCalls;
+                    bool isDivision = false;
+                    AggCallWalker::walk(target.expr, aggCalls, isDivision);
+                    if (aggCalls.size() >= 2 && isDivision) {
+                        std::string dn = displayNameForTarget(target, ti);
+                        cpuGB.aggColumns.push_back(dn);
+                        cpuGB.aggFuncs.push_back("RATIO");
+                        cpuGB.aggColumns.push_back("__hidden_" + dn + "_den");
+                        cpuGB.aggFuncs.push_back("RATIO_DEN");
+                        complex = true;
+                    }
+                }
+                if (!complex) {
+                    cpuGB.aggColumns.push_back(displayNameForTarget(target, ti));
+                    cpuGB.aggFuncs.push_back(aggFuncName(target.agg->func));
+                }
+            }
+        }
+
+        // Detect scalar subquery HAVING: compute threshold from grouped data.
+        if (aq.having) {
+            if (auto* cmp = std::get_if<Comparison>(&aq.having->node)) {
+                if (auto* lit = cmp->right ? std::get_if<Literal>(&cmp->right->node) : nullptr) {
+                    std::visit([&](auto&& v) {
+                        using T = std::decay_t<decltype(v)>;
+                        if constexpr (std::is_same_v<T, int>) {
+                            int sentinel = v;
+                                if (sentinel < -1000000) { // INT_MIN range → scalar subquery sentinel
+                                    int sqIdx = sentinel - INT_MIN;
+                                if (sqIdx >= 0 && sqIdx < (int)aq.subqueries.size()) {
+                                    auto& sq = aq.subqueries[sqIdx];
+                                    if (sq.type == AnalyzedQuery::Subquery::SCALAR_SUBQUERY) {
+                                        // Find index of first SUM aggregate in aggColumns
+                                        int aggIdx = -1;
+                                        int aggCount = 0;
+                                        for (size_t ti = 0; ti < aq.targets.size(); ++ti) {
+                                            if (aq.targets[ti].isAgg && aq.targets[ti].agg) {
+                                                if (aggFuncName(aq.targets[ti].agg->func) != "RATIO"
+                                                    && aggFuncName(aq.targets[ti].agg->func) != "RATIO_DEN") {
+                                                    if (aggIdx < 0) aggIdx = aggCount;
+                                                }
+                                                aggCount++;
+                                            }
+                                        }
+                                        if (aggIdx < 0 && aggCount > 0) aggIdx = 0;
+                                        // Extract factor from subquery JSON (e.g. 0.0001)
+                                        double factor = 0.0;
+                                        try {
+                                            nlohmann::json sqJson = nlohmann::json::parse(sq.sql);
+                                            if (sqJson.contains("SelectStmt")) {
+                                                auto& ss = sqJson["SelectStmt"];
+                                                if (ss.contains("targetList") && ss["targetList"].is_array()) {
+                                                    for (auto& t : ss["targetList"]) {
+                                                        if (!t.contains("ResTarget")) continue;
+                                                        auto& rt = t["ResTarget"];
+                                                        if (!rt.contains("val")) continue;
+                                                        auto& val = rt["val"];
+                                                        if (!val.contains("A_Expr")) continue;
+                                                        auto& ae = val["A_Expr"];
+                                                        if (!ae.contains("rexpr")) continue;
+                                                        auto& rexpr = ae["rexpr"];
+                                                        if (!rexpr.contains("A_Const")) continue;
+                                                        auto& ac = rexpr["A_Const"];
+                                                        // fval can be "Float" or direct "fval" key
+                                                        if (ac.contains("val") && ac["val"].contains("Float")) {
+                                                            factor = ac["val"]["Float"].value("fval", 0.0);
+                                                        } else if (ac.contains("ival") && ac["ival"].contains("ival")) {
+                                                            factor = std::stod(ac["ival"]["ival"].get<std::string>());
+                                                        } else if (ac.contains("fval") && ac["fval"].contains("fval")) {
+                                                            factor = std::stod(ac["fval"]["fval"].get<std::string>());
+                                                        }
+                                                        if (factor != 0.0) break;
+                                                    }
+                                                }
+                                            }
+                                        } catch (...) {}
+                                        cpuGB.havingAggIdx = aggIdx;
+                                        cpuGB.havingMultiplier = factor;
+                                        cpuGB.havingSentinel = sentinel;
+                                    }
+                                }
+                            }
+                        }
+                    }, lit->value);
+                }
             }
         }
 
@@ -2209,22 +2946,88 @@ std::optional<MetalQueryPlan> buildGenericMultiTableAdhocPlan_impl(
             if (stringLen > 0) sizeExpr += " * " + std::to_string(stringLen);
 
             std::string expr;
+            bool needDenCol = false;
+            ExprPtr denExpr;
             if (target.isAgg && target.agg) {
-                // For aggregates in materialize mode, emit the raw input value
-                // (COUNT → 1.0, others → inner expression) — host will aggregate.
-                if (target.agg->func == AggFunc::COUNT || target.agg->isStar) {
-                    expr = "1.0f";
-                    type = DataType::FLOAT;
-                } else if (target.agg->innerExpr) {
-                    expr = exprToMetal(target.agg->innerExpr, idxVar);
-                    expr = rewriteForProbe(expr, idxVar, carryVar, aq.schema);
-                    type = DataType::FLOAT;
-                } else {
-                    expr = "0";
+                // Check for complex aggregate (e.g. SUM(CASE...) / SUM(volume))
+                bool complex = false;
+                if (target.agg->func == AggFunc::SUM && target.expr) {
+                    std::vector<const FuncCall*> aggCalls;
+                    bool isDivision = false;
+                    AggCallWalker::walk(target.expr, aggCalls, isDivision);
+                    if (aggCalls.size() >= 2 && isDivision && !aggCalls[0]->args.empty() && !aggCalls[1]->args.empty()) {
+                        // Emit num column with the ACTUAL display name
+                        ExprPtr numExpr = aggCalls[0]->args[0];
+                        expr = exprToMetal(numExpr, idxVar);
+                        // For CHAR_FIXED columns in multi-instance tables (e.g. n1/n2),
+                        // prioritize the charFixedKeys entry matching the ColRef's alias
+                        // so the correct carry variable is used for indexing.
+                        {
+                            std::set<std::string> exprAliases;
+                            std::function<void(const ExprPtr&)> collectAliases;
+                            collectAliases = [&](const ExprPtr& e) {
+                                if (!e) return;
+                                if (auto* cr = std::get_if<ColRef>(&e->node)) {
+                                    if (cr->dataType == DataType::CHAR_FIXED && !cr->tableAlias.empty())
+                                        exprAliases.insert(cr->tableAlias);
+                                } else if (auto* be = std::get_if<BinaryExpr>(&e->node)) {
+                                    collectAliases(be->left);
+                                    collectAliases(be->right);
+                                } else if (auto* cw = std::get_if<CaseWhen>(&e->node)) {
+                                    for (auto& b : cw->branches) {
+                                        if (b.condition) {
+                                            if (auto* cmp = std::get_if<Comparison>(&b.condition->node)) {
+                                                collectAliases(cmp->left);
+                                                collectAliases(cmp->right);
+                                            }
+                                        }
+                                        collectAliases(b.result);
+                                    }
+                                    if (cw->elseResult) collectAliases(cw->elseResult);
+                                } else if (auto* fc = std::get_if<FuncCall>(&e->node)) {
+                                    for (auto& a : fc->args) collectAliases(a);
+                                }
+                            };
+                            collectAliases(numExpr);
+                            // Alias-based matching in rewriteForProbe handles
+                            // disambiguation — no reordering needed.
+                            expr = rewriteForProbe(expr, idxVar, carryVar, charFixedJoinKey, aq.schema);
+                        }
+                        type = DataType::FLOAT;
+                        int numLen = fixedStringLenForExpr(aggCalls[0]->args[0], aq.schema);
+                        materialize->addColumn(bufferName, metalTypeForDataType(type),
+                                               expr, displayName, sizeExpr, numLen);
+                        matColIdx++;
+                        // Set up denominator column (hidden name)
+                        bufferName = "d_adhoc_matgb_" + std::to_string(matColIdx) + "_" + sanitizeIdentifier("__hidden_" + displayName + "_den");
+                        std::string denDisplayName = "__hidden_" + displayName + "_den";
+                        displayName = denDisplayName;
+                        denExpr = aggCalls[1]->args[0];
+                        expr = exprToMetal(denExpr, idxVar);
+                        expr = rewriteForProbe(expr, idxVar, carryVar, charFixedJoinKey, aq.schema);
+                        type = DataType::FLOAT;
+                        stringLen = fixedStringLenForExpr(aggCalls[1]->args[0], aq.schema);
+                        sizeExpr = outputSize;
+                        if (stringLen > 0) sizeExpr += " * " + std::to_string(stringLen);
+                        complex = true;
+                    }
+                }
+                if (!complex) {
+                    // Standard aggregate: emit raw input value for host group-by.
+                    if (target.agg->func == AggFunc::COUNT || target.agg->isStar) {
+                        expr = "1.0f";
+                        type = DataType::FLOAT;
+                    } else if (target.agg->innerExpr) {
+                        expr = exprToMetal(target.agg->innerExpr, idxVar);
+                        expr = rewriteForProbe(expr, idxVar, carryVar, charFixedJoinKey, aq.schema);
+                        type = DataType::FLOAT;
+                    } else {
+                        expr = "0";
+                    }
                 }
             } else {
                 expr = materializeValueExpr(target.expr, idxVar, aq.schema);
-                expr = rewriteForProbe(expr, idxVar, carryVar, aq.schema);
+                expr = rewriteForProbe(expr, idxVar, carryVar, charFixedJoinKey, aq.schema);
             }
 
             // Handle CHAR1/CHAR_FIXED from non-probe tables
@@ -2242,7 +3045,10 @@ std::optional<MetalQueryPlan> buildGenericMultiTableAdhocPlan_impl(
                         if (jkIt != charFixedJoinKey.end()) {
                             int len = fixedStringLenForExpr(target.expr, aq.schema);
                             std::string from = col->column + " + " + idxVar + " * " + std::to_string(len);
-                            std::string to = col->column + " + " + jkIt->second + "[" + idxVar + "] * " + std::to_string(len);
+                            const auto& jk = jkIt->second;
+                            std::string to = col->column + " + " + jk.expr +
+                                (jk.isArray ? ("[" + idxVar + "]") : "") +
+                                " * " + std::to_string(len);
                             size_t pos = expr.find(from);
                             if (pos != std::string::npos)
                                 expr.replace(pos, from.size(), to);
@@ -2368,7 +3174,7 @@ std::optional<MetalQueryPlan> buildGenericMultiTableAdhocPlan_impl(
         DataType vt = inferExprDataType(target.agg->innerExpr);
 
         std::string raw = exprToMetal(target.agg->innerExpr, idxVar);
-        std::string finalExpr = rewriteForProbe(raw, idxVar, carryVar, aq.schema);
+        std::string finalExpr = rewriteForProbe(raw, idxVar, carryVar, charFixedJoinKey, aq.schema);
 
         if (func == AggFunc::AVG) {
             bool isFloat = (vt == DataType::FLOAT);
@@ -2526,9 +3332,9 @@ std::optional<MetalQueryPlan> buildGenericMultiTableAdhocPlan_impl(
     if (!aq.orderBy.empty() || aq.limit >= 0) {
         MetalQueryPlan::CpuSort cpuSort;
         cpuSort.limit = aq.limit;
-        for (const auto& order : aq.orderBy) {
-            auto column = orderColumnForExpr(order.expr, aq.targets);
-            if (column) cpuSort.keys.push_back({*column, order.descending});
+        for (int oi = 0; oi < (int)aq.orderBy.size(); ++oi) {
+            auto column = resolveOrderColumn(aq.orderBy[oi].expr, oi, aq.orderBy, aq.targets);
+            if (column) cpuSort.keys.push_back({*column, aq.orderBy[oi].descending});
         }
         plan.cpuSort = cpuSort;
     }
@@ -2540,6 +3346,7 @@ std::optional<MetalQueryPlan> buildGenericMultiTableAdhocPlan_impl(
 std::optional<MetalQueryPlan> buildGenericSingleTableAdhocPlan(const AnalyzedQuery& aq, std::string* error) {
     auto fail = [&](const std::string& msg) -> std::optional<MetalQueryPlan> {
         if (error) *error = msg;
+        if (getenv("GEN_DEBUG")) fprintf(stderr, "[GEN_DEBUG] single-table: reject: %s\n", msg.c_str());
         return std::nullopt;
     };
 
@@ -2548,14 +3355,18 @@ std::optional<MetalQueryPlan> buildGenericSingleTableAdhocPlan(const AnalyzedQue
     if (aq.tables[0] == "__subquery__") return fail("Single-table planner: subqueries not supported.");
     if (!filtersSupported(aq.filters)) return fail("Single-table planner: WHERE clause contains expressions not supported on GPU.");
 
-    // Cascade through sub-builders. Each sub-builder may return nullopt
-    // without an error when it simply doesn't match the pattern (e.g.
-    // scalar agg when GROUP BY is present). Only the last builder in the
-    // chain writes the final error.
     std::string subError;
-    if (auto scalar = buildScalarAggPlan(aq, &subError)) return scalar;
-    if (auto grouped = buildGroupedAggPlan(aq, &subError)) return grouped;
-    return buildMaterializePlan(aq, error);
+    if (auto scalar = buildScalarAggPlan(aq, &subError)) {
+        if (getenv("GEN_DEBUG")) fprintf(stderr, "[GEN_DEBUG] single-table: -> buildScalarAggPlan\n");
+        return scalar;
+    }
+    if (auto grouped = buildGroupedAggPlan(aq, &subError)) {
+        if (getenv("GEN_DEBUG")) fprintf(stderr, "[GEN_DEBUG] single-table: -> buildGroupedAggPlan\n");
+        return grouped;
+    }
+    auto mat = buildMaterializePlan(aq, error);
+    if (mat && getenv("GEN_DEBUG")) fprintf(stderr, "[GEN_DEBUG] single-table: -> buildMaterializePlan (cpuGB=%d)\n", mat->cpuGroupBy.has_value());
+    return mat;
 }
 
 std::optional<MetalQueryPlan> buildGenericMultiTableAdhocPlan(

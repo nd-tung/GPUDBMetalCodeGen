@@ -1,6 +1,7 @@
 #include "query_analyzer.h"
 #include "tpch_schema.h"
 #include "catalog.hpp"
+#include "metal_plan_common.h"
 
 extern "C" {
 #include "pg_query.h"
@@ -9,7 +10,9 @@ extern "C" {
 
 #include <stdexcept>
 #include <algorithm>
+#include <climits>
 #include <iostream>
+#include <set>
 #include <unordered_map>
 
 using json = nlohmann::json;
@@ -52,6 +55,13 @@ std::pair<std::string, std::string> resolveColumn(const std::string& colName,
         for (auto& t : tables) {
             if (g_analyzeCatalog->hasColumn(t, colName)) return {t, colName};
         }
+        // Catalog may be empty (fromSchemaProvider builds no columns);
+        // fall back to SchemaProvider for column existence checks.
+        if (g_analyzeSchema) {
+            for (auto& t : tables) {
+                if (g_analyzeSchema->hasColumn(t, colName)) return {t, colName};
+            }
+        }
         return {"", colName};
     }
     // Fallback: SchemaProvider
@@ -62,6 +72,13 @@ std::pair<std::string, std::string> resolveColumn(const std::string& colName,
 }
 
 } // anonymous namespace
+
+// File-scope: scalar subqueries encountered during walkExpr.
+// After analysis, these are moved into aq.subqueries.
+struct ScalarSubqueryInfo {
+    std::string sql; // JSON dump of subselect
+};
+static std::vector<ScalarSubqueryInfo> g_scalarSubqueries;
 
 SchemaProvider& defaultSchemaProvider() {
     static TPCHSchemaProvider s;
@@ -124,7 +141,8 @@ ExprPtr walkColumnRef(const json& node, const std::vector<std::string>& tables) 
         auto sqit = g_subqueryAliasMap.find(colName);
         if (sqit != g_subqueryAliasMap.end())
             return Expr::col(sqit->second.table, sqit->second.column,
-                             sqit->second.colIndex, sqit->second.dataType);
+                             sqit->second.colIndex, sqit->second.dataType,
+                             sqit->second.fixedWidth, sqit->second.tableAlias);
         // Check subquery expression aliases for WHERE/HAVING contexts.
         auto eqit = g_subqueryExprMap.find(colName);
         if (eqit != g_subqueryExprMap.end()) return eqit->second;
@@ -136,7 +154,16 @@ ExprPtr walkColumnRef(const json& node, const std::vector<std::string>& tables) 
     DataType dt = resolvedType;
     if (dt == DataType::INT && g_analyzeSchema)
         dt = g_analyzeSchema->columnType(resolvedTable, colName);
-    return Expr::col(resolvedTable, colName, -1, dt);
+    int fw = 0;
+    if (dt == DataType::CHAR_FIXED && g_analyzeSchema)
+        fw = g_analyzeSchema->columnFixedWidth(resolvedTable, colName);
+    if (colName == "n_name" && getenv("GEN_DEBUG"))
+        fprintf(stderr, "[GEN_DEBUG] walkColumnRef: %s.%s dt=%d fw=%d schema=%p\n",
+                resolvedTable.c_str(), colName.c_str(), (int)dt, fw, (void*)g_analyzeSchema);
+    std::string alias;
+    if (!tblQualifier.empty() && g_aliasMap.find(tblQualifier) != g_aliasMap.end())
+        alias = tblQualifier; // e.g. "n1" → stored for join disambiguation
+    return Expr::col(resolvedTable, colName, -1, dt, fw, alias);
 }
 
 ExprPtr walkConst(const json& node) {
@@ -362,6 +389,10 @@ ExprPtr walkAExpr(const json& node, const std::vector<std::string>& tables) {
 ExprPtr walkExpr(const json& node, const std::vector<std::string>& tables) {
     if (node.contains("ColumnRef"))
         return walkColumnRef(node["ColumnRef"], tables);
+    if (node.contains("fields")) {
+        // Bare ColumnRef without outer "ColumnRef" key (e.g., GROUP BY items)
+        return walkColumnRef(node, tables);
+    }
     if (node.contains("A_Const"))
         return walkConst(node["A_Const"]);
     if (node.contains("TypeCast"))
@@ -372,6 +403,16 @@ ExprPtr walkExpr(const json& node, const std::vector<std::string>& tables) {
     if (node.contains("A_Expr"))
         return walkAExpr(node["A_Expr"], tables);
     if (node.contains("SubLink")) {
+        // Scalar subquery expression (EXPR_SUBLINK) — store for later evaluation
+        auto& sl = node["SubLink"];
+        std::string subType = sl.value("subLinkType", "EXISTS_SUBLINK");
+        if (subType == "EXPR_SUBLINK" && sl.contains("subselect")) {
+            int idx = (int)g_scalarSubqueries.size();
+            ScalarSubqueryInfo sq;
+            sq.sql = sl["subselect"].dump();
+            g_scalarSubqueries.push_back(sq);
+            return Expr::lit(INT_MIN + idx); // sentinel: negative value encodes subquery index
+        }
         // Subquery expression — return placeholder
         return Expr::lit(0);
     }
@@ -628,9 +669,9 @@ bool isJoinCondition(const PredPtr& pred, JoinClause& jc) {
     // Self-joins are valid (e.g. l1.l_orderkey = l2.l_orderkey in EXISTS subqueries).
     // The multi-table builder disambiguates via the visited-node BFS.
 
-    jc.leftTable = leftCol->table;
+    jc.leftTable = leftCol->tableAlias.empty() ? leftCol->table : leftCol->tableAlias;
     jc.leftCol = leftCol->column;
-    jc.rightTable = rightCol->table;
+    jc.rightTable = rightCol->tableAlias.empty() ? rightCol->table : rightCol->tableAlias;
     jc.rightCol = rightCol->column;
     return true;
 }
@@ -773,16 +814,35 @@ SelectTarget extractTarget(const json& resTarget, const std::vector<std::string>
         }
     } else {
         // A_Expr or other non-FuncCall top-level — check for nested aggregates
+        st.expr = walkExpr(val, tables);
         if (containsAggregateJson(val)) {
             st.isAgg = true;
-            // Tag this as a complex aggregate expression (GPU computes inner aggs, CPU computes outer expr)
             AggTarget at;
-            at.func = AggFunc::SUM; // placeholder — outer expression combines aggregates
             at.alias = st.alias;
             at.isStar = false;
+            // Try to extract the inner expression from a simple FuncCall aggregate
+            // (e.g. SUM(x)/7.0 → innerExpr = x, func = SUM)
+            std::function<bool(const ExprPtr&)> tryExtract;
+            tryExtract = [&](const ExprPtr& e) -> bool {
+                if (!e) return false;
+                if (auto* fc = std::get_if<FuncCall>(&e->node)) {
+                    if (fc->name == "sum" || fc->name == "count" || fc->name == "avg" || fc->name == "min" || fc->name == "max") {
+                        if (fc->name == "sum") at.func = AggFunc::SUM;
+                        else if (fc->name == "count") at.func = AggFunc::COUNT;
+                        else if (fc->name == "avg") at.func = AggFunc::AVG;
+                        else if (fc->name == "min") at.func = AggFunc::MIN;
+                        else at.func = AggFunc::MAX;
+                        if (!fc->args.empty()) at.innerExpr = fc->args[0];
+                        return true;
+                    }
+                }
+                if (auto* be = std::get_if<BinaryExpr>(&e->node))
+                    return tryExtract(be->left) || tryExtract(be->right);
+                return false;
+            };
+            tryExtract(st.expr);
             st.agg = at;
         }
-        st.expr = walkExpr(val, tables);
     }
     return st;
 }
@@ -838,7 +898,6 @@ AnalyzedQuery analyzeSQL(const std::string& sql, const SchemaProvider* schema) {
     AnalyzedQuery aq;
     aq.schema = schema ? schema : &g_defaultSchema;
     g_analyzeSchema = aq.schema;
-    g_analyzeCatalog = aq.catalog;
 
     // Build a catalog from the schema provider (cached per schema).
     static const SchemaProvider* s_catFor = nullptr;
@@ -848,6 +907,7 @@ AnalyzedQuery analyzeSQL(const std::string& sql, const SchemaProvider* schema) {
         s_catFor = aq.schema;
     }
     aq.catalog = &s_catalog;
+    g_analyzeCatalog = aq.catalog;
 
     g_aliasMap.clear();
     g_subqueryAliasMap.clear();
@@ -991,13 +1051,15 @@ AnalyzedQuery analyzeSQL(const std::string& sql, const SchemaProvider* schema) {
     // Walk the JSON AST for EXISTS_SUBLINK nodes, extract the inner query's
     // FROM table and WHERE correlation predicate, and merge into the main query.
     // Then remove the placeholder ExistsPred from filters.
-    if (sel.contains("whereClause")) {
+    {
         std::function<void(const json&, bool)> inlineExists = [&](const json& node, bool negated) {
             if (node.is_object() && node.contains("SubLink")) {
                 auto& sl = node["SubLink"];
                 std::string subType = sl.value("subLinkType", "");
                 if (subType == "EXISTS_SUBLINK" && sl.contains("subselect")) {
                     auto& sub = sl["subselect"]["SelectStmt"];
+                    // Track tables before adding inner tables — these come from EXISTS
+                    size_t tablesBefore = aq.tables.size();
                     if (sub.contains("fromClause")) {
                         for (auto& item : sub["fromClause"]) {
                             extractTables(item, aq.tables, aq.tableAliases);
@@ -1009,16 +1071,243 @@ AnalyzedQuery analyzeSQL(const std::string& sql, const SchemaProvider* schema) {
                             g_aliasMap[aq.tableAliases[i]] = aq.tables[i];
                         }
                     }
+                    // Track which tables are the EXISTS inner tables
+                    std::set<std::string> existsTables;
+                    for (size_t ti = tablesBefore; ti < aq.tables.size(); ++ti)
+                        existsTables.insert(aq.tables[ti]);
                     if (sub.contains("whereClause")) {
                         // Record join count before adding: new joins from NOT EXISTS
-                        // are anti-joins.
+                        // are anti-joins; EXISTS joins are semi-joins.
                         size_t joinCountBefore = aq.joins.size();
+                        size_t filterCountBefore = aq.filters.size();
                         auto innerPred = walkPredicate(sub["whereClause"], aq.tables);
                         separatePredicates(innerPred, aq.tables, aq.joins, aq.filters);
+                        // Move single-table inner filters to instance-specific storage
+                        // so they don't leak to other instances of the same base table.
+                        // Only move if the predicate doesn't cross instance boundaries
+                        // (e.g. l3.l_suppkey <> l1.l_suppkey stays in aq.filters).
+                        for (size_t ti = tablesBefore; ti < aq.tables.size(); ++ti) {
+                            const std::string& alias = (ti < aq.tableAliases.size()) ? aq.tableAliases[ti] : aq.tables[ti];
+                            const std::string& innerTable = aq.tables[ti];
+                            for (size_t fi = filterCountBefore; fi < aq.filters.size(); ) {
+                                std::map<std::string, std::string> colToTable;
+                                collectColumnTables(aq.filters[fi], colToTable);
+                                if (colToTable.size() == 1 && colToTable.begin()->second == innerTable) {
+                                    // Check for cross-instance: walk predicate for aliases
+                                    std::set<std::string> filterAliases;
+                                    std::function<void(const PredPtr&)> collAliases;
+                                    collAliases = [&](const PredPtr& p) {
+                                        if (!p) return;
+                                        std::visit([&](auto&& n) {
+                                            if constexpr (std::is_same_v<std::decay_t<decltype(n)>, Comparison>) {
+                                                for (auto* e : {&n.left, &n.right}) {
+                                                    if (*e && std::get_if<ColRef>(&(*e)->node)) {
+                                                        auto& cr = std::get<ColRef>((*e)->node);
+                                                        if (!cr.tableAlias.empty())
+                                                            filterAliases.insert(cr.tableAlias);
+                                                    }
+                                                }
+                                            } else if constexpr (std::is_same_v<std::decay_t<decltype(n)>, LogicalAnd> || std::is_same_v<std::decay_t<decltype(n)>, LogicalOr>) {
+                                                for (auto& c : n.children) collAliases(c);
+                                            } else if constexpr (std::is_same_v<std::decay_t<decltype(n)>, LogicalNot>) {
+                                                collAliases(n.child);
+                                            }
+                                        }, p->node);
+                                    };
+                                    collAliases(aq.filters[fi]);
+                                    if (filterAliases.size() <= 1) {
+                                        aq.instanceFilters[alias].push_back(aq.filters[fi]);
+                                        aq.filters.erase(aq.filters.begin() + fi);
+                                    } else {
+                                        ++fi;
+                                    }
+                                } else {
+                                    ++fi;
+                                }
+                            }
+                        }
                         if (negated) {
                             for (size_t j = joinCountBefore; j < aq.joins.size(); ++j) {
                                 aq.joins[j].anti = true;
+                                aq.joins[j].semi = true;
+                                if (existsTables.count(aq.joins[j].leftTable))
+                                    aq.joins[j].innerTable = aq.joins[j].leftTable;
+                                else if (existsTables.count(aq.joins[j].rightTable))
+                                    aq.joins[j].innerTable = aq.joins[j].rightTable;
                             }
+                        } else {
+                            // EXISTS: mark new joins as semi-joins
+                            for (size_t j = joinCountBefore; j < aq.joins.size(); ++j) {
+                                aq.joins[j].semi = true;
+                                // Set innerTable to the EXISTS inner table
+                                if (existsTables.count(aq.joins[j].leftTable))
+                                    aq.joins[j].innerTable = aq.joins[j].leftTable;
+                                else if (existsTables.count(aq.joins[j].rightTable))
+                                    aq.joins[j].innerTable = aq.joins[j].rightTable;
+                            }
+                        }
+                    }
+                }
+                // IN subquery (ANY_SUBLINK): o_orderkey IN (SELECT l_orderkey FROM ...)
+                // Convert to: add inner tables + WHERE + join on testexpr = inner col.
+                if (subType == "ANY_SUBLINK" && sl.contains("subselect") && sl.contains("testexpr")) {
+                    auto& sub = sl["subselect"]["SelectStmt"];
+                    size_t tablesBefore = aq.tables.size();
+                    // Extract inner FROM tables — allow duplicates since this
+                    // table instance needs its own build phase (e.g. GROUP BY).
+                    if (sub.contains("fromClause")) {
+                        for (auto& item : sub["fromClause"]) {
+                            std::vector<std::string> newTables, newAliases;
+                            extractTables(item, newTables, newAliases);
+                            for (size_t ni = 0; ni < newTables.size(); ++ni) {
+                                aq.tables.push_back(newTables[ni]);
+                                std::string alias = ni < newAliases.size() ? newAliases[ni] : newTables[ni];
+                                // Use unique alias to distinguish from existing instance
+                                if (tablesBefore < aq.tables.size())
+                                    alias += "_IN";
+                                aq.tableAliases.push_back(alias);
+                            }
+                        }
+                        g_aliasMap.clear();
+                        for (size_t i = 0; i < aq.tables.size() && i < aq.tableAliases.size(); ++i) {
+                            g_aliasMap[aq.tableAliases[i]] = aq.tables[i];
+                        }
+                    }
+                    // Walk the outer test expression (column on outer query side)
+                    auto testExpr = walkExpr(sl["testexpr"], aq.tables);
+                    auto* testCol = testExpr ? std::get_if<ColRef>(&testExpr->node) : nullptr;
+                    // Find the first column in the inner SELECT target list
+                    ColRef innerCol;
+                    if (sub.contains("targetList")) {
+                        for (auto& t : sub["targetList"]) {
+                            if (!t.contains("ResTarget")) continue;
+                            auto& rt = t["ResTarget"];
+                            if (!rt.contains("val")) continue;
+                            auto innerExpr = walkExpr(rt["val"], aq.tables);
+                            if (auto* ic = innerExpr ? std::get_if<ColRef>(&innerExpr->node) : nullptr) {
+                                innerCol = *ic;
+                                break;
+                            }
+                        }
+                    }
+                    // Add join: outer_col = inner_col
+                    if (testCol && !innerCol.table.empty()) {
+                        JoinClause jc;
+                        jc.leftTable = testCol->table;
+                        jc.leftCol = testCol->column;
+                        jc.rightTable = innerCol.table;
+                        jc.rightCol = innerCol.column;
+                        jc.anti = negated;
+                        aq.joins.push_back(jc);
+                    }
+                    // Extract inner WHERE conditions as joins/filters
+                    if (sub.contains("whereClause")) {
+                        size_t filterCountBefore = aq.filters.size();
+                        auto innerPred = walkPredicate(sub["whereClause"], aq.tables);
+                        separatePredicates(innerPred, aq.tables, aq.joins, aq.filters);
+                        for (size_t ti = tablesBefore; ti < aq.tables.size(); ++ti) {
+                            const std::string& alias = (ti < aq.tableAliases.size()) ? aq.tableAliases[ti] : aq.tables[ti];
+                            const std::string& innerTable = aq.tables[ti];
+                            for (size_t fi = filterCountBefore; fi < aq.filters.size(); ) {
+                                std::map<std::string, std::string> colToTable;
+                                collectColumnTables(aq.filters[fi], colToTable);
+                                if (colToTable.size() == 1 && colToTable.begin()->second == innerTable) {
+                                    std::set<std::string> filterAliases;
+                                    std::function<void(const PredPtr&)> collAliases;
+                                    collAliases = [&](const PredPtr& p) {
+                                        if (!p) return;
+                                        std::visit([&](auto&& n) {
+                                            if constexpr (std::is_same_v<std::decay_t<decltype(n)>, Comparison>) {
+                                                for (auto* e : {&n.left, &n.right}) {
+                                                    if (*e && std::get_if<ColRef>(&(*e)->node)) {
+                                                        auto& cr = std::get<ColRef>((*e)->node);
+                                                        if (!cr.tableAlias.empty())
+                                                            filterAliases.insert(cr.tableAlias);
+                                                    }
+                                                }
+                                            } else if constexpr (std::is_same_v<std::decay_t<decltype(n)>, LogicalAnd> || std::is_same_v<std::decay_t<decltype(n)>, LogicalOr>) {
+                                                for (auto& c : n.children) collAliases(c);
+                                            } else if constexpr (std::is_same_v<std::decay_t<decltype(n)>, LogicalNot>) {
+                                                collAliases(n.child);
+                                            }
+                                        }, p->node);
+                                    };
+                                    collAliases(aq.filters[fi]);
+                                    if (filterAliases.size() <= 1) {
+                                        aq.instanceFilters[alias].push_back(aq.filters[fi]);
+                                        aq.filters.erase(aq.filters.begin() + fi);
+                                    } else {
+                                        ++fi;
+                                    }
+                                } else {
+                                    ++fi;
+                                }
+                            }
+                        }
+                    }
+                    // Handle inner GROUP BY + HAVING (e.g. Q18)
+                    if (sub.contains("groupClause") && sub.contains("havingClause")) {
+                        // Find the alias of the inner table added by this subquery
+                        std::string innerAlias;
+                        for (size_t ti = tablesBefore; ti < aq.tables.size() && ti < aq.tableAliases.size(); ++ti) {
+                            if (aq.tables[ti] == innerCol.table) { innerAlias = aq.tableAliases[ti]; break; }
+                        }
+                        if (innerAlias.empty()) innerAlias = innerCol.table;
+                        // Extract GROUP BY column
+                        std::string groupCol;
+                        const auto& gb = sub["groupClause"];
+                        if (gb.is_array() && !gb.empty()) {
+                            for (const auto& gitem : gb) {
+                                const json* colNode = &gitem;
+                                if (gitem.contains("ColumnRef")) colNode = &gitem["ColumnRef"];
+                                auto colExpr = walkExpr(*colNode, aq.tables);
+                                if (auto* cr = colExpr ? std::get_if<ColRef>(&colExpr->node) : nullptr) {
+                                    groupCol = cr->column;
+                                    break;
+                                }
+                            }
+                        }
+                        // Extract aggregate: find FuncCall in HAVING (e.g. SUM(l_quantity))
+                        std::string aggFunc, aggExpr;
+                        PredPtr havingPred;
+                        {
+                            const auto& hc = sub["havingClause"];
+                            auto hPred = walkPredicate(hc, aq.tables);
+                            if (hPred) {
+                                havingPred = hPred;
+                                std::function<void(const PredPtr&)> findAgg;
+                                findAgg = [&](const PredPtr& p) {
+                                    if (!p || !aggFunc.empty()) return;
+                                    std::visit([&](auto&& n) {
+                                        using T = std::decay_t<decltype(n)>;
+                                        if constexpr (std::is_same_v<T, Comparison>) {
+                                            for (auto* e : {&n.left, &n.right}) {
+                                                if (*e && std::get_if<FuncCall>(&(*e)->node)) {
+                                                    auto& fc = std::get<FuncCall>((*e)->node);
+                                                    aggFunc = fc.name;
+                                                    if (!fc.args.empty() && fc.args[0]) {
+                                                        if (auto* cr = std::get_if<ColRef>(&fc.args[0]->node))
+                                                            aggExpr = cr->column;
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        // other predicate types: not relevant
+                                    }, p->node);
+                                };
+                                findAgg(havingPred);
+                            }
+                        }
+                        if (!groupCol.empty() && !aggFunc.empty()) {
+                            AnalyzedQuery::InSubqueryAggInfo info;
+                            info.alias = innerAlias;
+                            info.baseTable = innerCol.table;
+                            info.tableIndex = (int)tablesBefore;
+                            info.groupCol = groupCol;
+                            info.aggFunc = aggFunc;
+                            info.aggExpr = aggExpr;
+                            info.havingPred = havingPred;
+                            aq.inSubAggs.push_back(info);
                         }
                     }
                 }
@@ -1046,6 +1335,7 @@ AnalyzedQuery analyzeSQL(const std::string& sql, const SchemaProvider* schema) {
                         }
                     }
                 }
+                return; // Don't recurse into children twice
             }
             if (node.is_object()) {
                 for (auto& [k, v] : node.items()) inlineExists(v, innerNegated);
@@ -1053,17 +1343,33 @@ AnalyzedQuery analyzeSQL(const std::string& sql, const SchemaProvider* schema) {
                 for (auto& i : node) inlineExists(i, innerNegated);
             }
         };
-        inlineExists(sel["whereClause"], false);
+        if (sel.contains("whereClause"))
+            inlineExists(sel["whereClause"], false);
+        // Also inline EXISTS subqueries from FROM-clause subqueries
+        // (e.g. Q22's NOT EXISTS inside a FROM subquery).
+        if (sel.contains("fromClause")) {
+            for (auto& item : sel["fromClause"])
+                inlineExists(item, false);
+        }
 
         // Remove placeholder ExistsPred entries from filters (they've been inlined).
         // Also handle NOT EXISTS: LogicalNot(ExistsPred) must be removed too since
         // the negation will be applied as an anti-join or anti-bitmap-probe.
+        // Also remove empty InList placeholders from ANY_SUBLINK inlining.
+        // Also remove LogicalNot(InList) wrappers around empty InLists.
         aq.filters.erase(
             std::remove_if(aq.filters.begin(), aq.filters.end(),
                 [](const PredPtr& p) {
                     if (std::holds_alternative<ExistsPred>(p->node)) return true;
                     if (auto* ln = std::get_if<LogicalNot>(&p->node)) {
-                        return ln->child && std::holds_alternative<ExistsPred>(ln->child->node);
+                        if (ln->child && std::holds_alternative<ExistsPred>(ln->child->node))
+                            return true;
+                        // Also remove LogicalNot wrapping empty InList (from NOT IN subquery)
+                        if (auto* il = ln->child ? std::get_if<InList>(&ln->child->node) : nullptr)
+                            return il->values.empty();
+                    }
+                    if (auto* il = std::get_if<InList>(&p->node)) {
+                        return il->values.empty(); // empty = placeholder from ANY_SUBLINK
                     }
                     return false;
                 }),
@@ -1072,10 +1378,9 @@ AnalyzedQuery analyzeSQL(const std::string& sql, const SchemaProvider* schema) {
 
     // Rebuild alias map after inlineExists may have added new tables
     // with aliases (e.g. Q21's l2, l3 from EXISTS subqueries).
-    g_aliasMap.clear();
     for (size_t i = 0; i < aq.tables.size() && i < aq.tableAliases.size(); ++i) {
-        g_aliasMap[aq.tableAliases[i]] = aq.tables[i];
-    }
+                            g_aliasMap[aq.tableAliases[i]] = aq.tables[i];
+                        }
 
     // 3. Extract SELECT targets
     if (sel.contains("targetList")) {
@@ -1131,7 +1436,8 @@ AnalyzedQuery analyzeSQL(const std::string& sql, const SchemaProvider* schema) {
                 auto it = aq.subqueryColMap.find(cr->column);
                 if (it != aq.subqueryColMap.end()) {
                     expr = Expr::col(it->second.table, it->second.column,
-                                     it->second.colIndex, it->second.dataType);
+                                     it->second.colIndex, it->second.dataType,
+                                     it->second.fixedWidth, it->second.tableAlias);
                     return;
                 }
                 auto eit = aq.subqueryExprMap.find(cr->column);
@@ -1170,6 +1476,15 @@ AnalyzedQuery analyzeSQL(const std::string& sql, const SchemaProvider* schema) {
     // GROUP BY and ORDER BY keep their original ColRef — the subquery alias
     // name is used for display-name matching in orderColumnForExpr and
     // materialize column naming; the resolved expression is used in targets.
+
+    // Transfer scalar subqueries from file-scope to AnalyzedQuery.
+    for (auto& sq : g_scalarSubqueries) {
+        AnalyzedQuery::Subquery aqSq;
+        aqSq.type = AnalyzedQuery::Subquery::SCALAR_SUBQUERY;
+        aqSq.sql = sq.sql;
+        aq.subqueries.push_back(aqSq);
+    }
+    g_scalarSubqueries.clear();
 
     return aq;
 }

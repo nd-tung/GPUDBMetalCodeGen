@@ -27,10 +27,12 @@ enum class AggFunc { SUM, COUNT, AVG, MIN, MAX, COUNT_DISTINCT };
 enum class CmpOp { EQ, NE, LT, LE, GT, GE };
 
 struct ColRef {
-    std::string table;    // e.g. "lineitem"
-    std::string column;   // e.g. "l_shipdate"
-    int         colIndex; // resolved TPC-H column index
+    std::string table;      // e.g. "lineitem" (base table for schema lookups)
+    std::string column;     // e.g. "l_shipdate"
+    int         colIndex;   // resolved TPC-H column index
     DataType    dataType;
+    int         fixedWidth = 0; // for CHAR_FIXED — carried through subquery aliases
+    std::string tableAlias; // e.g. "n1" — used for disambiguation in joins
 };
 
 struct Literal {
@@ -59,9 +61,9 @@ struct FuncCall {
 struct Expr {
     std::variant<ColRef, Literal, BinaryExpr, CaseWhen, FuncCall> node;
 
-    static ExprPtr col(const std::string& table, const std::string& col, int idx, DataType dt) {
+    static ExprPtr col(const std::string& table, const std::string& col, int idx, DataType dt, int fw = 0, const std::string& alias = "") {
         auto e = std::make_shared<Expr>();
-        e->node = ColRef{table, col, idx, dt};
+        e->node = ColRef{table, col, idx, dt, fw, alias};
         return e;
     }
     static ExprPtr lit(int v) {

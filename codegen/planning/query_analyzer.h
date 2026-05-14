@@ -2,6 +2,7 @@
 #include "query_plan.h"
 #include <string>
 #include <vector>
+#include <map>
 #include <optional>
 #include <unordered_map>
 
@@ -19,6 +20,8 @@ struct JoinClause {
     std::string leftCol, rightCol;
     bool anti = false;       // true for NOT EXISTS → anti-semi-join
     bool leftOuter = false;  // true for LEFT OUTER JOIN
+    bool semi = false;       // true for EXISTS → semi-join (inner table = child)
+    std::string innerTable;  // for semi joins: the EXISTS inner table
 };
 
 struct AggTarget {
@@ -50,6 +53,23 @@ struct AnalyzedQuery {
 
     // WHERE predicates (non-join predicates, per-table filters)
     std::vector<PredPtr> filters;
+
+    // Per-instance filters keyed by alias (e.g. l3-specific filters from
+    // NOT EXISTS subquery — should NOT apply to other instances of same base table).
+    std::map<std::string, std::vector<PredPtr>> instanceFilters;
+
+    // IN subquery with GROUP BY + HAVING (e.g. Q18): aggregate metadata
+    // so the builder creates an AtomicAgg build phase instead of a plain bitmap.
+    struct InSubqueryAggInfo {
+        std::string alias;        // table alias (e.g. "lineitem" duplicate)
+        std::string baseTable;    // base table name
+        int tableIndex = -1;      // index in aq.tables (to identify the dup)
+        std::string groupCol;     // GROUP BY column
+        std::string aggFunc;      // "SUM", "COUNT", "AVG"
+        std::string aggExpr;      // expression inside aggregate (e.g. "l_quantity")
+        PredPtr havingPred;       // HAVING predicate (e.g. SUM > 300)
+    };
+    std::vector<InSubqueryAggInfo> inSubAggs;
 
     // SELECT target list
     std::vector<SelectTarget> targets;

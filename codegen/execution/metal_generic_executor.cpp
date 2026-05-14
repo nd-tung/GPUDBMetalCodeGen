@@ -228,6 +228,7 @@ void MetalGenericExecutor::bindPhaseBuffers(MTL::ComputeCommandEncoder* encoder,
                 // Look up registered scalar value and set via setBytes
                 auto ii = scalarInts_.find(b.name);
                 if (ii != scalarInts_.end()) {
+                    if (getenv("GEN_DEBUG")) fprintf(stderr, "[BIND] constant %s = %d at idx=%d\n", b.name.c_str(), ii->second, b.bufferIndex);
                     encoder->setBytes(&ii->second, sizeof(int), b.bufferIndex);
                 } else {
                     auto fi = scalarFloats_.find(b.name);
@@ -267,6 +268,10 @@ void MetalGenericExecutor::encodePhase(MTL::ComputeCommandEncoder* encoder,
                                        const BufferMap& buffers) {
     encoder->setComputePipelineState(pso);
     bindPhaseBuffers(encoder, phase, buffers);
+    if (getenv("GEN_DEBUG")) {
+        for (const auto& [name, val] : scalarFloats_) fprintf(stderr, "[SCALAR_VAL] %s=%f\n", name.c_str(), val);
+        for (const auto& [name, val] : scalarInts_) fprintf(stderr, "[SCALAR_VAL] %s=%lld\n", name.c_str(), (long long)val);
+    }
 
     NS::UInteger tgSize = pso->maxTotalThreadsPerThreadgroup();
     if (tgSize > (NS::UInteger)phase.threadgroupSize)

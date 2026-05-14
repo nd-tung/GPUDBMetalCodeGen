@@ -208,13 +208,19 @@ private:
 class TPCHSchemaProvider : public SchemaProvider {
 public:
     DataType columnType(const std::string& table, const std::string& col) const override {
-        return TPCHSchema::instance().table(table).col(col).type;
+        auto it = TPCHSchema::instance().tables.find(table);
+        if (it == TPCHSchema::instance().tables.end()) return DataType::INT;
+        auto jt = it->second.nameToIdx.find(col);
+        if (jt == it->second.nameToIdx.end()) return DataType::INT;
+        return it->second.columns[jt->second].type;
     }
     int columnFixedWidth(const std::string& table, const std::string& col) const override {
         return TPCHSchema::instance().table(table).col(col).fixedWidth;
     }
     bool hasColumn(const std::string& table, const std::string& col) const override {
-        return TPCHSchema::instance().table(table).nameToIdx.count(col) > 0;
+        auto it = TPCHSchema::instance().tables.find(table);
+        if (it == TPCHSchema::instance().tables.end()) return false;
+        return it->second.nameToIdx.count(col) > 0;
     }
     std::string maxKeySymbol(const std::string& table) const override {
         return TPCHSchema::instance().table(table).maxKeySymbol;
@@ -250,6 +256,7 @@ public:
     std::optional<std::pair<std::string, std::string>> pkInfo(const std::string& table) const override {
         if (table == "customer") return std::make_pair("c_custkey",   "maxCustkey");
         if (table == "orders")   return std::make_pair("o_orderkey",  "maxOrderkey");
+        if (table == "lineitem") return std::make_pair("l_orderkey",  "maxOrderkey");
         if (table == "supplier") return std::make_pair("s_suppkey",   "maxSuppkey");
         if (table == "part")     return std::make_pair("p_partkey",   "maxPartkey");
         if (table == "partsupp") return std::make_pair("ps_suppkey",  "maxSuppkey");

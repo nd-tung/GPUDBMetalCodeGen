@@ -1,6 +1,5 @@
 #include "metal_adhoc_plan_api.h"
 #include "metal_generic_adhoc_builder.h"
-#include "metal_tpch_query_builders.h"
 
 namespace codegen {
 
@@ -9,15 +8,16 @@ std::optional<MetalQueryPlan> buildAdhocSQLPlan(const AnalyzedQuery& aq,
                                                 std::string* error) {
     std::string singleError, multiError;
     auto dispatch = [&]() -> std::optional<MetalQueryPlan> {
-        if (auto p = buildGenericSingleTableAdhocPlan(aq, &singleError)) return p;
-        if (auto p = buildGenericMultiTableAdhocPlan(aq, &multiError)) return p;
-        if (auto p = buildQ6Plan(aq)) return p;
-        if (auto p = buildQ1Plan(aq)) return p;
-        if (auto p = buildQ14Plan(aq)) return p;
-        if (auto p = buildQ4Plan(aq)) return p;
-        if (auto p = buildQ12Plan(aq)) return p;
-        if (auto p = buildQ10Plan(aq)) return p;
-        if (auto p = buildQ7Plan(aq)) return p;
+        if (auto p = buildGenericSingleTableAdhocPlan(aq, &singleError)) {
+            if (getenv("GEN_DEBUG")) fprintf(stderr, "[DISPATCH] -> buildGenericSingleTableAdhocPlan\n");
+            return p;
+        }
+        if (auto p = buildGenericMultiTableAdhocPlan(aq, &multiError)) {
+            if (getenv("GEN_DEBUG")) fprintf(stderr, "[DISPATCH] -> buildGenericMultiTableAdhocPlan\n");
+            return p;
+        }
+        if (getenv("GEN_DEBUG")) fprintf(stderr, "[DISPATCH] no builder matched. singleErr=%s multiErr=%s\n",
+                                         singleError.c_str(), multiError.c_str());
         return std::nullopt;
     };
 

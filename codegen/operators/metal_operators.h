@@ -229,6 +229,32 @@ private:
     std::string keyExpr_;
 };
 
+// Left-outer probe: always consumes, but zeroes-out right-side
+// variables when the bitmap test fails. Preserves left-table rows
+// that have no match.
+class MetalLeftOuterProbe : public MetalUnaryOperator {
+public:
+    struct DefaultVar {
+        std::string varName;
+        std::string varType;   // "int", "float", etc.
+        std::string defaultVal; // "0", "0.0f", etc.
+    };
+    MetalLeftOuterProbe(std::unique_ptr<MetalOperator> child,
+                        const std::string& bitmapName,
+                        const std::string& keyExpr,
+                        std::vector<DefaultVar> rightVars);
+    void produce(MetalCodegen& cg, ConsumerFn consume) override;
+    std::string describe() const override;
+    void iusUsed(std::vector<IU>& out) const override {
+        appendIUsFromExpr(keyExpr_, out);
+    }
+
+private:
+    std::string bitmapName_;
+    std::string keyExpr_;
+    std::vector<DefaultVar> rightVars_;
+};
+
 // ===================================================================
 // DIRECT-ADDRESS MAP OPERATORS
 // ===================================================================
