@@ -354,6 +354,10 @@ void MetalCodegen::registerScalarAggAverageColumn(const std::string& displayName
 }
 
 void MetalCodegen::registerMaterializeOutput(const std::string& counterBuffer) {
+    if (resultSchema_.kind != MetalResultSchema::MATERIALIZE ||
+        resultSchema_.counterBuffer != counterBuffer) {
+        resultSchema_.columns.clear();
+    }
     resultSchema_.kind = MetalResultSchema::MATERIALIZE;
     resultSchema_.counterBuffer = counterBuffer;
 }
@@ -361,12 +365,16 @@ void MetalCodegen::registerMaterializeOutput(const std::string& counterBuffer) {
 void MetalCodegen::registerOutputColumn(const std::string& displayName,
                                          const std::string& bufferName,
                                          const std::string& elementType,
-                                         int stringLen) {
+                                         int stringLen,
+                                         int scaleDown,
+                                         bool isLongPair) {
     MetalResultSchema::ColumnDesc col;
     col.displayName = displayName;
     col.bufferName = bufferName;
     col.elementType = elementType;
     col.stringLen = stringLen;
+    col.scaleDown = scaleDown;
+    col.isLongPair = isLongPair;
     resultSchema_.columns.push_back(col);
 }
 

@@ -52,8 +52,6 @@ const ColRef* fixedStringCol(const ExprPtr& expr) {
     if (!expr) return nullptr;
     auto* col = std::get_if<ColRef>(&expr->node);
     if (!col || col->dataType != DataType::CHAR_FIXED) return nullptr;
-    if (getenv("GEN_DEBUG"))
-        fprintf(stderr, "[GEN_DEBUG] fixedStringCol: %s.%s dt=%d\n", col->table.c_str(), col->column.c_str(), (int)col->dataType);
     return col;
 }
 
@@ -239,13 +237,6 @@ std::optional<std::string> fixedStringComparisonMetal(const Comparison& cmp,
     if (op != CmpOp::EQ && op != CmpOp::NE) return std::nullopt;
 
     std::string eq = fixedStringEqMetal(*col, *literal, idxVar, schema);
-    if (getenv("GEN_DEBUG")) {
-        int w = 0; bool has = false;
-        if (schema) { w = schema->columnFixedWidth(col->table, col->column); has = schema->hasColumn(col->table, col->column); }
-        fprintf(stderr, "[GEN_DEBUG] fixedStringComparison: col=%s.%s lit=%s hasCol=%d width=%d tbls=%zu eq=[%s]\n",
-                col->table.c_str(), col->column.c_str(), literal->c_str(),
-                (int)has, w, schema ? schema->tableNames().size() : 0, eq.c_str());
-    }
     if (op == CmpOp::NE) return "!(" + eq + ")";
     return eq;
 }
@@ -496,14 +487,6 @@ std::string exprToMetal(const ExprPtr& expr, const std::string& idxVar,
             for (size_t i = 0; i < node.branches.size(); ++i) {
                 if (i > 0) result += " : ";
                 std::string cond = predToMetal(node.branches[i].condition, idxVar, schema);
-                if (getenv("GEN_DEBUG")) {
-                    auto* cmp = std::get_if<Comparison>(&node.branches[i].condition->node);
-                    if (cmp) {
-                        auto* lc = std::get_if<ColRef>(&cmp->left->node);
-                        if (lc) fprintf(stderr, "[GEN_DEBUG] CaseWhen: col=%s.%s dt=%d cond=[%s]\n",
-                                        lc->table.c_str(), lc->column.c_str(), (int)lc->dataType, cond.c_str());
-                    }
-                }
                 std::string val = exprToMetal(node.branches[i].result, idxVar, schema);
                 result += cond + " ? " + val;
             }
@@ -705,7 +688,7 @@ void addGpuSortToPlan(MetalQueryPlan& plan,
         "GPU_sort_step", sortKeyBuf, sortIdxBuf, nResultsExpr);
 
     // Mark plan for sorted-index remapping during result collection
-    plan.gpuSort = MetalQueryPlan::GpuSort{sortIdxBuf, nResultsExpr, sortDesc};
+    plan.gpuSort = MetalQueryPlan::GpuSort{sortIdxBuf, nResultsExpr, sortDesc, -1};
 }
 
 std::string exprToMetalForHaving(const ExprPtr& expr,

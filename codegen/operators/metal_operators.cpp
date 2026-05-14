@@ -847,7 +847,7 @@ void MetalKeyedAgg::addAggregate(const std::string& name, int offset,
                                   bool isLongPair,
                                   int scaleDown) {
     aggregates_.push_back({name, offset, valueExpr, atomicOp, isLongPair, scaleDown,
-                           false, false});
+                           false, false, "", ""});
 }
 
 void MetalKeyedAgg::addAggregateWithMeta(const std::string& name, int offset,
@@ -1337,49 +1337,46 @@ std::string MetalBitmapPopcount::describe() const {
 
 MetalInitSortKeys::MetalInitSortKeys(const std::string& sourceColumn, const std::string& sourceType,
                                      const std::string& sortKeyBuf, const std::string& sortIdxBuf,
-                                     const std::string& nResultsExpr, bool descending)
+                                     const std::string& nResultsExpr, bool descending,
+                                     const std::string& capacityExpr)
     : sourceColumn_(sourceColumn), sourceType_(sourceType),
       sortKeyBuf_(sortKeyBuf), sortIdxBuf_(sortIdxBuf),
-      nResultsExpr_(nResultsExpr), descending_(descending) {}
+      nResultsExpr_(nResultsExpr), capacityExpr_(capacityExpr),
+      descending_(descending) {}
 
 void MetalInitSortKeys::produce(MetalCodegen& cg, ConsumerFn consume) {
     // Size expressions
-    std::string srckeySize = nResultsExpr_;
-    std::string paddedSize = "next_pow2(" + nResultsExpr_ + ")";
+    std::string capacity = capacityExpr_.empty() ? nResultsExpr_ : capacityExpr_;
+    std::string srckeySize = capacity;
+    std::string paddedSize = "next_pow2(" + capacity + ")";
 
     // Allocate padded sort buffers (zero-init; fills padding with 0xFF for keys, 0 for indices)
     cg.addBufferParam(sortKeyBuf_, "uint64_t", paddedSize, true, 0xFF);
     cg.addBufferParam(sortIdxBuf_, "int", paddedSize, true);
-    cg.addScalarParam("n_" + nResultsExpr_, "uint");
+    cg.addScalarParam(nResultsExpr_, "uint");
 
     // Source buffer (read-only, already allocated by a prior phase)
     cg.addBufferParam(sourceColumn_, sourceType_, srckeySize, false);
 
-    // Key encoding: grid-stride over the source column
+    // Key encoding: grid-stride over the source column.  Keep the encoding
+    // inline because Metal does not allow helper function declarations inside
+    // generated kernel bodies.
     std::string idxVar = "i";
-    if (sourceType_ == "float") {
-        // IEEE 754 float → uint64_t: reinterpret as uint32_t, flip sign, zero-extend
-        cg.addLine("uint64_t _encode_float(float v) {");
-        cg.addLine("    uint32_t bits = as_type<uint32_t>(v);");
-        cg.addLine("    uint64_t out = (int32_t(bits) < 0) ? ~uint64_t(bits) : (uint64_t(bits) ^ 0x8000000000000000ULL);");
-        cg.addLine("    return " + std::string(descending_ ? "~out" : "out") + ";");
-        cg.addLine("}");
-    } else {
-        // int: flip sign bit, zero-extend
-        cg.addLine("uint64_t _encode_int(int v) {");
-        cg.addLine("    uint64_t out = uint64_t(uint32_t(v) ^ 0x80000000u);");
-        cg.addLine("    return " + std::string(descending_ ? "~out" : "out") + ";");
-        cg.addLine("}");
-    }
 
     cg.addBlock("for (uint " + idxVar + " = tid; " + idxVar +
-                " < n_" + nResultsExpr_ + "; " + idxVar + " += tpg)", [&]() {
+                " < " + nResultsExpr_ + "; " + idxVar + " += tpg)", [&]() {
         std::string valExpr = sourceColumn_ + "[" + idxVar + "]";
         if (sourceType_ == "float") {
-            cg.addLine(sortKeyBuf_ + "[" + idxVar + "] = _encode_float(" + valExpr + ");");
+            cg.addLine("uint _sort_bits = as_type<uint>(" + valExpr + ");");
+            cg.addLine("uint _sort_key32 = ((_sort_bits & 0x80000000u) != 0u) ? "
+                       "(~_sort_bits) : (_sort_bits ^ 0x80000000u);");
+            cg.addLine("uint64_t _sort_key = uint64_t(_sort_key32);");
         } else {
-            cg.addLine(sortKeyBuf_ + "[" + idxVar + "] = _encode_int(" + valExpr + ");");
+            cg.addLine("uint64_t _sort_key = uint64_t(uint(" + valExpr + ") ^ 0x80000000u);");
         }
+        if (descending_)
+            cg.addLine("_sort_key = ~_sort_key;");
+        cg.addLine(sortKeyBuf_ + "[" + idxVar + "] = _sort_key;");
         cg.addLine(sortIdxBuf_ + "[" + idxVar + "] = " + idxVar + ";");
     });
     consume(); // no downstream operators
@@ -1466,14 +1463,16 @@ std::string MetalInitSortKeys::describe() const {
 
 MetalBitonicSortStep::MetalBitonicSortStep(const std::string& sortKeyBuf,
                                            const std::string& sortIdxBuf,
-                                           const std::string& nResultsExpr)
+                                           const std::string& nResultsExpr,
+                                           const std::string& capacityExpr)
     : sortKeyBuf_(sortKeyBuf), sortIdxBuf_(sortIdxBuf),
-      nResultsExpr_(nResultsExpr) {}
+      nResultsExpr_(nResultsExpr), capacityExpr_(capacityExpr) {}
 
 void MetalBitonicSortStep::produce(MetalCodegen& cg, ConsumerFn consume) {
     // Allocate sort buffers (already allocated by init phase; addBitmapReadParam
     // tells the executor to look these up in allocatedBuffers_)
-    std::string paddedSize = "next_pow2(" + nResultsExpr_ + ")";
+    std::string capacity = capacityExpr_.empty() ? nResultsExpr_ : capacityExpr_;
+    std::string paddedSize = "next_pow2(" + capacity + ")";
     cg.addBufferParam(sortKeyBuf_, "uint64_t", paddedSize, false);
     cg.addBufferParam(sortIdxBuf_, "int", paddedSize, false);
     cg.addScalarParam("sort_k", "uint");

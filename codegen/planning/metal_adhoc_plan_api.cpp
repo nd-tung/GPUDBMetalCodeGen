@@ -1,7 +1,36 @@
 #include "metal_adhoc_plan_api.h"
 #include "metal_generic_adhoc_builder.h"
 
+#include <sstream>
+#include <vector>
+
 namespace codegen {
+
+namespace {
+
+bool validateStrictGenericPlan(const MetalQueryPlan& plan, std::string* error) {
+    std::vector<std::string> fallbacks;
+    if (plan.cpuSort) fallbacks.push_back("cpuSort");
+    if (plan.cpuGroupBy) fallbacks.push_back("cpuGroupBy");
+    if (plan.cpuScalarAgg) fallbacks.push_back("cpuScalarAgg");
+    if (fallbacks.empty()) return true;
+
+    if (error) {
+        std::ostringstream oss;
+        oss << "Strict generic SQL plan contains CPU relational fallback";
+        if (fallbacks.size() > 1) oss << "s";
+        oss << ": ";
+        for (size_t i = 0; i < fallbacks.size(); ++i) {
+            if (i) oss << ", ";
+            oss << fallbacks[i];
+        }
+        oss << ". This SQL shape must be implemented with GPU generic operators or rejected as unsupported.";
+        *error = oss.str();
+    }
+    return false;
+}
+
+} // namespace
 
 std::optional<MetalQueryPlan> buildAdhocSQLPlan(const AnalyzedQuery& aq,
                                                 const std::string& label,
@@ -9,15 +38,11 @@ std::optional<MetalQueryPlan> buildAdhocSQLPlan(const AnalyzedQuery& aq,
     std::string singleError, multiError;
     auto dispatch = [&]() -> std::optional<MetalQueryPlan> {
         if (auto p = buildGenericSingleTableAdhocPlan(aq, &singleError)) {
-            if (getenv("GEN_DEBUG")) fprintf(stderr, "[DISPATCH] -> buildGenericSingleTableAdhocPlan\n");
             return p;
         }
         if (auto p = buildGenericMultiTableAdhocPlan(aq, &multiError)) {
-            if (getenv("GEN_DEBUG")) fprintf(stderr, "[DISPATCH] -> buildGenericMultiTableAdhocPlan\n");
             return p;
         }
-        if (getenv("GEN_DEBUG")) fprintf(stderr, "[DISPATCH] no builder matched. singleErr=%s multiErr=%s\n",
-                                         singleError.c_str(), multiError.c_str());
         return std::nullopt;
     };
 
@@ -31,6 +56,9 @@ std::optional<MetalQueryPlan> buildAdhocSQLPlan(const AnalyzedQuery& aq,
             *error = "Ad-hoc SQL: query does not match any supported pattern.";
     }
     if (!plan) return plan;
+
+    if (!validateStrictGenericPlan(*plan, error))
+        return std::nullopt;
 
     if (!label.empty()) plan->name = label;
     if (label.rfind("MB", 0) == 0) plan->chunkable = true;

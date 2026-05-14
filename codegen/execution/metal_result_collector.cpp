@@ -609,6 +609,8 @@ GenericResult MetalResultCollector::collectKeyedAgg(const MetalResultSchema& sch
                     } else {
                         sumVal = (double)(int64_t)data[rowBase + slot.offset];
                     }
+                    if (slot.scaleDown < -1)
+                        sumVal /= static_cast<double>(-slot.scaleDown);
                     if (cntSlot.isFloatSum) {
                         uint32_t raw = data[rowBase + cntSlot.offset];
                         float f; memcpy(&f, &raw, sizeof(float));
@@ -719,12 +721,31 @@ GenericResult MetalResultCollector::collectMaterialize(const MetalResultSchema& 
                 continue;
             }
 
-            if (col.elementType == "float") {
+            if (col.isLongPair) {
+                const auto* arr = static_cast<const uint32_t*>(bIt->second->contents());
+                uint32_t lo = arr[r * 2];
+                uint32_t hi = arr[r * 2 + 1];
+                int64_t v = ((int64_t)hi << 32) | (int64_t)lo;
+                if (col.scaleDown > 0)
+                    row.push_back(static_cast<double>(v) / col.scaleDown);
+                else
+                    row.push_back(v);
+            } else if (col.elementType == "float") {
                 const auto* arr = static_cast<const float*>(bIt->second->contents());
                 row.push_back(static_cast<double>(arr[r]));
             } else if (col.elementType == "int" || col.elementType == "uint") {
                 const auto* arr = static_cast<const uint32_t*>(bIt->second->contents());
-                row.push_back(static_cast<int64_t>(arr[r]));
+                int64_t v = static_cast<int64_t>(arr[r]);
+                if (col.scaleDown > 0)
+                    row.push_back(static_cast<double>(v) / col.scaleDown);
+                else
+                    row.push_back(v);
+            } else if (col.elementType == "long") {
+                const auto* arr = static_cast<const int64_t*>(bIt->second->contents());
+                if (col.scaleDown > 0)
+                    row.push_back(static_cast<double>(arr[r]) / col.scaleDown);
+                else
+                    row.push_back(static_cast<int64_t>(arr[r]));
             } else if (col.elementType == "char") {
                 if (col.stringLen > 0) {
                     const auto* arr = static_cast<const char*>(bIt->second->contents());

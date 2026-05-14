@@ -112,6 +112,7 @@ struct MetalResultSchema {
         std::string elementType;    // "uint", "float", "char"
         int stringLen = 0;          // for fixed-width strings
         bool isLongPair = false;    // needs lo/hi reconstruction
+        int scaleDown = 0;          // optional display divisor for scaled integers
     };
     std::vector<ColumnDesc> columns;
 

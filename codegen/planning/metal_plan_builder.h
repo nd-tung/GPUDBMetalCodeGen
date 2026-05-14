@@ -114,6 +114,7 @@ struct MetalQueryPlan {
         std::string sortedIndexBuffer;   // name of int[] buffer with sorted indices
         std::string nResults;            // symbolic name for the row count (e.g. n_lineitem)
         bool descending = false;         // column sort direction
+        int limit = -1;                  // optional LIMIT after GPU ordering
     };
     std::optional<GpuSort> gpuSort;
 
