@@ -252,7 +252,8 @@ std::optional<std::string> fixedStringComparisonMetal(const Comparison& cmp,
 
 std::string exprToMetalForPredicate(const ExprPtr& expr,
                                     const ExprPtr& other,
-                                    const std::string& idxVar) {
+                                    const std::string& idxVar,
+                                    const SchemaProvider* schema = nullptr) {
     if (isDateColumnExpr(other)) {
         if (auto dateValue = parseDateStringExpr(expr)) {
             return std::to_string(*dateValue);
@@ -273,7 +274,7 @@ std::string exprToMetalForPredicate(const ExprPtr& expr,
             }
         }
     }
-    return exprToMetal(expr, idxVar);
+    return exprToMetal(expr, idxVar, schema);
 }
 
 } // namespace
@@ -402,8 +403,8 @@ std::string exprToMetal(const ExprPtr& expr, const std::string& idxVar,
             }, node.value);
         }
         else if constexpr (std::is_same_v<T, BinaryExpr>) {
-            std::string l = exprToMetal(node.left, idxVar);
-            std::string r = exprToMetal(node.right, idxVar);
+            std::string l = exprToMetal(node.left, idxVar, schema);
+            std::string r = exprToMetal(node.right, idxVar, schema);
             switch (node.op) {
                 case ExprOp::ADD: return "(" + l + " + " + r + ")";
                 case ExprOp::SUB: return "(" + l + " - " + r + ")";
@@ -422,7 +423,7 @@ std::string exprToMetal(const ExprPtr& expr, const std::string& idxVar,
                         if (auto* s = std::get_if<std::string>(&lit->value)) unit = *s;
                     }
                 }
-                std::string col = node.args.size() > 1 ? exprToMetal(node.args[1], idxVar) : "";
+                std::string col = node.args.size() > 1 ? exprToMetal(node.args[1], idxVar, schema) : "";
                 if (unit == "year")   return "(" + col + " / 10000)";
                 if (unit == "month") return "((" + col + " / 100) % 100)";
                 if (unit == "day")    return "(" + col + " % 100)";
@@ -446,9 +447,10 @@ std::string exprToMetal(const ExprPtr& expr, const std::string& idxVar,
                 if (node.args.size() > 0 && node.args[0]) {
                     if (auto* cr = std::get_if<ColRef>(&node.args[0]->node)) {
                         colName = cr->column;
-                    try {
-                        if (schema) fw = schema->columnFixedWidth(cr->table, cr->column);
-                    } catch (...) {}
+                        try {
+                            if (schema) fw = schema->columnFixedWidth(cr->table, cr->column);
+                        } catch (...) {}
+                        if (fw <= 0) fw = cr->fixedWidth;
                     }
                 }
                 if (colName.empty()) return "0";
@@ -473,21 +475,21 @@ std::string exprToMetal(const ExprPtr& expr, const std::string& idxVar,
             // — these are emitted as raw inner expressions for materialize/agg.
             if (node.name == "sum" || node.name == "count" || node.name == "avg" ||
                 node.name == "min" || node.name == "max") {
-                if (!node.args.empty()) return exprToMetal(node.args[0], idxVar);
+                if (!node.args.empty()) return exprToMetal(node.args[0], idxVar, schema);
                 return "0";
             }
             std::ostringstream os;
             os << node.name << "(";
             for (size_t i = 0; i < node.args.size(); i++) {
                 if (i) os << ", ";
-                os << exprToMetal(node.args[i], idxVar);
+                os << exprToMetal(node.args[i], idxVar, schema);
             }
             os << ")";
             return os.str();
         }
         else if constexpr (std::is_same_v<T, CaseWhen>) {
             if (node.branches.empty()) {
-                if (node.elseResult) return exprToMetal(node.elseResult, idxVar);
+                if (node.elseResult) return exprToMetal(node.elseResult, idxVar, schema);
                 return "0";
             }
             std::string result = "(";
@@ -506,7 +508,7 @@ std::string exprToMetal(const ExprPtr& expr, const std::string& idxVar,
                 result += cond + " ? " + val;
             }
             if (node.elseResult)
-                result += " : " + exprToMetal(node.elseResult, idxVar);
+                result += " : " + exprToMetal(node.elseResult, idxVar, schema);
             else
                 result += " : 0";
             result += ")";
@@ -529,8 +531,8 @@ std::string predToMetal(const PredPtr& pred, const std::string& idxVar,
             if (auto fixedStringCmp = fixedStringComparisonMetal(node, idxVar, schema)) {
                 return *fixedStringCmp;
             }
-            std::string l = exprToMetalForPredicate(node.left, node.right, idxVar);
-            std::string r = exprToMetalForPredicate(node.right, node.left, idxVar);
+            std::string l = exprToMetalForPredicate(node.left, node.right, idxVar, schema);
+            std::string r = exprToMetalForPredicate(node.right, node.left, idxVar, schema);
             switch (node.op) {
                 case CmpOp::EQ: return l + " == " + r;
                 case CmpOp::NE: return l + " != " + r;
@@ -542,9 +544,9 @@ std::string predToMetal(const PredPtr& pred, const std::string& idxVar,
             return l + " == " + r;
         }
         else if constexpr (std::is_same_v<T, Between>) {
-            std::string e = exprToMetal(node.expr, idxVar);
-            std::string lo = exprToMetalForPredicate(node.low, node.expr, idxVar);
-            std::string hi = exprToMetalForPredicate(node.high, node.expr, idxVar);
+            std::string e = exprToMetal(node.expr, idxVar, schema);
+            std::string lo = exprToMetalForPredicate(node.low, node.expr, idxVar, schema);
+            std::string hi = exprToMetalForPredicate(node.high, node.expr, idxVar, schema);
             return "(" + e + " >= " + lo + " && " + e + " <= " + hi + ")";
         }
         else if constexpr (std::is_same_v<T, InList>) {
@@ -572,11 +574,11 @@ std::string predToMetal(const PredPtr& pred, const std::string& idxVar,
                     return cond.empty() ? "false" : "(" + cond + ")";
                 }
             }
-            std::string e = exprToMetal(node.expr, idxVar);
+            std::string e = exprToMetal(node.expr, idxVar, schema);
             std::string cond;
             for (size_t i = 0; i < node.values.size(); i++) {
                 if (i) cond += " || ";
-                cond += e + " == " + exprToMetalForPredicate(node.values[i], node.expr, idxVar);
+                cond += e + " == " + exprToMetalForPredicate(node.values[i], node.expr, idxVar, schema);
             }
             return "(" + cond + ")";
         }
@@ -584,7 +586,7 @@ std::string predToMetal(const PredPtr& pred, const std::string& idxVar,
             std::string cond;
             for (size_t i = 0; i < node.children.size(); i++) {
                 if (i) cond += " && ";
-                cond += "(" + predToMetal(node.children[i], idxVar) + ")";
+                cond += "(" + predToMetal(node.children[i], idxVar, schema) + ")";
             }
             return cond;
         }
@@ -592,12 +594,12 @@ std::string predToMetal(const PredPtr& pred, const std::string& idxVar,
             std::string cond;
             for (size_t i = 0; i < node.children.size(); i++) {
                 if (i) cond += " || ";
-                cond += "(" + predToMetal(node.children[i], idxVar) + ")";
+                cond += "(" + predToMetal(node.children[i], idxVar, schema) + ")";
             }
             return "(" + cond + ")";
         }
         else if constexpr (std::is_same_v<T, LogicalNot>) {
-            return "!(" + predToMetal(node.child, idxVar) + ")";
+            return "!(" + predToMetal(node.child, idxVar, schema) + ")";
         }
         else if constexpr (std::is_same_v<T, Like>) {
             if (auto fixedStringLike = fixedStringLikeMetal(node, idxVar, schema)) {

@@ -783,6 +783,24 @@ SelectTarget extractTarget(const json& resTarget, const std::vector<std::string>
     SelectTarget st;
     st.alias = resTarget.value("name", "");
     auto& val = resTarget["val"];
+    auto sqlVisibleColumnName = [](const json& expr) -> std::string {
+        if (!expr.contains("ColumnRef")) return "";
+        const auto& cr = expr["ColumnRef"];
+        if (!cr.contains("fields") || !cr["fields"].is_array() || cr["fields"].empty())
+            return "";
+        const auto& field = cr["fields"].back();
+        if (field.contains("String") && field["String"].contains("sval"))
+            return field["String"]["sval"].get<std::string>();
+        if (field.contains("sval"))
+            return field["sval"].get<std::string>();
+        return "";
+    };
+    if (st.alias.empty()) {
+        // Preserve the SQL-visible name of a direct SELECT column before
+        // resolution rewrites FROM-subquery aliases to their source
+        // expressions (e.g. `supp_nation` -> `n1.n_name`).
+        st.alias = sqlVisibleColumnName(val);
+    }
     if (val.contains("FuncCall")) {
         auto& fc = val["FuncCall"];
         std::string funcName;

@@ -194,7 +194,7 @@ MetalRangeScan::MetalRangeScan(const std::string& rangeName, const std::string& 
 
 void MetalRangeScan::produce(MetalCodegen& cg, ConsumerFn consume) {
     cg.setPhaseScannedTable(rangeName_);
-    cg.addScalarParam("n_" + rangeName_, "uint");
+    cg.addResolvedScalarParam("n_" + rangeName_, "uint", rangeName_);
     for (const auto& sc : sideColumns_) {
         cg.addColumnParam(sc.param, sc.type, sc.table);
     }
@@ -1171,8 +1171,13 @@ void MetalAtomicAgg::produce(MetalCodegen& cg, ConsumerFn consume) {
     cg.addAtomicBufferParam(arrayName_, atomicType_, sizeExpr_);
 
     child_->produce(cg, [&]() {
-        cg.addLine("atomic_fetch_add_explicit(&" + arrayName_ + "[" + bucketExpr_ +
-                   "], (" + castType_ + ")(" + valueExpr_ + "), memory_order_relaxed);");
+        if (atomicType_ == "atomic_uint" && castType_ == "float") {
+            cg.addLine("atomic_add_float(&" + arrayName_ + "[" + bucketExpr_ +
+                       "], (float)(" + valueExpr_ + "));");
+        } else {
+            cg.addLine("atomic_fetch_add_explicit(&" + arrayName_ + "[" + bucketExpr_ +
+                       "], (" + castType_ + ")(" + valueExpr_ + "), memory_order_relaxed);");
+        }
         consume();
     });
 }
