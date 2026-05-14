@@ -1258,6 +1258,22 @@ struct MultiTableTreeNode {
     bool composite() const { return !keyOnSelf2.empty(); }
 };
 
+struct ExistsDistinctInfo {
+    int childIdx = -1;
+    size_t filterIndex = 0;
+    std::string childValueCol;
+    std::string parentValueCol;
+    std::string firstBuffer;
+    std::string stateBuffer;
+    std::string multiBitmap;
+    bool anti = false;
+};
+
+bool colRefMatchesNode(const ColRef& col, const MultiTableTreeNode& node) {
+    if (!col.tableAlias.empty()) return col.tableAlias == node.table;
+    return col.table == node.baseTable || col.table == node.table;
+}
+
 // Build a tree rooted at `probeIdx` from `aq.joins`.  Each edge is
 // consumed exactly once via BFS; if any join is unused or any table
 // is unreachable the function returns false.  Edges between the same
@@ -1639,6 +1655,137 @@ std::optional<std::string> inSubqueryAggregateCarryExpr(
     }
     return std::nullopt;
 }
+
+class MetalExistsDistinctBuild : public MetalUnaryOperator {
+public:
+    MetalExistsDistinctBuild(std::unique_ptr<MetalOperator> child,
+                             std::string firstBuffer,
+                             std::string stateBuffer,
+                             std::string multiBitmap,
+                             std::string keyExpr,
+                             std::string valueExpr,
+                             std::string sizeExpr)
+        : MetalUnaryOperator(std::move(child)),
+          firstBuffer_(std::move(firstBuffer)),
+          stateBuffer_(std::move(stateBuffer)),
+          multiBitmap_(std::move(multiBitmap)),
+          keyExpr_(std::move(keyExpr)),
+          valueExpr_(std::move(valueExpr)),
+          sizeExpr_(std::move(sizeExpr)) {}
+
+    void produce(MetalCodegen& cg, ConsumerFn consume) override {
+        cg.addAtomicBufferParam(firstBuffer_, "atomic_uint", sizeExpr_);
+        cg.addAtomicBufferParam(stateBuffer_, "atomic_uint", sizeExpr_);
+        cg.addBitmapWriteParam(multiBitmap_, "(" + sizeExpr_ + " + 31) / 32");
+
+        const std::string suffix = sanitizeIdentifier(firstBuffer_);
+        child_->produce(cg, [&]() {
+            cg.addLine("uint _exists_key_" + suffix + " = (uint)(" + keyExpr_ + ");");
+            cg.addLine("uint _exists_val_" + suffix + " = (uint)(" + valueExpr_ + ");");
+            cg.addLine("while (true) {");
+            cg.addLine("    uint _exists_state_" + suffix + " = atomic_load_explicit(&" +
+                       stateBuffer_ + "[_exists_key_" + suffix + "], memory_order_relaxed);");
+            cg.addLine("    if (_exists_state_" + suffix + " == 0u) {");
+            cg.addLine("        uint _exists_expected_" + suffix + " = 0u;");
+            cg.addLine("        if (atomic_compare_exchange_weak_explicit(&" + stateBuffer_ +
+                       "[_exists_key_" + suffix + "], &_exists_expected_" + suffix +
+                       ", 1u, memory_order_relaxed, memory_order_relaxed)) {");
+            cg.addLine("            atomic_store_explicit(&" + firstBuffer_ + "[_exists_key_" +
+                       suffix + "], _exists_val_" + suffix + ", memory_order_relaxed);");
+            cg.addLine("            atomic_store_explicit(&" + stateBuffer_ + "[_exists_key_" +
+                       suffix + "], 2u, memory_order_relaxed);");
+            cg.addLine("            break;");
+            cg.addLine("        }");
+            cg.addLine("    } else if (_exists_state_" + suffix + " == 2u) {");
+            cg.addLine("        uint _exists_first_" + suffix + " = atomic_load_explicit(&" +
+                       firstBuffer_ + "[_exists_key_" + suffix + "], memory_order_relaxed);");
+            cg.addLine("        if (_exists_first_" + suffix + " != _exists_val_" + suffix +
+                       ") bitmap_set(" + multiBitmap_ + ", _exists_key_" + suffix + ");");
+            cg.addLine("        break;");
+            cg.addLine("    }");
+            cg.addLine("}");
+            consume();
+        });
+    }
+
+    std::string describe() const override {
+        return "ExistsDistinctBuild(" + firstBuffer_ + ")";
+    }
+
+    void iusUsed(std::vector<IU>& out) const override {
+        appendIUsFromExpr(keyExpr_, out);
+        appendIUsFromExpr(valueExpr_, out);
+    }
+
+private:
+    std::string firstBuffer_;
+    std::string stateBuffer_;
+    std::string multiBitmap_;
+    std::string keyExpr_;
+    std::string valueExpr_;
+    std::string sizeExpr_;
+};
+
+class MetalExistsDistinctProbe : public MetalUnaryOperator {
+public:
+    MetalExistsDistinctProbe(std::unique_ptr<MetalOperator> child,
+                             std::string firstBuffer,
+                             std::string stateBuffer,
+                             std::string multiBitmap,
+                             std::string keyExpr,
+                             std::string valueExpr,
+                             bool anti)
+        : MetalUnaryOperator(std::move(child)),
+          firstBuffer_(std::move(firstBuffer)),
+          stateBuffer_(std::move(stateBuffer)),
+          multiBitmap_(std::move(multiBitmap)),
+          keyExpr_(std::move(keyExpr)),
+          valueExpr_(std::move(valueExpr)),
+          anti_(anti) {}
+
+    void produce(MetalCodegen& cg, ConsumerFn consume) override {
+        cg.addBufferParam(firstBuffer_, "const atomic_uint", "", false);
+        cg.addBufferParam(stateBuffer_, "const atomic_uint", "", false);
+        cg.addBitmapReadParam(multiBitmap_, "");
+
+        const std::string suffix = sanitizeIdentifier(firstBuffer_);
+        child_->produce(cg, [&]() {
+            cg.addLine("uint _exists_key_" + suffix + " = (uint)(" + keyExpr_ + ");");
+            cg.addLine("uint _exists_val_" + suffix + " = (uint)(" + valueExpr_ + ");");
+            cg.addLine("uint _exists_state_" + suffix + " = atomic_load_explicit(&" +
+                       stateBuffer_ + "[_exists_key_" + suffix + "], memory_order_relaxed);");
+            cg.addLine("bool _exists_other_" + suffix + " = false;");
+            cg.addLine("if (_exists_state_" + suffix + " == 2u) {");
+            cg.addLine("    uint _exists_first_" + suffix + " = atomic_load_explicit(&" +
+                       firstBuffer_ + "[_exists_key_" + suffix + "], memory_order_relaxed);");
+            cg.addLine("    _exists_other_" + suffix + " = bitmap_test_atomic(" +
+                       multiBitmap_ + ", _exists_key_" + suffix + ") || " +
+                       "(_exists_first_" + suffix + " != _exists_val_" + suffix + ");");
+            cg.addLine("}");
+            cg.addIf(std::string(anti_ ? "!" : "") + "_exists_other_" + suffix, [&]() {
+                consume();
+            });
+        });
+    }
+
+    std::string describe() const override {
+        return std::string(anti_ ? "NotExistsDistinctProbe(" : "ExistsDistinctProbe(") +
+               firstBuffer_ + ")";
+    }
+
+    void iusUsed(std::vector<IU>& out) const override {
+        appendIUsFromExpr(keyExpr_, out);
+        appendIUsFromExpr(valueExpr_, out);
+    }
+
+private:
+    std::string firstBuffer_;
+    std::string stateBuffer_;
+    std::string multiBitmap_;
+    std::string keyExpr_;
+    std::string valueExpr_;
+    bool anti_;
+};
 
 // Returns the table that owns column `c` (looking up the schema).
 // If the column appears in multiple tables (column-name collision is
@@ -3264,6 +3411,71 @@ std::optional<MetalQueryPlan> buildGenericMultiTableAdhocPlan_impl(
             neededByTable[owner].insert(col);
     }
 
+    std::map<int, ExistsDistinctInfo> existsDistinctByChild;
+    std::set<size_t> consumedCrossFilters;
+    for (int child = 0; child < (int)nodes.size(); ++child) {
+        if (!nodes[child].semi || nodes[child].parent != probeIdx || nodes[child].composite())
+            continue;
+        int parent = nodes[child].parent;
+        if (parent < 0) continue;
+        for (size_t fi = 0; fi < crossFilters.size(); ++fi) {
+            if (consumedCrossFilters.count(fi)) continue;
+            auto* cmp = crossFilters[fi] ? std::get_if<Comparison>(&crossFilters[fi]->node) : nullptr;
+            if (!cmp || cmp->op != CmpOp::NE) continue;
+            auto* left = cmp->left ? std::get_if<ColRef>(&cmp->left->node) : nullptr;
+            auto* right = cmp->right ? std::get_if<ColRef>(&cmp->right->node) : nullptr;
+            if (!left || !right) continue;
+
+            const ColRef* childCol = nullptr;
+            const ColRef* parentCol = nullptr;
+            if (colRefMatchesNode(*left, nodes[child]) &&
+                colRefMatchesNode(*right, nodes[parent])) {
+                childCol = left;
+                parentCol = right;
+            } else if (colRefMatchesNode(*right, nodes[child]) &&
+                       colRefMatchesNode(*left, nodes[parent])) {
+                childCol = right;
+                parentCol = left;
+            } else {
+                continue;
+            }
+
+            DataType childType = aq.schema->columnType(nodes[child].baseTable, childCol->column);
+            DataType parentType = aq.schema->columnType(nodes[parent].baseTable, parentCol->column);
+            if ((childType != DataType::INT && childType != DataType::DATE &&
+                 childType != DataType::CHAR1) ||
+                childType != parentType) {
+                continue;
+            }
+
+            ExistsDistinctInfo info;
+            info.childIdx = child;
+            info.filterIndex = fi;
+            info.childValueCol = childCol->column;
+            info.parentValueCol = parentCol->column;
+            info.firstBuffer = "d_exists_" + nodes[child].table + "_" +
+                               sanitizeIdentifier(childCol->column) + "_first";
+            info.stateBuffer = "d_exists_" + nodes[child].table + "_" +
+                               sanitizeIdentifier(childCol->column) + "_state";
+            info.multiBitmap = "d_exists_" + nodes[child].table + "_" +
+                               sanitizeIdentifier(childCol->column) + "_multi";
+            info.anti = nodes[child].anti;
+            existsDistinctByChild[child] = info;
+            consumedCrossFilters.insert(fi);
+            neededByTable[nodes[child].baseTable].insert(info.childValueCol);
+            neededByTable[nodes[parent].baseTable].insert(info.parentValueCol);
+            break;
+        }
+    }
+    if (!consumedCrossFilters.empty()) {
+        std::vector<PredPtr> residualCrossFilters;
+        for (size_t fi = 0; fi < crossFilters.size(); ++fi) {
+            if (!consumedCrossFilters.count(fi))
+                residualCrossFilters.push_back(crossFilters[fi]);
+        }
+        crossFilters.swap(residualCrossFilters);
+    }
+
     // ---------- Validate non-probe nodes ----------
     // PK uniqueness is required for IndexJoin (value carrying).  SemiJoin-only
     // edges (no carries from this node or its descendants) can use any column
@@ -3618,6 +3830,21 @@ std::optional<MetalQueryPlan> buildGenericMultiTableAdhocPlan_impl(
         auto pkU = multiTablePkInfo(tname, aq.schema);
         const std::string sizeSym = pkU->sizeSym;
 
+        auto existsDistinctIt = existsDistinctByChild.find(u);
+        if (existsDistinctIt != existsDistinctByChild.end()) {
+            const auto& info = existsDistinctIt->second;
+            pipe = std::make_unique<MetalExistsDistinctBuild>(
+                std::move(pipe),
+                info.firstBuffer,
+                info.stateBuffer,
+                info.multiBitmap,
+                storeKey,
+                info.childValueCol + "[" + idxVar + "]",
+                sizeSym);
+            appendPhase(plan, "ADHOC_multi_build_" + tag, std::move(pipe));
+            continue;
+        }
+
         const auto& sub = subtreeCarry[u];
         // Always create a bitmap for the SemiJoin filter.
         pipe = std::make_unique<MetalBitmapBuild>(
@@ -3801,6 +4028,20 @@ std::optional<MetalQueryPlan> buildGenericMultiTableAdhocPlan_impl(
     for (int c : nodes[probeIdx].children) {
         const std::string& probeKey = nodes[c].keyOnParent + "[" + idxVar + "]";
         const auto& subC = subtreeCarry[c];
+
+        auto existsDistinctIt = existsDistinctByChild.find(c);
+        if (existsDistinctIt != existsDistinctByChild.end()) {
+            const auto& info = existsDistinctIt->second;
+            probePipe = std::make_unique<MetalExistsDistinctProbe>(
+                std::move(probePipe),
+                info.firstBuffer,
+                info.stateBuffer,
+                info.multiBitmap,
+                probeKey,
+                info.parentValueCol + "[" + idxVar + "]",
+                info.anti);
+            continue;
+        }
 
         if (nodes[c].useHashJoin) {
             // HashJoin probe.  Capacity expression must match the
