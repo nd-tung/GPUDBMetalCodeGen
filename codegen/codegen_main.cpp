@@ -334,6 +334,10 @@ static void applyGpuSortRemap(codegen::GenericResult& result,
         sortedRows[i] = std::move(result.rows[remap[i]]);
     }
     result.rows = std::move(sortedRows);
+
+    if (gpuSort.limit >= 0 && result.rows.size() > static_cast<size_t>(gpuSort.limit)) {
+        result.rows.resize(static_cast<size_t>(gpuSort.limit));
+    }
 }
 
 // Host-side GROUP BY for MaterializeAgg fallback.
@@ -654,6 +658,19 @@ static bool runCodegenQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
             if (plan.cpuSort) {
                 printf("  cpuSort.keys      : %zu  limit=%d\n",
                        plan.cpuSort->keys.size(), plan.cpuSort->limit);
+            }
+            if (plan.cpuGroupBy) {
+                printf("  cpuGroupBy.keys   : %zu  aggs=%zu\n",
+                       plan.cpuGroupBy->keyColumns.size(),
+                       plan.cpuGroupBy->aggColumns.size());
+            }
+            if (plan.cpuScalarAgg) {
+                printf("  cpuScalarAgg.aggs : %zu\n",
+                       plan.cpuScalarAgg->aggColumns.size());
+            }
+            if (plan.gpuSort) {
+                printf("  gpuSort.index     : %s  limit=%d\n",
+                       plan.gpuSort->sortedIndexBuffer.c_str(), plan.gpuSort->limit);
             }
             printf("---\n");
 

@@ -139,7 +139,8 @@ public:
                                         ExprPtr projectionExpr = nullptr);
     void registerMaterializeOutput(const std::string& counterBuffer);
     void registerOutputColumn(const std::string& displayName, const std::string& bufferName,
-                              const std::string& elementType, int stringLen = 0);
+                              const std::string& elementType, int stringLen = 0,
+                              int scaleDown = 0, bool isLongPair = false);
     void registerKeyedAggOutput(const std::string& bufferName, int numBuckets, int valuesPerBucket,
                                 const std::vector<MetalResultSchema::KeyedAggSlot>& slots = {},
                                 const std::string& keyDisplayName = "",

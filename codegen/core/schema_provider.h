@@ -38,6 +38,16 @@ public:
 
     // Table metadata for codegen.
     virtual std::string maxKeySymbol(const std::string& table) const = 0;
+    virtual std::string keyDomainSymbol(const std::string& table,
+                                        const std::string& col) const {
+        (void)table;
+        (void)col;
+        return "";
+    }
+    virtual std::string distinctDomainSymbol(const std::string& table,
+                                             const std::string& col) const {
+        return keyDomainSymbol(table, col);
+    }
     virtual std::vector<std::string> tableNames() const = 0;
 
     // GROUP BY domain info.
@@ -50,6 +60,15 @@ public:
     virtual int tableProbePriority(const std::string& table) const = 0;
     virtual std::optional<std::pair<std::string, std::string>> pkInfo(
         const std::string& table) const = 0;
+
+    // Decimal-like FLOAT metadata.  A positive value means the column can be
+    // represented as round(value * scale) for deterministic integer SUM/AVG.
+    virtual int numericScale(const std::string& table,
+                             const std::string& col) const {
+        (void)table;
+        (void)col;
+        return 0;
+    }
 
     // Runtime sizing.
     virtual size_t tableRowCount(const std::string& table) const = 0;

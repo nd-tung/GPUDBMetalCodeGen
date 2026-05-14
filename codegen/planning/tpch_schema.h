@@ -5,9 +5,7 @@
 #include <vector>
 #include <unordered_map>
 #include <stdexcept>
-#include <string>
-#include <vector>
-#include <unordered_map>
+#include <utility>
 
 namespace codegen {
 
@@ -26,6 +24,17 @@ struct ColumnDef {
     int         domainMin = -1;    // for INT/DATE GROUP BY: -1 means unknown
     int         domainMax = -1;    // for INT/DATE GROUP BY: -1 means unknown
     std::vector<char> charDomain;  // for CHAR1 GROUP BY: ordered known values
+
+    ColumnDef(std::string n, int idx, DataType dt,
+              int width = 0, int minDomain = -1, int maxDomain = -1,
+              std::vector<char> chars = {})
+        : name(std::move(n)),
+          index(idx),
+          type(dt),
+          fixedWidth(width),
+          domainMin(minDomain),
+          domainMax(maxDomain),
+          charDomain(std::move(chars)) {}
 };
 
 struct TableDef {
@@ -225,6 +234,25 @@ public:
     std::string maxKeySymbol(const std::string& table) const override {
         return TPCHSchema::instance().table(table).maxKeySymbol;
     }
+    std::string keyDomainSymbol(const std::string& table,
+                                const std::string& col) const override {
+        if (auto gd = groupDomain(table, col))
+            return std::to_string(gd->maxValue + 1);
+        if (auto pk = pkInfo(table); pk && pk->first == col)
+            return pk->second;
+        if (table == "lineitem" && col == "l_partkey") return "maxPartkey";
+        if (table == "lineitem" && col == "l_suppkey") return "maxSuppkey";
+        if (table == "orders" && col == "o_custkey") return "maxCustkey";
+        if (table == "partsupp" && col == "ps_partkey") return "maxPartkey";
+        if (table == "customer" && col == "c_nationkey") return "25";
+        if (table == "supplier" && col == "s_nationkey") return "25";
+        if (table == "nation" && col == "n_regionkey") return "5";
+        return "";
+    }
+    std::string distinctDomainSymbol(const std::string& table,
+                                     const std::string& col) const override {
+        return keyDomainSymbol(table, col);
+    }
     std::vector<std::string> tableNames() const override {
         std::vector<std::string> names;
         for (auto& [name, _] : TPCHSchema::instance().tables) names.push_back(name);
@@ -264,7 +292,15 @@ public:
         if (table == "region")   return std::make_pair("r_regionkey", "5");
         return std::nullopt;
     }
-    size_t tableRowCount(const std::string& table) const override { return 0; }
+    int numericScale(const std::string& table,
+                     const std::string& col) const override {
+        auto it = TPCHSchema::instance().tables.find(table);
+        if (it == TPCHSchema::instance().tables.end()) return 0;
+        auto jt = it->second.nameToIdx.find(col);
+        if (jt == it->second.nameToIdx.end()) return 0;
+        return it->second.columns[jt->second].type == DataType::FLOAT ? 100 : 0;
+    }
+    size_t tableRowCount(const std::string& /*table*/) const override { return 0; }
 };
 
 // ===================================================================

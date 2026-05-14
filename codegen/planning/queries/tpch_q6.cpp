@@ -5,7 +5,7 @@ namespace codegen {
 
 namespace {
 
-std::optional<MetalQueryPlan> buildQ6PlanForShape(const std::set<std::string>& usedCols,
+std::optional<MetalQueryPlan> buildQ6PlanForShape(const std::set<std::string>& /*usedCols*/,
                                                   const std::string& filterCond,
                                                   const std::string& aggExpr,
                                                   const std::string& alias) {

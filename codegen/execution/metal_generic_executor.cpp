@@ -2,32 +2,15 @@
 #include <iostream>
 #include <chrono>
 #include <cstring>
-#include <cstdlib>
 #include <stdexcept>
 
 namespace codegen {
 
 namespace {
 
-const char* commandBufferStatusName(MTL::CommandBufferStatus status) {
-    switch (status) {
-        case MTL::CommandBufferStatusNotEnqueued: return "NotEnqueued";
-        case MTL::CommandBufferStatusEnqueued: return "Enqueued";
-        case MTL::CommandBufferStatusCommitted: return "Committed";
-        case MTL::CommandBufferStatusScheduled: return "Scheduled";
-        case MTL::CommandBufferStatusCompleted: return "Completed";
-        case MTL::CommandBufferStatusError: return "Error";
-        default: return "Unknown";
-    }
-}
-
 void checkCommandBufferStatus(MTL::CommandBuffer* cmdBuf,
                               const std::string& phaseName) {
     auto status = cmdBuf->status();
-    if (getenv("GEN_DEBUG")) {
-        fprintf(stderr, "[GEN_DEBUG] phase %s command buffer status=%s\n",
-                phaseName.c_str(), commandBufferStatusName(status));
-    }
     if (status == MTL::CommandBufferStatusError) {
         std::string msg = "Metal command buffer failed";
         if (!phaseName.empty()) msg += " in phase '" + phaseName + "'";
@@ -265,7 +248,6 @@ void MetalGenericExecutor::bindPhaseBuffers(MTL::ComputeCommandEncoder* encoder,
                 // Look up registered scalar value and set via setBytes
                 auto ii = scalarInts_.find(b.name);
                 if (ii != scalarInts_.end()) {
-                    if (getenv("GEN_DEBUG")) fprintf(stderr, "[BIND] constant %s = %d at idx=%d\n", b.name.c_str(), ii->second, b.bufferIndex);
                     encoder->setBytes(&ii->second, sizeof(int), b.bufferIndex);
                 } else {
                     auto fi = scalarFloats_.find(b.name);
@@ -305,10 +287,6 @@ void MetalGenericExecutor::encodePhase(MTL::ComputeCommandEncoder* encoder,
                                        const BufferMap& buffers) {
     encoder->setComputePipelineState(pso);
     bindPhaseBuffers(encoder, phase, buffers);
-    if (getenv("GEN_DEBUG")) {
-        for (const auto& [name, val] : scalarFloats_) fprintf(stderr, "[SCALAR_VAL] %s=%f\n", name.c_str(), val);
-        for (const auto& [name, val] : scalarInts_) fprintf(stderr, "[SCALAR_VAL] %s=%lld\n", name.c_str(), (long long)val);
-    }
 
     NS::UInteger tgSize = pso->maxTotalThreadsPerThreadgroup();
     if (tgSize > (NS::UInteger)phase.threadgroupSize)

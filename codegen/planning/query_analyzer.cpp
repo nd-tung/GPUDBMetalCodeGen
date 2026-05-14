@@ -157,9 +157,6 @@ ExprPtr walkColumnRef(const json& node, const std::vector<std::string>& tables) 
     int fw = 0;
     if (dt == DataType::CHAR_FIXED && g_analyzeSchema)
         fw = g_analyzeSchema->columnFixedWidth(resolvedTable, colName);
-    if (colName == "n_name" && getenv("GEN_DEBUG"))
-        fprintf(stderr, "[GEN_DEBUG] walkColumnRef: %s.%s dt=%d fw=%d schema=%p\n",
-                resolvedTable.c_str(), colName.c_str(), (int)dt, fw, (void*)g_analyzeSchema);
     std::string alias;
     if (!tblQualifier.empty() && g_aliasMap.find(tblQualifier) != g_aliasMap.end())
         alias = tblQualifier; // e.g. "n1" → stored for join disambiguation
@@ -1209,8 +1206,11 @@ AnalyzedQuery analyzeSQL(const std::string& sql, const SchemaProvider* schema) {
                     }
                     // Track which tables are the EXISTS inner tables
                     std::set<std::string> existsTables;
-                    for (size_t ti = tablesBefore; ti < aq.tables.size(); ++ti)
+                    for (size_t ti = tablesBefore; ti < aq.tables.size(); ++ti) {
                         existsTables.insert(aq.tables[ti]);
+                        if (ti < aq.tableAliases.size())
+                            existsTables.insert(aq.tableAliases[ti]);
+                    }
                     if (sub.contains("whereClause")) {
                         // Record join count before adding: new joins from NOT EXISTS
                         // are anti-joins; EXISTS joins are semi-joins.

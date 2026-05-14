@@ -25,7 +25,7 @@ public:
 
     // Collect all column references (IUs) consumed by this operator.
     // Operators override this to report which columns they reference.
-    virtual void iusUsed(std::vector<IU>& out) const {}
+    virtual void iusUsed(std::vector<IU>& /*out*/) const {}
 
     // Extract every colName[idxVar] reference from a kernel-side
     // expression string (e.g. "l_shipdate[i]", "o_orderkey[j] + 1").
@@ -691,10 +691,13 @@ public:
     // sortKeyBuf: name of output uint64_t sort key buffer
     // sortIdxBuf: name of output int row index buffer
     // nResultsExpr: expression for the number of source rows
+    // capacityExpr: optional allocation capacity when nResultsExpr is a
+    // runtime scalar produced by an earlier phase.
     // descending: if true, invert sort keys so ascending sort → descending order
     MetalInitSortKeys(const std::string& sourceColumn, const std::string& sourceType,
                       const std::string& sortKeyBuf, const std::string& sortIdxBuf,
-                      const std::string& nResultsExpr, bool descending);
+                      const std::string& nResultsExpr, bool descending,
+                      const std::string& capacityExpr = "");
     void produce(MetalCodegen& cg, ConsumerFn consume) override;
     std::string describe() const override;
 
@@ -714,6 +717,7 @@ private:
     std::string sortKeyBuf_;
     std::string sortIdxBuf_;
     std::string nResultsExpr_;
+    std::string capacityExpr_;
     bool descending_;
 };
 
@@ -722,7 +726,8 @@ public:
     // sortKeyBuf / sortIdxBuf: buffer names matching those in MetalInitSortKeys
     // nResultsExpr: same expression used for init — used for grid sizing
     MetalBitonicSortStep(const std::string& sortKeyBuf, const std::string& sortIdxBuf,
-                         const std::string& nResultsExpr);
+                         const std::string& nResultsExpr,
+                         const std::string& capacityExpr = "");
     void produce(MetalCodegen& cg, ConsumerFn consume) override;
     std::string describe() const override;
 
@@ -730,6 +735,7 @@ private:
     std::string sortKeyBuf_;
     std::string sortIdxBuf_;
     std::string nResultsExpr_;
+    std::string capacityExpr_;
 };
 
 } // namespace codegen
