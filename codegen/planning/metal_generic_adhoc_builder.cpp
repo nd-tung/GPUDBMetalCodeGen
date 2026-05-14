@@ -224,6 +224,13 @@ static std::optional<std::string> resolveOrderColumn(const ExprPtr& expr,
     (void)orderBy;
     auto col = orderColumnForExpr(expr, targets);
     if (col) return col;
+    if (expr) {
+        const std::string orderExprName = displayNameForExpr(expr);
+        for (size_t i = 0; i < targets.size(); ++i) {
+            if (targets[i].expr && displayNameForExpr(targets[i].expr) == orderExprName)
+                return displayNameForTarget(targets[i], i);
+        }
+    }
     // Positional fallback: the Nth ORDER BY item maps to the Nth SELECT target
     // (ColRef items are matched via the column name above; non-ColRef items
     //  and unresolved ColRefs fall through here).
@@ -2069,14 +2076,14 @@ static std::string scalarLookupReplacement(const ScalarLookupInfo& info,
         }
         case ScalarLookupInfo::GlobalSum:
             return "(" + scalarFloatLiteral(info.multiplier) +
-                   " * as_type<float>(atomic_load_explicit(&" + info.sumBuffer +
-                   "[0], memory_order_relaxed)))";
+                   " * atomic_load_explicit(&" + info.sumBuffer +
+                   "[0], memory_order_relaxed))";
         case ScalarLookupInfo::GlobalAvg:
             return "((atomic_load_explicit(&" + info.countBuffer +
                    "[0], memory_order_relaxed) > 0u) ? (" +
                    scalarFloatLiteral(info.multiplier) +
-                   " * as_type<float>(atomic_load_explicit(&" + info.sumBuffer +
-                   "[0], memory_order_relaxed)) / (float)atomic_load_explicit(&" +
+                   " * atomic_load_explicit(&" + info.sumBuffer +
+                   "[0], memory_order_relaxed) / (float)atomic_load_explicit(&" +
                    info.countBuffer + "[0], memory_order_relaxed)) : " +
                    scalarNanExpr() + ")";
         case ScalarLookupInfo::GlobalCount:
@@ -2118,6 +2125,15 @@ static std::string rewriteScalarSentinels(const std::string& cond, const std::st
     return result;
 }
 
+static bool referencesScalarSentinel(const std::string& text,
+                                     const std::vector<ScalarLookupInfo>& lookups) {
+    for (const auto& info : lookups) {
+        if (text.find(std::to_string(info.sentinel)) != std::string::npos)
+            return true;
+    }
+    return false;
+}
+
 static void attachScalarLookupBuffers(MetalQueryPlan::Phase& phase,
                                        const std::vector<ScalarLookupInfo>& lookups) {
     auto addResolvedScalar = [&](const std::string& name,
@@ -2138,13 +2154,18 @@ static void attachScalarLookupBuffers(MetalQueryPlan::Phase& phase,
                       info.kind == ScalarLookupInfo::GlobalCount;
         if (global) {
             if (!info.sumBuffer.empty())
-                phase.extraBuffers.push_back({info.sumBuffer, "atomic_uint", false, false});
+                phase.extraBuffers.push_back({
+                    info.sumBuffer,
+                    (info.kind == ScalarLookupInfo::GlobalSum ||
+                     info.kind == ScalarLookupInfo::GlobalAvg) ? "atomic_float" : "atomic_uint",
+                    true,
+                    false});
             if (!info.countBuffer.empty())
-                phase.extraBuffers.push_back({info.countBuffer, "atomic_uint", false, false});
+                phase.extraBuffers.push_back({info.countBuffer, "atomic_uint", true, false});
             if (!info.minBuffer.empty())
-                phase.extraBuffers.push_back({info.minBuffer, "atomic_uint", false, false});
+                phase.extraBuffers.push_back({info.minBuffer, "atomic_uint", true, false});
             if (!info.maxBuffer.empty())
-                phase.extraBuffers.push_back({info.maxBuffer, "atomic_uint", false, false});
+                phase.extraBuffers.push_back({info.maxBuffer, "atomic_uint", true, false});
             if (!info.stateBuffer.empty())
                 phase.extraBuffers.push_back({info.stateBuffer, "uint", true, false});
             continue;
@@ -2813,12 +2834,15 @@ static std::optional<ScalarLookupInfo> buildDecorrelatedScalarPreAgg(
                   buf_(std::move(buf)), state_(std::move(state)),
                   value_(std::move(value)) {}
             void produce(MetalCodegen& cg, ConsumerFn) override {
-                cg.addAtomicBufferParam(buf_, "atomic_uint", "1");
+                cg.addAtomicBufferParam(buf_,
+                                        op_ == "sum" ? "atomic_float" : "atomic_uint",
+                                        "1");
                 if (!state_.empty()) cg.addAtomicBufferParam(state_, "atomic_uint", "1");
                 child_->produce(cg, [&]() {
                     std::string v = "(float)(" + value_ + ")";
                     if (op_ == "sum")
-                        cg.addLine("atomic_add_float(&" + buf_ + "[0], " + v + ");");
+                        cg.addLine("atomic_fetch_add_explicit(&" + buf_ + "[0], " +
+                                   v + ", memory_order_relaxed);");
                     else if (op_ == "min")
                         cg.addLine("atomic_min_float_seen(&" + buf_ + "[0], &" +
                                    state_ + "[0], " + v + ");");
@@ -2839,7 +2863,7 @@ static std::optional<ScalarLookupInfo> buildDecorrelatedScalarPreAgg(
             auto count = std::make_unique<MetalAtomicCount>(
                 makeAggInput(), info.countBuffer, "0u", "1");
             appendPhase(plan, "ADHOC_scalar_global_" + std::to_string(dsq.sqIdx) + "_count",
-                        std::move(count));
+                        std::move(count), 256);
             return info;
         }
         if (dsq.func == AggFunc::AVG) {
@@ -2849,11 +2873,11 @@ static std::optional<ScalarLookupInfo> buildDecorrelatedScalarPreAgg(
             auto count = std::make_unique<MetalAtomicCount>(
                 makeAggInput(), info.countBuffer, "0u", "1");
             appendPhase(plan, "ADHOC_scalar_global_" + std::to_string(dsq.sqIdx) + "_avg_count",
-                        std::move(count));
+                        std::move(count), 256);
             auto sum = std::make_unique<ScalarGlobalFloatAgg>(
                 makeAggInput(), "sum", info.sumBuffer, "", valueExpr);
             appendPhase(plan, "ADHOC_scalar_global_" + std::to_string(dsq.sqIdx) + "_avg_sum",
-                        std::move(sum));
+                        std::move(sum), 256);
             return info;
         }
         if (dsq.func == AggFunc::SUM) {
@@ -2862,7 +2886,7 @@ static std::optional<ScalarLookupInfo> buildDecorrelatedScalarPreAgg(
             auto sum = std::make_unique<ScalarGlobalFloatAgg>(
                 makeAggInput(), "sum", info.sumBuffer, "", valueExpr);
             appendPhase(plan, "ADHOC_scalar_global_" + std::to_string(dsq.sqIdx) + "_sum",
-                        std::move(sum));
+                        std::move(sum), 256);
             return info;
         }
         if (dsq.func == AggFunc::MIN || dsq.func == AggFunc::MAX) {
@@ -2877,7 +2901,7 @@ static std::optional<ScalarLookupInfo> buildDecorrelatedScalarPreAgg(
                 info.stateBuffer, valueExpr);
             appendPhase(plan, "ADHOC_scalar_global_" + std::to_string(dsq.sqIdx) +
                               (isMin ? "_min" : "_max"),
-                        std::move(minmax));
+                        std::move(minmax), 256);
             return info;
         }
         return std::nullopt;
@@ -3198,6 +3222,166 @@ static std::vector<ScalarLookupInfo> buildCorrelatedScalarPreAggs(const Analyzed
     return result;
 }
 
+static std::string fromSubqueryBaseForKey(const FromSubqueryAggInfo& info,
+                                          const std::string& tableKey) {
+    for (size_t i = 0; i < info.tables.size(); ++i) {
+        if (info.tables[i] == tableKey)
+            return info.tables[i];
+        if (i < info.tableAliases.size() && info.tableAliases[i] == tableKey)
+            return info.tables[i];
+    }
+    return tableKey;
+}
+
+static bool fromSubqueryColMatches(const FromSubqueryAggInfo& info,
+                                   const ColRef& col,
+                                   const std::string& tableKey,
+                                   const std::string& column) {
+    if (col.column != column) return false;
+    if (col.table == tableKey) return true;
+    if (!col.tableAlias.empty() && col.tableAlias == tableKey) return true;
+    return fromSubqueryBaseForKey(info, tableKey) == col.table;
+}
+
+static std::optional<MetalQueryPlan> buildFromSubqueryAggHistogramPlan(
+    const AnalyzedQuery& aq, std::string* error) {
+    (void)error;
+    if (aq.fromSubqueryAggs.size() != 1) return std::nullopt;
+    if (aq.groupBy.size() != 1) return std::nullopt;
+
+    const auto& fsq = aq.fromSubqueryAggs[0];
+    auto* outerGroupCol = aq.groupBy[0] ? std::get_if<ColRef>(&aq.groupBy[0]->node) : nullptr;
+    std::string innerAggAlias = outerGroupCol ? outerGroupCol->column : "";
+    if (innerAggAlias.empty()) {
+        for (size_t ti = 0; ti < aq.targets.size(); ++ti) {
+            if (!aq.targets[ti].isAgg) {
+                if (!innerAggAlias.empty()) return std::nullopt;
+                innerAggAlias = displayNameForTarget(aq.targets[ti], ti);
+            }
+        }
+    }
+    if (innerAggAlias.empty()) return std::nullopt;
+
+    const SelectTarget* outerCount = nullptr;
+    size_t outerCountIndex = 0;
+    bool hasOuterGroupProjection = false;
+    for (size_t ti = 0; ti < aq.targets.size(); ++ti) {
+        const auto& target = aq.targets[ti];
+        const std::string display = displayNameForTarget(target, ti);
+        if (!target.isAgg && display == innerAggAlias) {
+            hasOuterGroupProjection = true;
+        } else if (target.isAgg && target.agg && target.agg->func == AggFunc::COUNT) {
+            outerCount = &target;
+            outerCountIndex = ti;
+        }
+    }
+    if (!hasOuterGroupProjection || !outerCount) return std::nullopt;
+
+    const SelectTarget* innerAgg = nullptr;
+    for (size_t ti = 0; ti < fsq.targets.size(); ++ti) {
+        const auto& target = fsq.targets[ti];
+        if (target.isAgg && target.agg &&
+            displayNameForTarget(target, ti) == innerAggAlias) {
+            innerAgg = &target;
+            break;
+        }
+    }
+    if (!innerAgg || !innerAgg->agg || innerAgg->agg->func != AggFunc::COUNT)
+        return std::nullopt;
+    if (fsq.groupBy.size() != 1) return std::nullopt;
+    auto* innerGroupCol = fsq.groupBy[0] ? std::get_if<ColRef>(&fsq.groupBy[0]->node) : nullptr;
+    if (!innerGroupCol) return std::nullopt;
+
+    const JoinClause* leftOuterJoin = nullptr;
+    for (const auto& jc : fsq.joins) {
+        if (!jc.leftOuter) continue;
+        if (fromSubqueryColMatches(fsq, *innerGroupCol, jc.leftTable, jc.leftCol)) {
+            leftOuterJoin = &jc;
+            break;
+        }
+    }
+    if (!leftOuterJoin) return std::nullopt;
+
+    const std::string groupBase = fromSubqueryBaseForKey(fsq, leftOuterJoin->leftTable);
+    const std::string aggBase = fromSubqueryBaseForKey(fsq, leftOuterJoin->rightTable);
+    const std::string groupJoinCol = leftOuterJoin->leftCol;
+    const std::string aggJoinCol = leftOuterJoin->rightCol;
+    if (groupBase.empty() || aggBase.empty() || groupJoinCol.empty() || aggJoinCol.empty())
+        return std::nullopt;
+
+    std::vector<PredPtr> aggFilters;
+    for (const auto& filter : fsq.filters) {
+        std::set<std::string> filterTables;
+        collectPredTables(filter, filterTables);
+        bool appliesToAgg = filterTables.empty();
+        if (!filterTables.empty()) {
+            appliesToAgg = std::all_of(filterTables.begin(), filterTables.end(),
+                [&](const std::string& table) { return table == aggBase; });
+        }
+        if (!appliesToAgg) return std::nullopt;
+        aggFilters.push_back(filter);
+    }
+
+    std::string countSize = maxKeySymbolForColumn(groupBase, groupJoinCol, aq.schema);
+    if (countSize.empty()) return std::nullopt;
+
+    MetalQueryPlan plan;
+    plan.name = "ADHOC_FROM_SUBQUERY_AGG";
+    const std::string idxVar = "i";
+    const std::string tag = sanitizeIdentifier(fsq.alias.empty() ? "from_subquery" : fsq.alias);
+    const std::string countBuffer = "d_adhoc_" + tag + "_count";
+
+    {
+        std::set<std::string> scanCols{aggJoinCol};
+        for (const auto& filter : aggFilters) collectColumns(filter, scanCols);
+        auto scan = makeScanForCols(aggBase, idxVar, scanCols, aq.schema);
+        auto filtered = maybeSelect(std::move(scan), combineFilters(aggFilters, idxVar, aq.schema));
+        auto count = std::make_unique<MetalAtomicCount>(
+            std::move(filtered), countBuffer, aggJoinCol + "[" + idxVar + "]", countSize);
+        appendPhase(plan, "ADHOC_from_subquery_count_" + tag, std::move(count));
+    }
+
+    {
+        std::set<std::string> scanCols{groupJoinCol};
+        auto scan = makeScanForCols(groupBase, idxVar, scanCols, aq.schema);
+        auto materialize = std::make_unique<MetalMaterialize>(
+            std::move(scan), "d_adhoc_" + tag + "_result_count", "1");
+
+        const std::string outputSize = tableSizeName(groupBase);
+        const std::string groupKeyExpr = groupJoinCol + "[" + idxVar + "]";
+        const std::string countExpr = "(int)atomic_load_explicit(&" + countBuffer +
+            "[" + groupKeyExpr + "], memory_order_relaxed)";
+        const std::string outerCountName = displayNameForTarget(*outerCount, outerCountIndex);
+
+        materialize->addColumn("d_adhoc_" + tag + "_0_" + sanitizeIdentifier(innerAggAlias),
+                               "int", countExpr, innerAggAlias, outputSize);
+        materialize->addColumn("d_adhoc_" + tag + "_1_" + sanitizeIdentifier(outerCountName),
+                               "float", "1.0f", outerCountName, outputSize);
+
+        auto& phase = appendPhase(plan, "ADHOC_from_subquery_materialize_" + tag,
+                                  std::move(materialize));
+        phase.extraBuffers.push_back({countBuffer, "atomic_uint", true, false});
+    }
+
+    MetalQueryPlan::CpuGroupBy cpuGB;
+    cpuGB.keyColumns.push_back(innerAggAlias);
+    cpuGB.aggColumns.push_back(displayNameForTarget(*outerCount, outerCountIndex));
+    cpuGB.aggFuncs.push_back("COUNT");
+    plan.cpuGroupBy = std::move(cpuGB);
+
+    MetalQueryPlan::CpuSort cpuSort;
+    cpuSort.limit = aq.limit;
+    for (int oi = 0; oi < (int)aq.orderBy.size(); ++oi) {
+        auto column = resolveOrderColumn(aq.orderBy[oi].expr, oi, aq.orderBy, aq.targets);
+        if (!column) return std::nullopt;
+        cpuSort.keys.push_back({*column, aq.orderBy[oi].descending});
+    }
+    if (!cpuSort.keys.empty() || cpuSort.limit >= 0)
+        plan.cpuSort = std::move(cpuSort);
+
+    return plan;
+}
+
 std::optional<MetalQueryPlan> buildGenericMultiTableAdhocPlan_impl(
     const AnalyzedQuery& aq, std::string* error) {
 
@@ -3205,6 +3389,11 @@ std::optional<MetalQueryPlan> buildGenericMultiTableAdhocPlan_impl(
         if (error) *error = msg;
         return std::nullopt;
     };
+
+    if (auto fromSubqueryPlan = buildFromSubqueryAggHistogramPlan(aq, error))
+        return fromSubqueryPlan;
+    if (!aq.fromSubqueryAggs.empty())
+        return fail("Multi-table planner: grouped FROM-subquery shape is not supported by the generic decomposition path.");
 
     if (aq.tables.size() < 2) return fail("Multi-table planner: query references fewer than 2 tables.");
     for (const auto& t : aq.tables) {
@@ -3581,9 +3770,11 @@ std::optional<MetalQueryPlan> buildGenericMultiTableAdhocPlan_impl(
 
     auto scalarLookups = buildCorrelatedScalarPreAggs(aq, plan);
     const size_t firstNormalPhase = plan.phases.size();
+    std::set<std::string> scalarConsumerPhases;
     auto finalizePlan = [&]() -> MetalQueryPlan {
         for (size_t pi = firstNormalPhase; pi < plan.phases.size(); ++pi) {
-            attachScalarLookupBuffers(plan.phases[pi], scalarLookups);
+            if (scalarConsumerPhases.count(plan.phases[pi].name))
+                attachScalarLookupBuffers(plan.phases[pi], scalarLookups);
         }
         return std::move(plan);
     };
@@ -3654,6 +3845,8 @@ std::optional<MetalQueryPlan> buildGenericMultiTableAdhocPlan_impl(
         if (itInst != aq.instanceFilters.end())
             buildFilters.insert(buildFilters.end(), itInst->second.begin(), itInst->second.end());
         std::string filterCond = combineFilters(buildFilters, idxVar, aq.schema);
+        const bool buildUsesScalarLookup =
+            referencesScalarSentinel(filterCond, scalarLookups);
         filterCond = rewriteScalarSentinels(filterCond, idxVar, scalarLookups, tname, aq.schema);
         pipe = maybeSelect(std::move(pipe), filterCond);
 
@@ -3741,7 +3934,9 @@ std::optional<MetalQueryPlan> buildGenericMultiTableAdhocPlan_impl(
             auto aggPipe = std::make_unique<MetalAtomicAgg>(
                 std::move(pipe), aggArrayName, bucketExpr, valExpr,
                 sizeSym, "atomic_uint", "float");
-            appendPhase(plan, "ADHOC_multi_agg_" + tag, std::move(aggPipe));
+            const std::string aggPhaseName = "ADHOC_multi_agg_" + tag;
+            appendPhase(plan, aggPhaseName, std::move(aggPipe));
+            if (buildUsesScalarLookup) scalarConsumerPhases.insert(aggPhaseName);
 
             // Phase B: range scan + HAVING filter + bitmap build
             auto rscan = std::make_unique<MetalRangeScan>(sizeSym, idxVar);
@@ -3785,7 +3980,8 @@ std::optional<MetalQueryPlan> buildGenericMultiTableAdhocPlan_impl(
                     "int", sizeSym);
             }
 
-            appendPhase(plan, "ADHOC_multi_build_" + tag, std::move(bmpBuild));
+            const std::string buildPhaseName = "ADHOC_multi_build_" + tag;
+            appendPhase(plan, buildPhaseName, std::move(bmpBuild));
 
             // The bitmap-conversion phase reads the agg array. Register it as
             // a side buffer since MetalSelection doesn't auto-register params.
@@ -3822,13 +4018,18 @@ std::optional<MetalQueryPlan> buildGenericMultiTableAdhocPlan_impl(
             }
             pipe = std::make_unique<MetalHashMapBuild>(
                 std::move(pipe), mapName, k1, k2, valExpr, capExpr);
-            appendPhase(plan, "ADHOC_multi_build_" + tag, std::move(pipe));
+            const std::string buildPhaseName = "ADHOC_multi_build_" + tag;
+            appendPhase(plan, buildPhaseName, std::move(pipe));
+            if (buildUsesScalarLookup) scalarConsumerPhases.insert(buildPhaseName);
             builtBitmaps.insert(u);
             continue;
         }
 
         auto pkU = multiTablePkInfo(tname, aq.schema);
-        const std::string sizeSym = pkU->sizeSym;
+        std::string sizeSym = maxKeySymbolForColumn(tname, nodes[u].keyOnSelf, aq.schema);
+        if (sizeSym.empty()) {
+            sizeSym = pkU ? pkU->sizeSym : tableSizeName(tname);
+        }
 
         auto existsDistinctIt = existsDistinctByChild.find(u);
         if (existsDistinctIt != existsDistinctByChild.end()) {
@@ -3841,7 +4042,9 @@ std::optional<MetalQueryPlan> buildGenericMultiTableAdhocPlan_impl(
                 storeKey,
                 info.childValueCol + "[" + idxVar + "]",
                 sizeSym);
-            appendPhase(plan, "ADHOC_multi_build_" + tag, std::move(pipe));
+            const std::string buildPhaseName = "ADHOC_multi_build_" + tag;
+            appendPhase(plan, buildPhaseName, std::move(pipe));
+            if (buildUsesScalarLookup) scalarConsumerPhases.insert(buildPhaseName);
             continue;
         }
 
@@ -3868,7 +4071,9 @@ std::optional<MetalQueryPlan> buildGenericMultiTableAdhocPlan_impl(
                 storeKey, valExpr, "int", sizeSym);
         }
 
-        appendPhase(plan, "ADHOC_multi_build_" + tag, std::move(pipe));
+        const std::string buildPhaseName = "ADHOC_multi_build_" + tag;
+        appendPhase(plan, buildPhaseName, std::move(pipe));
+        if (buildUsesScalarLookup) scalarConsumerPhases.insert(buildPhaseName);
         builtBitmaps.insert(u);
     }
 
@@ -3985,6 +4190,8 @@ std::optional<MetalQueryPlan> buildGenericMultiTableAdhocPlan_impl(
             probeFilters.insert(probeFilters.end(), itInst->second.begin(), itInst->second.end());
     }
     std::string probeFilterCond = combineFilters(probeFilters, idxVar, aq.schema);
+    bool probeUsesScalarLookup =
+        referencesScalarSentinel(probeFilterCond, scalarLookups);
     probeFilterCond = rewriteScalarSentinels(probeFilterCond, idxVar, scalarLookups, probeTable, aq.schema);
 
     // Insert MetalArrayLookup operators for scalar subquery carries BEFORE
@@ -4003,7 +4210,7 @@ std::optional<MetalQueryPlan> buildGenericMultiTableAdhocPlan_impl(
                     : MetalUnaryOperator(std::move(c)), buf_(buf), key_(key),
                       var_(var), idx_(idx) {}
                 void produce(MetalCodegen& cg, ConsumerFn consume) override {
-                    cg.addBufferParam(buf_, "atomic_uint", "", true, 0);
+                    cg.addBufferParam(buf_, "const atomic_uint", "", false, 0);
                     child_->produce(cg, [&]() {
                         cg.addLine("uint " + var_ + " = atomic_load_explicit(&" +
                                    buf_ + "[" + key_ + "], memory_order_relaxed);");
@@ -4130,6 +4337,8 @@ std::optional<MetalQueryPlan> buildGenericMultiTableAdhocPlan_impl(
         }
         auto cfKeys = charFixedJoinKey;
         std::string cond = combineFilters(crossFilters, idxVar, aq.schema);
+        probeUsesScalarLookup =
+            probeUsesScalarLookup || referencesScalarSentinel(cond, scalarLookups);
         cond = rewriteScalarSentinels(cond, idxVar, scalarLookups, probeTable, aq.schema);
         cond = rewriteForProbe(cond, idxVar, carryVar, cfKeys, aq.schema);
         // Rewrite build-side INT/DATE column indices.
@@ -4375,7 +4584,9 @@ std::optional<MetalQueryPlan> buildGenericMultiTableAdhocPlan_impl(
                 reduce->setAccumulatorResultAlias(alias, idx, 0, projectionExpr);
             }
         }
-        auto& phaseRef = appendPhase(plan, "ADHOC_multi_probe_scalar", std::move(reduce));
+        const std::string scalarPhaseName = "ADHOC_multi_probe_scalar";
+        auto& phaseRef = appendPhase(plan, scalarPhaseName, std::move(reduce));
+        if (probeUsesScalarLookup) scalarConsumerPhases.insert(scalarPhaseName);
         // Register build-side CHAR_FIXED columns as extra buffers
         for (const auto& [tname, cols] : neededByTable) {
             if (tname == probeTable) continue;
@@ -4722,7 +4933,9 @@ std::optional<MetalQueryPlan> buildGenericMultiTableAdhocPlan_impl(
 
         if (!cpuSort.keys.empty() || cpuSort.limit >= 0) plan.cpuSort = cpuSort;
         plan.cpuGroupBy = cpuGB;
-        appendPhase(plan, "ADHOC_multi_matgb", std::move(materialize));
+        const std::string matgbPhaseName = "ADHOC_multi_matgb";
+        appendPhase(plan, matgbPhaseName, std::move(materialize));
+        if (probeUsesScalarLookup) scalarConsumerPhases.insert(matgbPhaseName);
 
         // Register build-side CHAR_FIXED extra buffers on the newly created phase.
         for (const auto& [tname, cols] : neededByTable) {
@@ -4978,7 +5191,9 @@ std::optional<MetalQueryPlan> buildGenericMultiTableAdhocPlan_impl(
         agg->setHaving(aq.having);
     }
 
-    appendPhase(plan, "ADHOC_multi_probe_group", std::move(agg));
+    const std::string groupPhaseName = "ADHOC_multi_probe_group";
+    appendPhase(plan, groupPhaseName, std::move(agg));
+    if (probeUsesScalarLookup) scalarConsumerPhases.insert(groupPhaseName);
 
     // Add bitmap popcount phases for each COUNT(DISTINCT).
     for (size_t di = 0; di < distinctEntries.size(); ++di) {

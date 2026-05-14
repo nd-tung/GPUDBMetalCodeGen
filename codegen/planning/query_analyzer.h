@@ -38,6 +38,16 @@ struct SelectTarget {
     std::optional<AggTarget> agg;
 };
 
+struct FromSubqueryAggInfo {
+    std::string alias;  // FROM-subquery alias
+    std::vector<std::string> tables;
+    std::vector<std::string> tableAliases;
+    std::vector<JoinClause> joins;
+    std::vector<PredPtr> filters;
+    std::vector<SelectTarget> targets;
+    std::vector<ExprPtr> groupBy;
+};
+
 struct OrderByItem {
     ExprPtr expr;
     bool descending = false;
@@ -70,6 +80,12 @@ struct AnalyzedQuery {
         PredPtr havingPred;       // HAVING predicate (e.g. SUM > 300)
     };
     std::vector<InSubqueryAggInfo> inSubAggs;
+
+    // Grouped FROM-clause subqueries retain their aggregation boundary here.
+    // The legacy flattened maps below are still used for simple FROM views,
+    // but grouped subqueries need this metadata so the generic planner does
+    // not treat an inner aggregate as a carried raw column.
+    std::vector<FromSubqueryAggInfo> fromSubqueryAggs;
 
     // SELECT target list
     std::vector<SelectTarget> targets;

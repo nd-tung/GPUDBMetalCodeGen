@@ -2,9 +2,46 @@
 #include <iostream>
 #include <chrono>
 #include <cstring>
+#include <cstdlib>
 #include <stdexcept>
 
 namespace codegen {
+
+namespace {
+
+const char* commandBufferStatusName(MTL::CommandBufferStatus status) {
+    switch (status) {
+        case MTL::CommandBufferStatusNotEnqueued: return "NotEnqueued";
+        case MTL::CommandBufferStatusEnqueued: return "Enqueued";
+        case MTL::CommandBufferStatusCommitted: return "Committed";
+        case MTL::CommandBufferStatusScheduled: return "Scheduled";
+        case MTL::CommandBufferStatusCompleted: return "Completed";
+        case MTL::CommandBufferStatusError: return "Error";
+        default: return "Unknown";
+    }
+}
+
+void checkCommandBufferStatus(MTL::CommandBuffer* cmdBuf,
+                              const std::string& phaseName) {
+    auto status = cmdBuf->status();
+    if (getenv("GEN_DEBUG")) {
+        fprintf(stderr, "[GEN_DEBUG] phase %s command buffer status=%s\n",
+                phaseName.c_str(), commandBufferStatusName(status));
+    }
+    if (status == MTL::CommandBufferStatusError) {
+        std::string msg = "Metal command buffer failed";
+        if (!phaseName.empty()) msg += " in phase '" + phaseName + "'";
+        if (auto* err = cmdBuf->error()) {
+            if (auto* desc = err->localizedDescription()) {
+                msg += ": ";
+                msg += desc->utf8String();
+            }
+        }
+        throw std::runtime_error(msg);
+    }
+}
+
+} // namespace
 
 // ===================================================================
 // Construction
@@ -398,6 +435,7 @@ MetalExecutionResult MetalGenericExecutor::execute(
             encoder->endEncoding();
             cmdBuf->commit();
             cmdBuf->waitUntilCompleted();
+            checkCommandBufferStatus(cmdBuf, "warmup");
             continue;
         }
 
@@ -437,6 +475,7 @@ MetalExecutionResult MetalGenericExecutor::execute(
             encoder->endEncoding();
             cmdBuf->commit();
             cmdBuf->waitUntilCompleted();
+            checkCommandBufferStatus(cmdBuf, phase.name);
 
             // Invoke host-side post-dispatch hook (e.g. read GPU-computed
             // scalar back into scalarFloats_ for later phases).
