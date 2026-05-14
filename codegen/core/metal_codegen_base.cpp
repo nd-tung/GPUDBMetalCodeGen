@@ -315,7 +315,7 @@ void MetalCodegen::registerScalarAggOutput(const std::string& loBuffer,
 }
 
 void MetalCodegen::registerScalarAggColumn(const std::string& displayName, int index,
-                                            int scaleDown) {
+                                            int scaleDown, ExprPtr projectionExpr) {
     resultSchema_.kind = MetalResultSchema::SCALAR_AGG;
     MetalResultSchema::ScalarAggEntry entry;
     entry.displayName = displayName;
@@ -324,6 +324,7 @@ void MetalCodegen::registerScalarAggColumn(const std::string& displayName, int i
     entry.hiBuffer = scalarAggPendingHi_;
     entry.isLongPair = !scalarAggPendingHi_.empty();
     entry.elementType = scalarAggPendingType_;
+    entry.projectionExpr = std::move(projectionExpr);
     (void)index;
     resultSchema_.scalarAggs.push_back(entry);
 }
@@ -334,7 +335,8 @@ void MetalCodegen::registerScalarAggAverageColumn(const std::string& displayName
                                                   const std::string& denominatorLoBuffer,
                                                   const std::string& denominatorHiBuffer,
                                                   const std::string& type,
-                                                  int scaleDown) {
+                                                  int scaleDown,
+                                                  ExprPtr projectionExpr) {
     resultSchema_.kind = MetalResultSchema::SCALAR_AGG;
     MetalResultSchema::ScalarAggEntry entry;
     entry.displayName = displayName;
@@ -347,6 +349,7 @@ void MetalCodegen::registerScalarAggAverageColumn(const std::string& displayName
     entry.denomIsLongPair = !denominatorHiBuffer.empty();
     entry.divideByDenominator = true;
     entry.elementType = type == "long" ? "uint" : "float";
+    entry.projectionExpr = std::move(projectionExpr);
     resultSchema_.scalarAggs.push_back(entry);
 }
 

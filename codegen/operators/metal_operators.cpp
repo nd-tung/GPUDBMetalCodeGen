@@ -587,15 +587,19 @@ void MetalTGReduce::setResultAlias(const std::string& displayName, int scaleDown
 
 void MetalTGReduce::setAccumulatorResultAlias(const std::string& displayName,
                                               int accumulatorIndex,
-                                              int scaleDown) {
-    resultInfos_.push_back({displayName, scaleDown, accumulatorIndex, -1});
+                                              int scaleDown,
+                                              ExprPtr projectionExpr) {
+    resultInfos_.push_back({displayName, scaleDown, accumulatorIndex, -1,
+                            std::move(projectionExpr)});
 }
 
 void MetalTGReduce::setAverageResultAlias(const std::string& displayName,
                                           int numeratorIndex,
                                           int denominatorIndex,
-                                          int scaleDown) {
-    resultInfos_.push_back({displayName, scaleDown, numeratorIndex, denominatorIndex});
+                                          int scaleDown,
+                                          ExprPtr projectionExpr) {
+    resultInfos_.push_back({displayName, scaleDown, numeratorIndex, denominatorIndex,
+                            std::move(projectionExpr)});
 }
 
 void MetalTGReduce::produce(MetalCodegen& cg, ConsumerFn consume) {
@@ -807,10 +811,12 @@ void MetalTGReduce::produce(MetalCodegen& cg, ConsumerFn consume) {
                 cg.registerScalarAggAverageColumn(info.displayName,
                                                   acc.loBuffer, acc.hiBuffer,
                                                   denom.loBuffer, denom.hiBuffer,
-                                                  acc.type, info.scaleDown);
+                                                  acc.type, info.scaleDown,
+                                                  info.projectionExpr);
             } else {
                 cg.registerScalarAggOutput(acc.loBuffer, acc.hiBuffer, acc.type);
-                cg.registerScalarAggColumn(info.displayName, info.accumulatorIndex, info.scaleDown);
+                cg.registerScalarAggColumn(info.displayName, info.accumulatorIndex, info.scaleDown,
+                                           info.projectionExpr);
             }
         }
     }

@@ -4,6 +4,7 @@
 #include <sstream>
 #include <cstring>
 #include <algorithm>
+#include <cctype>
 #include <cstdint>
 #include <unordered_map>
 
@@ -194,6 +195,52 @@ GenericResult MetalResultCollector::collect(const MetalResultSchema& schema,
 // collectScalarAgg
 // ===================================================================
 
+static double scalarValueAsDouble(const GenericResult::Value& value) {
+    double out = 0.0;
+    std::visit([&](auto&& v) {
+        using T = std::decay_t<decltype(v)>;
+        if constexpr (std::is_same_v<T, double>) out = v;
+        else if constexpr (std::is_same_v<T, int64_t>) out = static_cast<double>(v);
+    }, value);
+    return out;
+}
+
+static bool isAggregateFuncName(std::string name) {
+    for (auto& c : name) c = (char)std::tolower((unsigned char)c);
+    return name == "sum" || name == "count" || name == "avg" ||
+           name == "min" || name == "max";
+}
+
+static GenericResult::Value evaluateScalarAggProjection(const ExprPtr& expr,
+                                                        double aggregateValue) {
+    if (!expr) return aggregateValue;
+
+    if (auto* lit = std::get_if<Literal>(&expr->node)) {
+        if (auto* i = std::get_if<int>(&lit->value)) return (int64_t)*i;
+        if (auto* f = std::get_if<float>(&lit->value)) return (double)*f;
+        if (auto* s = std::get_if<std::string>(&lit->value)) return *s;
+        return (int64_t)0;
+    }
+
+    if (auto* call = std::get_if<FuncCall>(&expr->node)) {
+        if (isAggregateFuncName(call->name)) return aggregateValue;
+        return (int64_t)0;
+    }
+
+    if (auto* bin = std::get_if<BinaryExpr>(&expr->node)) {
+        double l = scalarValueAsDouble(evaluateScalarAggProjection(bin->left, aggregateValue));
+        double r = scalarValueAsDouble(evaluateScalarAggProjection(bin->right, aggregateValue));
+        switch (bin->op) {
+            case ExprOp::ADD: return l + r;
+            case ExprOp::SUB: return l - r;
+            case ExprOp::MUL: return l * r;
+            case ExprOp::DIV: return r != 0.0 ? l / r : 0.0;
+        }
+    }
+
+    return (int64_t)0;
+}
+
 GenericResult MetalResultCollector::collectScalarAgg(const MetalResultSchema& schema,
                                                      const BufferMap& buffers) {
     GenericResult result;
@@ -244,7 +291,11 @@ GenericResult MetalResultCollector::collectScalarAgg(const MetalResultSchema& sc
             value /= static_cast<double>(entry.scaleDown);
         }
 
-        row.push_back(value);
+        if (entry.projectionExpr) {
+            row.push_back(evaluateScalarAggProjection(entry.projectionExpr, value));
+        } else {
+            row.push_back(value);
+        }
     }
 
     if (!row.empty())

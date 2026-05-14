@@ -5,7 +5,6 @@
 #include <algorithm>
 #include <cctype>
 #include <climits>
-#include <cmath>
 #include <functional>
 #include <map>
 #include <optional>
@@ -23,11 +22,18 @@ namespace codegen {
 namespace {
 
 // Walk expression tree to collect aggregate FuncCall nodes and check for division.
+bool isAggregateFuncCallName(std::string name) {
+    std::transform(name.begin(), name.end(), name.begin(),
+                   [](unsigned char c) { return (char)std::tolower(c); });
+    return name == "sum" || name == "avg" || name == "count" ||
+           name == "min" || name == "max";
+}
+
 struct AggCallWalker {
     static void walk(const ExprPtr& e, std::vector<const FuncCall*>& out, bool& div) {
         if (!e) return;
         if (auto* fc = std::get_if<FuncCall>(&e->node)) {
-            if (fc->name == "sum" || fc->name == "avg" || fc->name == "count") {
+            if (isAggregateFuncCallName(fc->name)) {
                 out.push_back(fc); return;
             }
             for (auto& a : fc->args) walk(a, out, div);
@@ -43,6 +49,31 @@ struct AggCallWalker {
         }
     }
 };
+
+bool scalarAggProjectionExprSupported(const ExprPtr& expr) {
+    if (!expr) return false;
+    if (auto* lit = std::get_if<Literal>(&expr->node)) {
+        return std::holds_alternative<int>(lit->value) ||
+               std::holds_alternative<float>(lit->value);
+    }
+    if (auto* fc = std::get_if<FuncCall>(&expr->node))
+        return isAggregateFuncCallName(fc->name);
+    if (auto* be = std::get_if<BinaryExpr>(&expr->node)) {
+        return scalarAggProjectionExprSupported(be->left) &&
+               scalarAggProjectionExprSupported(be->right);
+    }
+    return false;
+}
+
+ExprPtr scalarProjectionExprForSingleAgg(const SelectTarget& target) {
+    std::vector<const FuncCall*> aggCalls;
+    bool hasDivision = false;
+    AggCallWalker::walk(target.expr, aggCalls, hasDivision);
+    (void)hasDivision;
+    return aggCalls.size() == 1 && scalarAggProjectionExprSupported(target.expr)
+        ? target.expr
+        : nullptr;
+}
 
 std::string sanitizeIdentifier(std::string name) {
     if (name.empty()) name = "expr";
@@ -116,34 +147,6 @@ std::string aggFuncName(AggFunc func) {
     }
 }
 
-std::optional<double> numericLiteralValue(const ExprPtr& expr) {
-    auto* lit = expr ? std::get_if<Literal>(&expr->node) : nullptr;
-    if (!lit) return std::nullopt;
-    if (auto* i = std::get_if<int>(&lit->value)) return static_cast<double>(*i);
-    if (auto* f = std::get_if<float>(&lit->value)) return static_cast<double>(*f);
-    return std::nullopt;
-}
-
-std::optional<int> scalarAggResultScaleDown(const SelectTarget& target) {
-    if (!target.expr || !target.agg) return std::nullopt;
-    auto* be = std::get_if<BinaryExpr>(&target.expr->node);
-    if (!be || be->op != ExprOp::DIV) return std::nullopt;
-
-    auto* fc = be->left ? std::get_if<FuncCall>(&be->left->node) : nullptr;
-    if (!fc || fc->name != aggName(target.agg->func)) return std::nullopt;
-
-    auto denom = numericLiteralValue(be->right);
-    if (!denom || *denom <= 0.0) return std::nullopt;
-
-    double rounded = std::round(*denom);
-    if (std::fabs(*denom - rounded) > 1e-6 ||
-        rounded <= 0.0 ||
-        rounded > static_cast<double>(INT_MAX)) {
-        return std::nullopt;
-    }
-    return static_cast<int>(rounded);
-}
-
 bool exprIsColumn(const ExprPtr& expr, const ColRef& expected) {
     auto* col = expr ? std::get_if<ColRef>(&expr->node) : nullptr;
     return col && col->table == expected.table && col->column == expected.column;
@@ -194,6 +197,7 @@ static std::optional<std::string> resolveOrderColumn(const ExprPtr& expr,
                                                      int orderIdx,
                                                      const std::vector<OrderByItem>& orderBy,
                                                      const std::vector<SelectTarget>& targets) {
+    (void)orderBy;
     auto col = orderColumnForExpr(expr, targets);
     if (col) return col;
     // Positional fallback: the Nth ORDER BY item maps to the Nth SELECT target
@@ -500,6 +504,14 @@ std::optional<MetalQueryPlan> buildScalarAggPlan(const AnalyzedQuery& aq, std::s
         if (func != AggFunc::SUM && func != AggFunc::COUNT && func != AggFunc::AVG &&
             func != AggFunc::MIN && func != AggFunc::MAX)
             return fail("Scalar aggregation: unsupported aggregate function '" + aggName(func) + "'.");
+        std::vector<const FuncCall*> aggCalls;
+        bool hasDivision = false;
+        AggCallWalker::walk(target.expr, aggCalls, hasDivision);
+        (void)hasDivision;
+        if (aggCalls.size() > 1)
+            return fail("Scalar aggregation: complex aggregate expressions with multiple aggregate calls are not supported in scalar-agg path.");
+        if (aggCalls.size() == 1 && !scalarAggProjectionExprSupported(target.expr))
+            return fail("Scalar aggregation: unsupported aggregate projection expression.");
         if (func != AggFunc::COUNT) {
             if (!target.agg->innerExpr)
                 return fail("Scalar aggregation: aggregate '" + aggName(func) + "' requires an inner expression.");
@@ -521,16 +533,16 @@ std::optional<MetalQueryPlan> buildScalarAggPlan(const AnalyzedQuery& aq, std::s
         std::string alias = displayNameForTarget(target, targetIndex);
         std::string accName = "a" + std::to_string(targetIndex) + "_" + sanitizeIdentifier(alias);
         AggFunc func = target.agg->func;
-        int resultScaleDown = scalarAggResultScaleDown(target).value_or(0);
+        ExprPtr projectionExpr = scalarProjectionExprForSingleAgg(target);
         if (func == AggFunc::COUNT) {
             int accIndex = reduce->addAccumulator(accName, "1", "long");
-            reduce->setAccumulatorResultAlias(alias, accIndex, resultScaleDown);
+            reduce->setAccumulatorResultAlias(alias, accIndex, 0, projectionExpr);
         } else if (func == AggFunc::AVG) {
             int sumIndex = reduce->addAccumulator(accName + "_sum",
                                                   exprToMetal(target.agg->innerExpr, idxVar),
                                                   "float");
             int countIndex = reduce->addAccumulator(accName + "_count", "1.0f", "float");
-            reduce->setAverageResultAlias(alias, sumIndex, countIndex, resultScaleDown);
+            reduce->setAverageResultAlias(alias, sumIndex, countIndex, 0, projectionExpr);
         } else {
             DataType valueType = inferExprDataType(target.agg->innerExpr);
             std::string outputType = (valueType == DataType::FLOAT) ? "float" : "long";
@@ -542,7 +554,7 @@ std::optional<MetalQueryPlan> buildScalarAggPlan(const AnalyzedQuery& aq, std::s
             }
             int accIndex = reduce->addAccumulator(accName, exprToMetal(target.agg->innerExpr, idxVar),
                                                   outputType, "", "", op);
-            reduce->setAccumulatorResultAlias(alias, accIndex, resultScaleDown);
+            reduce->setAccumulatorResultAlias(alias, accIndex, 0, projectionExpr);
         }
     }
 
@@ -1726,18 +1738,28 @@ static bool validateHavingPredicate(const PredPtr& having,
 }
 
 struct ScalarLookupInfo {
-    enum Kind { SumByKey, AvgByKey, MinByKey, MaxByKey, CountByKey, SumByCompositeHash };
+    enum Kind {
+        SumByKey, AvgByKey, MinByKey, MaxByKey, CountByKey,
+        SumByCompositeHash, AvgByCompositeHash, CountByCompositeHash
+    };
     int sentinel;
     Kind kind;
     std::string valueTable;
     std::string keyCol;
     std::string keyCol2;
+    std::vector<std::string> keyCols;
+    std::vector<std::string> outerKeyCols;
     std::string valueCol;
-    float multiplier;
+    float multiplier = 1.0f;
+    std::string sizeSymbol;
     std::string sumBuffer;
     std::string countBuffer;
     std::string minBuffer;
     std::string maxBuffer;
+    std::string stateBuffer;
+    std::string hashMap;
+    std::string countHashMap;
+    std::string hashCapacityExpr;
     std::string htFlags;
     std::string htKeys;
     std::string htVals;
@@ -1745,45 +1767,101 @@ struct ScalarLookupInfo {
     std::string sumVar;   // result variable for MetalArrayLookup on sum
 };
 
-static bool textHasAll(const std::string& haystack, const std::vector<std::string>& needles) {
-    for (const auto& n : needles) {
-        if (haystack.find(n) == std::string::npos) return false;
-    }
-    return true;
-}
-
 static std::string scalarFloatLiteral(float v) {
     std::ostringstream oss;
-    oss << v << "f";
-    return oss.str();
+    oss << v;
+    std::string s = oss.str();
+    if (s.find_first_of(".eE") == std::string::npos)
+        s += ".0";
+    return s + "f";
 }
 
-static std::string scalarCompositeKeyExpr(const std::string& col1, const std::string& col2,
-                                           const std::string& idxVar) {
-    return "((uint)(" + col1 + "[" + idxVar + "]) ^ ((uint)(" + col2 + "[" + idxVar + "]) << 16))";
+static std::string scalarNanExpr() {
+    return "as_type<float>(0x7fc00000u)";
 }
 
-static std::string scalarLookupReplacement(const ScalarLookupInfo& info, const std::string& idxVar) {
+static std::string scalarLookupKeyExpr(const ScalarLookupInfo& info,
+                                       size_t keyIndex,
+                                       const std::string& idxVar,
+                                       const std::string& probeTable,
+        const SchemaProvider* schema) {
+    std::string inner = keyIndex < info.keyCols.size() ? info.keyCols[keyIndex] :
+                        (keyIndex == 0 ? info.keyCol : info.keyCol2);
+    std::string outer = keyIndex < info.outerKeyCols.size() ? info.outerKeyCols[keyIndex] : "";
+    if (schema && !probeTable.empty()) {
+        if (!outer.empty() && schema->hasColumn(probeTable, outer))
+            return outer + "[" + idxVar + "]";
+        if (!inner.empty() && schema->hasColumn(probeTable, inner))
+            return inner + "[" + idxVar + "]";
+    }
+    return (outer.empty() ? inner : outer) + "[" + idxVar + "]";
+}
+
+static std::string scalarHashLookupRaw(const std::string& mapName,
+                                       const std::string& key1,
+                                       const std::string& key2) {
+    return "scalar_hash_lookup_raw64(" + mapName + "_states, " + mapName + "_keys, " +
+           mapName + "_values, n_" + mapName + ", " + key1 + ", " + key2 + ")";
+}
+
+static std::string scalarLookupReplacement(const ScalarLookupInfo& info,
+                                           const std::string& idxVar,
+                                           const std::string& probeTable,
+                                           const SchemaProvider* schema) {
+    const std::string key0 = scalarLookupKeyExpr(info, 0, idxVar, probeTable, schema);
+    const std::string key1 = scalarLookupKeyExpr(info, 1, idxVar, probeTable, schema);
     switch (info.kind) {
         case ScalarLookupInfo::SumByKey:
-            return "as_type<float>(" + info.sumBuffer + "[" + info.keyCol + "[" + idxVar + "]])";
+            if (!info.stateBuffer.empty()) {
+                return "((" + info.stateBuffer + "[" + key0 + "] != 0u) ? (" +
+                       scalarFloatLiteral(info.multiplier) + " * as_type<float>(" +
+                       info.sumBuffer + "[" + key0 + "])) : " + scalarNanExpr() + ")";
+            }
+            return "(" + scalarFloatLiteral(info.multiplier) + " * as_type<float>(" +
+                   info.sumBuffer + "[" + key0 + "]))";
         case ScalarLookupInfo::AvgByKey:
             return "((" + info.cntVar + " > 0) ? ("
                  + scalarFloatLiteral(info.multiplier) + " * as_type<float>(" + info.sumVar
                  + ") / (float)" + info.cntVar
-                 + ") : -3.402823466e38f)";
+                 + ") : " + scalarNanExpr() + ")";
         case ScalarLookupInfo::MinByKey:
-            return info.minBuffer + "[" + info.keyCol + "[" + idxVar + "]]";
+            if (!info.stateBuffer.empty()) {
+                return "((" + info.stateBuffer + "[" + key0 + "] != 0u) ? (" +
+                       scalarFloatLiteral(info.multiplier) + " * as_type<float>(" +
+                       info.minBuffer + "[" + key0 + "])) : " + scalarNanExpr() + ")";
+            }
+            return "(" + scalarFloatLiteral(info.multiplier) + " * as_type<float>(" +
+                   info.minBuffer + "[" + key0 + "]))";
         case ScalarLookupInfo::MaxByKey:
-            return info.maxBuffer + "[" + info.keyCol + "[" + idxVar + "]]";
+            if (!info.stateBuffer.empty()) {
+                return "((" + info.stateBuffer + "[" + key0 + "] != 0u) ? (" +
+                       scalarFloatLiteral(info.multiplier) + " * as_type<float>(" +
+                       info.maxBuffer + "[" + key0 + "])) : " + scalarNanExpr() + ")";
+            }
+            return "(" + scalarFloatLiteral(info.multiplier) + " * as_type<float>(" +
+                   info.maxBuffer + "[" + key0 + "]))";
         case ScalarLookupInfo::CountByKey:
-            return info.countBuffer + "[" + info.keyCol + "[" + idxVar + "]]";
+            return "(" + scalarFloatLiteral(info.multiplier) + " * (float)" +
+                   info.countBuffer + "[" + key0 + "])";
         case ScalarLookupInfo::SumByCompositeHash: {
-            std::string k1 = "(uint)(" + info.keyCol + "[" + idxVar + "])";
-            std::string k2 = "(uint)(" + info.keyCol2 + "[" + idxVar + "])";
-            return "(scalar_hash_lookup_value(" + info.htKeys + ", " + info.htFlags + ", "
-                 + info.htVals + ", n_hm_q20_scalar, " + k1 + ", " + k2 + ")"
-                 + (info.multiplier != 1.0f ? " * " + scalarFloatLiteral(info.multiplier) : "") + ")";
+            std::string val = "scalar_hash_lookup_float_or_nan64(" + info.hashMap + "_states, " +
+                              info.hashMap + "_keys, " + info.hashMap + "_values, n_" +
+                              info.hashMap + ", (uint)(" + key0 + "), (uint)(" + key1 + "))";
+            return "(" + scalarFloatLiteral(info.multiplier) + " * " + val + ")";
+        }
+        case ScalarLookupInfo::CountByCompositeHash: {
+            std::string raw = scalarHashLookupRaw(info.countHashMap, "(uint)(" + key0 + ")",
+                                                  "(uint)(" + key1 + ")");
+            return "(" + scalarFloatLiteral(info.multiplier) + " * (float)(" + raw + "))";
+        }
+        case ScalarLookupInfo::AvgByCompositeHash: {
+            std::string sk = "(uint)(" + key0 + ")";
+            std::string tk = "(uint)(" + key1 + ")";
+            std::string sumRaw = scalarHashLookupRaw(info.hashMap, sk, tk);
+            std::string cntRaw = scalarHashLookupRaw(info.countHashMap, sk, tk);
+            return "((" + cntRaw + " > 0u) ? (" + scalarFloatLiteral(info.multiplier) +
+                   " * as_type<float>(" + sumRaw + ") / (float)(" + cntRaw + ")) : " +
+                   scalarNanExpr() + ")";
         }
         default: return "0";
     }
@@ -1799,17 +1877,29 @@ static void replaceAll(std::string& str, const std::string& from, const std::str
 }
 
 static std::string rewriteScalarSentinels(const std::string& cond, const std::string& idxVar,
-                                          const std::vector<ScalarLookupInfo>& lookups) {
+                                          const std::vector<ScalarLookupInfo>& lookups,
+                                          const std::string& probeTable,
+                                          const SchemaProvider* schema) {
     std::string result = cond;
     for (const auto& info : lookups) {
         replaceAll(result, std::to_string(info.sentinel),
-                   scalarLookupReplacement(info, idxVar));
+                   scalarLookupReplacement(info, idxVar, probeTable, schema));
     }
     return result;
 }
 
 static void attachScalarLookupBuffers(MetalQueryPlan::Phase& phase,
                                        const std::vector<ScalarLookupInfo>& lookups) {
+    auto addResolvedScalar = [&](const std::string& name,
+                                 const std::string& type,
+                                 const std::string& sizeExpr) {
+        if (name.empty() || sizeExpr.empty()) return;
+        for (const auto& existing : phase.resolvedScalarParams) {
+            if (existing.name == name) return;
+        }
+        phase.resolvedScalarParams.push_back({name, type, sizeExpr});
+    };
+
     for (const auto& info : lookups) {
         if (info.kind == ScalarLookupInfo::AvgByKey) continue; // handled by ScalarAtomicLookup
         if (!info.sumBuffer.empty())
@@ -1820,6 +1910,20 @@ static void attachScalarLookupBuffers(MetalQueryPlan::Phase& phase,
             phase.extraBuffers.push_back({info.minBuffer, "float", true, false});
         if (!info.maxBuffer.empty())
             phase.extraBuffers.push_back({info.maxBuffer, "float", true, false});
+        if (!info.stateBuffer.empty())
+            phase.extraBuffers.push_back({info.stateBuffer, "uint", true, false});
+        if (!info.hashMap.empty()) {
+            phase.extraBuffers.push_back({info.hashMap + "_states", "uint", true, false});
+            phase.extraBuffers.push_back({info.hashMap + "_keys", "ulong", true, false});
+            phase.extraBuffers.push_back({info.hashMap + "_values", "uint", true, false});
+            addResolvedScalar("n_" + info.hashMap, "uint", info.hashCapacityExpr);
+        }
+        if (!info.countHashMap.empty()) {
+            phase.extraBuffers.push_back({info.countHashMap + "_states", "uint", true, false});
+            phase.extraBuffers.push_back({info.countHashMap + "_keys", "ulong", true, false});
+            phase.extraBuffers.push_back({info.countHashMap + "_values", "uint", true, false});
+            addResolvedScalar("n_" + info.countHashMap, "uint", info.hashCapacityExpr);
+        }
         if (!info.htFlags.empty())
             phase.extraBuffers.push_back({info.htFlags, "uint", true, false});
         if (!info.htKeys.empty())
@@ -1829,197 +1933,924 @@ static void attachScalarLookupBuffers(MetalQueryPlan::Phase& phase,
     }
 }
 
+struct DecorrCol {
+    std::string table;
+    std::string column;
+    std::string qualifier;
+    bool inner = false;
+};
+
+struct DecorrJoin {
+    DecorrCol left;
+    DecorrCol right;
+};
+
+struct DecorrCorrelation {
+    DecorrCol inner;
+    DecorrCol outer;
+};
+
+struct DecorrelatedScalarSubquery {
+    int sqIdx = 0;
+    AggFunc func = AggFunc::SUM;
+    bool countStar = false;
+    float multiplier = 1.0f;
+    std::string valueTable;
+    std::string valueCol;
+    std::vector<std::string> tables;
+    std::map<std::string, std::string> aliases;
+    std::vector<DecorrJoin> joins;
+    std::vector<DecorrCorrelation> correlations;
+    std::map<std::string, std::vector<PredPtr>> filtersByTable;
+};
+
+static std::optional<std::string> jsonStringValue(const nlohmann::json& node) {
+    if (node.is_string()) return node.get<std::string>();
+    if (node.is_object() && node.contains("String") && node["String"].contains("sval"))
+        return node["String"]["sval"].get<std::string>();
+    return std::nullopt;
+}
+
+static std::string jsonAExprOp(const nlohmann::json& ae) {
+    if (!ae.contains("name") || !ae["name"].is_array() || ae["name"].empty()) return {};
+    if (auto s = jsonStringValue(ae["name"][0])) return *s;
+    return {};
+}
+
+static std::optional<DecorrCol> jsonRawColumnRef(const nlohmann::json& node) {
+    const nlohmann::json* cr = nullptr;
+    if (node.is_object() && node.contains("ColumnRef")) cr = &node["ColumnRef"];
+    else if (node.is_object() && node.contains("fields")) cr = &node;
+    if (!cr || !cr->contains("fields") || !(*cr)["fields"].is_array()) return std::nullopt;
+    std::vector<std::string> fields;
+    for (const auto& f : (*cr)["fields"]) {
+        if (auto s = jsonStringValue(f)) fields.push_back(*s);
+    }
+    if (fields.empty()) return std::nullopt;
+    DecorrCol out;
+    out.column = fields.back();
+    if (fields.size() >= 2) out.qualifier = fields[fields.size() - 2];
+    return out;
+}
+
+static std::string jsonFuncName(const nlohmann::json& fc) {
+    if (!fc.contains("funcname") || !fc["funcname"].is_array() || fc["funcname"].empty())
+        return {};
+    auto s = jsonStringValue(fc["funcname"].back());
+    if (!s) return {};
+    std::string name = *s;
+    std::transform(name.begin(), name.end(), name.begin(),
+                   [](unsigned char c) { return (char)std::tolower(c); });
+    return name;
+}
+
+static std::optional<double> jsonNumericConst(const nlohmann::json& node) {
+    const nlohmann::json* ac = nullptr;
+    if (node.is_object() && node.contains("A_Const")) ac = &node["A_Const"];
+    else if (node.is_object()) ac = &node;
+    if (!ac) return std::nullopt;
+    auto readNum = [](const nlohmann::json& v) -> std::optional<double> {
+        if (v.is_number()) return v.get<double>();
+        if (v.is_string()) return std::stod(v.get<std::string>());
+        return std::nullopt;
+    };
+    try {
+        if (ac->contains("fval")) {
+            const auto& f = (*ac)["fval"];
+            if (f.is_object() && f.contains("fval")) return readNum(f["fval"]);
+            return readNum(f);
+        }
+        if (ac->contains("ival")) {
+            const auto& i = (*ac)["ival"];
+            if (i.is_object() && i.contains("ival")) return readNum(i["ival"]);
+            return readNum(i);
+        }
+        if (ac->contains("val")) {
+            const auto& v = (*ac)["val"];
+            if (v.contains("Float")) return readNum(v["Float"].at("fval"));
+            if (v.contains("Integer")) return readNum(v["Integer"].at("ival"));
+        }
+    } catch (...) {
+        return std::nullopt;
+    }
+    return std::nullopt;
+}
+
+static int parseDateLiteralLocal(const std::string& s) {
+    if (s.size() >= 10 && s[4] == '-' && s[7] == '-') {
+        return std::stoi(s.substr(0, 4)) * 10000 +
+               std::stoi(s.substr(5, 2)) * 100 +
+               std::stoi(s.substr(8, 2));
+    }
+    return 0;
+}
+
+static int dateAddYearsLocal(int yyyymmdd, int years) {
+    int y = yyyymmdd / 10000;
+    int md = yyyymmdd % 10000;
+    return (y + years) * 10000 + md;
+}
+
+static DecorrCol resolveDecorrCol(DecorrCol col,
+                                  const DecorrelatedScalarSubquery& dsq,
+                                  const SchemaProvider* schema) {
+    if (!col.qualifier.empty()) {
+        auto it = dsq.aliases.find(col.qualifier);
+        if (it != dsq.aliases.end()) {
+            col.table = it->second;
+            col.inner = true;
+            return col;
+        }
+        if (schema && schema->hasColumn(col.qualifier, col.column)) {
+            col.table = col.qualifier;
+            col.inner = true;
+            return col;
+        }
+        col.table = col.qualifier;
+        col.inner = false;
+        return col;
+    }
+
+    std::string match;
+    for (const auto& table : dsq.tables) {
+        if (schema && schema->hasColumn(table, col.column)) {
+            if (!match.empty()) {
+                col.inner = false;
+                return col;
+            }
+            match = table;
+        }
+    }
+    if (!match.empty()) {
+        col.table = match;
+        col.inner = true;
+    }
+    return col;
+}
+
+static ExprPtr jsonExprToExpr(const nlohmann::json& node,
+                              const DecorrelatedScalarSubquery& dsq,
+                              const SchemaProvider* schema);
+
+static ExprPtr jsonConstToExpr(const nlohmann::json& ac) {
+    if (ac.contains("ival")) {
+        const auto& iv = ac["ival"];
+        if (iv.is_object() && iv.contains("ival")) return Expr::lit(iv["ival"].get<int>());
+        return Expr::lit(0);
+    }
+    if (ac.contains("fval")) {
+        const auto& fv = ac["fval"];
+        if (fv.is_object() && fv.contains("fval"))
+            return Expr::litf(std::stof(fv["fval"].get<std::string>()));
+        return Expr::litf(0.0f);
+    }
+    if (ac.contains("sval")) {
+        const auto& sv = ac["sval"];
+        if (sv.is_object() && sv.contains("sval"))
+            return Expr::lits(sv["sval"].get<std::string>());
+    }
+    return Expr::lit(0);
+}
+
+static ExprPtr jsonTypeCastToExpr(const nlohmann::json& tc,
+                                  const DecorrelatedScalarSubquery& dsq,
+                                  const SchemaProvider* schema) {
+    std::string typ;
+    if (tc.contains("typeName") && tc["typeName"].contains("names")) {
+        for (const auto& n : tc["typeName"]["names"]) {
+            if (auto s = jsonStringValue(n)) typ = *s;
+        }
+    }
+    auto arg = jsonExprToExpr(tc.value("arg", nlohmann::json{}), dsq, schema);
+    if (typ == "date") {
+        if (auto* lit = std::get_if<Literal>(&arg->node)) {
+            if (auto* sv = std::get_if<std::string>(&lit->value))
+                return Expr::lit(parseDateLiteralLocal(*sv));
+        }
+    }
+    if (typ == "interval") {
+        if (auto* lit = std::get_if<Literal>(&arg->node)) {
+            if (auto* sv = std::get_if<std::string>(&lit->value)) return Expr::lit(std::stoi(*sv));
+            if (auto* iv = std::get_if<int>(&lit->value)) return Expr::lit(*iv);
+        }
+    }
+    return arg;
+}
+
+static ExprPtr jsonExprToExpr(const nlohmann::json& node,
+                              const DecorrelatedScalarSubquery& dsq,
+                              const SchemaProvider* schema) {
+    if (node.contains("ColumnRef")) {
+        auto raw = jsonRawColumnRef(node);
+        if (!raw) return Expr::lit(0);
+        auto col = resolveDecorrCol(*raw, dsq, schema);
+        DataType dt = (col.inner && schema) ? schema->columnType(col.table, col.column) : DataType::INT;
+        int fw = (dt == DataType::CHAR_FIXED && schema) ? schema->columnFixedWidth(col.table, col.column) : 0;
+        return Expr::col(col.inner ? col.table : "", col.column, -1, dt, fw, col.qualifier);
+    }
+    if (node.contains("A_Const")) return jsonConstToExpr(node["A_Const"]);
+    if (node.contains("TypeCast")) return jsonTypeCastToExpr(node["TypeCast"], dsq, schema);
+    if (node.contains("FuncCall")) {
+        FuncCall fc;
+        fc.name = jsonFuncName(node["FuncCall"]);
+        if (node["FuncCall"].contains("args")) {
+            for (const auto& arg : node["FuncCall"]["args"])
+                fc.args.push_back(jsonExprToExpr(arg, dsq, schema));
+        }
+        auto out = std::make_shared<Expr>();
+        out->node = std::move(fc);
+        return out;
+    }
+    if (node.contains("A_Expr")) {
+        const auto& ae = node["A_Expr"];
+        std::string op = jsonAExprOp(ae);
+        if (op == "+" || op == "-" || op == "*" || op == "/") {
+            auto left = jsonExprToExpr(ae.value("lexpr", nlohmann::json{}), dsq, schema);
+            auto right = jsonExprToExpr(ae.value("rexpr", nlohmann::json{}), dsq, schema);
+            ExprOp eop = ExprOp::ADD;
+            if (op == "-") eop = ExprOp::SUB;
+            else if (op == "*") eop = ExprOp::MUL;
+            else if (op == "/") eop = ExprOp::DIV;
+            if ((eop == ExprOp::ADD || eop == ExprOp::SUB)) {
+                auto* l = std::get_if<Literal>(&left->node);
+                auto* r = std::get_if<Literal>(&right->node);
+                if (l && r) {
+                    auto* dateVal = std::get_if<int>(&l->value);
+                    auto* intervalVal = std::get_if<int>(&r->value);
+                    if (dateVal && intervalVal && *dateVal > 19000101 && *dateVal < 21001231) {
+                        int years = *intervalVal;
+                        if (eop == ExprOp::SUB) years = -years;
+                        return Expr::lit(dateAddYearsLocal(*dateVal, years));
+                    }
+                }
+            }
+            return Expr::binary(eop, left, right);
+        }
+    }
+    return Expr::lit(0);
+}
+
+static CmpOp cmpOpFromJson(const std::string& op) {
+    if (op == "=") return CmpOp::EQ;
+    if (op == "<>" || op == "!=") return CmpOp::NE;
+    if (op == "<") return CmpOp::LT;
+    if (op == "<=") return CmpOp::LE;
+    if (op == ">") return CmpOp::GT;
+    if (op == ">=") return CmpOp::GE;
+    return CmpOp::EQ;
+}
+
+static PredPtr jsonPredToPred(const nlohmann::json& node,
+                              const DecorrelatedScalarSubquery& dsq,
+                              const SchemaProvider* schema) {
+    if (node.contains("BoolExpr")) {
+        const auto& be = node["BoolExpr"];
+        std::string op = be.value("boolop", "AND_EXPR");
+        std::vector<PredPtr> children;
+        if (be.contains("args")) {
+            for (const auto& arg : be["args"])
+                children.push_back(jsonPredToPred(arg, dsq, schema));
+        }
+        if (op == "OR_EXPR") return Predicate::logOr(std::move(children));
+        if (op == "NOT_EXPR" && !children.empty()) return Predicate::logNot(children.front());
+        return Predicate::logAnd(std::move(children));
+    }
+    if (node.contains("A_Expr")) {
+        const auto& ae = node["A_Expr"];
+        std::string kind = ae.value("kind", "AEXPR_OP");
+        std::string op = jsonAExprOp(ae);
+        if (kind == "AEXPR_LIKE" || kind == "AEXPR_ILIKE") {
+            auto expr = jsonExprToExpr(ae.value("lexpr", nlohmann::json{}), dsq, schema);
+            auto patExpr = jsonExprToExpr(ae.value("rexpr", nlohmann::json{}), dsq, schema);
+            std::string pat;
+            if (auto* lit = std::get_if<Literal>(&patExpr->node))
+                if (auto* sv = std::get_if<std::string>(&lit->value)) pat = *sv;
+            return Predicate::like(expr, pat, op == "!~~" || op == "!~~*");
+        }
+        auto left = jsonExprToExpr(ae.value("lexpr", nlohmann::json{}), dsq, schema);
+        auto right = jsonExprToExpr(ae.value("rexpr", nlohmann::json{}), dsq, schema);
+        return Predicate::cmp(cmpOpFromJson(op), left, right);
+    }
+    return Predicate::cmp(CmpOp::EQ, Expr::lit(1), Expr::lit(1));
+}
+
+static void collectJsonConjuncts(const nlohmann::json& node,
+                                 std::vector<nlohmann::json>& out) {
+    if (node.contains("BoolExpr") && node["BoolExpr"].value("boolop", "") == "AND_EXPR") {
+        for (const auto& arg : node["BoolExpr"]["args"]) collectJsonConjuncts(arg, out);
+        return;
+    }
+    out.push_back(node);
+}
+
+static void collectPredTables(const PredPtr& pred, std::set<std::string>& tables) {
+    std::map<std::string, std::string> colToTable;
+    collectColumnTables(pred, colToTable);
+    for (const auto& [_, table] : colToTable) {
+        if (!table.empty()) tables.insert(table);
+    }
+}
+
+static std::string maxKeySymbolForColumn(const std::string& table,
+                                         const std::string& col,
+                                         const SchemaProvider* schema) {
+    if (col.find("partkey") != std::string::npos) return "maxPartkey";
+    if (col.find("suppkey") != std::string::npos) return "maxSuppkey";
+    if (col.find("custkey") != std::string::npos) return "maxCustkey";
+    if (col.find("orderkey") != std::string::npos) return "maxOrderkey";
+    if (schema) {
+        if (auto gd = schema->groupDomain(table, col))
+            return std::to_string(gd->maxValue + 1);
+        auto pk = schema->pkInfo(table);
+        if (pk && pk->first == col) return pk->second;
+    }
+    return schema ? schema->maxKeySymbol(table) : "";
+}
+
+static bool extractDecorrelatedAggTarget(const nlohmann::json& node,
+                                         DecorrelatedScalarSubquery& dsq,
+                                         const SchemaProvider* schema,
+                                         float multiplier = 1.0f) {
+    if (!node.is_object()) return false;
+    if (node.contains("TypeCast"))
+        return extractDecorrelatedAggTarget(node["TypeCast"].value("arg", nlohmann::json{}),
+                                            dsq, schema, multiplier);
+    if (node.contains("FuncCall")) {
+        const auto& fc = node["FuncCall"];
+        std::string name = jsonFuncName(fc);
+        if (!isAggregateFuncCallName(name)) return false;
+        if (name == "sum") dsq.func = AggFunc::SUM;
+        else if (name == "avg") dsq.func = AggFunc::AVG;
+        else if (name == "min") dsq.func = AggFunc::MIN;
+        else if (name == "max") dsq.func = AggFunc::MAX;
+        else if (name == "count") dsq.func = AggFunc::COUNT;
+        dsq.multiplier = multiplier;
+        dsq.countStar = !fc.contains("args") || fc["args"].empty();
+        if (!dsq.countStar) {
+            auto raw = jsonRawColumnRef(fc["args"][0]);
+            if (!raw) return false;
+            auto col = resolveDecorrCol(*raw, dsq, schema);
+            if (!col.inner) return false;
+            dsq.valueTable = col.table;
+            dsq.valueCol = col.column;
+        }
+        return true;
+    }
+    if (!node.contains("A_Expr")) return false;
+    const auto& ae = node["A_Expr"];
+    std::string op = jsonAExprOp(ae);
+    if (op == "*") {
+        if (auto lit = jsonNumericConst(ae.value("lexpr", nlohmann::json{})))
+            return extractDecorrelatedAggTarget(ae.value("rexpr", nlohmann::json{}),
+                                                dsq, schema, multiplier * (float)*lit);
+        if (auto lit = jsonNumericConst(ae.value("rexpr", nlohmann::json{})))
+            return extractDecorrelatedAggTarget(ae.value("lexpr", nlohmann::json{}),
+                                                dsq, schema, multiplier * (float)*lit);
+    }
+    if (op == "/") {
+        if (auto lit = jsonNumericConst(ae.value("rexpr", nlohmann::json{}))) {
+            if (*lit != 0.0)
+                return extractDecorrelatedAggTarget(ae.value("lexpr", nlohmann::json{}),
+                                                    dsq, schema, multiplier / (float)*lit);
+        }
+    }
+    return false;
+}
+
+static std::optional<DecorrelatedScalarSubquery> parseDecorrelatedScalarSubquery(
+        const std::string& sqlJson,
+        const AnalyzedQuery& aq,
+        int sqIdx) {
+    nlohmann::json root;
+    try { root = nlohmann::json::parse(sqlJson); } catch (...) { return std::nullopt; }
+    if (!root.contains("SelectStmt")) return std::nullopt;
+    const auto& ss = root["SelectStmt"];
+
+    DecorrelatedScalarSubquery dsq;
+    dsq.sqIdx = sqIdx;
+    if (!ss.contains("fromClause") || !ss["fromClause"].is_array()) return std::nullopt;
+    for (const auto& from : ss["fromClause"]) {
+        if (!from.contains("RangeVar")) continue;
+        const auto& rv = from["RangeVar"];
+        std::string rel = rv.value("relname", "");
+        if (rel.empty()) continue;
+        dsq.tables.push_back(rel);
+        dsq.aliases[rel] = rel;
+        if (rv.contains("alias") && rv["alias"].contains("Alias"))
+            dsq.aliases[rv["alias"]["Alias"].value("aliasname", rel)] = rel;
+    }
+    if (dsq.tables.empty()) return std::nullopt;
+
+    if (!ss.contains("targetList") || !ss["targetList"].is_array() || ss["targetList"].empty())
+        return std::nullopt;
+    bool foundAgg = false;
+    for (const auto& target : ss["targetList"]) {
+        if (!target.contains("ResTarget") || !target["ResTarget"].contains("val")) continue;
+        if (extractDecorrelatedAggTarget(target["ResTarget"]["val"], dsq, aq.schema)) {
+            foundAgg = true;
+            break;
+        }
+    }
+    if (!foundAgg) return std::nullopt;
+
+    std::vector<nlohmann::json> conjuncts;
+    if (ss.contains("whereClause")) collectJsonConjuncts(ss["whereClause"], conjuncts);
+    for (const auto& predJson : conjuncts) {
+        bool classified = false;
+        if (predJson.contains("A_Expr") && jsonAExprOp(predJson["A_Expr"]) == "=") {
+            auto leftRaw = jsonRawColumnRef(predJson["A_Expr"].value("lexpr", nlohmann::json{}));
+            auto rightRaw = jsonRawColumnRef(predJson["A_Expr"].value("rexpr", nlohmann::json{}));
+            if (leftRaw && rightRaw) {
+                auto left = resolveDecorrCol(*leftRaw, dsq, aq.schema);
+                auto right = resolveDecorrCol(*rightRaw, dsq, aq.schema);
+                if (left.inner && right.inner) {
+                    if (left.table != right.table || left.column != right.column)
+                        dsq.joins.push_back({left, right});
+                    classified = true;
+                } else if (left.inner != right.inner) {
+                    dsq.correlations.push_back(left.inner
+                        ? DecorrCorrelation{left, right}
+                        : DecorrCorrelation{right, left});
+                    classified = true;
+                }
+            }
+        }
+        if (classified) continue;
+
+        auto pred = jsonPredToPred(predJson, dsq, aq.schema);
+        std::set<std::string> predTables;
+        collectPredTables(pred, predTables);
+        if (predTables.size() != 1) return std::nullopt;
+        dsq.filtersByTable[*predTables.begin()].push_back(pred);
+    }
+
+    if (dsq.correlations.empty() || dsq.correlations.size() > 2) return std::nullopt;
+    if (dsq.countStar && dsq.valueTable.empty())
+        dsq.valueTable = dsq.correlations.front().inner.table;
+    if (dsq.valueTable.empty()) return std::nullopt;
+    return dsq;
+}
+
+struct DecorrelatedBitmapState {
+    std::string table;
+    std::string column;
+    std::string bitmap;
+    std::string sizeExpr;
+    bool externalToTable = false;
+};
+
+static std::optional<ScalarLookupInfo> buildDecorrelatedScalarPreAgg(
+        const DecorrelatedScalarSubquery& dsq,
+        const AnalyzedQuery& aq,
+        MetalQueryPlan& plan) {
+    const std::string idxVar = "i";
+    std::map<std::string, std::set<std::string>> relevantCols;
+    for (const auto& j : dsq.joins) {
+        relevantCols[j.left.table].insert(j.left.column);
+        relevantCols[j.right.table].insert(j.right.column);
+    }
+    for (const auto& c : dsq.correlations)
+        relevantCols[c.inner.table].insert(c.inner.column);
+
+    auto filterCondFor = [&](const std::string& table) {
+        auto it = dsq.filtersByTable.find(table);
+        if (it == dsq.filtersByTable.end()) return std::string("true");
+        return combineFilters(it->second, idxVar, aq.schema);
+    };
+    auto makeFilteredScan = [&](const std::string& table) -> std::unique_ptr<MetalOperator> {
+        std::unique_ptr<MetalOperator> pipe = makeAutoScan(table, idxVar);
+        return maybeSelect(std::move(pipe), filterCondFor(table));
+    };
+
+    std::map<std::pair<std::string, std::string>, DecorrelatedBitmapState> states;
+    auto addState = [&](const std::string& table, const std::string& col,
+                        DecorrelatedBitmapState state) {
+        states[{table, col}] = std::move(state);
+    };
+    auto hasState = [&](const std::string& table, const std::string& col) {
+        return states.count({table, col}) != 0;
+    };
+    auto stateName = [&](const std::string& table, const std::string& col,
+                         const std::string& suffix) {
+        return "d_scalar_" + std::to_string(dsq.sqIdx) + "_" +
+               sanitizeIdentifier(table + "_" + col + "_" + suffix) + "_bmp";
+    };
+
+    for (const auto& [table, filters] : dsq.filtersByTable) {
+        auto colsIt = relevantCols.find(table);
+        if (colsIt == relevantCols.end()) continue;
+        for (const auto& col : colsIt->second) {
+            std::string bitmap = stateName(table, col, "seed");
+            auto pipe = makeFilteredScan(table);
+            auto build = std::make_unique<MetalBitmapBuild>(
+                std::move(pipe), bitmap, col + "[" + idxVar + "]",
+                maxKeySymbolForColumn(table, col, aq.schema));
+            appendPhase(plan, "ADHOC_scalar_decorrelate_" + std::to_string(dsq.sqIdx) +
+                              "_" + sanitizeIdentifier(table + "_" + col + "_seed"),
+                        std::move(build));
+            addState(table, col, {table, col, bitmap,
+                                  maxKeySymbolForColumn(table, col, aq.schema), false});
+        }
+    }
+
+    bool changed = true;
+    int guard = 0;
+    while (changed && guard++ < 64) {
+        changed = false;
+        std::vector<DecorrelatedBitmapState> snapshot;
+        for (const auto& [_, state] : states) snapshot.push_back(state);
+
+        for (const auto& st : snapshot) {
+            auto colsIt = relevantCols.find(st.table);
+            if (colsIt != relevantCols.end()) {
+                for (const auto& outCol : colsIt->second) {
+                    if (outCol == st.column || hasState(st.table, outCol)) continue;
+                    std::string bitmap = stateName(st.table, outCol, "xfer");
+                    std::unique_ptr<MetalOperator> pipe = makeAutoScan(st.table, idxVar);
+                    pipe = std::make_unique<MetalBitmapProbe>(
+                        std::move(pipe), st.bitmap, st.column + "[" + idxVar + "]");
+                    pipe = maybeSelect(std::move(pipe), filterCondFor(st.table));
+                    auto build = std::make_unique<MetalBitmapBuild>(
+                        std::move(pipe), bitmap, outCol + "[" + idxVar + "]",
+                        maxKeySymbolForColumn(st.table, outCol, aq.schema));
+                    appendPhase(plan, "ADHOC_scalar_decorrelate_" + std::to_string(dsq.sqIdx) +
+                                      "_" + sanitizeIdentifier(st.table + "_" + outCol + "_xfer"),
+                                std::move(build));
+                    addState(st.table, outCol, {st.table, outCol, bitmap,
+                                                maxKeySymbolForColumn(st.table, outCol, aq.schema),
+                                                st.externalToTable});
+                    changed = true;
+                }
+            }
+
+            for (const auto& j : dsq.joins) {
+                const DecorrCol* src = nullptr;
+                const DecorrCol* dst = nullptr;
+                if (j.left.table == st.table && j.left.column == st.column) {
+                    src = &j.left; dst = &j.right;
+                } else if (j.right.table == st.table && j.right.column == st.column) {
+                    src = &j.right; dst = &j.left;
+                }
+                if (!src || !dst || hasState(dst->table, dst->column)) continue;
+                std::string bitmap = stateName(dst->table, dst->column, "join");
+                std::unique_ptr<MetalOperator> pipe = makeAutoScan(dst->table, idxVar);
+                pipe = std::make_unique<MetalBitmapProbe>(
+                    std::move(pipe), st.bitmap, dst->column + "[" + idxVar + "]");
+                pipe = maybeSelect(std::move(pipe), filterCondFor(dst->table));
+                auto build = std::make_unique<MetalBitmapBuild>(
+                    std::move(pipe), bitmap, dst->column + "[" + idxVar + "]",
+                    maxKeySymbolForColumn(dst->table, dst->column, aq.schema));
+                appendPhase(plan, "ADHOC_scalar_decorrelate_" + std::to_string(dsq.sqIdx) +
+                                  "_" + sanitizeIdentifier(dst->table + "_" + dst->column + "_join"),
+                            std::move(build));
+                addState(dst->table, dst->column, {dst->table, dst->column, bitmap,
+                                                   maxKeySymbolForColumn(dst->table, dst->column, aq.schema),
+                                                   true});
+                changed = true;
+            }
+        }
+    }
+
+    auto makeAggInput = [&]() -> std::unique_ptr<MetalOperator> {
+        std::unique_ptr<MetalOperator> pipe = makeAutoScan(dsq.valueTable, idxVar);
+        pipe = maybeSelect(std::move(pipe), filterCondFor(dsq.valueTable));
+        for (const auto& [_, st] : states) {
+            if (st.table == dsq.valueTable && st.externalToTable) {
+                pipe = std::make_unique<MetalBitmapProbe>(
+                    std::move(pipe), st.bitmap, st.column + "[" + idxVar + "]");
+            }
+        }
+        return pipe;
+    };
+
+    ScalarLookupInfo info;
+    info.sentinel = INT_MIN + dsq.sqIdx;
+    info.valueTable = dsq.valueTable;
+    info.valueCol = dsq.valueCol;
+    info.multiplier = dsq.multiplier;
+    for (const auto& c : dsq.correlations) {
+        info.keyCols.push_back(c.inner.column);
+        info.outerKeyCols.push_back(c.outer.column);
+    }
+    info.keyCol = info.keyCols.empty() ? "" : info.keyCols[0];
+    info.keyCol2 = info.keyCols.size() > 1 ? info.keyCols[1] : "";
+
+    const std::string base = "d_scalar_" + std::to_string(dsq.sqIdx) + "_" +
+                             sanitizeIdentifier(dsq.valueTable + "_" + info.keyCol +
+                                                (info.keyCol2.empty() ? "" : "_" + info.keyCol2) +
+                                                "_" + (dsq.valueCol.empty() ? "star" : dsq.valueCol));
+    if (info.keyCols.size() == 1) {
+        info.sizeSymbol = maxKeySymbolForColumn(dsq.valueTable, info.keyCol, aq.schema);
+        const std::string keyExpr = info.keyCol + "[" + idxVar + "]";
+        if (dsq.func == AggFunc::COUNT) {
+            info.kind = ScalarLookupInfo::CountByKey;
+            info.countBuffer = base + "_cnt";
+            auto count = std::make_unique<MetalAtomicCount>(
+                makeAggInput(), info.countBuffer, keyExpr, info.sizeSymbol);
+            appendPhase(plan, "ADHOC_scalar_decorrelate_" + std::to_string(dsq.sqIdx) + "_count",
+                        std::move(count));
+            return info;
+        }
+
+        struct ScalarDirectFloatAgg : MetalUnaryOperator {
+            std::string op_, buf_, state_, key_, value_, size_;
+            ScalarDirectFloatAgg(std::unique_ptr<MetalOperator> child,
+                                 std::string op, std::string buf, std::string state,
+                                 std::string key, std::string value, std::string size)
+                : MetalUnaryOperator(std::move(child)), op_(std::move(op)), buf_(std::move(buf)),
+                  state_(std::move(state)), key_(std::move(key)), value_(std::move(value)),
+                  size_(std::move(size)) {}
+            void produce(MetalCodegen& cg, ConsumerFn) override {
+                cg.addAtomicBufferParam(buf_, "atomic_uint", size_);
+                if (!state_.empty()) cg.addAtomicBufferParam(state_, "atomic_uint", size_);
+                child_->produce(cg, [&]() {
+                    std::string k = "(uint)(" + key_ + ")";
+                    std::string v = "(float)(" + value_ + ")";
+                    if (!state_.empty()) {
+                        cg.addLine("atomic_store_explicit(&" + state_ + "[" + k +
+                                   "], 1u, memory_order_relaxed);");
+                    }
+                    if (op_ == "sum")
+                        cg.addLine("atomic_add_float(&" + buf_ + "[" + k + "], " + v + ");");
+                    else if (op_ == "min")
+                        cg.addLine("atomic_min_float(&" + buf_ + "[" + k + "], " + v + ");");
+                    else if (op_ == "max")
+                        cg.addLine("atomic_max_float(&" + buf_ + "[" + k + "], " + v + ");");
+                });
+            }
+            std::string describe() const override { return "ScalarDirectFloatAgg(" + op_ + ")"; }
+            void iusUsed(std::vector<IU>& out) const override {
+                appendIUsFromExpr(key_, out);
+                appendIUsFromExpr(value_, out);
+            }
+        };
+
+        const std::string valueExpr = dsq.countStar ? "1.0f" : dsq.valueCol + "[" + idxVar + "]";
+        if (dsq.func == AggFunc::AVG) {
+            info.kind = ScalarLookupInfo::AvgByKey;
+            info.countBuffer = base + "_cnt";
+            info.sumBuffer = base + "_sum";
+            info.cntVar = "_scalar_" + std::to_string(dsq.sqIdx) + "_cnt";
+            info.sumVar = "_scalar_" + std::to_string(dsq.sqIdx) + "_sum";
+            auto count = std::make_unique<MetalAtomicCount>(
+                makeAggInput(), info.countBuffer, keyExpr, info.sizeSymbol);
+            appendPhase(plan, "ADHOC_scalar_decorrelate_" + std::to_string(dsq.sqIdx) + "_avg_count",
+                        std::move(count));
+            auto sum = std::make_unique<ScalarDirectFloatAgg>(
+                makeAggInput(), "sum", info.sumBuffer, "", keyExpr, valueExpr, info.sizeSymbol);
+            appendPhase(plan, "ADHOC_scalar_decorrelate_" + std::to_string(dsq.sqIdx) + "_avg_sum",
+                        std::move(sum));
+            return info;
+        }
+        if (dsq.func == AggFunc::SUM) {
+            info.kind = ScalarLookupInfo::SumByKey;
+            info.sumBuffer = base + "_sum";
+            info.stateBuffer = base + "_seen";
+            auto sum = std::make_unique<ScalarDirectFloatAgg>(
+                makeAggInput(), "sum", info.sumBuffer, info.stateBuffer, keyExpr, valueExpr,
+                info.sizeSymbol);
+            appendPhase(plan, "ADHOC_scalar_decorrelate_" + std::to_string(dsq.sqIdx) + "_sum",
+                        std::move(sum));
+            return info;
+        }
+        if (dsq.func == AggFunc::MIN || dsq.func == AggFunc::MAX) {
+            bool isMin = dsq.func == AggFunc::MIN;
+            info.kind = isMin ? ScalarLookupInfo::MinByKey : ScalarLookupInfo::MaxByKey;
+            if (isMin) info.minBuffer = base + "_min";
+            else info.maxBuffer = base + "_max";
+            info.stateBuffer = base + "_seen";
+            struct ScalarFillFloatBuffer : MetalOperator {
+                std::string buf_, size_, fill_;
+                ScalarFillFloatBuffer(std::string buf, std::string size, std::string fill)
+                    : buf_(std::move(buf)), size_(std::move(size)), fill_(std::move(fill)) {}
+                void produce(MetalCodegen& cg, ConsumerFn) override {
+                    std::string n = "n_" + sanitizeIdentifier(buf_);
+                    cg.addAtomicBufferParam(buf_, "atomic_uint", size_);
+                    cg.addResolvedScalarParam(n, "uint", size_);
+                    cg.addBlock("for (uint i = tid; i < " + n + "; i += tpg)", [&]() {
+                        cg.addLine("atomic_store_explicit(&" + buf_ +
+                                   "[i], as_type<uint>(" + fill_ + "), memory_order_relaxed);");
+                    });
+                }
+                std::string describe() const override { return "ScalarFillFloatBuffer"; }
+            };
+            appendPhase(plan, "ADHOC_scalar_decorrelate_" + std::to_string(dsq.sqIdx) +
+                              (isMin ? "_min_init" : "_max_init"),
+                        std::make_unique<ScalarFillFloatBuffer>(
+                            isMin ? info.minBuffer : info.maxBuffer,
+                            info.sizeSymbol,
+                            isMin ? "3.402823466e38f" : "-3.402823466e38f"));
+            auto minmax = std::make_unique<ScalarDirectFloatAgg>(
+                makeAggInput(), isMin ? "min" : "max", isMin ? info.minBuffer : info.maxBuffer,
+                info.stateBuffer, keyExpr, valueExpr, info.sizeSymbol);
+            appendPhase(plan, "ADHOC_scalar_decorrelate_" + std::to_string(dsq.sqIdx) +
+                              (isMin ? "_min" : "_max"),
+                        std::move(minmax));
+            return info;
+        }
+        return std::nullopt;
+    }
+
+    if (info.keyCols.size() == 2) {
+        if (dsq.func == AggFunc::MIN || dsq.func == AggFunc::MAX) return std::nullopt;
+        info.hashCapacityExpr = "next_pow2(" + tableSizeName(dsq.valueTable) + " * 2)";
+        std::string k1 = "(uint)(" + info.keyCol + "[" + idxVar + "])";
+        std::string k2 = "(uint)(" + info.keyCol2 + "[" + idxVar + "])";
+        std::string valueExpr = dsq.countStar ? "1u" : dsq.valueCol + "[" + idxVar + "]";
+
+        const std::string hashLookupHelpers = R"(
+	static ulong scalar_hash_pack2(uint k1, uint k2) {
+	    return ((ulong)k1 << 32) | (ulong)k2;
+	}
+	
+	static uint scalar_hash_mix64(ulong x) {
+	    x ^= x >> 33;
+	    x *= 0xff51afd7ed558ccdUL;
+	    x ^= x >> 33;
+	    x *= 0xc4ceb9fe1a85ec53UL;
+	    x ^= x >> 33;
+	    return (uint)x ^ (uint)(x >> 32);
+	}
+	
+	static void scalar_hash_insert_add_u32_64(device atomic_uint* states,
+	                                          device ulong* keys,
+	                                          device atomic_uint* vals,
+	                                          uint cap, uint k1, uint k2, uint value) {
+	    ulong key = scalar_hash_pack2(k1, k2);
+	    uint mask = cap - 1u;
+	    uint slot = scalar_hash_mix64(key) & mask;
+	    for (uint probe = 0u; probe < cap; ++probe) {
+	        uint state = atomic_load_explicit(&states[slot], memory_order_relaxed);
+	        if (state == 0u) {
+	            uint expected = 0u;
+	            if (atomic_compare_exchange_weak_explicit(&states[slot], &expected, 1u,
+	                    memory_order_relaxed, memory_order_relaxed)) {
+	                keys[slot] = key;
+	                atomic_store_explicit(&vals[slot], 0u, memory_order_relaxed);
+	                atomic_store_explicit(&states[slot], 2u, memory_order_relaxed);
+	                atomic_fetch_add_explicit(&vals[slot], value, memory_order_relaxed);
+	                return;
+	            }
+	            continue;
+	        }
+	        while (state == 1u) {
+	            state = atomic_load_explicit(&states[slot], memory_order_relaxed);
+	        }
+	        if (state == 2u && keys[slot] == key) {
+	            atomic_fetch_add_explicit(&vals[slot], value, memory_order_relaxed);
+	            return;
+	        }
+	        slot = (slot + 1u) & mask;
+	    }
+	}
+	
+	static void scalar_hash_insert_add_float_64(device atomic_uint* states,
+	                                            device ulong* keys,
+	                                            device atomic_uint* vals,
+	                                            uint cap, uint k1, uint k2, float value) {
+	    ulong key = scalar_hash_pack2(k1, k2);
+	    uint mask = cap - 1u;
+	    uint slot = scalar_hash_mix64(key) & mask;
+	    for (uint probe = 0u; probe < cap; ++probe) {
+	        uint state = atomic_load_explicit(&states[slot], memory_order_relaxed);
+	        if (state == 0u) {
+	            uint expected = 0u;
+	            if (atomic_compare_exchange_weak_explicit(&states[slot], &expected, 1u,
+	                    memory_order_relaxed, memory_order_relaxed)) {
+	                keys[slot] = key;
+	                atomic_store_explicit(&vals[slot], 0u, memory_order_relaxed);
+	                atomic_store_explicit(&states[slot], 2u, memory_order_relaxed);
+	                atomic_add_float(&vals[slot], value);
+	                return;
+	            }
+	            continue;
+	        }
+	        while (state == 1u) {
+	            state = atomic_load_explicit(&states[slot], memory_order_relaxed);
+	        }
+	        if (state == 2u && keys[slot] == key) {
+	            atomic_add_float(&vals[slot], value);
+	            return;
+	        }
+	        slot = (slot + 1u) & mask;
+	    }
+	}
+	
+	static uint scalar_hash_lookup_raw64(const device uint* states,
+	                                     const device ulong* keys,
+	                                     const device uint* vals,
+	                                     uint cap, uint k1, uint k2) {
+	    ulong key = scalar_hash_pack2(k1, k2);
+	    uint mask = cap - 1u;
+	    uint slot = scalar_hash_mix64(key) & mask;
+	    for (uint probe = 0u; probe < cap; ++probe) {
+	        uint state = states[slot];
+	        if (state == 0u) return 0u;
+	        if (state == 2u && keys[slot] == key) return vals[slot];
+	        slot = (slot + 1u) & mask;
+	    }
+	    return 0u;
+	}
+	
+	static float scalar_hash_lookup_float_or_nan64(const device uint* states,
+	                                               const device ulong* keys,
+	                                               const device uint* vals,
+	                                               uint cap, uint k1, uint k2) {
+	    ulong key = scalar_hash_pack2(k1, k2);
+	    uint mask = cap - 1u;
+	    uint slot = scalar_hash_mix64(key) & mask;
+	    for (uint probe = 0u; probe < cap; ++probe) {
+	        uint state = states[slot];
+	        if (state == 0u) return as_type<float>(0x7fc00000u);
+	        if (state == 2u && keys[slot] == key) return as_type<float>(vals[slot]);
+	        slot = (slot + 1u) & mask;
+	    }
+	    return as_type<float>(0x7fc00000u);
+	}
+	)";
+        if (std::find(plan.helpers.begin(), plan.helpers.end(), hashLookupHelpers) ==
+            plan.helpers.end()) {
+            plan.helpers.push_back(hashLookupHelpers);
+        }
+
+        struct ScalarCompositeHashAgg : MetalUnaryOperator {
+            std::string map_, key1_, key2_, value_, cap_;
+            bool valueIsFloat_;
+            ScalarCompositeHashAgg(std::unique_ptr<MetalOperator> child,
+                                   std::string map,
+                                   std::string key1,
+                                   std::string key2,
+                                   std::string value,
+                                   std::string cap,
+                                   bool valueIsFloat)
+                : MetalUnaryOperator(std::move(child)), map_(std::move(map)),
+                  key1_(std::move(key1)), key2_(std::move(key2)),
+                  value_(std::move(value)), cap_(std::move(cap)),
+                  valueIsFloat_(valueIsFloat) {}
+            void produce(MetalCodegen& cg, ConsumerFn consume) override {
+                cg.addAtomicBufferParam(map_ + "_states", "atomic_uint", cap_, 0);
+                cg.addBufferParam(map_ + "_keys", "ulong", cap_, false);
+                cg.addAtomicBufferParam(map_ + "_values", "atomic_uint", cap_, 0);
+                cg.addResolvedScalarParam("n_" + map_, "uint", cap_);
+                child_->produce(cg, [&]() {
+                    if (valueIsFloat_) {
+                        cg.addLine("scalar_hash_insert_add_float_64(" + map_ + "_states, " +
+                                   map_ + "_keys, " + map_ + "_values, n_" + map_ +
+                                   ", (uint)(" + key1_ + "), (uint)(" + key2_ +
+                                   "), (float)(" + value_ + "));");
+                    } else {
+                        cg.addLine("scalar_hash_insert_add_u32_64(" + map_ + "_states, " +
+                                   map_ + "_keys, " + map_ + "_values, n_" + map_ +
+                                   ", (uint)(" + key1_ + "), (uint)(" + key2_ +
+                                   "), (uint)(" + value_ + "));");
+                    }
+                    consume();
+                });
+            }
+            std::string describe() const override { return "ScalarCompositeHashAgg(" + map_ + ")"; }
+            void iusUsed(std::vector<IU>& out) const override {
+                appendIUsFromExpr(key1_, out);
+                appendIUsFromExpr(key2_, out);
+                appendIUsFromExpr(value_, out);
+            }
+        };
+
+        if (dsq.func == AggFunc::COUNT || dsq.func == AggFunc::AVG) {
+            info.countHashMap = "hm_scalar_" + std::to_string(dsq.sqIdx) + "_count";
+            auto count = std::make_unique<ScalarCompositeHashAgg>(
+                makeAggInput(), info.countHashMap, k1, k2, "1u", info.hashCapacityExpr, false);
+            appendPhase(plan, "ADHOC_scalar_decorrelate_" + std::to_string(dsq.sqIdx) + "_hash_count",
+                        std::move(count));
+        }
+        if (dsq.func == AggFunc::SUM || dsq.func == AggFunc::AVG) {
+            info.hashMap = "hm_scalar_" + std::to_string(dsq.sqIdx) + "_sum";
+            auto sum = std::make_unique<ScalarCompositeHashAgg>(
+                makeAggInput(), info.hashMap, k1, k2, valueExpr, info.hashCapacityExpr, true);
+            appendPhase(plan, "ADHOC_scalar_decorrelate_" + std::to_string(dsq.sqIdx) + "_hash_sum",
+                        std::move(sum));
+        }
+        if (dsq.func == AggFunc::AVG) info.kind = ScalarLookupInfo::AvgByCompositeHash;
+        else if (dsq.func == AggFunc::COUNT) info.kind = ScalarLookupInfo::CountByCompositeHash;
+        else info.kind = ScalarLookupInfo::SumByCompositeHash;
+        return info;
+    }
+
+    return std::nullopt;
+}
+
 static std::vector<ScalarLookupInfo> buildCorrelatedScalarPreAggs(const AnalyzedQuery& aq,
                                                                    MetalQueryPlan& plan) {
     std::vector<ScalarLookupInfo> result;
-    const std::string idxVar = "i";
-
     int sqIdx = 0;
     for (const auto& sq : aq.subqueries) {
-        if (sq.type != AnalyzedQuery::Subquery::SCALAR_SUBQUERY) { sqIdx++; continue; }
-
-        const std::string& sql = sq.sql;
-
-        if (textHasAll(sql, {"avg", "l_quantity", "l_partkey", "p_partkey"})) {
-            ScalarLookupInfo info;
-            info.sentinel = INT_MIN + sqIdx;
-            info.kind = ScalarLookupInfo::AvgByKey;
-            info.valueTable = "lineitem";
-            info.keyCol = "l_partkey";
-            info.valueCol = "l_quantity";
-            info.multiplier = 0.2f;
-            info.countBuffer = "d_q17_scalar_cnt";
-            info.sumBuffer = "d_q17_scalar_sum";
-            info.cntVar = "_scalar_cnt";
-            info.sumVar = "_scalar_sum";
-
-            plan.helpers.push_back(R"(
-static void scalar_atomic_add_float(device atomic_uint* arr, uint idx, float val) {
-    uint old = atomic_load_explicit(&arr[idx], memory_order_relaxed);
-    do {
-        float sum = as_type<float>(old) + val;
-        uint newval = as_type<uint>(sum);
-        if (atomic_compare_exchange_weak_explicit(&arr[idx], &old, newval,
-                memory_order_relaxed, memory_order_relaxed))
-            break;
-    } while (true);
-}
-)");
-            const std::string sizeSym = "maxPartkey";
-            // Count phase: atomic_uint, write as uint
-            auto countScan = makeScanForCols(info.valueTable, idxVar, {info.keyCol}, aq.schema);
-            auto count = std::make_unique<MetalAtomicCount>(
-                std::move(countScan), info.countBuffer, info.keyCol + "[" + idxVar + "]", sizeSym);
-            appendPhase(plan, "ADHOC_scalar_pre_q17_cnt", std::move(count));
-
-            // Sum phase: use scalar_atomic_add_float helper via custom terminal
-            struct ScalarAddFloatTerminal : MetalUnaryOperator {
-                std::string idx_, keyCol_, valCol_, buf_, sizeSym_;
-                ScalarAddFloatTerminal(std::unique_ptr<MetalOperator> c, std::string idx,
-                    std::string kc, std::string vc, std::string buf, std::string ss)
-                    : MetalUnaryOperator(std::move(c)), idx_(idx), keyCol_(kc),
-                      valCol_(vc), buf_(buf), sizeSym_(ss) {}
-                void produce(MetalCodegen& cg, ConsumerFn) override {
-                    cg.addBufferParam(buf_, "atomic_uint", sizeSym_, true, 0);
-                    child_->produce(cg, [&]() {
-                        cg.addLine("scalar_atomic_add_float(" + buf_ + ", (uint)" +
-                                   keyCol_ + "[" + idx_ + "], " + valCol_ + "[" + idx_ + "]);");
-                    });
-                }
-                std::string describe() const override { return "ScalarAddFloat"; }
-            };
-            auto sumScan = makeScanForCols(info.valueTable, idxVar, {info.keyCol, info.valueCol}, aq.schema);
-            auto side = std::make_unique<ScalarAddFloatTerminal>(
-                std::move(sumScan), idxVar, info.keyCol, info.valueCol, info.sumBuffer, sizeSym);
-            appendPhase(plan, "ADHOC_scalar_pre_q17_sum", std::move(side));
-
-            // Update lookup to use as_type<float> for the uint sum buffer
-            info.kind = ScalarLookupInfo::AvgByKey; // marker for attachment
-
-            result.push_back(std::move(info));
-            sqIdx++;
-            continue;
+        if (sq.type == AnalyzedQuery::Subquery::SCALAR_SUBQUERY) {
+            if (auto dsq = parseDecorrelatedScalarSubquery(sq.sql, aq, sqIdx)) {
+                if (auto info = buildDecorrelatedScalarPreAgg(*dsq, aq, plan))
+                    result.push_back(std::move(*info));
+            }
         }
-
-        if (textHasAll(sql, {"min", "ps_supplycost", "ps_partkey", "r_name", "EUROPE"})) {
-            ScalarLookupInfo info;
-            info.sentinel = INT_MIN + sqIdx;
-            info.kind = ScalarLookupInfo::MinByKey;
-            info.valueTable = "partsupp";
-            info.keyCol = "ps_partkey";
-            info.valueCol = "ps_supplycost";
-
-            plan.helpers.push_back(R"(
-static void scalar_atomic_min_float(device atomic_uint* arr, uint idx, float val) {
-    atomic_min_float(&arr[idx], val);
-}
-)");
-
-            auto rscan = makeAutoScan("region", idxVar);
-            auto rBmp = std::make_unique<MetalBitmapBuild>(
-                std::move(rscan), "d_q2_scalar_region_bmp", "r_regionkey[" + idxVar + "]", "5");
-            appendPhase(plan, "ADHOC_scalar_pre_q2_region", std::move(rBmp));
-
-            auto nscan = makeAutoScan("nation", idxVar);
-            auto nprobe = std::make_unique<MetalBitmapProbe>(
-                std::move(nscan), "d_q2_scalar_region_bmp", "n_regionkey[" + idxVar + "]");
-            auto nBmp = std::make_unique<MetalBitmapBuild>(
-                std::move(nprobe), "d_q2_scalar_nation_bmp", "n_nationkey[" + idxVar + "]", "25");
-            appendPhase(plan, "ADHOC_scalar_pre_q2_nation", std::move(nBmp));
-
-            auto sscan = makeAutoScan("supplier", idxVar);
-            auto sprobe = std::make_unique<MetalBitmapProbe>(
-                std::move(sscan), "d_q2_scalar_nation_bmp", "s_nationkey[" + idxVar + "]");
-            auto sBmp = std::make_unique<MetalBitmapBuild>(
-                std::move(sprobe), "d_q2_scalar_supplier_bmp", "s_suppkey[" + idxVar + "]", "maxSuppkey");
-            appendPhase(plan, "ADHOC_scalar_pre_q2_supplier", std::move(sBmp));
-
-            const std::string minBuf = "d_q2_scalar_min_cost";
-            info.minBuffer = minBuf;
-            auto psscan = makeAutoScan(info.valueTable, idxVar);
-            auto psprobe = std::make_unique<MetalBitmapProbe>(
-                std::move(psscan), "d_q2_scalar_supplier_bmp", "ps_suppkey[" + idxVar + "]");
-            auto minPhase = std::make_unique<MetalComputeExpr>(
-                std::move(psprobe), "_unused", "int",
-                "(scalar_atomic_min_float(" + minBuf + ", (uint)(" + info.keyCol + "[" + idxVar + "]), "
-                + info.valueCol + "[" + idxVar + "]), 0)");
-            auto& phaseRef = appendPhase(plan, "ADHOC_scalar_pre_q2_min", std::move(minPhase));
-            phaseRef.extraBuffers.push_back({minBuf, "atomic_uint", false, false});
-
-            result.push_back(info);
-            sqIdx++;
-            continue;
-        }
-
-        if (textHasAll(sql, {"sum", "l_quantity", "l_partkey", "ps_partkey", "l_suppkey", "ps_suppkey"})) {
-            ScalarLookupInfo info;
-            info.sentinel = INT_MIN + sqIdx;
-            info.kind = ScalarLookupInfo::SumByCompositeHash;
-            info.valueTable = "lineitem";
-            info.keyCol = "l_partkey";
-            info.keyCol2 = "l_suppkey";
-            info.valueCol = "l_quantity";
-            info.multiplier = 0.5f;
-
-            const std::string hmName = "hm_q20_scalar";
-            const std::string capExpr = "next_pow2((maxPartkey + 1) * 4)";
-
-            plan.helpers.push_back(R"(
-static float scalar_hash_lookup_value(const device uint* g_keys1,
-                                      const device uint* g_keys2,
-                                      const device uint* g_vals,
-                                      uint cap, uint k1, uint k2) {
-    uint mask = cap - 1u;
-    uint slot = hashmap_mix2(k1, k2) & mask;
-    for (uint probe = 0u; probe < cap; ++probe) {
-        uint k1slot = g_keys1[slot];
-        if (k1slot == 0xFFFFFFFFu) return 0.0f;
-        if (k1slot == k1 && g_keys2[slot] == k2)
-            return as_type<float>(g_vals[slot]);
-        slot = (slot + 1u) & mask;
-    }
-    return 0.0f;
-}
-)");
-
-            auto pScan = makeAutoScan("part", idxVar);
-            auto pSel = std::make_unique<MetalSelection>(
-                std::move(pScan), "p_size[" + idxVar + "] > 0");
-            auto pBmp = std::make_unique<MetalBitmapBuild>(
-                std::move(pSel), "d_q20_scalar_part_bmp", "p_partkey[" + idxVar + "]", "maxPartkey");
-            appendPhase(plan, "ADHOC_scalar_pre_q20_part", std::move(pBmp));
-
-            auto psScan = makeAutoScan("partsupp", idxVar);
-            auto psProbe = std::make_unique<MetalBitmapProbe>(
-                std::move(psScan), "d_q20_scalar_part_bmp", "ps_partkey[" + idxVar + "]");
-            auto psHash = std::make_unique<MetalHashMapAgg>(
-                std::move(psProbe), hmName,
-                "(uint)(ps_partkey[" + idxVar + "])",
-                "(uint)(ps_suppkey[" + idxVar + "])",
-                "0u", capExpr);
-            appendPhase(plan, "ADHOC_scalar_pre_q20_partsupp", std::move(psHash));
-
-            auto liScan = makeAutoScan(info.valueTable, idxVar);
-            auto liDate = std::make_unique<MetalSelection>(
-                std::move(liScan), "l_shipdate[" + idxVar + "] >= 19940101 && l_shipdate[" + idxVar + "] <= 19941231");
-            auto liHash = std::make_unique<MetalHashMapAgg>(
-                std::move(liDate), hmName,
-                "(uint)(" + info.keyCol + "[" + idxVar + "])",
-                "(uint)(" + info.keyCol2 + "[" + idxVar + "])",
-                info.valueCol + "[" + idxVar + "]", capExpr, true);
-            appendPhase(plan, "ADHOC_scalar_pre_q20_lineitem", std::move(liHash));
-
-            info.htKeys = hmName + "_keys1";
-            info.htFlags = hmName + "_keys2";
-            info.htVals = hmName + "_vals";
-            result.push_back(info);
-            sqIdx++;
-            continue;
-        }
-
         sqIdx++;
     }
-
     return result;
 }
 
@@ -2272,7 +3103,6 @@ std::optional<MetalQueryPlan> buildGenericMultiTableAdhocPlan_impl(
     std::map<int, std::vector<CarriedKey>> subtreeCarry;     // local + descendants
     std::function<void(int)> dfs = [&](int u) {
         const std::string& tname = nodes[u].baseTable;
-        const std::string& tnameAlias = nodes[u].table;
         // Local carries: columns from this table needed at probe, EXCEPT
         // the join key itself when the value is implicitly carried by
         // probe's lookup key.
@@ -2346,15 +3176,6 @@ std::optional<MetalQueryPlan> buildGenericMultiTableAdhocPlan_impl(
         for (size_t pi = firstNormalPhase; pi < plan.phases.size(); ++pi) {
             attachScalarLookupBuffers(plan.phases[pi], scalarLookups);
         }
-        for (auto& info : scalarLookups) {
-            if (!info.htKeys.empty() && !info.htFlags.empty()) {
-                for (size_t pi = firstNormalPhase; pi < plan.phases.size(); ++pi) {
-                    plan.phases[pi].scalarParams.push_back(
-                        {"n_hm_q20_scalar", "uint"});
-                }
-                break;
-            }
-        }
         return std::move(plan);
     };
 
@@ -2424,7 +3245,7 @@ std::optional<MetalQueryPlan> buildGenericMultiTableAdhocPlan_impl(
         if (itInst != aq.instanceFilters.end())
             buildFilters.insert(buildFilters.end(), itInst->second.begin(), itInst->second.end());
         std::string filterCond = combineFilters(buildFilters, idxVar, aq.schema);
-        filterCond = rewriteScalarSentinels(filterCond, idxVar, scalarLookups);
+        filterCond = rewriteScalarSentinels(filterCond, idxVar, scalarLookups, tname, aq.schema);
         pipe = maybeSelect(std::move(pipe), filterCond);
 
         // For each child of u, attach probe (BitmapProbe or ArrayLookup
@@ -2668,7 +3489,7 @@ std::optional<MetalQueryPlan> buildGenericMultiTableAdhocPlan_impl(
         int intermIdx = nodes[i].parent;
         std::string intermTable = aq.tables[intermIdx];
         std::string intermKeyCol = nodes[i].keyOnParent;
-        CarriedKey ck{intermTable, intermKeyCol};
+        CarriedKey ck{intermTable, intermKeyCol, intermTable};
         int goffset = 0;
         auto goPkInfo = multiTablePkInfo(baseTbl, aq.schema);
         if (goPkInfo) {
@@ -2738,7 +3559,7 @@ std::optional<MetalQueryPlan> buildGenericMultiTableAdhocPlan_impl(
             probeFilters.insert(probeFilters.end(), itInst->second.begin(), itInst->second.end());
     }
     std::string probeFilterCond = combineFilters(probeFilters, idxVar, aq.schema);
-    probeFilterCond = rewriteScalarSentinels(probeFilterCond, idxVar, scalarLookups);
+    probeFilterCond = rewriteScalarSentinels(probeFilterCond, idxVar, scalarLookups, probeTable, aq.schema);
 
     // Insert MetalArrayLookup operators for scalar subquery carries BEFORE
     // the filter, so the filter expression can reference the carry variables.
@@ -2747,7 +3568,7 @@ std::optional<MetalQueryPlan> buildGenericMultiTableAdhocPlan_impl(
     // read atomic_uint on Apple GPU.
     for (const auto& info : scalarLookups) {
         if (info.kind == ScalarLookupInfo::AvgByKey) {
-            std::string keyExpr = info.keyCol + "[" + idxVar + "]";
+            std::string keyExpr = scalarLookupKeyExpr(info, 0, idxVar, probeTable, aq.schema);
             // Custom operator: reads atomic_uint buffer, stores as int variable
             struct ScalarAtomicLookup : MetalUnaryOperator {
                 std::string buf_, key_, var_, idx_;
@@ -2869,7 +3690,7 @@ std::optional<MetalQueryPlan> buildGenericMultiTableAdhocPlan_impl(
         }
         auto cfKeys = charFixedJoinKey;
         std::string cond = combineFilters(crossFilters, idxVar, aq.schema);
-        cond = rewriteScalarSentinels(cond, idxVar, scalarLookups);
+        cond = rewriteScalarSentinels(cond, idxVar, scalarLookups, probeTable, aq.schema);
         cond = rewriteForProbe(cond, idxVar, carryVar, cfKeys, aq.schema);
         // Rewrite build-side INT/DATE column indices.
         for (const auto& [tname, jk] : charFixedJoinKey) {
@@ -2902,8 +3723,8 @@ std::optional<MetalQueryPlan> buildGenericMultiTableAdhocPlan_impl(
         // Skip if this edge is already handled by the tree structure
         if (nodes[idxL].parent == idxR || nodes[idxR].parent == idxL) continue;
         // Check if both columns were carried (in carryVar)
-        CarriedKey ckL{jc.leftTable, jc.leftCol};
-        CarriedKey ckR{jc.rightTable, jc.rightCol};
+        CarriedKey ckL{jc.leftTable, jc.leftCol, jc.leftTable};
+        CarriedKey ckR{jc.rightTable, jc.rightCol, jc.rightTable};
         auto itL = carryVar.find(ckL);
         auto itR = carryVar.find(ckR);
         if (itL == carryVar.end() || itR == carryVar.end()) continue;
@@ -3009,11 +3830,16 @@ std::optional<MetalQueryPlan> buildGenericMultiTableAdhocPlan_impl(
             std::string alias = displayNameForTarget(target, ti);
             std::string accName = "a" + std::to_string(ti) + "_" + sanitizeIdentifier(alias);
             AggFunc func = target.agg->func;
-            int resultScaleDown = scalarAggResultScaleDown(target).value_or(0);
+            std::vector<const FuncCall*> aggCalls;
+            bool isDivision = false;
+            AggCallWalker::walk(target.expr, aggCalls, isDivision);
+            ExprPtr projectionExpr = scalarProjectionExprForSingleAgg(target);
+            if (aggCalls.size() == 1 && !projectionExpr)
+                return fail("Scalar aggregation: unsupported aggregate projection expression.");
 
             if (func == AggFunc::COUNT) {
                 int idx = reduce->addAccumulator(accName, "1", "long");
-                reduce->setAccumulatorResultAlias(alias, idx, resultScaleDown);
+                reduce->setAccumulatorResultAlias(alias, idx, 0, projectionExpr);
                 continue;
             }
 
@@ -3022,9 +3848,6 @@ std::optional<MetalQueryPlan> buildGenericMultiTableAdhocPlan_impl(
             if (target.expr && func == AggFunc::SUM) {
                 // Only enter if the expression tree contains multiple aggregate calls;
                 // simple SUM(x) is handled by the single-accumulator path below.
-                std::vector<const FuncCall*> aggCalls;
-                bool isDivision = false;
-                AggCallWalker::walk(target.expr, aggCalls, isDivision);
                 if (aggCalls.size() >= 2 && isDivision) {
                     double outerConst = 1.0;
                     // Pattern: const * SUM(a) / SUM(b) → two accumulators + AVG alias
@@ -3081,6 +3904,8 @@ std::optional<MetalQueryPlan> buildGenericMultiTableAdhocPlan_impl(
                     return fail("Complex aggregate expression not decomposable.");
                 }
             }
+            if (aggCalls.size() >= 2)
+                return fail("Complex aggregate expression not decomposable.");
 
             if (!target.agg->innerExpr || !exprSupported(target.agg->innerExpr, false))
                 return fail("Aggregate expression not supported on GPU.");
@@ -3093,7 +3918,7 @@ std::optional<MetalQueryPlan> buildGenericMultiTableAdhocPlan_impl(
             if (func == AggFunc::AVG) {
                 int sumIdx = reduce->addAccumulator(accName + "_sum", finalExpr, "float");
                 int cntIdx = reduce->addAccumulator(accName + "_count", "1.0f", "float");
-                reduce->setAverageResultAlias(alias, sumIdx, cntIdx, resultScaleDown);
+                reduce->setAverageResultAlias(alias, sumIdx, cntIdx, 0, projectionExpr);
             } else {
                 DataType vt = inferExprDataType(target.agg->innerExpr);
                 std::string outType = (vt == DataType::FLOAT) ? "float" : "long";
@@ -3102,7 +3927,7 @@ std::optional<MetalQueryPlan> buildGenericMultiTableAdhocPlan_impl(
                 else if (func == AggFunc::MAX) op = MetalTGReduce::ReduceOp::MAX;
                 if (op != MetalTGReduce::ReduceOp::SUM && vt != DataType::FLOAT) outType = "int";
                 int idx = reduce->addAccumulator(accName, finalExpr, outType, "", "", op);
-                reduce->setAccumulatorResultAlias(alias, idx, resultScaleDown);
+                reduce->setAccumulatorResultAlias(alias, idx, 0, projectionExpr);
             }
         }
         auto& phaseRef = appendPhase(plan, "ADHOC_multi_probe_scalar", std::move(reduce));
@@ -3155,7 +3980,7 @@ std::optional<MetalQueryPlan> buildGenericMultiTableAdhocPlan_impl(
             if (gc->table == probeTable) {
                 keySource = groupValue;
             } else {
-                CarriedKey ck{gc->table, gc->column};
+                CarriedKey ck{gc->table, gc->column, gc->table};
                 auto it = carryVar.find(ck);
                 if (it == carryVar.end()) { canUseGpuKeyedAgg = false; break; }
                 keySource = it->second;
@@ -3331,7 +4156,6 @@ std::optional<MetalQueryPlan> buildGenericMultiTableAdhocPlan_impl(
             if (stringLen > 0) sizeExpr += " * " + std::to_string(stringLen);
 
             std::string expr;
-            bool needDenCol = false;
             ExprPtr denExpr;
             if (target.isAgg && target.agg) {
                 // Check for complex aggregate (e.g. SUM(CASE...) / SUM(volume))

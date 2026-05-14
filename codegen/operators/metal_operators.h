@@ -438,11 +438,13 @@ public:
     void setResultAlias(const std::string& displayName, int scaleDown = 0);
     void setAccumulatorResultAlias(const std::string& displayName,
                                    int accumulatorIndex,
-                                   int scaleDown = 0);
+                                   int scaleDown = 0,
+                                   ExprPtr projectionExpr = nullptr);
     void setAverageResultAlias(const std::string& displayName,
                                 int numeratorIndex,
                                 int denominatorIndex,
-                                int scaleDown = 0);
+                                int scaleDown = 0,
+                                ExprPtr projectionExpr = nullptr);
 
     void produce(MetalCodegen& cg, ConsumerFn consume) override;
     std::string describe() const override;
@@ -462,6 +464,7 @@ private:
         int scaleDown = 0;
         int accumulatorIndex = -1;
         int denominatorIndex = -1;
+        ExprPtr projectionExpr;
     };
     std::vector<ResultInfo> resultInfos_;
 };

@@ -127,14 +127,16 @@ public:
     // ---------------------------------------------------------------
     void registerScalarAggOutput(const std::string& loBuffer, const std::string& hiBuffer,
                                  const std::string& type);
-    void registerScalarAggColumn(const std::string& displayName, int index, int scaleDown = 0);
+    void registerScalarAggColumn(const std::string& displayName, int index, int scaleDown = 0,
+                                 ExprPtr projectionExpr = nullptr);
     void registerScalarAggAverageColumn(const std::string& displayName,
                                         const std::string& numeratorLoBuffer,
                                         const std::string& numeratorHiBuffer,
                                         const std::string& denominatorLoBuffer,
                                         const std::string& denominatorHiBuffer,
                                         const std::string& type,
-                                        int scaleDown = 0);
+                                        int scaleDown = 0,
+                                        ExprPtr projectionExpr = nullptr);
     void registerMaterializeOutput(const std::string& counterBuffer);
     void registerOutputColumn(const std::string& displayName, const std::string& bufferName,
                               const std::string& elementType, int stringLen = 0);

@@ -568,6 +568,7 @@ inline uint hashmap_insert_kv(device atomic_uint* keys1,
             atomic_store_explicit(&values[slot], value, memory_order_relaxed);
             return slot;
         }
+        if (expected == 0xFFFFFFFFu) continue;
         if (expected == key1) {
             // Wait for keys2 to be initialised before comparing.
             uint k2 = atomic_load_explicit(&keys2[slot], memory_order_relaxed);
@@ -596,6 +597,7 @@ inline uint hashmap_insert_add(device atomic_uint* keys1,
             atomic_fetch_add_explicit(&values[slot], value, memory_order_relaxed);
             return slot;
         }
+        if (expected == 0xFFFFFFFFu) continue;
         if (expected == key1) {
             uint k2 = atomic_load_explicit(&keys2[slot], memory_order_relaxed);
             while (k2 == 0xFFFFFFFFu) {
@@ -622,9 +624,10 @@ inline void hashmap_insert_add_float(device atomic_uint* keys1,
         if (atomic_compare_exchange_weak_explicit(&keys1[slot], &expected, key1,
                 memory_order_relaxed, memory_order_relaxed)) {
             atomic_store_explicit(&keys2[slot], key2, memory_order_relaxed);
-            atomic_store_explicit(&values[slot], as_type<uint>(value), memory_order_relaxed);
+            atomic_add_float(&values[slot], value);
             return;
         }
+        if (expected == 0xFFFFFFFFu) continue;
         if (expected == key1) {
             uint k2 = atomic_load_explicit(&keys2[slot], memory_order_relaxed);
             while (k2 == 0xFFFFFFFFu) {
