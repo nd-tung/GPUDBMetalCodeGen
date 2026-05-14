@@ -1711,6 +1711,8 @@ struct ScalarLookupInfo {
     std::string htFlags;
     std::string htKeys;
     std::string htVals;
+    std::string cntVar;   // result variable for MetalArrayLookup on count
+    std::string sumVar;   // result variable for MetalArrayLookup on sum
 };
 
 static bool textHasAll(const std::string& haystack, const std::vector<std::string>& needles) {
@@ -1736,10 +1738,10 @@ static std::string scalarLookupReplacement(const ScalarLookupInfo& info, const s
         case ScalarLookupInfo::SumByKey:
             return "as_type<float>(" + info.sumBuffer + "[" + info.keyCol + "[" + idxVar + "]])";
         case ScalarLookupInfo::AvgByKey:
-            return "((" + info.countBuffer + "[" + info.keyCol + "[" + idxVar + "]] > 0u) ? ("
-                 + scalarFloatLiteral(info.multiplier) + " * as_type<float>(" + info.sumBuffer
-                 + "[" + info.keyCol + "[" + idxVar + "]]) / (float)" + info.countBuffer
-                 + "[" + info.keyCol + "[" + idxVar + "]]) : -3.402823466e38f)";
+            return "((" + info.cntVar + " > 0) ? ("
+                 + scalarFloatLiteral(info.multiplier) + " * as_type<float>(" + info.sumVar
+                 + ") / (float)" + info.cntVar
+                 + ") : -3.402823466e38f)";
         case ScalarLookupInfo::MinByKey:
             return info.minBuffer + "[" + info.keyCol + "[" + idxVar + "]]";
         case ScalarLookupInfo::MaxByKey:
@@ -1779,6 +1781,7 @@ static std::string rewriteScalarSentinels(const std::string& cond, const std::st
 static void attachScalarLookupBuffers(MetalQueryPlan::Phase& phase,
                                        const std::vector<ScalarLookupInfo>& lookups) {
     for (const auto& info : lookups) {
+        if (info.kind == ScalarLookupInfo::AvgByKey) continue; // handled by ScalarAtomicLookup
         if (!info.sumBuffer.empty())
             phase.extraBuffers.push_back({info.sumBuffer, "uint", true, false});
         if (!info.countBuffer.empty())
@@ -1816,7 +1819,9 @@ static std::vector<ScalarLookupInfo> buildCorrelatedScalarPreAggs(const Analyzed
             info.valueCol = "l_quantity";
             info.multiplier = 0.2f;
             info.countBuffer = "d_q17_scalar_cnt";
-            info.sumBuffer = "d_q17_scalar_sum"; // atomic_uint, read via as_type<float>
+            info.sumBuffer = "d_q17_scalar_sum";
+            info.cntVar = "_scalar_cnt";
+            info.sumVar = "_scalar_sum";
 
             plan.helpers.push_back(R"(
 static void scalar_atomic_add_float(device atomic_uint* arr, uint idx, float val) {
@@ -2704,6 +2709,41 @@ std::optional<MetalQueryPlan> buildGenericMultiTableAdhocPlan_impl(
     }
     std::string probeFilterCond = combineFilters(probeFilters, idxVar, aq.schema);
     probeFilterCond = rewriteScalarSentinels(probeFilterCond, idxVar, scalarLookups);
+
+    // Insert MetalArrayLookup operators for scalar subquery carries BEFORE
+    // the filter, so the filter expression can reference the carry variables.
+    // Use a custom terminal that reads atomic_uint buffers via atomic_load_explicit,
+    // since regular MetalArrayLookup registers buffers as plain int which can't
+    // read atomic_uint on Apple GPU.
+    for (const auto& info : scalarLookups) {
+        if (info.kind == ScalarLookupInfo::AvgByKey) {
+            std::string keyExpr = info.keyCol + "[" + idxVar + "]";
+            // Custom operator: reads atomic_uint buffer, stores as int variable
+            struct ScalarAtomicLookup : MetalUnaryOperator {
+                std::string buf_, key_, var_, idx_;
+                ScalarAtomicLookup(std::unique_ptr<MetalOperator> c, std::string buf,
+                                   std::string key, std::string var, std::string idx)
+                    : MetalUnaryOperator(std::move(c)), buf_(buf), key_(key),
+                      var_(var), idx_(idx) {}
+                void produce(MetalCodegen& cg, ConsumerFn consume) override {
+                    cg.addBufferParam(buf_, "atomic_uint", "", true, 0);
+                    child_->produce(cg, [&]() {
+                        cg.addLine("uint " + var_ + " = atomic_load_explicit(&" +
+                                   buf_ + "[" + key_ + "], memory_order_relaxed);");
+                        consume();
+                    });
+                }
+                std::string describe() const override { return "ScalarAtomicLookup"; }
+            };
+            if (!info.cntVar.empty())
+                probePipe = std::make_unique<ScalarAtomicLookup>(
+                    std::move(probePipe), info.countBuffer, keyExpr, info.cntVar, idxVar);
+            if (!info.sumVar.empty())
+                probePipe = std::make_unique<ScalarAtomicLookup>(
+                    std::move(probePipe), info.sumBuffer, keyExpr, info.sumVar, idxVar);
+        }
+    }
+
     probePipe = maybeSelect(std::move(probePipe), probeFilterCond);
 
     // Probe each direct child.
