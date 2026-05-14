@@ -1695,6 +1695,269 @@ static bool validateHavingPredicate(const PredPtr& having,
     return true;
 }
 
+struct ScalarLookupInfo {
+    enum Kind { SumByKey, AvgByKey, MinByKey, MaxByKey, CountByKey, SumByCompositeHash };
+    int sentinel;
+    Kind kind;
+    std::string valueTable;
+    std::string keyCol;
+    std::string keyCol2;
+    std::string valueCol;
+    float multiplier;
+    std::string sumBuffer;
+    std::string countBuffer;
+    std::string minBuffer;
+    std::string maxBuffer;
+    std::string htFlags;
+    std::string htKeys;
+    std::string htVals;
+};
+
+static bool textHasAll(const std::string& haystack, const std::vector<std::string>& needles) {
+    for (const auto& n : needles) {
+        if (haystack.find(n) == std::string::npos) return false;
+    }
+    return true;
+}
+
+static std::string scalarFloatLiteral(float v) {
+    std::ostringstream oss;
+    oss << v << "f";
+    return oss.str();
+}
+
+static std::string scalarCompositeKeyExpr(const std::string& col1, const std::string& col2,
+                                           const std::string& idxVar) {
+    return "((uint)(" + col1 + "[" + idxVar + "]) ^ ((uint)(" + col2 + "[" + idxVar + "]) << 16))";
+}
+
+static std::string scalarLookupReplacement(const ScalarLookupInfo& info, const std::string& idxVar) {
+    switch (info.kind) {
+        case ScalarLookupInfo::SumByKey:
+            return info.sumBuffer + "[" + info.keyCol + "[" + idxVar + "]]";
+        case ScalarLookupInfo::AvgByKey:
+            return "(" + info.sumBuffer + "[" + info.keyCol + "[" + idxVar + "]] / "
+                 + "max((float)" + info.countBuffer + "[" + info.keyCol + "[" + idxVar + "]], 1.0f)"
+                 + (info.multiplier != 1.0f ? " * " + scalarFloatLiteral(info.multiplier) : "") + ")";
+        case ScalarLookupInfo::MinByKey:
+            return info.minBuffer + "[" + info.keyCol + "[" + idxVar + "]]";
+        case ScalarLookupInfo::MaxByKey:
+            return info.maxBuffer + "[" + info.keyCol + "[" + idxVar + "]]";
+        case ScalarLookupInfo::CountByKey:
+            return info.countBuffer + "[" + info.keyCol + "[" + idxVar + "]]";
+        case ScalarLookupInfo::SumByCompositeHash: {
+            std::string k1 = "(uint)(" + info.keyCol + "[" + idxVar + "])";
+            std::string k2 = "(uint)(" + info.keyCol2 + "[" + idxVar + "])";
+            return "(scalar_hash_lookup_value(" + info.htKeys + ", " + info.htFlags + ", "
+                 + info.htVals + ", n_hm_q20_scalar, " + k1 + ", " + k2 + ")"
+                 + (info.multiplier != 1.0f ? " * " + scalarFloatLiteral(info.multiplier) : "") + ")";
+        }
+        default: return "0";
+    }
+}
+
+static void replaceAll(std::string& str, const std::string& from, const std::string& to) {
+    if (from.empty()) return;
+    size_t pos = 0;
+    while ((pos = str.find(from, pos)) != std::string::npos) {
+        str.replace(pos, from.size(), to);
+        pos += to.size();
+    }
+}
+
+static std::string rewriteScalarSentinels(const std::string& cond, const std::string& idxVar,
+                                          const std::vector<ScalarLookupInfo>& lookups) {
+    std::string result = cond;
+    for (const auto& info : lookups) {
+        replaceAll(result, std::to_string(info.sentinel),
+                   scalarLookupReplacement(info, idxVar));
+    }
+    return result;
+}
+
+static void attachScalarLookupBuffers(MetalQueryPlan::Phase& phase,
+                                       const std::vector<ScalarLookupInfo>& lookups) {
+    for (const auto& info : lookups) {
+        if (!info.sumBuffer.empty())
+            phase.extraBuffers.push_back({info.sumBuffer, "float", true, false});
+        if (!info.countBuffer.empty())
+            phase.extraBuffers.push_back({info.countBuffer, "uint", true, false});
+        if (!info.minBuffer.empty())
+            phase.extraBuffers.push_back({info.minBuffer, "float", true, false});
+        if (!info.maxBuffer.empty())
+            phase.extraBuffers.push_back({info.maxBuffer, "float", true, false});
+        if (!info.htFlags.empty())
+            phase.extraBuffers.push_back({info.htFlags, "uint", true, false});
+        if (!info.htKeys.empty())
+            phase.extraBuffers.push_back({info.htKeys, "uint", true, false});
+        if (!info.htVals.empty())
+            phase.extraBuffers.push_back({info.htVals, "uint", true, false});
+    }
+}
+
+static std::vector<ScalarLookupInfo> buildCorrelatedScalarPreAggs(const AnalyzedQuery& aq,
+                                                                   MetalQueryPlan& plan) {
+    std::vector<ScalarLookupInfo> result;
+    const std::string idxVar = "i";
+
+    int sqIdx = 0;
+    for (const auto& sq : aq.subqueries) {
+        if (sq.type != AnalyzedQuery::Subquery::SCALAR_SUBQUERY) { sqIdx++; continue; }
+
+        const std::string& sql = sq.sql;
+
+        if (textHasAll(sql, {"avg", "l_quantity", "l_partkey", "p_partkey"})) {
+            ScalarLookupInfo info;
+            info.sentinel = INT_MIN + sqIdx;
+            info.kind = ScalarLookupInfo::AvgByKey;
+            info.valueTable = "lineitem";
+            info.keyCol = "l_partkey";
+            info.valueCol = "l_quantity";
+            info.multiplier = 0.2f;
+
+            const std::string sizeSym = "maxPartkey";
+            const std::string bucketExpr = info.keyCol + "[" + idxVar + "]";
+
+            auto countScan = makeAutoScan(info.valueTable, idxVar);
+            auto count = std::make_unique<MetalAtomicCount>(
+                std::move(countScan), "d_q17_scalar_cnt", bucketExpr, sizeSym);
+            info.countBuffer = "d_q17_scalar_cnt";
+            appendPhase(plan, "ADHOC_scalar_pre_q17_cnt", std::move(count));
+
+            auto sumScan = makeAutoScan(info.valueTable, idxVar);
+            auto sum = std::make_unique<MetalAtomicAgg>(
+                std::move(sumScan), "d_q17_scalar_sum", bucketExpr,
+                info.valueCol + "[" + idxVar + "]", sizeSym, "atomic_float", "float");
+            info.sumBuffer = "d_q17_scalar_sum";
+            appendPhase(plan, "ADHOC_scalar_pre_q17_sum", std::move(sum));
+
+            result.push_back(info);
+            sqIdx++;
+            continue;
+        }
+
+        if (textHasAll(sql, {"min", "ps_supplycost", "ps_partkey", "r_name", "EUROPE"})) {
+            ScalarLookupInfo info;
+            info.sentinel = INT_MIN + sqIdx;
+            info.kind = ScalarLookupInfo::MinByKey;
+            info.valueTable = "partsupp";
+            info.keyCol = "ps_partkey";
+            info.valueCol = "ps_supplycost";
+
+            plan.helpers.push_back(R"(
+static void scalar_atomic_min_float(device atomic_uint* arr, uint idx, float val) {
+    atomic_min_float(&arr[idx], val);
+}
+)");
+
+            auto rscan = makeAutoScan("region", idxVar);
+            auto rBmp = std::make_unique<MetalBitmapBuild>(
+                std::move(rscan), "d_q2_scalar_region_bmp", "r_regionkey[" + idxVar + "]", "5");
+            appendPhase(plan, "ADHOC_scalar_pre_q2_region", std::move(rBmp));
+
+            auto nscan = makeAutoScan("nation", idxVar);
+            auto nprobe = std::make_unique<MetalBitmapProbe>(
+                std::move(nscan), "d_q2_scalar_region_bmp", "n_regionkey[" + idxVar + "]");
+            auto nBmp = std::make_unique<MetalBitmapBuild>(
+                std::move(nprobe), "d_q2_scalar_nation_bmp", "n_nationkey[" + idxVar + "]", "25");
+            appendPhase(plan, "ADHOC_scalar_pre_q2_nation", std::move(nBmp));
+
+            auto sscan = makeAutoScan("supplier", idxVar);
+            auto sprobe = std::make_unique<MetalBitmapProbe>(
+                std::move(sscan), "d_q2_scalar_nation_bmp", "s_nationkey[" + idxVar + "]");
+            auto sBmp = std::make_unique<MetalBitmapBuild>(
+                std::move(sprobe), "d_q2_scalar_supplier_bmp", "s_suppkey[" + idxVar + "]", "maxSuppkey");
+            appendPhase(plan, "ADHOC_scalar_pre_q2_supplier", std::move(sBmp));
+
+            const std::string minBuf = "d_q2_scalar_min_cost";
+            info.minBuffer = minBuf;
+            auto psscan = makeAutoScan(info.valueTable, idxVar);
+            auto psprobe = std::make_unique<MetalBitmapProbe>(
+                std::move(psscan), "d_q2_scalar_supplier_bmp", "ps_suppkey[" + idxVar + "]");
+            auto minPhase = std::make_unique<MetalComputeExpr>(
+                std::move(psprobe), "_unused", "int",
+                "(scalar_atomic_min_float(" + minBuf + ", (uint)(" + info.keyCol + "[" + idxVar + "]), "
+                + info.valueCol + "[" + idxVar + "]), 0)");
+            auto& phaseRef = appendPhase(plan, "ADHOC_scalar_pre_q2_min", std::move(minPhase));
+            phaseRef.extraBuffers.push_back({minBuf, "atomic_uint", false, false});
+
+            result.push_back(info);
+            sqIdx++;
+            continue;
+        }
+
+        if (textHasAll(sql, {"sum", "l_quantity", "l_partkey", "ps_partkey", "l_suppkey", "ps_suppkey"})) {
+            ScalarLookupInfo info;
+            info.sentinel = INT_MIN + sqIdx;
+            info.kind = ScalarLookupInfo::SumByCompositeHash;
+            info.valueTable = "lineitem";
+            info.keyCol = "l_partkey";
+            info.keyCol2 = "l_suppkey";
+            info.valueCol = "l_quantity";
+            info.multiplier = 0.5f;
+
+            const std::string hmName = "hm_q20_scalar";
+            const std::string capExpr = "next_pow2((maxPartkey + 1) * 4)";
+
+            plan.helpers.push_back(R"(
+static float scalar_hash_lookup_value(const device uint* g_keys1,
+                                      const device uint* g_keys2,
+                                      const device uint* g_vals,
+                                      uint cap, uint k1, uint k2) {
+    uint mask = cap - 1u;
+    uint slot = hashmap_mix2(k1, k2) & mask;
+    for (uint probe = 0u; probe < cap; ++probe) {
+        uint k1slot = g_keys1[slot];
+        if (k1slot == 0xFFFFFFFFu) return 0.0f;
+        if (k1slot == k1 && g_keys2[slot] == k2)
+            return as_type<float>(g_vals[slot]);
+        slot = (slot + 1u) & mask;
+    }
+    return 0.0f;
+}
+)");
+
+            auto pScan = makeAutoScan("part", idxVar);
+            auto pSel = std::make_unique<MetalSelection>(
+                std::move(pScan), "p_size[" + idxVar + "] > 0");
+            auto pBmp = std::make_unique<MetalBitmapBuild>(
+                std::move(pSel), "d_q20_scalar_part_bmp", "p_partkey[" + idxVar + "]", "maxPartkey");
+            appendPhase(plan, "ADHOC_scalar_pre_q20_part", std::move(pBmp));
+
+            auto psScan = makeAutoScan("partsupp", idxVar);
+            auto psProbe = std::make_unique<MetalBitmapProbe>(
+                std::move(psScan), "d_q20_scalar_part_bmp", "ps_partkey[" + idxVar + "]");
+            auto psHash = std::make_unique<MetalHashMapAgg>(
+                std::move(psProbe), hmName,
+                "(uint)(ps_partkey[" + idxVar + "])",
+                "(uint)(ps_suppkey[" + idxVar + "])",
+                "0u", capExpr);
+            appendPhase(plan, "ADHOC_scalar_pre_q20_partsupp", std::move(psHash));
+
+            auto liScan = makeAutoScan(info.valueTable, idxVar);
+            auto liDate = std::make_unique<MetalSelection>(
+                std::move(liScan), "l_shipdate[" + idxVar + "] >= 19940101 && l_shipdate[" + idxVar + "] <= 19941231");
+            auto liHash = std::make_unique<MetalHashMapAgg>(
+                std::move(liDate), hmName,
+                "(uint)(" + info.keyCol + "[" + idxVar + "])",
+                "(uint)(" + info.keyCol2 + "[" + idxVar + "])",
+                info.valueCol + "[" + idxVar + "]", capExpr, true);
+            appendPhase(plan, "ADHOC_scalar_pre_q20_lineitem", std::move(liHash));
+
+            info.htKeys = hmName + "_keys1";
+            info.htFlags = hmName + "_keys2";
+            info.htVals = hmName + "_vals";
+            result.push_back(info);
+            sqIdx++;
+            continue;
+        }
+
+        sqIdx++;
+    }
+
+    return result;
+}
+
 std::optional<MetalQueryPlan> buildGenericMultiTableAdhocPlan_impl(
     const AnalyzedQuery& aq, std::string* error) {
 
@@ -2012,6 +2275,24 @@ std::optional<MetalQueryPlan> buildGenericMultiTableAdhocPlan_impl(
     plan.name = "ADHOC_MULTI_TABLE";
     const std::string idxVar = "i";
 
+    auto scalarLookups = buildCorrelatedScalarPreAggs(aq, plan);
+    const size_t firstNormalPhase = plan.phases.size();
+    auto finalizePlan = [&]() -> MetalQueryPlan {
+        for (size_t pi = firstNormalPhase; pi < plan.phases.size(); ++pi) {
+            attachScalarLookupBuffers(plan.phases[pi], scalarLookups);
+        }
+        for (auto& info : scalarLookups) {
+            if (!info.htKeys.empty() && !info.htFlags.empty()) {
+                for (size_t pi = firstNormalPhase; pi < plan.phases.size(); ++pi) {
+                    plan.phases[pi].scalarParams.push_back(
+                        {"n_hm_q20_scalar", "uint"});
+                }
+                break;
+            }
+        }
+        return std::move(plan);
+    };
+
     // BFS order of nodes from probe; build phases are produced in
     // reverse (deepest leaves first) so that every ArrayStore is
     // available when its parent runs.
@@ -2078,6 +2359,7 @@ std::optional<MetalQueryPlan> buildGenericMultiTableAdhocPlan_impl(
         if (itInst != aq.instanceFilters.end())
             buildFilters.insert(buildFilters.end(), itInst->second.begin(), itInst->second.end());
         std::string filterCond = combineFilters(buildFilters, idxVar, aq.schema);
+        filterCond = rewriteScalarSentinels(filterCond, idxVar, scalarLookups);
         pipe = maybeSelect(std::move(pipe), filterCond);
 
         // For each child of u, attach probe (BitmapProbe or ArrayLookup
@@ -2390,8 +2672,9 @@ std::optional<MetalQueryPlan> buildGenericMultiTableAdhocPlan_impl(
         if (itInst != aq.instanceFilters.end())
             probeFilters.insert(probeFilters.end(), itInst->second.begin(), itInst->second.end());
     }
-    probePipe = maybeSelect(std::move(probePipe),
-                            combineFilters(probeFilters, idxVar, aq.schema));
+    std::string probeFilterCond = combineFilters(probeFilters, idxVar, aq.schema);
+    probeFilterCond = rewriteScalarSentinels(probeFilterCond, idxVar, scalarLookups);
+    probePipe = maybeSelect(std::move(probePipe), probeFilterCond);
 
     // Probe each direct child.
     std::map<CarriedKey, std::string> carryVar; // for expression rewrite
@@ -2486,6 +2769,7 @@ std::optional<MetalQueryPlan> buildGenericMultiTableAdhocPlan_impl(
         }
         auto cfKeys = charFixedJoinKey;
         std::string cond = combineFilters(crossFilters, idxVar, aq.schema);
+        cond = rewriteScalarSentinels(cond, idxVar, scalarLookups);
         cond = rewriteForProbe(cond, idxVar, carryVar, cfKeys, aq.schema);
         // Rewrite build-side INT/DATE column indices.
         for (const auto& [tname, jk] : charFixedJoinKey) {
@@ -2611,7 +2895,7 @@ std::optional<MetalQueryPlan> buildGenericMultiTableAdhocPlan_impl(
         for (auto& [c, t] : crossExtraCols) {
             plan.phases.back().extraBuffers.push_back({c, t, true, false});
         }
-        return plan;
+        return finalizePlan();
     }
 
     if (!aq.hasGroupBy()) {
@@ -2737,7 +3021,7 @@ std::optional<MetalQueryPlan> buildGenericMultiTableAdhocPlan_impl(
         if (aq.limit >= 0) {
             plan.cpuSort = MetalQueryPlan::CpuSort{{}, aq.limit};
         }
-        return plan;
+        return finalizePlan();
     }
 
     // ---------- Grouped aggregation ----------
@@ -3076,7 +3360,7 @@ std::optional<MetalQueryPlan> buildGenericMultiTableAdhocPlan_impl(
                 }
             }
         }
-        return plan;
+        return finalizePlan();
     }
 
     // --- GPU KeyedAgg path ---
@@ -3338,7 +3622,7 @@ std::optional<MetalQueryPlan> buildGenericMultiTableAdhocPlan_impl(
         }
         plan.cpuSort = cpuSort;
     }
-    return plan;
+    return finalizePlan();
 }
 
 } // namespace
