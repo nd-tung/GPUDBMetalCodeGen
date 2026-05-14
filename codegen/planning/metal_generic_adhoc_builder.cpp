@@ -1734,11 +1734,12 @@ static std::string scalarCompositeKeyExpr(const std::string& col1, const std::st
 static std::string scalarLookupReplacement(const ScalarLookupInfo& info, const std::string& idxVar) {
     switch (info.kind) {
         case ScalarLookupInfo::SumByKey:
-            return info.sumBuffer + "[" + info.keyCol + "[" + idxVar + "]]";
+            return "as_type<float>(" + info.sumBuffer + "[" + info.keyCol + "[" + idxVar + "]])";
         case ScalarLookupInfo::AvgByKey:
-            return "(" + info.sumBuffer + "[" + info.keyCol + "[" + idxVar + "]] / "
-                 + "max((float)" + info.countBuffer + "[" + info.keyCol + "[" + idxVar + "]], 1.0f)"
-                 + (info.multiplier != 1.0f ? " * " + scalarFloatLiteral(info.multiplier) : "") + ")";
+            return "((" + info.countBuffer + "[" + info.keyCol + "[" + idxVar + "]] > 0u) ? ("
+                 + scalarFloatLiteral(info.multiplier) + " * as_type<float>(" + info.sumBuffer
+                 + "[" + info.keyCol + "[" + idxVar + "]]) / (float)" + info.countBuffer
+                 + "[" + info.keyCol + "[" + idxVar + "]]) : -3.402823466e38f)";
         case ScalarLookupInfo::MinByKey:
             return info.minBuffer + "[" + info.keyCol + "[" + idxVar + "]]";
         case ScalarLookupInfo::MaxByKey:
@@ -1779,7 +1780,7 @@ static void attachScalarLookupBuffers(MetalQueryPlan::Phase& phase,
                                        const std::vector<ScalarLookupInfo>& lookups) {
     for (const auto& info : lookups) {
         if (!info.sumBuffer.empty())
-            phase.extraBuffers.push_back({info.sumBuffer, "float", true, false});
+            phase.extraBuffers.push_back({info.sumBuffer, "uint", true, false});
         if (!info.countBuffer.empty())
             phase.extraBuffers.push_back({info.countBuffer, "uint", true, false});
         if (!info.minBuffer.empty())
@@ -1814,24 +1815,53 @@ static std::vector<ScalarLookupInfo> buildCorrelatedScalarPreAggs(const Analyzed
             info.keyCol = "l_partkey";
             info.valueCol = "l_quantity";
             info.multiplier = 0.2f;
-
-            const std::string sizeSym = "maxPartkey";
-            const std::string bucketExpr = info.keyCol + "[" + idxVar + "]";
-
-            auto countScan = makeAutoScan(info.valueTable, idxVar);
-            auto count = std::make_unique<MetalAtomicCount>(
-                std::move(countScan), "d_q17_scalar_cnt", bucketExpr, sizeSym);
             info.countBuffer = "d_q17_scalar_cnt";
+            info.sumBuffer = "d_q17_scalar_sum"; // atomic_uint, read via as_type<float>
+
+            plan.helpers.push_back(R"(
+static void scalar_atomic_add_float(device atomic_uint* arr, uint idx, float val) {
+    uint old = atomic_load_explicit(&arr[idx], memory_order_relaxed);
+    do {
+        float sum = as_type<float>(old) + val;
+        uint newval = as_type<uint>(sum);
+        if (atomic_compare_exchange_weak_explicit(&arr[idx], &old, newval,
+                memory_order_relaxed, memory_order_relaxed))
+            break;
+    } while (true);
+}
+)");
+            const std::string sizeSym = "maxPartkey";
+            // Count phase: atomic_uint, write as uint
+            auto countScan = makeScanForCols(info.valueTable, idxVar, {info.keyCol}, aq.schema);
+            auto count = std::make_unique<MetalAtomicCount>(
+                std::move(countScan), info.countBuffer, info.keyCol + "[" + idxVar + "]", sizeSym);
             appendPhase(plan, "ADHOC_scalar_pre_q17_cnt", std::move(count));
 
-            auto sumScan = makeAutoScan(info.valueTable, idxVar);
-            auto sum = std::make_unique<MetalAtomicAgg>(
-                std::move(sumScan), "d_q17_scalar_sum", bucketExpr,
-                info.valueCol + "[" + idxVar + "]", sizeSym, "atomic_float", "float");
-            info.sumBuffer = "d_q17_scalar_sum";
-            appendPhase(plan, "ADHOC_scalar_pre_q17_sum", std::move(sum));
+            // Sum phase: use scalar_atomic_add_float helper via custom terminal
+            struct ScalarAddFloatTerminal : MetalUnaryOperator {
+                std::string idx_, keyCol_, valCol_, buf_, sizeSym_;
+                ScalarAddFloatTerminal(std::unique_ptr<MetalOperator> c, std::string idx,
+                    std::string kc, std::string vc, std::string buf, std::string ss)
+                    : MetalUnaryOperator(std::move(c)), idx_(idx), keyCol_(kc),
+                      valCol_(vc), buf_(buf), sizeSym_(ss) {}
+                void produce(MetalCodegen& cg, ConsumerFn) override {
+                    cg.addBufferParam(buf_, "atomic_uint", sizeSym_, true, 0);
+                    child_->produce(cg, [&]() {
+                        cg.addLine("scalar_atomic_add_float(" + buf_ + ", (uint)" +
+                                   keyCol_ + "[" + idx_ + "], " + valCol_ + "[" + idx_ + "]);");
+                    });
+                }
+                std::string describe() const override { return "ScalarAddFloat"; }
+            };
+            auto sumScan = makeScanForCols(info.valueTable, idxVar, {info.keyCol, info.valueCol}, aq.schema);
+            auto side = std::make_unique<ScalarAddFloatTerminal>(
+                std::move(sumScan), idxVar, info.keyCol, info.valueCol, info.sumBuffer, sizeSym);
+            appendPhase(plan, "ADHOC_scalar_pre_q17_sum", std::move(side));
 
-            result.push_back(info);
+            // Update lookup to use as_type<float> for the uint sum buffer
+            info.kind = ScalarLookupInfo::AvgByKey; // marker for attachment
+
+            result.push_back(std::move(info));
             sqIdx++;
             continue;
         }
