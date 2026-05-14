@@ -5,8 +5,25 @@
 #include <cstring>
 #include <algorithm>
 #include <cstdint>
+#include <unordered_map>
 
 namespace codegen {
+
+// CHAR1 display map: maps a single-char TPC-H CHAR1 value to its full display string.
+static const std::unordered_map<std::string, std::unordered_map<char, std::string>> kChar1DisplayMap = {
+    {"o_orderpriority", {{'1',"1-URGENT"},{'2',"2-HIGH"},{'3',"3-MEDIUM"},{'4',"4-NOT SPECIFIED"},{'5',"5-LOW"}}},
+    {"c_mktsegment", {{'A',"AUTOMOBILE"},{'B',"BUILDING"},{'F',"FURNITURE"},{'M',"MACHINERY"},{'H',"HOUSEHOLD"}}},
+    {"l_shipmode", {{'M',"MAIL"},{'S',"SHIP"}}}, // l_shipmode is CHAR_FIXED(2) but stored first char
+};
+
+static std::string char1Display(const std::string& colName, const std::string& value) {
+    auto it = kChar1DisplayMap.find(colName);
+    if (it == kChar1DisplayMap.end()) return value;
+    if (value.empty()) return value;
+    auto ci = it->second.find(value[0]);
+    if (ci == it->second.end()) return value;
+    return ci->second;
+}
 
 // ===================================================================
 // GenericResult::print
@@ -59,14 +76,26 @@ void GenericResult::print(int limit) const {
         std::cout << "|";
         for (size_t c = 0; c < columns.size() && c < rows[r].size(); c++) {
             std::cout << " ";
+            const std::string& colName = columns[c].name;
+            bool isDateCol = colName.size() >= 4 &&
+                             colName.substr(colName.size() - 4) == "date";
             std::visit([&](auto&& v) {
                 using T = std::decay_t<decltype(v)>;
-                if constexpr (std::is_same_v<T, int64_t>)
-                    std::cout << std::setw((int)widths[c]) << std::right << v;
-                else if constexpr (std::is_same_v<T, double>)
-                    std::cout << std::setw((int)widths[c]) << std::right << std::fixed << std::setprecision(2) << v;
-                else
-                    std::cout << std::setw((int)widths[c]) << std::right << v;
+                if constexpr (std::is_same_v<T, int64_t>) {
+                    if (isDateCol) {
+                        int d = static_cast<int>(v);
+                        char buf[12];
+                        snprintf(buf, sizeof(buf), "%04d-%02d-%02d", d / 10000, (d / 100) % 100, d % 100);
+                        std::cout << std::setw((int)widths[c]) << std::right << buf;
+                    } else {
+                        std::cout << std::setw((int)widths[c]) << std::right << v;
+                    }
+                }                 else if constexpr (std::is_same_v<T, double>)
+                    std::cout << std::setw((int)widths[c]) << std::right << std::fixed << std::setprecision(4) << v;
+                else {
+                    std::string display = char1Display(colName, v);
+                    std::cout << std::setw((int)widths[c]) << std::right << display;
+                }
             }, rows[r][c]);
             std::cout << " |";
         }
@@ -92,17 +121,28 @@ std::string GenericResult::toCanonical() const {
     for (const auto& row : rows) {
         for (size_t c = 0; c < row.size(); c++) {
             if (c) os << ",";
+            const std::string& colName = columns[c].name;
+            // Detect date columns by name suffix (e.g. o_orderdate, l_shipdate)
+            bool isDateCol = colName.size() >= 4 &&
+                             colName.substr(colName.size() - 4) == "date";
             std::visit([&](auto&& v) {
                 using T = std::decay_t<decltype(v)>;
                 if constexpr (std::is_same_v<T, int64_t>) {
-                    os << v;
+                    if (isDateCol) {
+                        int d = static_cast<int>(v);
+                        char buf[12];
+                        snprintf(buf, sizeof(buf), "%04d-%02d-%02d", d / 10000, (d / 100) % 100, d % 100);
+                        os << buf;
+                    } else {
+                        os << v;
+                    }
                 } else if constexpr (std::is_same_v<T, double>) {
                     char buf[64];
                     snprintf(buf, sizeof(buf), "%.4f", v);
                     os << buf;
                 } else {
                     // Quote string fields that contain commas, quotes, or newlines
-                    const std::string& sv = v;
+                    std::string sv = char1Display(colName, v);
                     bool needsQuote = sv.find_first_of(",\"\n\r") != std::string::npos;
                     if (needsQuote) {
                         os << '"';
@@ -445,8 +485,11 @@ GenericResult MetalResultCollector::collectKeyedAgg(const MetalResultSchema& sch
         result.columns.push_back({keyName, "int"});
     }
     if (!slots.empty()) {
-        for (const auto& slot : slots) {
+        for (size_t si = 0; si < slots.size(); ++si) {
+            const auto& slot = slots[si];
             result.columns.push_back({slot.name, slot.isLongPair ? "long" : "uint"});
+            // AVG sum with scaleDown < 0 → skip the following COUNT slot
+            if (slot.scaleDown < 0 && si + 1 < slots.size()) si++;
         }
     } else {
         for (int v = 0; v < valuesPerBucket; v++) {
@@ -498,8 +541,33 @@ GenericResult MetalResultCollector::collectKeyedAgg(const MetalResultSchema& sch
         decodeKeys(bucket, row);
 
         if (!slots.empty()) {
-            for (const auto& slot : slots) {
-                if (slot.isMinMax && slot.atomicOp == "min") {
+            for (size_t si = 0; si < slots.size(); ++si) {
+                const auto& slot = slots[si];
+                // AVG decomposition: scaleDown < 0 marks a SUM slot whose COUNT follows.
+                if (slot.scaleDown < 0 && si + 1 < slots.size()) {
+                    const auto& cntSlot = slots[si + 1];
+                    double sumVal = 0, cntVal = 0;
+                    if (slot.isFloatSum) {
+                        uint32_t raw = data[rowBase + slot.offset];
+                        float f; memcpy(&f, &raw, sizeof(float));
+                        sumVal = (double)f;
+                    } else if (slot.isLongPair) {
+                        uint32_t lo = data[rowBase + slot.offset];
+                        uint32_t hi = data[rowBase + slot.offset + 1];
+                        sumVal = (double)(((int64_t)hi << 32) | (int64_t)lo);
+                    } else {
+                        sumVal = (double)(int64_t)data[rowBase + slot.offset];
+                    }
+                    if (cntSlot.isFloatSum) {
+                        uint32_t raw = data[rowBase + cntSlot.offset];
+                        float f; memcpy(&f, &raw, sizeof(float));
+                        cntVal = (double)f;
+                    } else {
+                        cntVal = (double)(int64_t)data[rowBase + cntSlot.offset];
+                    }
+                    row.push_back(cntVal > 0 ? sumVal / cntVal : 0.0);
+                    si++; // skip COUNT slot
+                } else if (slot.isMinMax && slot.atomicOp == "min") {
                     // min aggregate: stored as raw value (int or float reinterpreted)
                     uint32_t raw = data[rowBase + slot.offset];
                     if (slot.isFloatSum) {
@@ -610,7 +678,7 @@ GenericResult MetalResultCollector::collectMaterialize(const MetalResultSchema& 
                 if (col.stringLen > 0) {
                     const auto* arr = static_cast<const char*>(bIt->second->contents());
                     std::string s(arr + r * col.stringLen, col.stringLen);
-                    while (!s.empty() && (s.back() == ' ' || s.back() == '\0'))
+                    while (!s.empty() && s.back() == '\0')
                         s.pop_back();
                     row.push_back(std::move(s));
                 } else {

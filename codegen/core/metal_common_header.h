@@ -198,6 +198,10 @@ inline long tg_reduce_min_long(long val, uint tid, uint tg_size,
 inline bool bitmap_test(const device uint* bitmap, int key) {
     return (bitmap[(uint)key >> 5] >> ((uint)key & 31u)) & 1u;
 }
+inline bool bitmap_test_atomic(const device atomic_uint* bitmap, int key) {
+    uint word = atomic_load_explicit(&bitmap[(uint)key >> 5], memory_order_relaxed);
+    return (word >> ((uint)key & 31u)) & 1u;
+}
 
 inline char packed_pattern_char(ulong lo, ulong hi, uint pos) {
     ulong word = (pos < 8u) ? lo : hi;

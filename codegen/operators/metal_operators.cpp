@@ -296,7 +296,7 @@ void MetalBitmapProbe::produce(MetalCodegen& cg, ConsumerFn consume) {
     cg.addBitmapReadParam(bitmapName_, "");  // size comes from build phase
 
     child_->produce(cg, [&]() {
-        cg.addIf("bitmap_test(" + bitmapName_ + ", " + keyExpr_ + ")", [&]() {
+        cg.addIf("bitmap_test_atomic(" + bitmapName_ + ", " + keyExpr_ + ")", [&]() {
             consume();
         });
     });
@@ -320,7 +320,7 @@ void MetalAntiBitmapProbe::produce(MetalCodegen& cg, ConsumerFn consume) {
     cg.addBitmapReadParam(bitmapName_, "");
 
     child_->produce(cg, [&]() {
-        cg.addIf("!bitmap_test(" + bitmapName_ + ", " + keyExpr_ + ")", [&]() {
+        cg.addIf("!bitmap_test_atomic(" + bitmapName_ + ", " + keyExpr_ + ")", [&]() {
             consume();
         });
     });
@@ -328,6 +328,36 @@ void MetalAntiBitmapProbe::produce(MetalCodegen& cg, ConsumerFn consume) {
 
 std::string MetalAntiBitmapProbe::describe() const {
     return "AntiBitmapProbe(" + bitmapName_ + ", key=" + keyExpr_ + ")";
+}
+
+// ===================================================================
+// MetalLeftOuterProbe
+// ===================================================================
+
+MetalLeftOuterProbe::MetalLeftOuterProbe(std::unique_ptr<MetalOperator> child,
+                                         const std::string& bitmapName,
+                                         const std::string& keyExpr,
+                                         std::vector<DefaultVar> rightVars)
+    : MetalUnaryOperator(std::move(child)),
+      bitmapName_(bitmapName), keyExpr_(keyExpr), rightVars_(std::move(rightVars)) {}
+
+void MetalLeftOuterProbe::produce(MetalCodegen& cg, ConsumerFn consume) {
+    cg.addBitmapReadParam(bitmapName_, "");
+
+    child_->produce(cg, [&]() {
+        cg.addIf("bitmap_test_atomic(" + bitmapName_ + ", " + keyExpr_ + ")", [&]() {
+            consume();
+        });
+        cg.addLine("else {");
+        for (const auto& dv : rightVars_)
+            cg.addLine(dv.varType + " " + dv.varName + " = " + dv.defaultVal + ";");
+        consume();
+        cg.addLine("}");
+    });
+}
+
+std::string MetalLeftOuterProbe::describe() const {
+    return "LeftOuterProbe(" + bitmapName_ + ", key=" + keyExpr_ + ")";
 }
 
 // ===================================================================

@@ -27,7 +27,8 @@ std::string exprToMetal(const ExprPtr& expr, const std::string& idxVar,
                         const SchemaProvider* schema = nullptr);
 std::string predToMetal(const PredPtr& pred, const std::string& idxVar,
                         const SchemaProvider* schema = nullptr);
-std::string combineFilters(const std::vector<PredPtr>& filters, const std::string& idxVar);
+std::string combineFilters(const std::vector<PredPtr>& filters, const std::string& idxVar,
+                            const SchemaProvider* schema = nullptr);
 
 struct MetalKeyedAggSlotForHaving {
     std::string name;       // aggregate slot display name (e.g. "sum(l_quantity)")
@@ -47,7 +48,8 @@ std::unique_ptr<MetalGridStrideScan> makeScan(const std::string& table,
                                                ColumnList columns);
 std::unique_ptr<MetalGridStrideScan> makeScanForCols(const std::string& table,
                                                       const std::string& idxVar,
-                                                      const std::set<std::string>& cols);
+                                                      const std::set<std::string>& cols,
+                                                      const SchemaProvider* schema = nullptr);
 // Create a scan with no explicit columns — columns are auto-discovered
 // at produce time via the IU chain (requires ColumnTypeResolver on codegen).
 std::unique_ptr<MetalGridStrideScan> makeAutoScan(const std::string& table,
@@ -57,8 +59,20 @@ std::unique_ptr<MetalOperator> maybeSelect(std::unique_ptr<MetalOperator> input,
                                            const std::string& filterCond);
 
 MetalQueryPlan::Phase& appendPhase(MetalQueryPlan& plan,
-                                   const std::string& name,
-                                   std::unique_ptr<MetalOperator> root,
-                                   int threadgroupSize = 1024);
+                                    const std::string& name,
+                                    std::unique_ptr<MetalOperator> root,
+                                    int threadgroupSize = 1024);
+
+// Add GPU bitonic sort phases to a plan.  Emits MetalInitSortKeys +
+// MetalBitonicSortStep phases with the post-dispatch (k,j) hook.
+// Sets plan.gpuSort so post-processing can remap rows using the
+// sorted index buffer.
+void addGpuSortToPlan(MetalQueryPlan& plan,
+                      const std::string& sortColBuffer,
+                      const std::string& sortColType,
+                      const std::string& nResultsExpr,
+                      bool sortDesc = false,
+                      const std::string& sortKeyBuf = "d_sortKey",
+                      const std::string& sortIdxBuf = "d_sortIdx");
 
 } // namespace codegen

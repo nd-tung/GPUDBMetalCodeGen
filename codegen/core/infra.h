@@ -253,7 +253,7 @@ inline LoadedColumns loadColumnsMulti(const std::string& filePath, const std::ve
                         auto& v = result.charCols[h.storageIdx];
                         int cp = (int)tokLen < h.fixedWidth ? (int)tokLen : h.fixedWidth;
                         v.insert(v.end(), tok, tok + cp);
-                        v.insert(v.end(), h.fixedWidth - cp, '\0');
+                        v.insert(v.end(), h.fixedWidth - cp, ' ');
                         break;
                     }
                 }
@@ -411,7 +411,7 @@ inline LoadedColumns loadColumnsMultiMmap(const std::string& filePath,
             case ColType::CHAR_FIXED:
                 h.storageIdx = result.charCols.size();
                 result.charMap[s.columnIndex] = h.storageIdx;
-                result.charCols.emplace_back(nLines * s.fixedWidth, '\0');
+                result.charCols.emplace_back(nLines * s.fixedWidth, ' ');
                 break;
         }
         handlers.push_back(h);
@@ -466,7 +466,6 @@ inline LoadedColumns loadColumnsMultiMmap(const std::string& filePath,
                             int cp = len < h.fixedWidth ? len : h.fixedWidth;
                             char* dst = result.charCols[h.storageIdx].data() + r * h.fixedWidth;
                             memcpy(dst, s, cp);
-                            // tail already '\0' (vector was zero-init)
                             break;
                         }
                     }

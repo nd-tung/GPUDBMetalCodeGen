@@ -340,14 +340,25 @@ static void applyCpuGroupBy(codegen::GenericResult& result,
 
     // Map column names to indices.
     std::vector<size_t> keyIdx, aggIdx;
+    std::set<size_t> usedCols;
     for (const auto& kc : gb.keyColumns) {
         for (size_t i = 0; i < result.columns.size(); ++i) {
-            if (result.columns[i].name == kc) { keyIdx.push_back(i); break; }
+            if (usedCols.count(i)) continue;
+            if (result.columns[i].name == kc) {
+                keyIdx.push_back(i);
+                usedCols.insert(i);
+                break;
+            }
         }
     }
     for (const auto& ac : gb.aggColumns) {
         for (size_t i = 0; i < result.columns.size(); ++i) {
-            if (result.columns[i].name == ac) { aggIdx.push_back(i); break; }
+            if (usedCols.count(i)) continue;
+            if (result.columns[i].name == ac) {
+                aggIdx.push_back(i);
+                usedCols.insert(i);
+                break;
+            }
         }
     }
     if (keyIdx.size() != gb.keyColumns.size()) return;
@@ -370,6 +381,7 @@ static void applyCpuGroupBy(codegen::GenericResult& result,
         codegen::GenericResult::Row keyValues;
         std::vector<double> sums;
         std::vector<double> counts;
+        std::vector<std::set<double>> distinctSets; // for COUNT(DISTINCT)
     };
     std::map<std::string, GroupAcc> groups;
 
@@ -381,15 +393,18 @@ static void applyCpuGroupBy(codegen::GenericResult& result,
         if (ga.sums.empty()) {
             ga.sums.resize(aggIdx.size(), 0.0);
             ga.counts.resize(aggIdx.size(), 0.0);
+            ga.distinctSets.resize(aggIdx.size());
             for (auto ki : keyIdx) ga.keyValues.push_back(row[ki]);
         }
 
         for (size_t a = 0; a < aggIdx.size(); ++a) {
             double val = valToDouble(row[aggIdx[a]]);
             const std::string& fn = gb.aggFuncs[a];
-            if (fn == "COUNT" || fn == "SUM") {
+            if (fn == "COUNT" || fn == "SUM" || fn == "RATIO" || fn == "RATIO_DEN") {
                 ga.sums[a] += val;
                 ga.counts[a] += (fn == "COUNT") ? 1.0 : 0.0;
+            } else if (fn == "COUNT_DISTINCT") {
+                ga.distinctSets[a].insert(val);
             } else if (fn == "AVG") {
                 ga.sums[a] += val;
                 ga.counts[a] += 1.0;
@@ -415,12 +430,61 @@ static void applyCpuGroupBy(codegen::GenericResult& result,
             const std::string& fn = gb.aggFuncs[a];
             if (fn == "AVG" && ga.counts[a] > 0.0)
                 row[aggIdx[a]] = ga.sums[a] / ga.counts[a];
+            else if (fn == "RATIO") {
+                double num = ga.sums[a], den = (a + 1 < aggIdx.size()) ? ga.sums[a + 1] : 0.0;
+                row[aggIdx[a]] = den != 0.0 ? num / den : 0.0;
+            }             else if (fn == "RATIO_DEN") {
+                row[aggIdx[a]] = 0.0; // hide denominator column
+            } else if (fn == "COUNT_DISTINCT") {
+                row[aggIdx[a]] = static_cast<double>(ga.distinctSets[a].size());
+            }
             else
                 row[aggIdx[a]] = ga.sums[a];
         }
         out.rows.push_back(std::move(row));
     }
+
+    // Apply HAVING filter: if havingMultiplier > 0, compute global sum
+    // of the target agg column and filter rows where agg < globalSum * multiplier.
+    if (gb.havingAggIdx >= 0 && gb.havingAggIdx < (int)aggIdx.size() && !out.rows.empty()) {
+        size_t havingCol = aggIdx[gb.havingAggIdx];
+        if (gb.havingMultiplier > 0.0) {
+            double globalSum = 0.0;
+            for (auto& row : out.rows) {
+                if (auto* d = std::get_if<double>(&row[havingCol]))
+                    globalSum += *d;
+            }
+            double threshold = globalSum * gb.havingMultiplier;
+            std::vector<codegen::GenericResult::Row> filtered;
+            for (auto& row : out.rows) {
+                if (auto* d = std::get_if<double>(&row[havingCol])) {
+                    if (*d > threshold) filtered.push_back(std::move(row));
+                }
+            }
+            out.rows = std::move(filtered);
+        }
+    }
+
     result = std::move(out);
+
+    // Remove hidden columns (__hidden_ prefix, used for RATIO denominator).
+    {
+        std::vector<size_t> dropIndices;
+        for (size_t c = 0; c < result.columns.size(); ++c) {
+            if (result.columns[c].name.compare(0, 9, "__hidden_") == 0)
+                dropIndices.push_back(c);
+        }
+        if (!dropIndices.empty()) {
+            // Remove from columns (reverse order to preserve indices)
+            for (auto it = dropIndices.rbegin(); it != dropIndices.rend(); ++it)
+                result.columns.erase(result.columns.begin() + *it);
+            // Remove from rows
+            for (auto& row : result.rows) {
+                for (auto it = dropIndices.rbegin(); it != dropIndices.rend(); ++it)
+                    row.erase(row.begin() + *it);
+            }
+        }
+    }
 }
 
 // ===================================================================
