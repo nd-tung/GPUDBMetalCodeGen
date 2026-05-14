@@ -908,6 +908,62 @@ void extractJoinOns(const json& fromItem, const std::vector<std::string>& tables
     }
 }
 
+std::string rangeSubselectAlias(const json& rs) {
+    if (!rs.contains("alias")) return "";
+    const auto& a = rs["alias"];
+    if (a.contains("Alias"))
+        return a["Alias"].value("aliasname", "");
+    if (a.contains("aliasname"))
+        return a.value("aliasname", "");
+    return "";
+}
+
+std::optional<FromSubqueryAggInfo> extractGroupedFromSubqueryInfo(const json& rs) {
+    if (!rs.contains("subquery") || !rs["subquery"].contains("SelectStmt"))
+        return std::nullopt;
+    const auto& sub = rs["subquery"]["SelectStmt"];
+    if (!sub.contains("groupClause") || !sub.contains("fromClause"))
+        return std::nullopt;
+
+    FromSubqueryAggInfo info;
+    info.alias = rangeSubselectAlias(rs);
+
+    for (const auto& item : sub["fromClause"])
+        extractTables(item, info.tables, info.tableAliases);
+    if (info.tables.empty())
+        return std::nullopt;
+
+    for (const auto& item : sub["fromClause"])
+        extractJoinOns(item, info.tables, info.joins, info.filters);
+
+    if (sub.contains("whereClause")) {
+        auto pred = walkPredicate(sub["whereClause"], info.tables);
+        separatePredicates(pred, info.tables, info.joins, info.filters);
+    }
+
+    if (sub.contains("targetList")) {
+        for (const auto& t : sub["targetList"]) {
+            if (t.contains("ResTarget"))
+                info.targets.push_back(extractTarget(t["ResTarget"], info.tables));
+        }
+    }
+
+    bool hasAggTarget = false;
+    for (const auto& target : info.targets) {
+        if (target.isAgg) {
+            hasAggTarget = true;
+            break;
+        }
+    }
+    if (!hasAggTarget)
+        return std::nullopt;
+
+    for (const auto& g : sub["groupClause"])
+        info.groupBy.push_back(walkExpr(g, info.tables));
+
+    return info;
+}
+
 // ===================================================================
 // PUBLIC: analyzeSQL
 // ===================================================================
@@ -1003,6 +1059,8 @@ AnalyzedQuery analyzeSQL(const std::string& sql, const SchemaProvider* schema) {
                 auto& rs = fromItem["RangeSubselect"];
                 if (rs.contains("subquery") && rs["subquery"].contains("SelectStmt")) {
                     auto& sub = rs["subquery"]["SelectStmt"];
+                    if (auto groupedInfo = extractGroupedFromSubqueryInfo(rs))
+                        aq.fromSubqueryAggs.push_back(std::move(*groupedInfo));
                     if (sub.contains("whereClause")) {
                         auto pred = walkPredicate(sub["whereClause"], aq.tables);
                         separatePredicates(pred, aq.tables, aq.joins, aq.filters);
