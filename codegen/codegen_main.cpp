@@ -969,7 +969,9 @@ static bool runCodegenQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
                     if (v.empty()) return 0.0;
                     std::sort(v.begin(), v.end());
                     if (v.size() > 1) v.pop_back();
-                    return v[v.size() / 2];
+                    size_t mid = v.size() / 2;
+                    if (v.size() % 2 == 1) return v[mid];
+                    return 0.5 * (v[mid - 1] + v[mid]);
                 };
                 totalP50[c] = p50DropMax(totals);
                 for (size_t i = 0; i < nPhases; i++) {
@@ -1106,11 +1108,13 @@ static bool runCodegenQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
             }
         }
 
-        // Median across measured trials (lower-median for even N).
+        // Median across measured trials.
         auto median = [](std::vector<double> v) -> double {
             if (v.empty()) return 0.0;
             std::sort(v.begin(), v.end());
-            return v[v.size() / 2];
+            size_t mid = v.size() / 2;
+            if (v.size() % 2 == 1) return v[mid];
+            return 0.5 * (v[mid - 1] + v[mid]);
         };
 
         // C1: percentile + MAD on the GPU-time trial distribution.
@@ -1118,8 +1122,8 @@ static bool runCodegenQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
             if (v.empty()) return 0.0;
             std::sort(v.begin(), v.end());
             // Nearest-rank percentile: ceil(p * N) - 1, clamped.
-            double idx = p * (double)v.size();
-            size_t i = (size_t)std::min<double>(std::max<double>(idx - 1, 0),
+            double rank = std::ceil(p * (double)v.size());
+            size_t i = (size_t)std::min<double>(std::max<double>(rank - 1.0, 0.0),
                                                 (double)(v.size() - 1));
             return v[i];
         };

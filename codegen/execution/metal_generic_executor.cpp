@@ -455,15 +455,22 @@ MetalExecutionResult MetalGenericExecutor::execute(
             cmdBuf->waitUntilCompleted();
             checkCommandBufferStatus(cmdBuf, phase.name);
 
+            double phaseSec = cmdBuf->GPUEndTime() - cmdBuf->GPUStartTime();
+            double hookGpuMs = 0.0;
+
             // Invoke host-side post-dispatch hook (e.g. read GPU-computed
-            // scalar back into scalarFloats_ for later phases).
+            // scalar back into scalarFloats_ for later phases). Some hooks
+            // launch additional GPU work after the initial phase dispatch
+            // (notably bitonic sort step loops); fold their reported GPU time
+            // into the same phase so totals do not undercount those kernels.
             if (phase.postDispatchHook) {
-                phase.postDispatchHook(*this);
+                hookGpuMs = phase.postDispatchHook(*this);
+                if (hookGpuMs < 0.0) hookGpuMs = 0.0;
             }
 
-            double phaseSec = cmdBuf->GPUEndTime() - cmdBuf->GPUStartTime();
-            totalGpuSec += phaseSec;
-            execResult.phaseTimesMs.push_back(static_cast<float>(phaseSec * 1000.0));
+            totalGpuSec += phaseSec + hookGpuMs / 1000.0;
+            execResult.phaseTimesMs.push_back(
+                static_cast<float>(phaseSec * 1000.0 + hookGpuMs));
             execResult.phaseNames.push_back(phase.name);
         }
 

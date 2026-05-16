@@ -76,6 +76,8 @@ struct KeyedCompactKeySpec {
     int stride = 1;
     std::vector<char> charMap;
     int keyBase = 0;
+    std::vector<std::string> stringMap;
+    int stringLen = 0;
 };
 
 struct KeyedCompactAggSpec {

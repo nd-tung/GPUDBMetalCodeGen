@@ -13,6 +13,7 @@
 
 #include <algorithm>
 #include <iterator>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <string>
@@ -41,6 +42,257 @@ void prependPlanPhases(MetalQueryPlan& target, MetalQueryPlan& prefix) {
             std::make_move_iterator(prefix.phases.end()));
     }
 }
+
+std::string metalCharLiteralLocal(char c) {
+    if (c == '\\') return "'\\\\'";
+    if (c == '\'') return "'\\''";
+    if (c == '\0') return "'\\0'";
+    return std::string("'") + c + "'";
+}
+
+std::string materializedValueAt(const GenericMatColumnDesc& col,
+                                const std::string& row) {
+    if (col.stringLen > 0) {
+        return col.bufferName + "[" + row + " * " +
+               std::to_string(col.stringLen) + "u]";
+    }
+    return col.bufferName + "[" + row + "]";
+}
+
+std::string charDomainBucketExpr(const std::string& raw,
+                                 const std::vector<char>& domain) {
+    if (domain.empty()) return "";
+    if (domain.size() == 1) return "0";
+    std::string expr = std::to_string(domain.size() - 1);
+    for (int i = static_cast<int>(domain.size()) - 2; i >= 0; --i) {
+        expr = "(" + raw + " == " + metalCharLiteralLocal(domain[(size_t)i]) +
+               " ? " + std::to_string(i) + " : " + expr + ")";
+    }
+    return expr;
+}
+
+std::string fixedStringDomainBucketExpr(const std::string& buffer,
+                                        const std::string& row,
+                                        int width,
+                                        const std::vector<std::string>& domain) {
+    if (domain.empty() || width <= 0) return "";
+    if (domain.size() == 1) return "0";
+    const std::string ptr = buffer + " + " + row + " * " +
+                            std::to_string(width) + "u";
+    std::string expr = std::to_string(domain.size() - 1);
+    for (int i = static_cast<int>(domain.size()) - 2; i >= 0; --i) {
+        expr = "(" + fixedStringEqMetalFromPointer(ptr, width, domain[(size_t)i]) +
+               " ? " + std::to_string(i) + " : " + expr + ")";
+    }
+    return expr;
+}
+
+const GenericMatColumnDesc* findMaterializedColumn(
+        const std::vector<GenericMatColumnDesc>& cols,
+        const std::string& displayName) {
+    for (const auto& col : cols) {
+        if (col.displayName == displayName) return &col;
+    }
+    return nullptr;
+}
+
+std::vector<std::string> uniqueStrings(std::vector<std::string> values) {
+    std::vector<std::string> out;
+    for (auto& value : values) {
+        if (std::find(out.begin(), out.end(), value) == out.end())
+            out.push_back(std::move(value));
+    }
+    return out;
+}
+
+std::vector<std::string> intersectStrings(const std::vector<std::string>& left,
+                                          const std::vector<std::string>& right) {
+    std::vector<std::string> out;
+    for (const auto& value : left) {
+        if (std::find(right.begin(), right.end(), value) != right.end())
+            out.push_back(value);
+    }
+    return out;
+}
+
+int maxStringLen(const std::vector<std::string>& values) {
+    int width = 0;
+    for (const auto& value : values)
+        width = std::max(width, static_cast<int>(value.size()));
+    return width;
+}
+
+std::vector<int64_t> uniqueInts(std::vector<int64_t> values) {
+    std::vector<int64_t> out;
+    for (auto value : values) {
+        if (std::find(out.begin(), out.end(), value) == out.end())
+            out.push_back(value);
+    }
+    return out;
+}
+
+std::vector<int64_t> intersectInts(const std::vector<int64_t>& left,
+                                   const std::vector<int64_t>& right) {
+    std::vector<int64_t> out;
+    for (auto value : left) {
+        if (std::find(right.begin(), right.end(), value) != right.end())
+            out.push_back(value);
+    }
+    return out;
+}
+
+std::optional<int64_t> integerLiteralForDomain(const GenericExprPtr& expr) {
+    if (!expr) return std::nullopt;
+    if (auto parsed = integerStringLiteralValue(expr)) return *parsed;
+    auto* lit = std::get_if<GenericLiteralExpr>(&expr->node);
+    if (!lit) return std::nullopt;
+    if (auto* value = std::get_if<int64_t>(&lit->value)) return *value;
+    return std::nullopt;
+}
+
+std::optional<std::vector<int64_t>> finiteIntDomainForPredicate(
+        const GenericPredicatePtr& pred,
+        const GenericExprPtr& target) {
+    if (!pred || !target) return std::nullopt;
+    return std::visit([&](const auto& node)
+            -> std::optional<std::vector<int64_t>> {
+        using T = std::decay_t<decltype(node)>;
+        if constexpr (std::is_same_v<T, GenericComparisonPred>) {
+            if (node.op != CmpOp::EQ) return std::nullopt;
+            if (genericExprEquivalent(node.left, target)) {
+                if (auto lit = integerLiteralForDomain(node.right))
+                    return uniqueInts({*lit});
+            }
+            if (genericExprEquivalent(node.right, target)) {
+                if (auto lit = integerLiteralForDomain(node.left))
+                    return uniqueInts({*lit});
+            }
+            return std::nullopt;
+        } else if constexpr (std::is_same_v<T, GenericInListPred>) {
+            if (!genericExprEquivalent(node.expr, target)) return std::nullopt;
+            std::vector<int64_t> values;
+            for (const auto& value : node.values) {
+                auto lit = integerLiteralForDomain(value);
+                if (!lit) return std::nullopt;
+                values.push_back(*lit);
+            }
+            return uniqueInts(std::move(values));
+        } else if constexpr (std::is_same_v<T, GenericLogicalPred>) {
+            if (node.children.empty()) return std::nullopt;
+            if (node.op == GenericLogicalPred::Op::And) {
+                std::optional<std::vector<int64_t>> domain;
+                for (const auto& child : node.children) {
+                    auto childDomain = finiteIntDomainForPredicate(child, target);
+                    if (!childDomain) continue;
+                    domain = domain
+                        ? intersectInts(*domain, *childDomain)
+                        : *childDomain;
+                }
+                return domain;
+            }
+            if (node.op == GenericLogicalPred::Op::Or) {
+                std::vector<int64_t> out;
+                for (const auto& child : node.children) {
+                    auto childDomain = finiteIntDomainForPredicate(child, target);
+                    if (!childDomain) return std::nullopt;
+                    out.insert(out.end(), childDomain->begin(), childDomain->end());
+                }
+                return uniqueInts(std::move(out));
+            }
+            return std::nullopt;
+        } else {
+            return std::nullopt;
+        }
+    }, pred->node);
+}
+
+std::optional<std::vector<std::string>> finiteStringDomainForPredicate(
+        const GenericPredicatePtr& pred,
+        const GenericExprPtr& target) {
+    if (!pred || !target) return std::nullopt;
+    return std::visit([&](const auto& node)
+            -> std::optional<std::vector<std::string>> {
+        using T = std::decay_t<decltype(node)>;
+        if constexpr (std::is_same_v<T, GenericComparisonPred>) {
+            if (node.op != CmpOp::EQ) return std::nullopt;
+            if (genericExprEquivalent(node.left, target)) {
+                if (auto lit = stringLiteralValue(node.right))
+                    return uniqueStrings({*lit});
+            }
+            if (genericExprEquivalent(node.right, target)) {
+                if (auto lit = stringLiteralValue(node.left))
+                    return uniqueStrings({*lit});
+            }
+            return std::nullopt;
+        } else if constexpr (std::is_same_v<T, GenericInListPred>) {
+            if (!genericExprEquivalent(node.expr, target)) return std::nullopt;
+            std::vector<std::string> values;
+            for (const auto& value : node.values) {
+                auto lit = stringLiteralValue(value);
+                if (!lit) return std::nullopt;
+                values.push_back(*lit);
+            }
+            return uniqueStrings(std::move(values));
+        } else if constexpr (std::is_same_v<T, GenericLogicalPred>) {
+            if (node.children.empty()) return std::nullopt;
+            if (node.op == GenericLogicalPred::Op::And) {
+                std::optional<std::vector<std::string>> domain;
+                for (const auto& child : node.children) {
+                    auto childDomain = finiteStringDomainForPredicate(child, target);
+                    if (!childDomain) continue;
+                    domain = domain
+                        ? intersectStrings(*domain, *childDomain)
+                        : *childDomain;
+                }
+                return domain;
+            }
+            if (node.op == GenericLogicalPred::Op::Or) {
+                std::vector<std::string> out;
+                for (const auto& child : node.children) {
+                    auto childDomain = finiteStringDomainForPredicate(child, target);
+                    if (!childDomain) return std::nullopt;
+                    out.insert(out.end(), childDomain->begin(), childDomain->end());
+                }
+                return uniqueStrings(std::move(out));
+            }
+            return std::nullopt;
+        } else {
+            return std::nullopt;
+        }
+    }, pred->node);
+}
+
+class MetalMaterializedRangeScan : public MetalOperator {
+public:
+    MetalMaterializedRangeScan(std::string rowsSymbol,
+                               std::string idxVar,
+                               std::vector<GenericMatColumnDesc> columns)
+        : rowsSymbol_(std::move(rowsSymbol)),
+          idxVar_(std::move(idxVar)),
+          columns_(std::move(columns)) {}
+
+    void produce(MetalCodegen& cg, ConsumerFn consume) override {
+        const std::string nParam = tableSizeName(rowsSymbol_);
+        cg.setPhaseScannedTable(rowsSymbol_);
+        cg.addResolvedScalarParam(nParam, "uint", rowsSymbol_);
+        for (const auto& col : columns_) {
+            cg.addBufferParam(col.bufferName, col.metalType, "", false);
+        }
+        cg.addBlock("for (uint " + idxVar_ + " = tid; " + idxVar_ + " < " +
+                    nParam + "; " + idxVar_ + " += tpg)", [&]() {
+            consume();
+        });
+    }
+
+    std::string describe() const override {
+        return "MaterializedRangeScan(" + rowsSymbol_ + ")";
+    }
+
+private:
+    std::string rowsSymbol_;
+    std::string idxVar_;
+    std::vector<GenericMatColumnDesc> columns_;
+};
 
 } // namespace
 
@@ -204,6 +456,325 @@ std::optional<MetalQueryPlan> lowerMultiTableGroupedAggregateIRToMetalImpl(
     if (!scalarLookups.empty())
         attachGenericScalarLookupBuffers(matPhase, scalarLookups);
 
+    GenericSortSpec sortSpec;
+    sortSpec.limit = limitValue(shape->limit);
+    if (auto* sort = sortDetail(shape->sort)) {
+        for (const auto& key : sort->keys) {
+            auto name = sortKeyDisplayNameForGroupedAgg(key, *aggregate, groupKeys);
+            if (!name)
+                return fail(error, "IR multi-table grouped aggregate lowerer: ORDER BY key is not an output.");
+            sortSpec.keys.push_back({*name, key.descending});
+        }
+    }
+
+    if (!aggregate->having && !aggregateNeedsHashGroupOutput(*aggregate)) {
+        bool directOk = true;
+        int totalBuckets = 1;
+        std::vector<IrGroupKeyDesc> denseKeys;
+        denseKeys.reserve(aggregate->groupBy.size());
+
+        const std::string idxVar = "i";
+        for (size_t i = 0; i < aggregate->groupBy.size(); ++i) {
+            const auto& group = aggregate->groupBy[i];
+            auto* col = group ? std::get_if<GenericColumnExpr>(&group->node) : nullptr;
+            const std::string displayName = groupDisplayNameForAggregate(*aggregate, i);
+            const auto* matCol = findMaterializedColumn(materializedCols, displayName);
+            if (!matCol) {
+                directOk = false;
+                break;
+            }
+
+            IrGroupKeyDesc key;
+            key.displayName = displayName;
+            key.stride = totalBuckets;
+            const std::string raw = materializedValueAt(*matCol, idxVar);
+            const auto* fd = shape->filter ? filterDetail(shape->filter) : nullptr;
+            auto finiteIntDomain = finiteIntDomainForPredicate(
+                fd ? fd->predicate : GenericPredicatePtr{}, group);
+            if ((group->type.type == DataType::INT ||
+                 group->type.type == DataType::DATE) &&
+                finiteIntDomain && !finiteIntDomain->empty()) {
+                auto [minIt, maxIt] = std::minmax_element(
+                    finiteIntDomain->begin(), finiteIntDomain->end());
+                int64_t minValue = *minIt;
+                int64_t maxValue = *maxIt;
+                int64_t domainSize = maxValue - minValue + 1;
+                if (domainSize <= 0 || domainSize > 4096 ||
+                    minValue < std::numeric_limits<int>::min() ||
+                    maxValue > std::numeric_limits<int>::max()) {
+                    directOk = false;
+                    break;
+                }
+                key.numValues = static_cast<int>(domainSize);
+                key.keyBase = static_cast<int>(minValue);
+                key.keyExpr = minValue != 0
+                    ? "(" + raw + " - " + std::to_string(minValue) + ")"
+                    : raw;
+                key.keyExpr = "clamp(" + key.keyExpr + ", 0, " +
+                              std::to_string(key.numValues - 1) + ")";
+            } else if (col && col->type.type == DataType::CHAR1) {
+                key.keyExpr = charDomainBucketExpr(raw, col->charDomain);
+                key.numValues = static_cast<int>(col->charDomain.size());
+                key.charMap = col->charDomain;
+                if (key.keyExpr.empty() || key.numValues <= 0) {
+                    directOk = false;
+                    break;
+                }
+            } else if (col && col->type.type == DataType::CHAR_FIXED) {
+                auto domain = finiteStringDomainForPredicate(
+                    fd ? fd->predicate : GenericPredicatePtr{}, group);
+                if (!domain || domain->empty() || matCol->stringLen <= 0) {
+                    directOk = false;
+                    break;
+                }
+                key.stringMap = *domain;
+                key.stringLen = std::max(matCol->stringLen, maxStringLen(key.stringMap));
+                key.numValues = static_cast<int>(key.stringMap.size());
+                key.keyExpr = fixedStringDomainBucketExpr(
+                    matCol->bufferName, idxVar, matCol->stringLen, key.stringMap);
+                if (key.keyExpr.empty() || key.numValues <= 0) {
+                    directOk = false;
+                    break;
+                }
+            } else if (col && (col->type.type == DataType::INT ||
+                        col->type.type == DataType::DATE) &&
+                       col->hasGroupDomain &&
+                       col->domainMax >= col->domainMin) {
+                key.numValues = col->domainMax - col->domainMin + 1;
+                key.keyBase = col->domainMin;
+                key.keyExpr = col->domainMin != 0
+                    ? "(" + raw + " - " + std::to_string(col->domainMin) + ")"
+                    : raw;
+                key.keyExpr = "clamp(" + key.keyExpr + ", 0, " +
+                              std::to_string(key.numValues - 1) + ")";
+            } else {
+                directOk = false;
+                break;
+            }
+
+            totalBuckets *= key.numValues;
+            if (key.numValues <= 0 || totalBuckets > 4096) {
+                directOk = false;
+                break;
+            }
+            denseKeys.push_back(std::move(key));
+        }
+
+        std::vector<IrPendingAgg> pending;
+        int valuesPerBucket = 0;
+        if (directOk) {
+            for (size_t i = 0; i < aggregate->aggregates.size(); ++i) {
+                const auto& projection = aggregate->aggregates[i];
+                auto* agg = projection.expr
+                    ? std::get_if<GenericAggregateExpr>(&projection.expr->node)
+                    : nullptr;
+                if (!agg) {
+                    directOk = false;
+                    break;
+                }
+                const std::string displayName = projection.name.empty()
+                    ? "agg_" + std::to_string(i)
+                    : projection.name;
+
+                if (agg->func == AggFunc::COUNT_DISTINCT ||
+                    agg->func == AggFunc::MIN ||
+                    agg->func == AggFunc::MAX) {
+                    directOk = false;
+                    break;
+                }
+
+                if (agg->func == AggFunc::COUNT) {
+                    IrPendingAgg out;
+                    out.displayName = displayName;
+                    out.offset = valuesPerBucket++;
+                    out.valueExpr = "1u";
+                    out.funcName = "COUNT";
+                    pending.push_back(std::move(out));
+                    continue;
+                }
+
+                const auto* matCol = findMaterializedColumn(materializedCols, displayName);
+                if (!agg->arg || !matCol || matCol->stringLen > 0) {
+                    directOk = false;
+                    break;
+                }
+                std::string valueExpr = materializedValueAt(*matCol, idxVar);
+                if (agg->func == AggFunc::AVG) {
+                    const int fixedScale = matCol->scaleDown;
+                    IrPendingAgg sum;
+                    sum.displayName = displayName;
+                    sum.offset = valuesPerBucket;
+                    sum.valueExpr = valueExpr;
+                    if (agg->arg->type.type == DataType::FLOAT && fixedScale > 0) {
+                        sum.valueExpr = scaledLongExpr(valueExpr, fixedScale);
+                        sum.isLongPair = true;
+                        sum.scaleDown = -fixedScale;
+                        valuesPerBucket += 2;
+                    } else if (agg->arg->type.type == DataType::FLOAT) {
+                        sum.isFloatSum = true;
+                        sum.scaleDown = -1;
+                        valuesPerBucket += 1;
+                    } else {
+                        sum.isLongPair = true;
+                        sum.scaleDown = -1;
+                        valuesPerBucket += 2;
+                    }
+                    sum.funcName = "AVG";
+                    sum.innerColumn = innerColumnName(agg->arg);
+                    pending.push_back(std::move(sum));
+
+                    IrPendingAgg cnt;
+                    cnt.displayName = displayName + "_cnt";
+                    cnt.offset = valuesPerBucket++;
+                    cnt.valueExpr = "1u";
+                    cnt.funcName = "AVG";
+                    pending.push_back(std::move(cnt));
+                    continue;
+                }
+
+                if (agg->func == AggFunc::SUM) {
+                    IrPendingAgg out;
+                    out.displayName = displayName;
+                    out.offset = valuesPerBucket;
+                    out.valueExpr = valueExpr;
+                    out.funcName = "SUM";
+                    out.innerColumn = innerColumnName(agg->arg);
+                    if (agg->arg->type.type == DataType::FLOAT && matCol->scaleDown > 0) {
+                        out.valueExpr = scaledLongExpr(valueExpr, matCol->scaleDown);
+                        out.isLongPair = true;
+                        out.scaleDown = matCol->scaleDown;
+                        valuesPerBucket += 2;
+                    } else if (agg->arg->type.type == DataType::FLOAT) {
+                        out.isFloatSum = true;
+                        valuesPerBucket += 1;
+                    } else {
+                        out.isLongPair = true;
+                        valuesPerBucket += 2;
+                    }
+                    pending.push_back(std::move(out));
+                    continue;
+                }
+
+                directOk = false;
+                break;
+            }
+        }
+
+        if (directOk && !pending.empty()) {
+            std::string bucketExpr = "(" + denseKeys.front().keyExpr + ")";
+            for (size_t i = 1; i < denseKeys.size(); ++i) {
+                bucketExpr = "(" + bucketExpr + " + (" + denseKeys[i].keyExpr + ") * " +
+                             std::to_string(denseKeys[i].stride) + ")";
+            }
+
+            const std::string rowsSym = "ir_multi_direct_group_rows";
+            auto scan = std::make_unique<MetalMaterializedRangeScan>(
+                rowsSym, idxVar, materializedCols);
+            auto keyed = std::make_unique<MetalKeyedAgg>(
+                std::move(scan), "d_ir_multi_direct_group_aggs", bucketExpr,
+                totalBuckets, valuesPerBucket,
+                std::to_string(totalBuckets * valuesPerBucket));
+
+            std::vector<std::string> keyNames;
+            std::vector<GroupKeyDecode> decodeInfo;
+            for (const auto& key : denseKeys) {
+                keyNames.push_back(key.displayName);
+                GroupKeyDecode d;
+                d.name = key.displayName;
+                d.numValues = key.numValues;
+                d.stride = key.stride;
+                d.charMap = key.charMap;
+                d.keyBase = key.keyBase;
+                decodeInfo.push_back(std::move(d));
+            }
+            keyed->setMultiKeyResult(keyNames, decodeInfo, totalBuckets);
+            for (const auto& agg : pending) {
+                keyed->addAggregateWithMeta(agg.displayName, agg.offset, agg.valueExpr,
+                                            agg.atomicOp, agg.isLongPair, agg.scaleDown,
+                                            agg.isFloatSum, agg.isMinMax,
+                                            agg.funcName, agg.innerColumn);
+            }
+
+            attachMaterializedCountHook(matPhase, resultCounter, rowsSym);
+            auto& directPhase = appendPhase(lowering->plan,
+                "GENERIC_ir_multi_table_direct_group", std::move(keyed));
+
+            std::vector<KeyedCompactKeySpec> compactKeys;
+            std::vector<GenericMatColumnDesc> compactCols;
+            for (const auto& key : denseKeys) {
+                compactKeys.push_back({key.displayName, key.numValues, key.stride,
+                                       key.charMap, key.keyBase, key.stringMap,
+                                       key.stringLen});
+                std::string buf = "d_ir_multi_direct_out_" +
+                                  std::to_string(compactCols.size()) + "_" +
+                                  sanitizeIdentifier(key.displayName);
+                const bool isStringKey = !key.charMap.empty() || !key.stringMap.empty();
+                compactCols.push_back(GenericMatColumnDesc{
+                    key.displayName, buf, isStringKey ? "char" : "int",
+                    key.stringMap.empty() ? 0 : key.stringLen});
+            }
+
+            std::vector<KeyedCompactAggSpec> compactAggs;
+            for (size_t pi = 0; pi < pending.size(); ++pi) {
+                const auto& p = pending[pi];
+                KeyedCompactAggSpec out;
+                out.displayName = p.displayName;
+                out.offset = p.offset;
+                out.isLongPair = p.isLongPair;
+                out.scaleDown = p.scaleDown;
+                out.isFloatSum = p.isFloatSum;
+                out.isMinMax = p.isMinMax;
+                out.atomicOp = p.atomicOp;
+                out.avgSumIsLongPair = p.isLongPair;
+
+                std::string metalType = "uint";
+                int outScale = 0;
+                bool outLongPair = false;
+                if (p.scaleDown < 0 && pi + 1 < pending.size()) {
+                    const auto& cnt = pending[pi + 1];
+                    out.isAvg = true;
+                    out.countOffset = cnt.offset;
+                    out.countIsFloat = cnt.isFloatSum;
+                    metalType = "float";
+                    ++pi;
+                } else if (p.isLongPair) {
+                    metalType = "uint";
+                    outScale = p.scaleDown > 0 ? p.scaleDown : 0;
+                    outLongPair = true;
+                    out.isLongPair = true;
+                } else if (p.isFloatSum || p.isMinMax) {
+                    metalType = "float";
+                }
+                std::string buf = "d_ir_multi_direct_out_" +
+                                  std::to_string(compactCols.size()) + "_" +
+                                  sanitizeIdentifier(out.displayName);
+                compactAggs.push_back(out);
+                compactCols.push_back(GenericMatColumnDesc{
+                    out.displayName, buf, metalType, 0, outScale, outLongPair});
+            }
+
+            const std::string compactCounter = "d_ir_multi_direct_result_count";
+            auto& compactPhase = appendPhase(lowering->plan,
+                "GENERIC_ir_multi_table_direct_group_compact",
+                makeKeyedAggCompactOperator(
+                    "d_ir_multi_direct_group_aggs", compactCounter, totalBuckets,
+                    valuesPerBucket, compactKeys, compactAggs, compactCols));
+            (void)directPhase;
+
+            if (!sortSpec.keys.empty() || sortSpec.limit >= 0) {
+                const std::string sortRowsSym = "n_gpu_sort_ir_multi_direct_group_rows";
+                attachMaterializedCountHook(compactPhase, compactCounter, sortRowsSym);
+                if (!appendGenericGpuSort(lowering->plan, "ir_multi_direct_group",
+                                          sortRowsSym, std::to_string(totalBuckets),
+                                          compactCols, sortSpec, error)) {
+                    return std::nullopt;
+                }
+            }
+
+            return std::move(lowering->plan);
+        }
+    }
+
     const std::string groupTag = "ir_multi_table_group";
     GenericGpuGroupSpec gbSpec;
     gbSpec.tag = groupTag;
@@ -220,17 +791,6 @@ std::optional<MetalQueryPlan> lowerMultiTableGroupedAggregateIRToMetalImpl(
     const std::string sortRowsSym = "n_gpu_sort_" + groupTag + "_rows";
     attachMaterializedCountHook(lowering->plan.phases.back(), gbSpec.outputCounter,
                                 sortRowsSym);
-
-    GenericSortSpec sortSpec;
-    sortSpec.limit = limitValue(shape->limit);
-    if (auto* sort = sortDetail(shape->sort)) {
-        for (const auto& key : sort->keys) {
-            auto name = sortKeyDisplayNameForGroupedAgg(key, *aggregate, groupKeys);
-            if (!name)
-                return fail(error, "IR multi-table grouped aggregate lowerer: ORDER BY key is not an output.");
-            sortSpec.keys.push_back({*name, key.descending});
-        }
-    }
 
     if (!sortSpec.keys.empty() || sortSpec.limit >= 0) {
         if (!appendGenericGpuSort(lowering->plan, "group_" + groupTag,

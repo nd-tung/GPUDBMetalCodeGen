@@ -127,6 +127,7 @@ private:
                 {"o_shippriority",  7, DataType::INT},
                 {"o_comment",       8, DataType::CHAR_FIXED, 79},
             });
+            s.tables["orders"].columns[5].charDomain = {'1', '2', '3', '4', '5'}; // o_orderpriority
             s.tables["orders"].columns[7].domainMin = 0;  s.tables["orders"].columns[7].domainMax = 0;   // o_shippriority
         }
 
