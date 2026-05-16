@@ -50,6 +50,7 @@ std::optional<MetalQueryPlan> buildQ22Plan_byName() {
                 if (cnt > 0) avg = sum / static_cast<float>(cnt);
             }
             ex.registerScalarFloat("avg_bal", avg);
+            return 0.0;
         };
     }
 

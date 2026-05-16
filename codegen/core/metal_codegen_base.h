@@ -19,9 +19,11 @@ class MetalCodegen;
 class MetalGenericExecutor;
 
 // Host hook run after a phase's GPU dispatch completes. May read output
-// buffers via executor.getAllocatedBuffer() and feed scalars to later
-// phases via registerScalarFloat()/registerScalarInt().
-using PostDispatchHook = std::function<void(MetalGenericExecutor&)>;
+// buffers via executor.getAllocatedBuffer(), feed scalars to later phases,
+// or launch follow-up GPU work such as bitonic sort steps.
+// Return any additional GPU milliseconds launched by the hook so timing
+// summaries account for hook-dispatched kernels.
+using PostDispatchHook = std::function<double(MetalGenericExecutor&)>;
 
 class MetalCodegen {
 public:

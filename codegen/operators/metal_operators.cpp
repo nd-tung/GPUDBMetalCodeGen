@@ -1489,15 +1489,15 @@ PostDispatchHook MetalInitSortKeys::makeBitonicHook(
     const std::string& nResultsExpr) {
     return [=](MetalGenericExecutor& executor) {
         auto* pso = executor.getPipelineState(sortPhaseName);
-        if (!pso) return;
+        if (!pso) return 0.0;
 
         auto* keyBuf = executor.getAllocatedBuffer(sortKeyBufName);
         auto* idxBuf = executor.getAllocatedBuffer(sortIdxBufName);
-        if (!keyBuf || !idxBuf) return;
+        if (!keyBuf || !idxBuf) return 0.0;
 
         // Read n_results from a registered scalar or symbol
         size_t n_results = 0;
-        if (!executor.tryGetSymbol(nResultsExpr, n_results) && n_results == 0) return;
+        if (!executor.tryGetSymbol(nResultsExpr, n_results) && n_results == 0) return 0.0;
         unsigned int n = (unsigned int)n_results;
         unsigned int np2 = nextPow2(n);
 
@@ -1511,8 +1511,9 @@ PostDispatchHook MetalInitSortKeys::makeBitonicHook(
         }
 
         auto* queue = executor.commandQueue();
-        if (!queue) return;
+        if (!queue) return 0.0;
 
+        double gpuMs = 0.0;
         for (unsigned int k = 2; k <= np2; k <<= 1) {
             for (unsigned int j = k >> 1; j > 0; j >>= 1) {
                 auto* cmdBuf = queue->commandBuffer();
@@ -1537,8 +1538,10 @@ PostDispatchHook MetalInitSortKeys::makeBitonicHook(
                 enc->endEncoding();
                 cmdBuf->commit();
                 cmdBuf->waitUntilCompleted();
+                gpuMs += (cmdBuf->GPUEndTime() - cmdBuf->GPUStartTime()) * 1000.0;
             }
         }
+        return gpuMs;
     };
 }
 

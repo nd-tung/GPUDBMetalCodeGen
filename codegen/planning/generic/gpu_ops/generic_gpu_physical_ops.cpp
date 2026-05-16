@@ -67,6 +67,8 @@ public:
 
         const std::string state = stateName();
         cg.addAtomicBufferParam(state, "atomic_uint", spec_.capacityExpr);
+        const std::string hash = hashName();
+        cg.addAtomicBufferParam(hash, "atomic_uint", spec_.capacityExpr);
 
         for (const auto& key : spec_.groupBy.keyColumns) {
             const auto* col = findMatColumn(spec_.inputColumns, key);
@@ -101,6 +103,7 @@ public:
 
         cg.addBlock("for (uint _r = tid; _r < " + spec_.inputRowsSymbol + "; _r += tpg)", [&]() {
             emitHashExpr(cg, "_r", "_hash");
+            cg.addLine("uint _fp = _hash | 1u;");
             cg.addLine("uint _slot = _hash & (" + spec_.capacitySymbol + " - 1u);");
             cg.addLine("uint _found = 0xFFFFFFFFu;");
             cg.addBlock("for (uint _probe = 0u; _probe < " + spec_.capacitySymbol + "; ++_probe)", [&]() {
@@ -120,6 +123,7 @@ public:
                     });
                     cg.addIf("_claimed", [&]() {
                         emitStoreKeys(cg, "_slot", "_r");
+                        cg.addLine("atomic_store_explicit(&" + hash + "[_slot], _fp, memory_order_relaxed);");
                         cg.addLine("atomic_store_explicit(&" + state + "[_slot], 2u, memory_order_relaxed);");
                         cg.addLine("_found = _slot;");
                     });
@@ -128,10 +132,20 @@ public:
                     cg.addLine("break;");
                 });
                 cg.addBlock("while (atomic_load_explicit(&" + state + "[_slot], memory_order_relaxed) == 1u)", [&]() {});
-                cg.addIf("atomic_load_explicit(&" + state + "[_slot], memory_order_relaxed) == 2u && " +
-                         keyEqualsExpr("_slot", "_r"), [&]() {
-                    cg.addLine("_found = _slot;");
-                    cg.addLine("break;");
+                cg.addIf("atomic_load_explicit(&" + state + "[_slot], memory_order_relaxed) == 2u", [&]() {
+                    cg.addLine("uint _slot_fp = atomic_load_explicit(&" + hash + "[_slot], memory_order_relaxed);");
+                    cg.addBlock("for (uint _hvis = 0u; _slot_fp == 0u && _hvis < 256u; ++_hvis)", [&]() {
+                        cg.addLine("_slot_fp = atomic_load_explicit(&" + hash + "[_slot], memory_order_relaxed);");
+                    });
+                    const std::string keyEq = keyEqualsExpr("_slot", "_r");
+                    cg.addLine("bool _key_eq = " + keyEq + ";");
+                    cg.addBlock("for (uint _vis = 0u; !_key_eq && _vis < 256u; ++_vis)", [&]() {
+                        cg.addLine("_key_eq = " + keyEq + ";");
+                    });
+                    cg.addIf("_key_eq || _slot_fp == _fp", [&]() {
+                        cg.addLine("_found = _slot;");
+                        cg.addLine("break;");
+                    });
                 });
                 cg.addLine("_slot = (_slot + 1u) & (" + spec_.capacitySymbol + " - 1u);");
             });
@@ -149,6 +163,7 @@ private:
 
     std::string suffix() const { return sanitizeIdentifier(spec_.tag); }
     std::string stateName() const { return "d_gpu_gb_" + suffix() + "_state"; }
+    std::string hashName() const { return "d_gpu_gb_" + suffix() + "_hash"; }
     std::string keyStoreName(const std::string& display) const {
         return "d_gpu_gb_" + suffix() + "_key_" + sanitizeIdentifier(display);
     }
@@ -702,7 +717,24 @@ private:
         cg.addLine("uint _encoded_" + std::to_string(outIdx) + " = (_bucket / " +
                    std::to_string(key.stride) + "u) % " +
                    std::to_string(std::max(1, key.numValues)) + "u;");
-        if (!key.charMap.empty()) {
+        if (!key.stringMap.empty()) {
+            const int width = std::max(1, key.stringLen);
+            for (int ci = 0; ci < width; ++ci) {
+                auto charAt = [&](const std::string& value) {
+                    return metalCharLiteral(ci < static_cast<int>(value.size())
+                        ? value[(size_t)ci]
+                        : '\0');
+                };
+                std::string expr = charAt(key.stringMap.back());
+                for (int i = static_cast<int>(key.stringMap.size()) - 2; i >= 0; --i) {
+                    expr = "(_encoded_" + std::to_string(outIdx) + " == " +
+                           std::to_string(i) + "u ? " + charAt(key.stringMap[(size_t)i]) +
+                           " : " + expr + ")";
+                }
+                cg.addLine(out.bufferName + "[_pos * " + std::to_string(width) +
+                           "u + " + std::to_string(ci) + "u] = " + expr + ";");
+            }
+        } else if (!key.charMap.empty()) {
             std::string expr = metalCharLiteral(key.charMap.back());
             for (int i = (int)key.charMap.size() - 2; i >= 0; --i) {
                 expr = "(_encoded_" + std::to_string(outIdx) + " == " +
@@ -905,15 +937,16 @@ PostDispatchHook makeGenericSortHook(
     return [=](MetalGenericExecutor& executor) {
         auto* pso = executor.getPipelineState(sortPhaseName);
         auto* idxBuf = executor.getAllocatedBuffer(sortIdxBufName);
-        if (!pso || !idxBuf) return;
+        if (!pso || !idxBuf) return 0.0;
         size_t nRows = 0;
-        if (!executor.tryGetSymbol(nRowsSymbol, nRows) || nRows == 0) return;
+        if (!executor.tryGetSymbol(nRowsSymbol, nRows) || nRows == 0) return 0.0;
         unsigned int n = (unsigned int)nRows;
         unsigned int np2 = MetalInitSortKeys::nextPow2(n);
         int* idxs = static_cast<int*>(idxBuf->contents());
         for (unsigned int i = n; i < np2; ++i) idxs[i] = -1;
         auto* queue = executor.commandQueue();
-        if (!queue) return;
+        if (!queue) return 0.0;
+        double gpuMs = 0.0;
         for (unsigned int k = 2; k <= np2; k <<= 1) {
             for (unsigned int j = k >> 1; j > 0; j >>= 1) {
                 auto* cmdBuf = queue->commandBuffer();
@@ -923,7 +956,13 @@ PostDispatchHook makeGenericSortHook(
                 int bindIdx = 1;
                 for (const auto& key : keys) {
                     auto* keyBuf = executor.getAllocatedBuffer(key.column.bufferName);
-                    if (!keyBuf) { enc->endEncoding(); cmdBuf->commit(); cmdBuf->waitUntilCompleted(); return; }
+                    if (!keyBuf) {
+                        enc->endEncoding();
+                        cmdBuf->commit();
+                        cmdBuf->waitUntilCompleted();
+                        gpuMs += (cmdBuf->GPUEndTime() - cmdBuf->GPUStartTime()) * 1000.0;
+                        return gpuMs;
+                    }
                     enc->setBuffer(keyBuf, 0, bindIdx++);
                 }
                 enc->setBytes(&k, sizeof(uint), bindIdx++);
@@ -938,8 +977,10 @@ PostDispatchHook makeGenericSortHook(
                 enc->endEncoding();
                 cmdBuf->commit();
                 cmdBuf->waitUntilCompleted();
+                gpuMs += (cmdBuf->GPUEndTime() - cmdBuf->GPUStartTime()) * 1000.0;
             }
         }
+        return gpuMs;
     };
 }
 
@@ -1002,10 +1043,13 @@ void attachMaterializedCountHook(MetalQueryPlan::Phase& phase,
     phase.postDispatchHook = [counterName = std::move(counterName),
                               symbolName = std::move(symbolName)](MetalGenericExecutor& executor) {
         auto* buf = executor.getAllocatedBuffer(counterName);
-        if (!buf) return;
+        if (!buf) return 0.0;
         uint32_t n = *static_cast<const uint32_t*>(buf->contents());
         executor.registerScalarInt(symbolName, (int)n);
         executor.registerSymbol(symbolName, n);
+        executor.registerScalarInt(tableSizeName(symbolName), (int)n);
+        executor.registerSymbol(tableSizeName(symbolName), n);
+        return 0.0;
     };
 }
 

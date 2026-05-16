@@ -92,7 +92,7 @@ static void q16_filter_emit(device atomic_uint* counter,
             auto* idxBuf = ex.getAllocatedBuffer("d_q16_filt_idx");
             auto* keyBuf = ex.getAllocatedBuffer("d_q16_filt_key");
             auto* mapBuf = ex.getAllocatedBuffer("d_q16_part_group_map");
-            if (!cntBuf || !idxBuf || !keyBuf || !mapBuf || !pd.p_brand) return;
+            if (!cntBuf || !idxBuf || !keyBuf || !mapBuf || !pd.p_brand) return 0.0;
             uint32_t cnt = *static_cast<uint32_t*>(cntBuf->contents());
             const uint32_t* fidx = static_cast<const uint32_t*>(idxBuf->contents());
             const uint64_t* fkey = static_cast<const uint64_t*>(keyBuf->contents());
@@ -152,6 +152,7 @@ static void q16_filter_emit(device atomic_uint* counter,
 
             pd.groups = std::move(groups);
             pd.numGroups = numGroups;
+            return 0.0;
         };
     }
 

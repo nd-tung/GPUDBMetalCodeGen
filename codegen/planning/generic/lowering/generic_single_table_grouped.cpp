@@ -250,7 +250,7 @@ std::optional<MetalQueryPlan> lowerSingleTableGroupedAggregateIRToMetal(
     std::vector<GenericMatColumnDesc> compactCols;
     for (const auto& key : groupKeys) {
         compactKeys.push_back({key.displayName, key.numValues, key.stride,
-                               key.charMap, key.keyBase});
+                               key.charMap, key.keyBase, {}, 0});
         std::string buf = "d_ir_keyed_out_" + std::to_string(compactCols.size()) +
                           "_" + sanitizeIdentifier(key.displayName);
         compactCols.push_back(GenericMatColumnDesc{

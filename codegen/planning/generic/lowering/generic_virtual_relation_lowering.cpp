@@ -1006,56 +1006,54 @@ std::optional<MetalQueryPlan> lowerFromSubqueryHistogramIRToMetal(
     {
         std::set<std::string> scanCols{groupJoinCol};
         auto scan = makeScanForCols(groupBase, idxVar, scanCols, aq.schema);
-        auto materialize = std::make_unique<MetalMaterialize>(
-            std::move(scan), "d_ir_from_subquery_" + tag + "_result_count",
-            "1");
-
-        const std::string outputSize = tableSizeName(groupBase);
         const std::string groupKeyExpr = groupJoinCol + "[" + idxVar + "]";
         const std::string countExpr =
             "(int)atomic_load_explicit(&" + countBuffer + "[" +
             groupKeyExpr + "], memory_order_relaxed)";
         const std::string outerCountName =
             analyzedDisplayNameForTarget(*outerCount, outerCountIndex);
-        std::vector<GenericMatColumnDesc> materializedCols;
+        constexpr int kHistogramBucketCap = 65536;
+        const std::string groupTag = "ir_from_subquery_hist_" + tag;
+        const std::string histBuffer = "d_ir_from_subquery_" + tag + "_hist";
+        auto hist = std::make_unique<MetalKeyedAgg>(
+            std::move(scan), histBuffer,
+            "min(" + countExpr + ", " +
+                std::to_string(kHistogramBucketCap - 1) + ")",
+            kHistogramBucketCap, 1);
+        hist->setKeyResult(innerAggAlias, 0);
+        hist->addAggregateWithMeta(outerCountName, 0, "1u", "add",
+                                   false, 0, false, false, "COUNT", "");
+        auto& histPhase = appendPhase(
+            plan, "GENERIC_ir_from_subquery_histogram_" + tag,
+            std::move(hist));
+        histPhase.extraBuffers.push_back({countBuffer, "atomic_uint", true, false});
 
+        const std::string compactCounter =
+            "d_ir_from_subquery_" + tag + "_hist_result_count";
+        std::vector<KeyedCompactKeySpec> compactKeys = {
+            {innerAggAlias, kHistogramBucketCap, 1, {}, 0, {}, 0}
+        };
+        std::vector<KeyedCompactAggSpec> compactAggs;
+        KeyedCompactAggSpec countOut;
+        countOut.displayName = outerCountName;
+        countOut.offset = 0;
+        compactAggs.push_back(countOut);
+
+        std::vector<GenericMatColumnDesc> compactCols;
         const std::string countCol = "d_ir_from_subquery_" + tag + "_0_" +
             sanitizeIdentifier(innerAggAlias);
         const std::string outerCountCol = "d_ir_from_subquery_" + tag + "_1_" +
             sanitizeIdentifier(outerCountName);
-        materialize->addColumn(countCol, "int", countExpr,
-                               innerAggAlias, outputSize);
-        materializedCols.push_back({innerAggAlias, countCol, "int", 0, 0, false});
-        materialize->addColumn(outerCountCol, "float", "1.0f",
-                               outerCountName, outputSize);
-        materializedCols.push_back({outerCountName, outerCountCol,
-                                    "float", 0, 0, false});
+        compactCols.push_back({innerAggAlias, countCol, "int", 0, 0, false});
+        compactCols.push_back({outerCountName, outerCountCol, "uint", 0, 0, false});
 
-        auto& phase = appendPhase(
-            plan, "GENERIC_ir_from_subquery_materialize_" + tag,
-            std::move(materialize));
-        phase.extraBuffers.push_back({countBuffer, "atomic_uint", true, false});
-
-        GenericGroupSpec groupSpec;
-        groupSpec.keyColumns.push_back(innerAggAlias);
-        groupSpec.aggColumns.push_back(outerCountName);
-        groupSpec.aggFuncs.push_back("COUNT");
-
-        const std::string groupTag = "ir_from_subquery_hist_" + tag;
-        GenericGpuGroupSpec gbSpec;
-        gbSpec.tag = groupTag;
-        gbSpec.inputCounter = "d_ir_from_subquery_" + tag + "_result_count";
-        gbSpec.inputRowsSymbol = "n_gpu_gb_" + groupTag + "_input";
-        gbSpec.capacityExpr = "next_pow2(" + outputSize + " * 2)";
-        gbSpec.capacitySymbol = "n_gpu_gb_" + groupTag + "_cap";
-        gbSpec.outputCounter = "d_gpu_gb_" + groupTag + "_count";
-        gbSpec.inputColumns = materializedCols;
-        gbSpec.groupBy = groupSpec;
-        attachMaterializedCountHook(phase, gbSpec.inputCounter,
-                                    gbSpec.inputRowsSymbol);
-        appendGenericGpuGroupBy(plan, gbSpec);
-        attachMaterializedCountHook(plan.phases.back(), gbSpec.outputCounter,
-                                    "n_gpu_sort_" + groupTag + "_rows");
+        auto& compactPhase = appendPhase(
+            plan, "GENERIC_ir_from_subquery_histogram_compact_" + tag,
+            makeKeyedAggCompactOperator(
+                histBuffer, compactCounter, kHistogramBucketCap, 1,
+                compactKeys, compactAggs, compactCols));
+        const std::string sortRowsSym = "n_gpu_sort_" + groupTag + "_rows";
+        attachMaterializedCountHook(compactPhase, compactCounter, sortRowsSym);
 
         GenericSortSpec sortSpec;
         sortSpec.limit = aq.limit;
@@ -1069,9 +1067,9 @@ std::optional<MetalQueryPlan> lowerFromSubqueryHistogramIRToMetal(
         }
         if (!sortSpec.keys.empty() || sortSpec.limit >= 0) {
             if (!appendGenericGpuSort(plan, "group_" + groupTag,
-                                      "n_gpu_sort_" + groupTag + "_rows",
-                                      gbSpec.capacityExpr,
-                                      genericGpuGroupOutputColumns(gbSpec),
+                                      sortRowsSym,
+                                      std::to_string(kHistogramBucketCap),
+                                      compactCols,
                                       sortSpec, error)) {
                 return std::nullopt;
             }
