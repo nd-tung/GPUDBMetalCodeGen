@@ -270,6 +270,68 @@ std::string exprToMetalForPredicate(const ExprPtr& expr,
 
 } // namespace
 
+std::optional<std::string> fixedStringLikeDataMetal(
+        const std::string& dataExpr,
+        const std::string& rowIndexExpr,
+        int width,
+        const std::string& pattern,
+        bool negated) {
+    if (width <= 0 || likePatternUsesUnsupportedWildcard(pattern))
+        return std::nullopt;
+    if (pattern.find('%') == std::string::npos)
+        return std::nullopt;
+
+    std::vector<std::string> segments = likeLiteralSegments(pattern);
+    if (segments.empty()) return negated ? std::string("false") : std::string("true");
+    if (segments.size() > 2) return std::nullopt;
+
+    const bool leadingWildcard = pattern.front() == '%';
+    const bool trailingWildcard = pattern.back() == '%';
+
+    if (segments.size() == 1 && !leadingWildcard && trailingWildcard &&
+        segments[0].size() > 16) {
+        const auto& prefix = segments[0];
+        int cmpLen = std::min(static_cast<int>(prefix.size()), width);
+        std::string base = dataExpr + "[" + rowIndexExpr + " * " +
+                           std::to_string(width) + "u + ";
+        std::string cond;
+        for (int i = 0; i < cmpLen; ++i) {
+            if (!cond.empty()) cond += " && ";
+            cond += base + std::to_string(i) + "] == " +
+                    metalCharLiteral(prefix[(size_t)i]);
+        }
+        std::string match = cond.empty() ? "true" : "(" + cond + ")";
+        return negated ? "!(" + match + ")" : match;
+    }
+
+    if (!likeSegmentsArePackable(segments)) return std::nullopt;
+
+    std::ostringstream call;
+    if (segments.size() == 1) {
+        const auto& segment = segments[0];
+        call << "fixed_like_one_segment(" << dataExpr << ", " << rowIndexExpr
+             << ", " << width << "u, " << packedSegmentWord(segment, 0)
+             << ", " << packedSegmentWord(segment, 8) << ", "
+             << segment.size() << "u, "
+             << (leadingWildcard ? "true" : "false") << ", "
+             << (trailingWildcard ? "true" : "false") << ")";
+    } else {
+        const auto& first = segments[0];
+        const auto& second = segments[1];
+        call << "fixed_like_two_segment(" << dataExpr << ", " << rowIndexExpr
+             << ", " << width << "u, " << packedSegmentWord(first, 0)
+             << ", " << packedSegmentWord(first, 8) << ", "
+             << first.size() << "u, " << packedSegmentWord(second, 0)
+             << ", " << packedSegmentWord(second, 8) << ", "
+             << second.size() << "u, "
+             << (leadingWildcard ? "true" : "false") << ", "
+             << (trailingWildcard ? "true" : "false") << ")";
+    }
+
+    std::string match = call.str();
+    return negated ? "!(" + match + ")" : match;
+}
+
 // ===================================================================
 // Helper: expression to Metal code string (columnar access: col[idx])
 // ===================================================================

@@ -5,6 +5,7 @@
 
 #include <initializer_list>
 #include <memory>
+#include <optional>
 #include <set>
 #include <string>
 #include <utility>
@@ -29,6 +30,12 @@ std::string predToMetal(const PredPtr& pred, const std::string& idxVar,
                         const SchemaProvider* schema = nullptr);
 std::string combineFilters(const std::vector<PredPtr>& filters, const std::string& idxVar,
                             const SchemaProvider* schema = nullptr);
+std::optional<std::string> fixedStringLikeDataMetal(
+    const std::string& dataExpr,
+    const std::string& rowIndexExpr,
+    int width,
+    const std::string& pattern,
+    bool negated);
 
 struct MetalKeyedAggSlotForHaving {
     std::string name;       // aggregate slot display name (e.g. "sum(l_quantity)")

@@ -1056,11 +1056,11 @@ std::optional<MetalQueryPlan> buildGroupedAggPlan(const AnalyzedQuery& aq, std::
     }
 
     if (!aq.orderBy.empty() || aq.limit >= 0) {
-        MetalQueryPlan::CpuSort cpuSort;
-        cpuSort.limit = aq.limit;
+        GenericSortSpec sortSpec;
+        sortSpec.limit = aq.limit;
         for (int oi = 0; oi < (int)aq.orderBy.size(); ++oi) {
             auto column = resolveOrderColumn(aq.orderBy[oi].expr, oi, aq.orderBy, aq.targets);
-            if (column) cpuSort.keys.push_back({*column, aq.orderBy[oi].descending});
+            if (column) sortSpec.keys.push_back({*column, aq.orderBy[oi].descending});
         }
         std::vector<KeyedCompactKeySpec> compactKeys;
         std::vector<GenericMatColumnDesc> compactCols;
@@ -1120,7 +1120,7 @@ std::optional<MetalQueryPlan> buildGroupedAggPlan(const AnalyzedQuery& aq, std::
         const std::string sortRowsSym = "n_gpu_sort_single_keyed_rows";
         attachMaterializedCountHook(compactPhase, compactCounter, sortRowsSym);
         if (!appendGenericGpuSort(plan, "single_keyed", sortRowsSym,
-                                  std::to_string(numBuckets), compactCols, cpuSort, error)) {
+                                  std::to_string(numBuckets), compactCols, sortSpec, error)) {
             return std::nullopt;
         }
     }
@@ -2031,36 +2031,7 @@ static bool validateHavingPredicate(const PredPtr& having,
     return true;
 }
 
-struct ScalarLookupInfo {
-    enum Kind {
-        SumByKey, AvgByKey, MinByKey, MaxByKey, CountByKey,
-        SumByCompositeHash, AvgByCompositeHash, CountByCompositeHash,
-        GlobalSum, GlobalAvg, GlobalMin, GlobalMax, GlobalCount
-    };
-    int sentinel;
-    Kind kind;
-    std::string valueTable;
-    std::string keyCol;
-    std::string keyCol2;
-    std::vector<std::string> keyCols;
-    std::vector<std::string> outerKeyCols;
-    std::string valueCol;
-    float multiplier = 1.0f;
-    std::string sizeSymbol;
-    std::string sumBuffer;
-    std::string countBuffer;
-    std::string minBuffer;
-    std::string maxBuffer;
-    std::string stateBuffer;
-    std::string hashMap;
-    std::string countHashMap;
-    std::string hashCapacityExpr;
-    std::string htFlags;
-    std::string htKeys;
-    std::string htVals;
-    std::string cntVar;   // result variable for MetalArrayLookup on count
-    std::string sumVar;   // result variable for MetalArrayLookup on sum
-};
+using ScalarLookupInfo = GenericScalarLookupInfo;
 
 static std::string scalarFloatLiteral(float v) {
     std::ostringstream oss;
@@ -3459,16 +3430,16 @@ static std::optional<MetalQueryPlan> buildSingleTableScalarLookupMaterializePlan
         attachScalarLookupBuffers(matPhase, scalarLookups);
 
     if (!aq.orderBy.empty() || aq.limit >= 0) {
-        MetalQueryPlan::CpuSort cpuSort;
-        cpuSort.limit = aq.limit;
+        GenericSortSpec sortSpec;
+        sortSpec.limit = aq.limit;
         for (int oi = 0; oi < (int)aq.orderBy.size(); ++oi) {
             auto column = resolveOrderColumn(aq.orderBy[oi].expr, oi, aq.orderBy, aq.targets);
-            if (column) cpuSort.keys.push_back({*column, aq.orderBy[oi].descending});
+            if (column) sortSpec.keys.push_back({*column, aq.orderBy[oi].descending});
         }
         const std::string sortRowsSym = "n_gpu_sort_single_scalar_lookup_rows";
         attachMaterializedCountHook(matPhase, "d_adhoc_result_count", sortRowsSym);
         if (!appendGenericGpuSort(plan, "single_scalar_lookup", sortRowsSym,
-                                  outputSize, materializedCols, cpuSort, error)) {
+                                  outputSize, materializedCols, sortSpec, error)) {
             return std::nullopt;
         }
     }
@@ -3821,18 +3792,18 @@ static std::optional<MetalQueryPlan> buildFromSubqueryAggTopScalarJoinPlan(
         phase.extraBuffers.push_back({extremumBuffer, "atomic_uint", true, false});
         phase.extraBuffers.push_back({extremumState, "atomic_uint", true, false});
 
-        MetalQueryPlan::CpuSort cpuSort;
-        cpuSort.limit = aq.limit;
+        GenericSortSpec sortSpec;
+        sortSpec.limit = aq.limit;
         for (int oi = 0; oi < (int)aq.orderBy.size(); ++oi) {
             auto column = resolveOrderColumn(aq.orderBy[oi].expr, oi, aq.orderBy, aq.targets);
             if (!column) return fail("ORDER BY column not found in SELECT targets.");
-            cpuSort.keys.push_back({*column, aq.orderBy[oi].descending});
+            sortSpec.keys.push_back({*column, aq.orderBy[oi].descending});
         }
-        if (!cpuSort.keys.empty() || cpuSort.limit >= 0) {
+        if (!sortSpec.keys.empty() || sortSpec.limit >= 0) {
             const std::string sortRowsSym = "n_gpu_sort_from_subquery_" + tag + "_rows";
             attachMaterializedCountHook(phase, "d_adhoc_" + tag + "_result_count", sortRowsSym);
             if (!appendGenericGpuSort(plan, "from_subquery_" + tag, sortRowsSym,
-                                      outputSize, materializedCols, cpuSort, error)) {
+                                      outputSize, materializedCols, sortSpec, error)) {
                 return std::nullopt;
             }
         }
@@ -3963,10 +3934,10 @@ static std::optional<MetalQueryPlan> buildFromSubqueryAggHistogramPlan(
                                   std::move(materialize));
         phase.extraBuffers.push_back({countBuffer, "atomic_uint", true, false});
 
-        MetalQueryPlan::CpuGroupBy cpuGB;
-        cpuGB.keyColumns.push_back(innerAggAlias);
-        cpuGB.aggColumns.push_back(outerCountName);
-        cpuGB.aggFuncs.push_back("COUNT");
+        GenericGroupSpec groupSpec;
+        groupSpec.keyColumns.push_back(innerAggAlias);
+        groupSpec.aggColumns.push_back(outerCountName);
+        groupSpec.aggFuncs.push_back("COUNT");
 
         const std::string groupTag = "from_subquery_hist_" + tag;
         GenericGpuGroupSpec gbSpec;
@@ -3977,25 +3948,25 @@ static std::optional<MetalQueryPlan> buildFromSubqueryAggHistogramPlan(
         gbSpec.capacitySymbol = "n_gpu_gb_" + groupTag + "_cap";
         gbSpec.outputCounter = "d_gpu_gb_" + groupTag + "_count";
         gbSpec.inputColumns = materializedCols;
-        gbSpec.groupBy = cpuGB;
+        gbSpec.groupBy = groupSpec;
         attachMaterializedCountHook(phase, gbSpec.inputCounter, gbSpec.inputRowsSymbol);
         appendGenericGpuGroupBy(plan, gbSpec);
         attachMaterializedCountHook(plan.phases.back(), gbSpec.outputCounter,
                                     "n_gpu_sort_" + groupTag + "_rows");
 
-        MetalQueryPlan::CpuSort cpuSort;
-        cpuSort.limit = aq.limit;
+        GenericSortSpec sortSpec;
+        sortSpec.limit = aq.limit;
         for (int oi = 0; oi < (int)aq.orderBy.size(); ++oi) {
             auto column = resolveOrderColumn(aq.orderBy[oi].expr, oi, aq.orderBy, aq.targets);
             if (!column) return std::nullopt;
-            cpuSort.keys.push_back({*column, aq.orderBy[oi].descending});
+            sortSpec.keys.push_back({*column, aq.orderBy[oi].descending});
         }
-        if (!cpuSort.keys.empty() || cpuSort.limit >= 0) {
+        if (!sortSpec.keys.empty() || sortSpec.limit >= 0) {
             if (!appendGenericGpuSort(plan, "group_" + groupTag,
                                       "n_gpu_sort_" + groupTag + "_rows",
                                       gbSpec.capacityExpr,
                                       genericGpuGroupOutputColumns(gbSpec),
-                                      cpuSort, error)) {
+                                      sortSpec, error)) {
                 return std::nullopt;
             }
         }
@@ -5018,12 +4989,12 @@ std::optional<MetalQueryPlan> buildGenericMultiTableAdhocPlan_impl(
     // ---------- Terminal operators ----------
     // Materialize path: no aggregation, no GROUP BY → emit joined rows directly.
     if (!aq.hasAggregation() && !aq.hasGroupBy()) {
-        MetalQueryPlan::CpuSort cpuSort;
-        cpuSort.limit = aq.limit;
+        GenericSortSpec sortSpec;
+        sortSpec.limit = aq.limit;
         for (int oi = 0; oi < (int)aq.orderBy.size(); ++oi) {
             auto column = resolveOrderColumn(aq.orderBy[oi].expr, oi, aq.orderBy, aq.targets);
             if (!column) return fail("ORDER BY column not found in SELECT targets.");
-            cpuSort.keys.push_back({*column, aq.orderBy[oi].descending});
+            sortSpec.keys.push_back({*column, aq.orderBy[oi].descending});
         }
 
         std::set<std::string> matCols;
@@ -5103,11 +5074,11 @@ std::optional<MetalQueryPlan> buildGenericMultiTableAdhocPlan_impl(
         for (auto& [c, t] : crossExtraCols) {
             matPhase.extraBuffers.push_back({c, t, true, false});
         }
-        if (!cpuSort.keys.empty() || cpuSort.limit >= 0) {
+        if (!sortSpec.keys.empty() || sortSpec.limit >= 0) {
             const std::string sortRowsSym = "n_gpu_sort_multi_materialize_rows";
             attachMaterializedCountHook(matPhase, "d_adhoc_multi_result_count", sortRowsSym);
             if (!appendGenericGpuSort(plan, "multi_materialize", sortRowsSym,
-                                      outputSize, materializedCols, cpuSort, error)) {
+                                      outputSize, materializedCols, sortSpec, error)) {
                 return std::nullopt;
             }
         }
@@ -5297,23 +5268,22 @@ std::optional<MetalQueryPlan> buildGenericMultiTableAdhocPlan_impl(
     if (totalBuckets > 4096) canUseGpuKeyedAgg = false;
 
     if (!canUseGpuKeyedAgg) {
-        // ---------- MaterializeAgg fallback: emit raw rows on GPU, group on host ----------
+        // ---------- MaterializeAgg fallback: emit raw rows on GPU, group generically ----------
         // Build a materialize plan that outputs group-by keys and aggregate inputs.
-        // Host-side GROUP BY happens after GPU result collection.
-        MetalQueryPlan::CpuSort cpuSort;
-        cpuSort.limit = aq.limit;
+        // Generic GPU hash GROUP BY happens after materialization.
+        GenericSortSpec sortSpec;
+        sortSpec.limit = aq.limit;
         for (int oi = 0; oi < (int)aq.orderBy.size(); ++oi) {
             auto column = resolveOrderColumn(aq.orderBy[oi].expr, oi, aq.orderBy, aq.targets);
             if (!column) return fail("ORDER BY column not found in SELECT targets.");
-            cpuSort.keys.push_back({*column, aq.orderBy[oi].descending});
+            sortSpec.keys.push_back({*column, aq.orderBy[oi].descending});
         }
 
-        // Build CpuGroupBy metadata.
-        MetalQueryPlan::CpuGroupBy cpuGB;
+        GenericGroupSpec groupSpec;
         for (const auto& g : aq.groupBy) {
             auto* gcRef = std::get_if<ColRef>(&g->node);
             if (gcRef) {
-                cpuGB.keyColumns.push_back(displayNameForTargetByCol(aq, *gcRef));
+                groupSpec.keyColumns.push_back(displayNameForTargetByCol(aq, *gcRef));
             } else {
                 // Non-ColRef GROUP BY (FuncCall, BinaryExpr, etc.):
                 // match by position against non-aggregate targets.
@@ -5327,7 +5297,7 @@ std::optional<MetalQueryPlan> buildGenericMultiTableAdhocPlan_impl(
                 for (size_t ti = 0; ti < aq.targets.size(); ++ti) {
                     if (!aq.targets[ti].isAgg) {
                         if (preceding == 0) {
-                            cpuGB.keyColumns.push_back(displayNameForTarget(aq.targets[ti], ti));
+                            groupSpec.keyColumns.push_back(displayNameForTarget(aq.targets[ti], ti));
                             break;
                         }
                         preceding--;
@@ -5345,16 +5315,16 @@ std::optional<MetalQueryPlan> buildGenericMultiTableAdhocPlan_impl(
                     AggCallWalker::walk(target.expr, aggCalls, isDivision);
                     if (aggCalls.size() >= 2 && isDivision) {
                         std::string dn = displayNameForTarget(target, ti);
-                        cpuGB.aggColumns.push_back(dn);
-                        cpuGB.aggFuncs.push_back("RATIO");
-                        cpuGB.aggColumns.push_back("__hidden_" + dn + "_den");
-                        cpuGB.aggFuncs.push_back("RATIO_DEN");
+                        groupSpec.aggColumns.push_back(dn);
+                        groupSpec.aggFuncs.push_back("RATIO");
+                        groupSpec.aggColumns.push_back("__hidden_" + dn + "_den");
+                        groupSpec.aggFuncs.push_back("RATIO_DEN");
                         complex = true;
                     }
                 }
                 if (!complex) {
-                    cpuGB.aggColumns.push_back(displayNameForTarget(target, ti));
-                    cpuGB.aggFuncs.push_back(aggFuncName(target.agg->func));
+                    groupSpec.aggColumns.push_back(displayNameForTarget(target, ti));
+                    groupSpec.aggFuncs.push_back(aggFuncName(target.agg->func));
                 }
             }
         }
@@ -5416,9 +5386,9 @@ std::optional<MetalQueryPlan> buildGenericMultiTableAdhocPlan_impl(
                                                 }
                                             }
                                         } catch (...) {}
-                                        cpuGB.havingAggIdx = aggIdx;
-                                        cpuGB.havingMultiplier = factor;
-                                        cpuGB.havingSentinel = sentinel;
+                                        groupSpec.havingAggIdx = aggIdx;
+                                        groupSpec.havingMultiplier = factor;
+                                        groupSpec.havingSentinel = sentinel;
                                     }
                                 }
                             }
@@ -5615,13 +5585,12 @@ std::optional<MetalQueryPlan> buildGenericMultiTableAdhocPlan_impl(
         gbSpec.capacitySymbol = "n_gpu_gb_" + groupTag + "_cap";
         gbSpec.outputCounter = "d_gpu_gb_" + groupTag + "_count";
         gbSpec.inputColumns = std::move(materializedCols);
-        gbSpec.groupBy = cpuGB;
+        gbSpec.groupBy = groupSpec;
         attachMaterializedCountHook(matPhase, gbSpec.inputCounter, gbSpec.inputRowsSymbol);
         appendGenericGpuGroupBy(plan, gbSpec);
         attachMaterializedCountHook(plan.phases.back(), gbSpec.outputCounter,
                                     "n_gpu_sort_" + groupTag + "_rows");
-        if (!cpuSort.keys.empty() || cpuSort.limit >= 0) {
-            MetalQueryPlan::CpuSort sortSpec = cpuSort;
+        if (!sortSpec.keys.empty() || sortSpec.limit >= 0) {
             if (!appendGenericGpuSort(plan, "group_" + groupTag,
                                       "n_gpu_sort_" + groupTag + "_rows",
                                       gbSpec.capacityExpr,
@@ -5906,6 +5875,48 @@ std::optional<MetalQueryPlan> buildGenericMultiTableAdhocPlan_impl(
 }
 
 } // namespace
+
+std::vector<GenericScalarLookupInfo> buildGenericScalarPreAggs(
+        const AnalyzedQuery& aq,
+        MetalQueryPlan& plan) {
+    return buildCorrelatedScalarPreAggs(aq, plan);
+}
+
+std::string genericScalarLookupKeyExpr(
+        const GenericScalarLookupInfo& info,
+        size_t keyIndex,
+        const std::string& idxVar,
+        const std::string& probeTable,
+        const SchemaProvider* schema) {
+    return scalarLookupKeyExpr(info, keyIndex, idxVar, probeTable, schema);
+}
+
+std::string rewriteGenericScalarSentinels(
+        const std::string& cond,
+        const std::string& idxVar,
+        const std::vector<GenericScalarLookupInfo>& lookups,
+        const std::string& probeTable,
+        const SchemaProvider* schema) {
+    return rewriteScalarSentinels(cond, idxVar, lookups, probeTable, schema);
+}
+
+bool referencesGenericScalarSentinel(
+        const std::string& text,
+        const std::vector<GenericScalarLookupInfo>& lookups) {
+    return referencesScalarSentinel(text, lookups);
+}
+
+bool referencesGenericScalarLookupBuffer(
+        const std::string& text,
+        const std::vector<GenericScalarLookupInfo>& lookups) {
+    return referencesScalarLookupBuffer(text, lookups);
+}
+
+void attachGenericScalarLookupBuffers(
+        MetalQueryPlan::Phase& phase,
+        const std::vector<GenericScalarLookupInfo>& lookups) {
+    attachScalarLookupBuffers(phase, lookups);
+}
 
 std::optional<MetalQueryPlan> buildGenericSingleTableAdhocPlan(const AnalyzedQuery& aq, std::string* error) {
     auto fail = [&](const std::string& msg) -> std::optional<MetalQueryPlan> {
