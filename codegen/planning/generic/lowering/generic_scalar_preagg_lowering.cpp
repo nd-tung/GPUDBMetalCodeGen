@@ -53,6 +53,65 @@ struct DecorrelatedBitmapState {
     bool externalToTable = false;
 };
 
+struct ResolvedCorrelation {
+    DecorrCol inner;
+    DecorrCol outer;
+};
+
+struct OuterFilterBinding {
+    std::string table;
+    std::string alias;
+};
+
+static std::optional<OuterFilterBinding> resolveOuterFilterBinding(
+        const DecorrCol& outer,
+        const AnalyzedQuery& aq) {
+    std::vector<OuterFilterBinding> matches;
+    auto addMatch = [&](std::string table, std::string alias) {
+        if (!aq.schema || !aq.schema->hasColumn(table, outer.column)) return;
+        for (const auto& existing : matches) {
+            if (existing.table == table && existing.alias == alias) return;
+        }
+        matches.push_back({std::move(table), std::move(alias)});
+    };
+
+    if (!outer.table.empty()) {
+        auto aliasIt = aq.aliasMap.find(outer.table);
+        if (aliasIt != aq.aliasMap.end()) {
+            addMatch(aliasIt->second, outer.table);
+        }
+        for (size_t i = 0; i < aq.tables.size(); ++i) {
+            const std::string alias = i < aq.tableAliases.size()
+                ? aq.tableAliases[i]
+                : aq.tables[i];
+            if (alias == outer.table || aq.tables[i] == outer.table)
+                addMatch(aq.tables[i], alias);
+        }
+        addMatch(outer.table, "");
+    } else {
+        for (size_t i = 0; i < aq.tables.size(); ++i) {
+            const std::string alias = i < aq.tableAliases.size()
+                ? aq.tableAliases[i]
+                : aq.tables[i];
+            addMatch(aq.tables[i], alias == aq.tables[i] ? "" : alias);
+        }
+    }
+
+    if (matches.size() != 1) return std::nullopt;
+    return matches.front();
+}
+
+static bool predicateOnlyReferencesTable(const PredPtr& pred,
+                                         const std::string& table) {
+    std::map<std::string, std::string> colToTable;
+    collectColumnTables(pred, colToTable);
+    if (colToTable.empty()) return false;
+    for (const auto& [_, refTable] : colToTable) {
+        if (refTable != table) return false;
+    }
+    return true;
+}
+
 static std::optional<ScalarLookupInfo> buildDecorrelatedScalarPreAgg(
         const DecorrelatedScalarSubquery& dsq,
         const AnalyzedQuery& aq,
@@ -66,9 +125,40 @@ static std::optional<ScalarLookupInfo> buildDecorrelatedScalarPreAgg(
     for (const auto& c : dsq.correlations)
         relevantCols[c.inner.table].insert(c.inner.column);
 
+    std::map<std::string, std::vector<PredPtr>> filtersByTable =
+        dsq.filtersByTable;
+    std::vector<ResolvedCorrelation> resolvedCorrelations;
+    std::set<const Predicate*> copiedOuterFilters;
+    for (const auto& c : dsq.correlations) {
+        DecorrCol outer = c.outer;
+        if (auto binding = resolveOuterFilterBinding(c.outer, aq)) {
+            outer.table = binding->table;
+            relevantCols[outer.table].insert(outer.column);
+
+            for (const auto& pred : aq.filters) {
+                if (!pred || copiedOuterFilters.count(pred.get())) continue;
+                if (!predicateOnlyReferencesTable(pred, binding->table)) continue;
+                filtersByTable[binding->table].push_back(pred);
+                copiedOuterFilters.insert(pred.get());
+            }
+            if (!binding->alias.empty()) {
+                auto instIt = aq.instanceFilters.find(binding->alias);
+                if (instIt != aq.instanceFilters.end()) {
+                    for (const auto& pred : instIt->second) {
+                        if (!pred || copiedOuterFilters.count(pred.get())) continue;
+                        filtersByTable[binding->table].push_back(pred);
+                        copiedOuterFilters.insert(pred.get());
+                    }
+                }
+            }
+        }
+        if (!outer.table.empty())
+            resolvedCorrelations.push_back({c.inner, outer});
+    }
+
     auto filterCondFor = [&](const std::string& table) {
-        auto it = dsq.filtersByTable.find(table);
-        if (it == dsq.filtersByTable.end()) return std::string("true");
+        auto it = filtersByTable.find(table);
+        if (it == filtersByTable.end()) return std::string("true");
         return combineFilters(it->second, idxVar, aq.schema);
     };
     auto makeFilteredScan = [&](const std::string& table) -> std::unique_ptr<MetalOperator> {
@@ -90,7 +180,7 @@ static std::optional<ScalarLookupInfo> buildDecorrelatedScalarPreAgg(
                sanitizeIdentifier(table + "_" + col + "_" + suffix) + "_bmp";
     };
 
-    for (const auto& [table, filters] : dsq.filtersByTable) {
+    for (const auto& [table, filters] : filtersByTable) {
         auto colsIt = relevantCols.find(table);
         if (colsIt == relevantCols.end()) continue;
         for (const auto& col : colsIt->second) {
@@ -153,6 +243,29 @@ static std::optional<ScalarLookupInfo> buildDecorrelatedScalarPreAgg(
                     maxKeySymbolForColumn(dst->table, dst->column, aq.schema));
                 appendPhase(plan, "GENERIC_scalar_decorrelate_" + std::to_string(dsq.sqIdx) +
                                   "_" + sanitizeIdentifier(dst->table + "_" + dst->column + "_join"),
+                            std::move(build));
+                addState(dst->table, dst->column, {dst->table, dst->column, bitmap, true});
+                changed = true;
+            }
+
+            for (const auto& c : resolvedCorrelations) {
+                const DecorrCol* dst = nullptr;
+                if (c.inner.table == st.table && c.inner.column == st.column) {
+                    dst = &c.outer;
+                } else if (c.outer.table == st.table && c.outer.column == st.column) {
+                    dst = &c.inner;
+                }
+                if (!dst || dst->table.empty() || hasState(dst->table, dst->column)) continue;
+                std::string bitmap = stateName(dst->table, dst->column, "corr");
+                std::unique_ptr<MetalOperator> pipe = makeAutoScan(dst->table, idxVar);
+                pipe = std::make_unique<MetalBitmapProbe>(
+                    std::move(pipe), st.bitmap, dst->column + "[" + idxVar + "]");
+                pipe = maybeSelect(std::move(pipe), filterCondFor(dst->table));
+                auto build = std::make_unique<MetalBitmapBuild>(
+                    std::move(pipe), bitmap, dst->column + "[" + idxVar + "]",
+                    maxKeySymbolForColumn(dst->table, dst->column, aq.schema));
+                appendPhase(plan, "GENERIC_scalar_decorrelate_" + std::to_string(dsq.sqIdx) +
+                                  "_" + sanitizeIdentifier(dst->table + "_" + dst->column + "_corr"),
                             std::move(build));
                 addState(dst->table, dst->column, {dst->table, dst->column, bitmap, true});
                 changed = true;

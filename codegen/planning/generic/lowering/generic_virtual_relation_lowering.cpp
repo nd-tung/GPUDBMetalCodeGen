@@ -1031,7 +1031,7 @@ std::optional<MetalQueryPlan> lowerFromSubqueryHistogramIRToMetal(
         const std::string compactCounter =
             "d_ir_from_subquery_" + tag + "_hist_result_count";
         std::vector<KeyedCompactKeySpec> compactKeys = {
-            {innerAggAlias, kHistogramBucketCap, 1, {}, 0, {}, 0}
+            {innerAggAlias, kHistogramBucketCap, {}, 1, {}, 0, {}, 0}
         };
         std::vector<KeyedCompactAggSpec> compactAggs;
         KeyedCompactAggSpec countOut;

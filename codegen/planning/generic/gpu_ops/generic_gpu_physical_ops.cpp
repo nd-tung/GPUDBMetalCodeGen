@@ -751,22 +751,47 @@ public:
                          int valuesPerBucket,
                          std::vector<KeyedCompactKeySpec> keys,
                          std::vector<KeyedCompactAggSpec> aggs,
-                         std::vector<GenericMatColumnDesc> outputs)
+                         std::vector<GenericMatColumnDesc> outputs,
+                         std::string bucketCountExpr,
+                         std::string bucketCountSymbol,
+                         KeyedCompactHavingSpec having)
         : inputBuffer_(std::move(inputBuffer)),
           outputCounter_(std::move(outputCounter)),
           numBuckets_(numBuckets),
           valuesPerBucket_(valuesPerBucket),
           keys_(std::move(keys)),
           aggs_(std::move(aggs)),
-          outputs_(std::move(outputs)) {}
+          outputs_(std::move(outputs)),
+          bucketCountExpr_(std::move(bucketCountExpr)),
+          bucketCountSymbol_(std::move(bucketCountSymbol)),
+          having_(std::move(having)) {}
 
     void produce(MetalCodegen& cg, ConsumerFn consume) override {
-        const std::string bucketCount = std::to_string(numBuckets_);
+        const std::string bucketCountExpr = bucketCountExpr_.empty()
+            ? std::to_string(numBuckets_)
+            : bucketCountExpr_;
+        std::string bucketCount;
+        if (!bucketCountExpr_.empty()) {
+            bucketCount = bucketCountSymbol_.empty()
+                ? "n_keyed_compact_buckets"
+                : bucketCountSymbol_;
+            cg.addResolvedScalarParam(bucketCount, "uint", bucketCountExpr);
+        } else {
+            bucketCount = std::to_string(numBuckets_);
+        }
+        const std::string bucketCountLimit = bucketCountExpr_.empty()
+            ? bucketCount + "u"
+            : bucketCount;
         cg.addBufferParam(inputBuffer_, "atomic_uint",
-                          std::to_string(numBuckets_ * valuesPerBucket_), false);
+                          bucketCountExpr + " * " +
+                          std::to_string(valuesPerBucket_), false);
         cg.addAtomicBufferParam(outputCounter_, "atomic_uint", "1");
+        if (!having_.scalarTotalBuffer.empty()) {
+            cg.addBufferParam(having_.scalarTotalBuffer, "atomic_uint",
+                              having_.scalarAggIsLongPair ? "2" : "1", false);
+        }
         for (const auto& out : outputs_) {
-            std::string sizeExpr = bucketCount;
+            std::string sizeExpr = bucketCountExpr;
             if (out.stringLen > 0)
                 sizeExpr += " * " + std::to_string(out.stringLen);
             if (out.isLongPair)
@@ -781,7 +806,7 @@ public:
                                     out.isLongPair);
         }
 
-        cg.addBlock("for (uint _bucket = tid; _bucket < " + bucketCount + "u; _bucket += tpg)", [&]() {
+        cg.addBlock("for (uint _bucket = tid; _bucket < " + bucketCountLimit + "; _bucket += tpg)", [&]() {
             cg.addLine("bool _has_data = false;");
             cg.addBlock("for (uint _v = 0; _v < " + std::to_string(valuesPerBucket_) + "u; ++_v)", [&]() {
                 cg.addIf("atomic_load_explicit(&" + inputBuffer_ + "[_bucket * " +
@@ -791,6 +816,7 @@ public:
                 });
             });
             cg.addIf("!_has_data", [&]() { cg.addLine("continue;"); });
+            emitHavingFilter(cg);
             cg.addLine("uint _pos = atomic_fetch_add_explicit(&" + outputCounter_ +
                        "[0], 1u, memory_order_relaxed);");
             for (size_t ki = 0; ki < keys_.size(); ++ki) {
@@ -813,6 +839,9 @@ private:
     std::vector<KeyedCompactKeySpec> keys_;
     std::vector<KeyedCompactAggSpec> aggs_;
     std::vector<GenericMatColumnDesc> outputs_;
+    std::string bucketCountExpr_;
+    std::string bucketCountSymbol_;
+    KeyedCompactHavingSpec having_;
 
     std::string valueBase() const {
         return "_bucket * " + std::to_string(valuesPerBucket_) + "u";
@@ -820,9 +849,11 @@ private:
 
     void emitKeyWrite(MetalCodegen& cg, const KeyedCompactKeySpec& key, size_t outIdx) const {
         const auto& out = outputs_[outIdx];
+        const std::string numValues = key.numValuesExpr.empty()
+            ? std::to_string(std::max(1, key.numValues)) + "u"
+            : key.numValuesExpr;
         cg.addLine("uint _encoded_" + std::to_string(outIdx) + " = (_bucket / " +
-                   std::to_string(key.stride) + "u) % " +
-                   std::to_string(std::max(1, key.numValues)) + "u;");
+                   std::to_string(key.stride) + "u) % " + numValues + ";");
         if (!key.stringMap.empty()) {
             const int width = std::max(1, key.stringLen);
             for (int ci = 0; ci < width; ++ci) {
@@ -857,6 +888,72 @@ private:
     std::string loadUintAt(int offset) const {
         return "atomic_load_explicit(&" + inputBuffer_ + "[" + valueBase() +
                " + " + std::to_string(offset) + "u], memory_order_relaxed)";
+    }
+
+    std::string longPairAsFloatExpr(int offset) const {
+        return "((float)" + loadUintAt(offset + 1) +
+               " * 4294967296.0f + (float)" + loadUintAt(offset) + ")";
+    }
+
+    std::string havingValueExpr(int offset,
+                                bool isLongPair,
+                                bool isFloatSum,
+                                int scaleDown,
+                                bool divideScale) const {
+        if (isLongPair) {
+            std::string expr = longPairAsFloatExpr(offset);
+            if (divideScale && scaleDown > 0)
+                expr = "(" + expr + " / " + std::to_string(scaleDown) + ".0f)";
+            return expr;
+        }
+        if (isFloatSum)
+            return "as_type<float>(" + loadUintAt(offset) + ")";
+        return "(float)(" + loadUintAt(offset) + ")";
+    }
+
+    std::string totalHavingValueExpr() const {
+        if (having_.scalarAggIsLongPair) {
+            return "((float)atomic_load_explicit(&" + having_.scalarTotalBuffer +
+                   "[1], memory_order_relaxed) * 4294967296.0f + "
+                   "(float)atomic_load_explicit(&" + having_.scalarTotalBuffer +
+                   "[0], memory_order_relaxed))";
+        }
+        if (having_.scalarAggIsFloatSum) {
+            return "as_type<float>(atomic_load_explicit(&" +
+                   having_.scalarTotalBuffer + "[0], memory_order_relaxed))";
+        }
+        return "(float)atomic_load_explicit(&" + having_.scalarTotalBuffer +
+               "[0], memory_order_relaxed)";
+    }
+
+    void emitHavingFilter(MetalCodegen& cg) const {
+        if (having_.scalarAggOffset >= 0 && !having_.scalarTotalBuffer.empty() &&
+            having_.scalarMultiplier >= 0.0) {
+            cg.addLine("float _having_value = " +
+                       havingValueExpr(having_.scalarAggOffset,
+                                       having_.scalarAggIsLongPair,
+                                       having_.scalarAggIsFloatSum,
+                                       having_.scalarAggScaleDown, false) + ";");
+            cg.addLine("float _having_threshold = " + totalHavingValueExpr() +
+                       " * " + std::to_string(having_.scalarMultiplier) + "f;");
+            const std::string op = having_.scalarCompareOp.empty()
+                ? ">"
+                : having_.scalarCompareOp;
+            cg.addIf("!(_having_value " + op + " _having_threshold)", [&]() {
+                cg.addLine("continue;");
+            });
+        }
+        if (having_.compareAggOffset >= 0 && !having_.compareOp.empty()) {
+            cg.addLine("float _having_cmp_value = " +
+                       havingValueExpr(having_.compareAggOffset,
+                                       having_.compareAggIsLongPair,
+                                       having_.compareAggIsFloatSum,
+                                       having_.compareAggScaleDown, true) + ";");
+            cg.addIf("!(_having_cmp_value " + having_.compareOp + " " +
+                     std::to_string(having_.compareValue) + "f)", [&]() {
+                cg.addLine("continue;");
+            });
+        }
     }
 
     void emitAggWrite(MetalCodegen& cg, const KeyedCompactAggSpec& agg, size_t outIdx) const {
@@ -1589,10 +1686,14 @@ std::unique_ptr<MetalOperator> makeKeyedAggCompactOperator(
     int valuesPerBucket,
     std::vector<KeyedCompactKeySpec> keys,
     std::vector<KeyedCompactAggSpec> aggs,
-    std::vector<GenericMatColumnDesc> outputs) {
+    std::vector<GenericMatColumnDesc> outputs,
+    std::string bucketCountExpr,
+    std::string bucketCountSymbol,
+    KeyedCompactHavingSpec having) {
     return std::make_unique<MetalKeyedAggCompact>(
         std::move(inputBuffer), std::move(outputCounter), numBuckets, valuesPerBucket,
-        std::move(keys), std::move(aggs), std::move(outputs));
+        std::move(keys), std::move(aggs), std::move(outputs),
+        std::move(bucketCountExpr), std::move(bucketCountSymbol), std::move(having));
 }
 
 bool appendGenericGpuSort(MetalQueryPlan& plan,

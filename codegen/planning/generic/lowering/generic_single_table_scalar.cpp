@@ -2,6 +2,7 @@
 #include "generic/lowering/generic_expression_metal.h"
 #include "generic/lowering/generic_plan_shapes.h"
 #include "metal_plan_common.h"
+#include "tpch_schema.h"
 
 #include <memory>
 #include <optional>
@@ -13,6 +14,33 @@ namespace {
 
 std::optional<MetalQueryPlan> fail(std::string* error, const std::string& msg) {
     if (error) *error = msg;
+    return std::nullopt;
+}
+
+std::optional<std::pair<std::string, TypeInfo>> scanAnchorColumn(
+        const GenericRelPlan& ir,
+        const GenericScanDetail& scan) {
+    if (const auto* inst = ir.findRelationInstance(scan.relationInstance)) {
+        if (const auto* rel = ir.findRelation(inst->relation)) {
+            if (!rel->primaryKeyColumn.empty()) {
+                TypeInfo type{DataType::INT, 0};
+                try {
+                    const auto& col = TPCHSchema::instance()
+                        .table(scan.table)
+                        .col(rel->primaryKeyColumn);
+                    type = TypeInfo{col.type, col.fixedWidth};
+                } catch (...) {}
+                return std::make_pair(rel->primaryKeyColumn, type);
+            }
+        }
+    }
+    try {
+        const auto& table = TPCHSchema::instance().table(scan.table);
+        if (!table.columns.empty()) {
+            const auto& col = table.columns.front();
+            return std::make_pair(col.name, TypeInfo{col.type, col.fixedWidth});
+        }
+    } catch (...) {}
     return std::nullopt;
 }
 
@@ -36,7 +64,9 @@ std::optional<MetalQueryPlan> lowerSingleTableScalarAggregateIRToMetal(
         return fail(error, "IR scalar aggregate lowerer: HAVING is not supported.");
 
     const std::string idxVar = "i";
-    std::unique_ptr<MetalOperator> pipe = makeAutoScan(scan->table, idxVar);
+    auto scanOp = makeAutoScan(scan->table, idxVar);
+    auto* scanRoot = scanOp.get();
+    std::unique_ptr<MetalOperator> pipe = std::move(scanOp);
     if (auto* filter = filterDetail(shape->filter)) {
         if (!predicateSupported(filter->predicate)) {
             return fail(error, "IR scalar aggregate lowerer: filter predicate is not supported.");
@@ -46,6 +76,7 @@ std::optional<MetalQueryPlan> lowerSingleTableScalarAggregateIRToMetal(
     }
 
     auto reduce = std::make_unique<MetalTGReduce>(std::move(pipe), "d_ir_scalar");
+    bool hasInputColumnReference = shape->filter != nullptr;
     for (size_t i = 0; i < aggregate->aggregates.size(); ++i) {
         const auto& projection = aggregate->aggregates[i];
         if (!projection.expr)
@@ -72,6 +103,7 @@ std::optional<MetalQueryPlan> lowerSingleTableScalarAggregateIRToMetal(
         if (!materializeExprSupported(agg->arg))
             return fail(error, "IR scalar aggregate lowerer: aggregate argument is not supported.");
 
+        hasInputColumnReference = true;
         std::string valueExpr = genericExprToMetal(agg->arg, idxVar);
         if (agg->func == AggFunc::AVG) {
             int sumIndex = reduce->addAccumulator(accName + "_sum", valueExpr, "float");
@@ -93,6 +125,14 @@ std::optional<MetalQueryPlan> lowerSingleTableScalarAggregateIRToMetal(
 
         int accIndex = reduce->addAccumulator(accName, valueExpr, outputType, "", "", op);
         reduce->setAccumulatorResultAlias(alias, accIndex, 0, nullptr);
+    }
+
+    if (!hasInputColumnReference) {
+        auto anchor = scanAnchorColumn(ir, *scan);
+        if (!anchor) {
+            return fail(error, "IR scalar aggregate lowerer: count-only scan has no anchor column.");
+        }
+        scanRoot->addColumn(anchor->first, metalTypeForType(anchor->second));
     }
 
     MetalQueryPlan plan;

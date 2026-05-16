@@ -939,6 +939,27 @@ int numericScaleForExpr(const GenericExprPtr& expr) {
     if (!expr) return 0;
     if (auto* col = std::get_if<GenericColumnExpr>(&expr->node))
         return col->numericScale;
+    if (auto* bin = std::get_if<GenericBinaryExpr>(&expr->node)) {
+        const int leftScale = numericScaleForExpr(bin->left);
+        const int rightScale = numericScaleForExpr(bin->right);
+        switch (bin->op) {
+            case ExprOp::ADD:
+            case ExprOp::SUB:
+                return leftScale == rightScale ? leftScale : 0;
+            case ExprOp::MUL:
+                if (leftScale > 0 &&
+                    bin->right && bin->right->type.type == DataType::INT) {
+                    return leftScale;
+                }
+                if (rightScale > 0 &&
+                    bin->left && bin->left->type.type == DataType::INT) {
+                    return rightScale;
+                }
+                return 0;
+            case ExprOp::DIV:
+                return 0;
+        }
+    }
     return 0;
 }
 

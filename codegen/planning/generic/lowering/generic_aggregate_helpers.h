@@ -16,6 +16,7 @@ struct IrGroupKeyDesc {
     std::string displayName;
     std::string keyExpr;
     int numValues = 0;
+    std::string numValuesExpr;
     int stride = 1;
     std::vector<char> charMap;
     int keyBase = 0;

@@ -3,6 +3,7 @@
 #include "../core/iu.hpp"
 #include "../../third_party/nlohmann/json.hpp"
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -553,6 +554,7 @@ public:
                            const std::vector<GroupKeyDecode>& keys,
                            int totalBuckets);
     void setHaving(const PredPtr& havingPredicate) { havingPredicate_ = havingPredicate; }
+    void setHavingTotal(const std::string& bufferName, int aggregateOffset);
     void produce(MetalCodegen& cg, ConsumerFn consume) override;
     std::string describe() const override;
     void iusUsed(std::vector<IU>& out) const override {
@@ -576,6 +578,12 @@ private:
     std::vector<Aggregate> aggregates_;
     std::vector<GroupKeyDecode> multiKeyDecode_;
     PredPtr havingPredicate_;
+
+    struct HavingTotal {
+        std::string bufferName;
+        int aggregateOffset = -1;
+    };
+    std::optional<HavingTotal> havingTotal_;
 
     struct DistinctBitmap {
         std::string outputName;     // buffer name for popcount output

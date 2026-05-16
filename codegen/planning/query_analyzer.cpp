@@ -841,6 +841,57 @@ SelectTarget extractTarget(const json& resTarget, const std::vector<std::string>
     return st;
 }
 
+bool resTargetIsStar(const json& resTarget) {
+    if (!resTarget.contains("val")) return false;
+    const auto& val = resTarget["val"];
+    if (!val.contains("ColumnRef")) return false;
+    const auto& cr = val["ColumnRef"];
+    if (!cr.contains("fields") || !cr["fields"].is_array() || cr["fields"].empty())
+        return false;
+    return cr["fields"].back().contains("A_Star");
+}
+
+std::string starQualifier(const json& resTarget) {
+    if (!resTargetIsStar(resTarget)) return "";
+    const auto& fields = resTarget["val"]["ColumnRef"]["fields"];
+    if (fields.size() < 2) return "";
+    const auto& first = fields.front();
+    if (first.contains("String") && first["String"].contains("sval"))
+        return first["String"]["sval"].get<std::string>();
+    if (first.contains("sval"))
+        return first["sval"].get<std::string>();
+    return "";
+}
+
+void appendStarTargets(const json& resTarget, AnalyzedQuery& aq) {
+    const std::string qualifier = starQualifier(resTarget);
+    bool matched = false;
+    for (size_t i = 0; i < aq.tables.size(); ++i) {
+        const std::string& table = aq.tables[i];
+        std::string alias = table;
+        if (i < aq.tableAliases.size() && !aq.tableAliases[i].empty())
+            alias = aq.tableAliases[i];
+        if (!qualifier.empty() && qualifier != table && qualifier != alias)
+            continue;
+
+        const auto& tdef = TPCHSchema::instance().table(table);
+        for (const auto& col : tdef.columns) {
+            SelectTarget st;
+            st.alias = col.name;
+            st.expr = Expr::col(table, col.name, col.index, col.type,
+                                col.fixedWidth, alias == table ? "" : alias);
+            aq.targets.push_back(std::move(st));
+        }
+        matched = true;
+    }
+    if (!matched) {
+        throw std::runtime_error(
+            qualifier.empty()
+                ? "SELECT * target has no FROM relation to expand"
+                : "SELECT target qualifier not found for *: " + qualifier);
+    }
+}
+
 // --- Explicit JOIN ON Extraction ---
 
 void extractJoinOns(const json& fromItem, const std::vector<std::string>& tables,
@@ -1467,8 +1518,12 @@ AnalyzedQuery analyzeSQL(const std::string& sql, const SchemaProvider* schema) {
     // Extract SELECT targets.
     if (sel.contains("targetList")) {
         for (auto& t : sel["targetList"]) {
-            if (t.contains("ResTarget"))
-                aq.targets.push_back(extractTarget(t["ResTarget"], aq.tables));
+            if (t.contains("ResTarget")) {
+                if (resTargetIsStar(t["ResTarget"]))
+                    appendStarTargets(t["ResTarget"], aq);
+                else
+                    aq.targets.push_back(extractTarget(t["ResTarget"], aq.tables));
+            }
         }
     }
 
