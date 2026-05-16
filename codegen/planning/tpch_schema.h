@@ -9,21 +9,16 @@
 
 namespace codegen {
 
-// ===================================================================
-// DATA TYPE ENUM
-// ===================================================================
-// TPC-H SCHEMA CATALOG
-// ===================================================================
-// Hard-coded TPC-H table definitions. Column indices match .tbl file layout.
+// TPC-H table definitions. Column indices match .tbl layout.
 
 struct ColumnDef {
     std::string name;
     int         index;
     DataType    type;
-    int         fixedWidth = 0;    // for CHAR_FIXED
-    int         domainMin = -1;    // for INT/DATE GROUP BY: -1 means unknown
-    int         domainMax = -1;    // for INT/DATE GROUP BY: -1 means unknown
-    std::vector<char> charDomain;  // for CHAR1 GROUP BY: ordered known values
+    int         fixedWidth = 0;
+    int         domainMin = -1;    // -1 means unknown
+    int         domainMax = -1;    // -1 means unknown
+    std::vector<char> charDomain;
 
     ColumnDef(std::string n, int idx, DataType dt,
               int width = 0, int minDomain = -1, int maxDomain = -1,
@@ -41,7 +36,7 @@ struct TableDef {
     std::string maxKeySymbol;
     std::string name;
     std::vector<ColumnDef> columns;
-    std::unordered_map<std::string, int> nameToIdx; // column name → index in columns[]
+    std::unordered_map<std::string, int> nameToIdx;
 
     const ColumnDef& col(const std::string& n) const {
         auto it = nameToIdx.find(n);
@@ -58,10 +53,6 @@ inline TableDef makeTable(const std::string& name, std::vector<ColumnDef> cols) 
         t.nameToIdx[t.columns[i].name] = (int)i;
     return t;
 }
-
-// ===================================================================
-// SCHEMA SINGLETON
-// ===================================================================
 
 struct TPCHSchema {
     std::unordered_map<std::string, TableDef> tables;
@@ -87,7 +78,6 @@ private:
     static TPCHSchema build() {
         TPCHSchema s;
 
-        // lineitem: 16 columns (0-15)
         {
             s.tables["lineitem"] = makeTable("lineitem", {
                 {"l_orderkey",      0,  DataType::INT},
@@ -111,10 +101,9 @@ private:
             s.tables["lineitem"].columns[3].domainMin = 1;  s.tables["lineitem"].columns[3].domainMax = 7;   // l_linenumber
             s.tables["lineitem"].columns[8].charDomain = {'A', 'N', 'R'};                                    // l_returnflag
             s.tables["lineitem"].columns[9].charDomain = {'F', 'O'};                                          // l_linestatus
-            s.tables["lineitem"].maxKeySymbol = "maxOrderkey";  // l_orderkey max ≈ maxOrderkey
+            s.tables["lineitem"].maxKeySymbol = "maxOrderkey";
         }
 
-        // orders: 9 columns (0-8)
         {
             s.tables["orders"] = makeTable("orders", {
                 {"o_orderkey",      0, DataType::INT},
@@ -131,7 +120,6 @@ private:
             s.tables["orders"].columns[7].domainMin = 0;  s.tables["orders"].columns[7].domainMax = 0;   // o_shippriority
         }
 
-        // customer: 8 columns (0-7)
         {
             s.tables["customer"] = makeTable("customer", {
                 {"c_custkey",    0, DataType::INT},
@@ -146,7 +134,6 @@ private:
             s.tables["customer"].columns[3].domainMin = 0;  s.tables["customer"].columns[3].domainMax = 24;  // c_nationkey
         }
 
-        // supplier: 7 columns (0-6)
         {
             s.tables["supplier"] = makeTable("supplier", {
                 {"s_suppkey",   0, DataType::INT},
@@ -160,7 +147,6 @@ private:
             s.tables["supplier"].columns[3].domainMin = 0;  s.tables["supplier"].columns[3].domainMax = 24;  // s_nationkey
         }
 
-        // part: 9 columns (0-8)
         {
             s.tables["part"] = makeTable("part", {
                 {"p_partkey",    0, DataType::INT},
@@ -176,7 +162,6 @@ private:
             s.tables["part"].columns[5].domainMin = 1;  s.tables["part"].columns[5].domainMax = 50;  // p_size
         }
 
-        // partsupp: 5 columns (0-4)
         s.tables["partsupp"] = makeTable("partsupp", {
             {"ps_partkey",    0, DataType::INT},
             {"ps_suppkey",    1, DataType::INT},
@@ -185,7 +170,6 @@ private:
             {"ps_comment",    4, DataType::CHAR_FIXED, 199},
         });
 
-        // nation: 4 columns (0-3)
         {
             s.tables["nation"] = makeTable("nation", {
                 {"n_nationkey",  0, DataType::INT},
@@ -197,7 +181,6 @@ private:
             s.tables["nation"].columns[2].domainMin = 0;  s.tables["nation"].columns[2].domainMax = 4;   // n_regionkey
         }
 
-        // region: 3 columns (0-2)
         {
             s.tables["region"] = makeTable("region", {
                 {"r_regionkey", 0, DataType::INT},
@@ -210,10 +193,6 @@ private:
         return s;
     }
 };
-
-// ===================================================================
-// TPCH SCHEMA PROVIDER (SchemaProvider implementation)
-// ===================================================================
 
 class TPCHSchemaProvider : public SchemaProvider {
 public:
@@ -237,18 +216,20 @@ public:
     }
     std::string keyDomainSymbol(const std::string& table,
                                 const std::string& col) const override {
-        if (auto gd = groupDomain(table, col))
-            return std::to_string(gd->maxValue + 1);
         if (auto pk = pkInfo(table); pk && pk->first == col)
             return pk->second;
         if (table == "lineitem" && col == "l_partkey") return "maxPartkey";
         if (table == "lineitem" && col == "l_suppkey") return "maxSuppkey";
+        if (table == "lineitem" && col == "l_orderkey") return "maxOrderkey";
         if (table == "orders" && col == "o_custkey") return "maxCustkey";
+        if (table == "orders" && col == "o_orderkey") return "maxOrderkey";
         if (table == "partsupp" && col == "ps_partkey") return "maxPartkey";
         if (table == "partsupp" && col == "ps_suppkey") return "maxSuppkey";
         if (table == "customer" && col == "c_nationkey") return "25";
         if (table == "supplier" && col == "s_nationkey") return "25";
         if (table == "nation" && col == "n_regionkey") return "5";
+        if (auto gd = groupDomain(table, col))
+            return std::to_string(gd->maxValue + 1);
         return "";
     }
     std::string distinctDomainSymbol(const std::string& table,
@@ -272,7 +253,7 @@ public:
         return TPCHSchema::instance().table(table).col(col).charDomain;
     }
     int tableProbePriority(const std::string& table) const override {
-        // TPC-H size ordering: lineitem > orders > partsupp > customer > part > supplier > nation > region
+        // Larger tables probe first.
         if (table == "lineitem") return 100;
         if (table == "orders")   return 80;
         if (table == "partsupp") return 70;
@@ -303,10 +284,6 @@ public:
     }
     size_t tableRowCount(const std::string& /*table*/) const override { return 0; }
 };
-
-// ===================================================================
-// FILE PATH RESOLUTION
-// ===================================================================
 
 inline std::string tblPath(const std::string& dataDir, const std::string& tableName) {
     return dataDir + tableName + ".tbl";

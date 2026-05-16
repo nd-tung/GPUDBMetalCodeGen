@@ -11,23 +11,23 @@ public:
     explicit RuntimeCompiler(MTL::Device* device) : device_(device) {}
     ~RuntimeCompiler();
 
-    // Compile Metal source into a library. Returns nullptr on error (prints diagnostics).
+    // Compile Metal source into a library; returns nullptr after diagnostics on error.
     MTL::Library* compile(const std::string& source);
 
     // Get or create a pipeline state for a kernel name from a compiled library.
     MTL::ComputePipelineState* getPipeline(MTL::Library* lib, const std::string& kernelName);
 
-    // Clear pipeline cache (releases all cached PSOs)
+    // Release all cached pipeline states.
     void clearCache();
 
-    // Number of cached pipelines
+    // Number of cached pipeline states.
     size_t cacheSize() const { return pipelineCache_.size(); }
 
     // Toggle Metal -ffast-math for subsequent compile() calls (default false).
     static void setFastMathEnabled(bool on) { sFastMath_ = on; }
     static bool fastMathEnabled() { return sFastMath_; }
 
-    // Compiled query: library + pipeline states for each phase
+    // Runtime objects needed to execute a compiled query.
     struct CompiledQuery {
         MTL::Library* library = nullptr;
         std::vector<MTL::ComputePipelineState*> pipelines;

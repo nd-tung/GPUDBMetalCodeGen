@@ -1,39 +1,45 @@
 #include "metal_plan_common.h"
+#include "generic/gpu_ops/generic_gpu_physical_ops.h"
 #include "tpch/metal_tpch_query_builders.h"
 
 namespace codegen {
 
-// ===================================================================
-// Q18: Large Volume Customer — 3 GPU phases (incl. compact emit), CPU sort
-// ===================================================================
+// Q18: Large Volume Customer.
 std::optional<MetalQueryPlan> buildQ18Plan_byName() {
     std::string idx = "i";
     MetalQueryPlan plan;
 
-    // Helper: per-orderkey filter + atomic-append into compact list.
-    // Caps writes at q18CompactCap to avoid out-of-bounds on extreme inputs;
-    // the tight cap is sized in preprocessing (1<<20 slots).
+    // Compact writes are capped by q18_compact_cap.
     plan.helpers.push_back(R"(
 static void q18_compact_emit(device atomic_uint* counter,
                               device uint* out_ok,
+                              device int* out_custkey,
+                              device float* out_totalprice,
+                              device int* out_orderdate,
                               device float* out_qty,
                               const device float* d_order_qty,
+                              const device int* d_q18_ok_lookup,
+                              const device int* o_custkey,
+                              const device float* o_totalprice,
+                              const device int* o_orderdate,
                               uint q18_compact_cap,
                               uint ok) {
     float q = d_order_qty[ok];
     if (!(q > 300.0f)) return;
+    int order_idx = d_q18_ok_lookup[ok];
+    if (order_idx < 0) return;
     uint slot = atomic_fetch_add_explicit(counter, 1u, memory_order_relaxed);
     if (slot < q18_compact_cap) {
         out_ok[slot] = ok;
+        out_custkey[slot] = o_custkey[order_idx];
+        out_totalprice[slot] = o_totalprice[order_idx];
+        out_orderdate[slot] = o_orderdate[order_idx];
         out_qty[slot] = q;
     }
 }
 )");
 
-    // Phase 1: build orderkey -> orders-row-index lookup on GPU
-    // (replaces the 1.5M sequential CPU writes that previously dominated
-    // Q18 preprocessing). fillByte = 0xFF gives -1 sentinel for missing
-    // orderkeys; orderkeys are unique by FK so no atomics needed.
+    // Build orderkey to orders-row lookup.
     {
         auto scan = makeAutoScan("orders", idx);
         auto store = std::make_unique<MetalArrayStore>(
@@ -43,7 +49,7 @@ static void q18_compact_emit(device atomic_uint* counter,
         appendPhase(plan, "Q18_build_ok_lookup", std::move(store), 256);
     }
 
-    // Phase 2: per-orderkey sum(l_quantity)
+    // Sum quantity per orderkey.
     {
         auto scan = makeAutoScan("lineitem", idx);
 
@@ -55,22 +61,53 @@ static void q18_compact_emit(device atomic_uint* counter,
         appendPhase(plan, "Q18_aggregate", std::move(agg));
     }
 
-    // Phase 3: GPU compact-emit qualifying orderkeys (qty > 300).
-    // Range scan over [0, n_q18_oks) reads the dense d_order_qty
-    // direct-address array and appends compact (ok, qty) pairs. The CPU
-    // post then iterates only the small qualifying set.
+    // Compact qualifying orders for GPU top-k.
+    const std::string resultRows = "q18_result_rows";
     {
         auto rscan = std::make_unique<MetalRangeScan>("q18_oks", idx);
+        rscan->addSideColumn("orders", "o_custkey", "int");
+        rscan->addSideColumn("orders", "o_totalprice", "float");
+        rscan->addSideColumn("orders", "o_orderdate", "int");
         auto sideEffect = std::make_unique<MetalComputeExpr>(
             std::move(rscan), "_q18_unused", "int",
             "(q18_compact_emit(d_q18_compact_count, d_q18_compact_ok, "
-            "d_q18_compact_qty, d_order_qty, q18_compact_cap, " + idx + "), 0)");
+            "d_q18_compact_custkey, d_q18_compact_totalprice, "
+            "d_q18_compact_orderdate, d_q18_compact_qty, d_order_qty, "
+            "d_q18_ok_lookup, o_custkey, o_totalprice, o_orderdate, "
+            "q18_compact_cap, " + idx + "), 0)");
         auto& phase = appendPhase(plan, "Q18_compact", std::move(sideEffect));
-        phase.extraBuffers.push_back({"d_q18_compact_count", "atomic_uint", false, true});
-        phase.extraBuffers.push_back({"d_q18_compact_ok",    "uint",        false, false});
-        phase.extraBuffers.push_back({"d_q18_compact_qty",   "float",       false, false});
-        phase.extraBuffers.push_back({"d_order_qty",         "float",       true,  false});
+        phase.extraBuffers.push_back({"d_q18_compact_count",      "atomic_uint", false, true});
+        phase.extraBuffers.push_back({"d_q18_compact_ok",         "uint",        false, false});
+        phase.extraBuffers.push_back({"d_q18_compact_custkey",    "int",         false, false});
+        phase.extraBuffers.push_back({"d_q18_compact_totalprice", "float",       false, false});
+        phase.extraBuffers.push_back({"d_q18_compact_orderdate",  "int",         false, false});
+        phase.extraBuffers.push_back({"d_q18_compact_qty",        "float",       false, false});
+        phase.extraBuffers.push_back({"d_order_qty",              "float",       true,  false});
+        phase.extraBuffers.push_back({"d_q18_ok_lookup",          "int",         true,  false});
         phase.scalarParams.push_back({"q18_compact_cap", "uint"});
+        attachMaterializedCountHook(phase, "d_q18_compact_count", resultRows);
+    }
+
+    // --- Result Order ---
+    // Use TopK for the required top 100 orders when available.
+    {
+        std::vector<GenericMatColumnDesc> columns = {
+            GenericMatColumnDesc("o_orderkey", "d_q18_compact_ok", "uint"),
+            GenericMatColumnDesc("c_custkey", "d_q18_compact_custkey", "int"),
+            GenericMatColumnDesc("o_totalprice", "d_q18_compact_totalprice", "float"),
+            GenericMatColumnDesc("o_orderdate", "d_q18_compact_orderdate", "int"),
+            GenericMatColumnDesc("sum(l_quantity)", "d_q18_compact_qty", "float"),
+        };
+        GenericSortSpec sortSpec;
+        sortSpec.keys.push_back({"o_totalprice", true});
+        sortSpec.keys.push_back({"o_orderdate", false});
+        sortSpec.limit = 100;
+        std::string topKError;
+        if (!appendGenericGpuTopK(plan, "q18_result", resultRows,
+                                  "maxOrderkey", columns, sortSpec, &topKError)) {
+            appendGenericGpuSort(plan, "q18_result", resultRows,
+                                 "maxOrderkey", columns, sortSpec, &topKError);
+        }
     }
 
     return plan;

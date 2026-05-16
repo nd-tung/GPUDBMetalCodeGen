@@ -1,7 +1,5 @@
 #pragma once
-// ===================================================================
-// MetalCodegen — Base class for composable Metal shader generation
-// ===================================================================
+// Composable Metal shader generation.
 
 #include "metal_param_binding.h"
 #include "iu.hpp"
@@ -18,20 +16,13 @@ using ConsumerFn = std::function<void()>;
 class MetalCodegen;
 class MetalGenericExecutor;
 
-// Host hook run after a phase's GPU dispatch completes. May read output
-// buffers via executor.getAllocatedBuffer(), feed scalars to later phases,
-// or launch follow-up GPU work such as bitonic sort steps.
-// Return any additional GPU milliseconds launched by the hook so timing
-// summaries account for hook-dispatched kernels.
+// Runs after a phase dispatch; returns extra GPU milliseconds launched by hook.
 using PostDispatchHook = std::function<double(MetalGenericExecutor&)>;
 
 class MetalCodegen {
 public:
     virtual ~MetalCodegen() = default;
 
-    // ---------------------------------------------------------------
-    // Code emission
-    // ---------------------------------------------------------------
     void addLine(const std::string& line);
     void addBlock(const std::string& header, std::function<void()> body,
                   const std::string& trailing = "");
@@ -39,94 +30,72 @@ public:
     void addComment(const std::string& comment);
     void increaseIndent();
     void decreaseIndent();
-    void addRawCode(const std::string& code);  // no indentation added
+    void addRawCode(const std::string& code);
 
-    // ---------------------------------------------------------------
-    // Helper / device functions (emitted once before all kernels)
-    // ---------------------------------------------------------------
+    // Emitted once before all kernels.
     void addHelper(const std::string& code);
 
-    // ---------------------------------------------------------------
-    // Phase management — each phase = one Metal kernel function
-    // ---------------------------------------------------------------
+    // Each phase emits one Metal kernel.
     void beginPhase(const std::string& phaseName);
     void endPhase();
     int phaseCount() const;
 
-    // Phase metadata (for dispatch configuration)
     void setPhaseScannedTable(const std::string& tableName);
     void setPhaseThreadgroupSize(int size);
     void setPhaseSingleThread(bool single);
     void setPhaseMaxThreadgroups(int max);
+    // Hooks run after the command buffer for the phase has completed.
     void setPhasePostDispatchHook(PostDispatchHook hook);
 
-    // ---------------------------------------------------------------
-    // Parameter registration (creates MetalParamBinding entries)
-    // ---------------------------------------------------------------
-    // Table: device const T* + constant uint& size (AoS struct)
+    // Table: device const T* plus constant uint& size.
     void addTableParam(const std::string& table, const std::string& metalType);
 
-    // Column: device const T* (columnar layout, one buffer per column)
+    // Column: device const T*.
     void addColumnParam(const std::string& paramName, const std::string& metalType,
                         const std::string& tableName = "");
 
-    // Table size only: constant uint& n_<table>
+    // Table size only: constant uint& n_<table>.
     void addTableSizeParam(const std::string& table);
 
-    // Device buffer: device T* (read-write)
+    // Device buffer: device T*.
     void addBufferParam(const std::string& name, const std::string& elemType,
                         const std::string& sizeExpr, bool zeroInit = true, int fillByte = 0);
 
-    // Atomic device buffer: device atomic_uint* (read-write).
-    // fillByte selects the memset value used to (re)initialise the buffer
-    // before each kernel dispatch (0 by default; 0xFF for sentinel-of-(-1)
-    // patterns such as hash-map key arrays).
+    // Atomic device buffer; fillByte supports sentinel initialization.
     void addAtomicBufferParam(const std::string& name, const std::string& atomicType,
                               const std::string& sizeExpr, int fillByte = 0);
 
-    // Constant scalar: constant T& (passed via setBytes)
-    // Constant scalar param: constant T& — value supplied via
-    // registerScalarInt/registerScalarFloat on the executor.
+    // Constant scalar: constant T& passed via setBytes.
     void addScalarParam(const std::string& name, const std::string& type);
 
-    // Resolved scalar param: same Metal-side declaration as addScalarParam,
-    // but the value is derived at dispatch time by evaluating `sizeExpr`
-    // through the executor's MetalSizeResolver (supports literals, symbols,
-    // arithmetic, and `next_pow2(...)`). Used for hash-map capacities and
-    // similar size-derived constants that depend on table cardinalities.
+    // Scalar derived from sizeExpr at dispatch time.
     void addResolvedScalarParam(const std::string& name, const std::string& type,
                                 const std::string& sizeExpr);
 
-    // Constant data: constant T* (host data, passed via setBytes)
+    // Constant data: constant T* passed via setBytes.
     void addConstantDataParam(const std::string& name, const std::string& type,
                               size_t bytes);
 
-    // Bitmap shorthand: device const uint* (read-only) / device atomic_uint* (write)
+    // Bitmap shorthand.
     void addBitmapReadParam(const std::string& name, const std::string& sizeExpr);
     void addBitmapWriteParam(const std::string& name, const std::string& sizeExpr);
 
-    // Hash map shorthand: atomic keys + lo/hi value buffers + size scalar
-    // Registers 3 atomic buffers (keys, valuesLo, valuesHi) + 1 scalar (n_mapName)
+    // Hash map shorthand: atomic keys, lo/hi values, and size scalar.
     void addHashMapParam(const std::string& mapName,
                          const std::string& keysName,
                          const std::string& valuesLoName,
                          const std::string& valuesHiName,
                          const std::string& sizeExpr);
-    // Read-only hash map (for lookup phases, already allocated by build)
+    // Read-only hash map for lookup phases.
     void addHashMapReadParam(const std::string& mapName,
                              const std::string& keysName,
                              const std::string& valuesLoName,
                              const std::string& valuesHiName);
 
-    // ---------------------------------------------------------------
-    // Global buffer size registration
-    // ---------------------------------------------------------------
     void setBufferSize(const std::string& name, const std::string& sizeExpr);
     const std::unordered_map<std::string, std::string>& getGlobalBufferSizes() const;
 
-    // ---------------------------------------------------------------
-    // Output schema registration (called by terminal operators)
-    // ---------------------------------------------------------------
+    // Result schema is consumed by MetalResultCollector after execution.
     void registerScalarAggOutput(const std::string& loBuffer, const std::string& hiBuffer,
                                  const std::string& type);
     void registerScalarAggColumn(const std::string& displayName, int index, int scaleDown = 0,
@@ -152,33 +121,23 @@ public:
     const MetalResultSchema& getResultSchema() const;
     MetalResultSchema& getResultSchemaMutable();
 
-    // ---------------------------------------------------------------
-    // Code generation — produce final Metal source
-    // ---------------------------------------------------------------
     std::string print();
 
-    // Access phase info (for executor dispatch configuration)
     struct PhaseInfo {
         std::string name;
+        // Generated Metal kernel body without the signature.
         std::string code;
+        // Empty scannedTable means dispatch size comes from explicit symbols.
         std::string scannedTable;
         int threadgroupSize = 1024;
         int maxThreadgroups = 0;
         bool isSingleThread = false;
         std::vector<MetalParamBinding> bindings;
-        // Optional host-side callback invoked by the executor after this
-        // phase's GPU dispatch completes. Used to read back GPU-computed
-        // scalars and feed them to later phases (replaces CPU preprocessing).
         PostDispatchHook postDispatchHook;
     };
     const std::vector<PhaseInfo>& getPhases() const;
 
-    // ---------------------------------------------------------------
-    // Column-type resolver (for IU auto-projection)
-    // ---------------------------------------------------------------
-    // Injected by the schema layer. Given a table name and column name,
-    // returns the Metal element type string ("int", "float", "char")
-    // or empty if the column is unknown.
+    // Injected by schema layer for IU auto-projection.
     void setColumnTypeResolver(ColumnTypeResolver r) {
         columnTypeResolver_ = std::move(r);
     }
@@ -188,56 +147,42 @@ public:
                                    : std::string{};
     }
 
-    // Mutable phase access (used by --autotune-tg to change TG size between
-    // dispatches without recompiling the kernels).
+    // Allows --autotune-tg to change TG size without recompiling.
     std::vector<PhaseInfo>& getPhasesMutable();
 
-    // Access all bindings across all phases (for buffer allocation)
+    // Flattened binding list used by the executor for allocation planning.
     std::vector<MetalParamBinding> getAllBindings() const;
 
 private:
-    // Phases
     std::vector<PhaseInfo> phases_;
     PhaseInfo* currentPhase_ = nullptr;
 
-    // Helper / device functions
     std::string helperCode_;
 
-    // Tables already registered (avoid double-registration)
     std::unordered_set<std::string> registeredTables_;
 
-    // Global buffer sizes
     std::unordered_map<std::string, std::string> globalBufferSizes_;
 
-    // Result schema
     MetalResultSchema resultSchema_;
     std::string scalarAggPendingLo_;
     std::string scalarAggPendingHi_;
     std::string scalarAggPendingType_;
 
-    // Current indentation
     unsigned indentLevel_ = 1;
     static constexpr unsigned INDENT_SIZE = 4;
 
-    // Helpers
     std::string indent() const;
     std::string generateSignature(const PhaseInfo& phase) const;
     static std::string commonHeader();
 
-    // Centralised binding push: validates an active phase, optionally skips
-    // duplicates, appends to currentPhase_->bindings, and (if sizeExpr is
-    // populated) records the size in globalBufferSizes_. Replaces the
-    // open-coded "if (!currentPhase_) throw … push_back" pattern that was
-    // repeated in every addXxxParam method.
+    // Central binding registration with active-phase and duplicate handling.
     void pushBinding(const char* op, MetalParamBinding b, bool dedup);
     void assignBufferIndices(PhaseInfo& phase);
 
-    // Column-type resolver for IU auto-projection
     ColumnTypeResolver columnTypeResolver_;
 };
 
-// RAII guard for indentation scope — automatically decrements on destruction.
-// Ensures indent level is always restored even if exceptions are thrown.
+// Restores indentation on scope exit.
 class IndentGuard {
 public:
     explicit IndentGuard(MetalCodegen& cg) : cg_(cg) { cg_.increaseIndent(); }

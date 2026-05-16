@@ -10,6 +10,8 @@ std::optional<MetalQueryPlan> buildQ4PlanForDateFilter(const std::string& filter
     plan.name = "Q4";
     std::string idxVar = "i";
 
+    // --- Late Orders Bitmap ---
+    // Mark orders that have at least one late lineitem.
     {
         auto scan = makeAutoScan("lineitem", idxVar);
 
@@ -23,6 +25,8 @@ std::optional<MetalQueryPlan> buildQ4PlanForDateFilter(const std::string& filter
         appendPhase(plan, "Q4_build_bitmap", std::move(bitmapBuild));
     }
 
+    // --- Priority Counts ---
+    // Count date-filtered orders by priority after the late-order probe.
     {
         auto scan = makeAutoScan("orders", idxVar);
 
@@ -45,21 +49,15 @@ std::optional<MetalQueryPlan> buildQ4PlanForDateFilter(const std::string& filter
 
 } // namespace
 
-// ===================================================================
-// Q4 Plan Builder — Order Priority Checking
-// Pattern: BitmapBuild(lineitem, late) → Filter+KeyedAgg(orders, date)
-// ===================================================================
-
+// Q4: Order Priority Checking.
 std::optional<MetalQueryPlan> buildQ4Plan(const AnalyzedQuery& aq) {
-    // Q4: orders table with GROUP BY o_orderpriority
-    // + EXISTS subquery on lineitem (commitdate < receiptdate)
+    // Match orders grouped by priority with an EXISTS late-lineitem predicate.
     if (aq.tables.size() < 1) return std::nullopt;
     bool hasOrders = false;
     for (auto& t : aq.tables) if (t == "orders") hasOrders = true;
     if (!hasOrders) return std::nullopt;
     if (!aq.hasGroupBy()) return std::nullopt;
 
-    // Check for EXISTS subquery and o_orderpriority GROUP BY
     bool hasExists = false;
     for (auto& f : aq.filters) {
         std::visit([&](auto&& node) {
@@ -69,7 +67,6 @@ std::optional<MetalQueryPlan> buildQ4Plan(const AnalyzedQuery& aq) {
     }
     if (!hasExists) return std::nullopt;
 
-    // Verify GROUP BY o_orderpriority
     bool groupByPriority = false;
     for (auto& g : aq.groupBy) {
         std::visit([&](auto&& node) {

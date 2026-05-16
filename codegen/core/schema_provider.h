@@ -1,14 +1,7 @@
 #pragma once
-// ===================================================================
-// Schema Provider — abstract interface for schema-agnostic codegen.
-//
-// Replaces direct TPCHSchema::instance() calls with an injected
-// provider, enabling non-TPC-H schemas without code changes.
-//
-// The TPCHSchemaProvider (in tpch_schema.h) wraps the existing
-// TPC-H singleton.  User-supplied schemas implement this interface
-// and register it with the query analyzer.
-// ===================================================================
+// --- Schema Provider ---
+// Abstract schema interface used by analyzer, planning, and codegen.
+// TPCHSchemaProvider implements this interface for the built-in TPC-H schema.
 
 #include "../planning/query_plan.h"
 #include <cstddef>
@@ -18,7 +11,7 @@
 
 namespace codegen {
 
-// Domain info for GROUP BY on integer/date columns.
+// GROUP BY domain for integer/date columns.
 struct GroupDomain {
     int minValue = 0;
     int maxValue = 0;
@@ -61,8 +54,7 @@ public:
     virtual std::optional<std::pair<std::string, std::string>> pkInfo(
         const std::string& table) const = 0;
 
-    // Decimal-like FLOAT metadata.  A positive value means the column can be
-    // represented as round(value * scale) for deterministic integer SUM/AVG.
+    // Positive scale enables deterministic integer SUM/AVG for decimal-like floats.
     virtual int numericScale(const std::string& table,
                              const std::string& col) const {
         (void)table;

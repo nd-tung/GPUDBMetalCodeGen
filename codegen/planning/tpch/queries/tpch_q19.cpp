@@ -3,13 +3,13 @@
 
 namespace codegen {
 
-// ===================================================================
-// Q19: Discounted Revenue — 2 phases
-// ===================================================================
+// Q19: Discounted Revenue.
 std::optional<MetalQueryPlan> buildQ19Plan_byName() {
     std::string idx = "i";
     MetalQueryPlan plan;
 
+    // --- Helpers ---
+    // Fixed-width brand and container checks encode the three Q19 cases.
     plan.helpers.push_back(R"(
 static bool brand_eq(const device char* brand, uint idx, char d1, char d2) {
     const device char* b = brand + idx * 10;
@@ -39,7 +39,8 @@ static int container_match(const device char* cont, uint idx) {
 }
 )");
 
-    // Phase 1: Build part condition bitmask map
+    // --- Part Condition Map ---
+    // Bitmask values identify which Q19 quantity range applies.
     {
         auto scan = makeAutoScan("part", idx);
 
@@ -61,12 +62,12 @@ static int container_match(const device char* cont, uint idx) {
         appendPhase(plan, "Q19_build_part_cond", std::move(store), 256);
     }
 
-    // Phase 2: Scan lineitem, lookup part condition, check quantity, reduce revenue
+    // --- Revenue Reduction ---
+    // Probe part conditions, check quantity ranges, then reduce revenue.
     {
         auto scan = makeAutoScan("lineitem", idx);
 
-        // l_shipmode IN ('AIR', 'REG AIR') — 'A..' or 'RE..'
-        // l_shipinstruct = 'DELIVER IN PERSON' — first char 'D'
+        // AIR/REG AIR and DELIVER IN PERSON are identified by fixed prefixes.
         auto filtered = std::make_unique<MetalSelection>(std::move(scan),
             "(l_shipmode[" + idx + " * 2] == 'A' || (l_shipmode[" + idx + " * 2] == 'R' && l_shipmode[" + idx + " * 2 + 1] == 'E')) && l_shipinstruct[" + idx + " * 25] == 'D'");
 

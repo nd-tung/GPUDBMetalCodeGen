@@ -44,7 +44,7 @@ std::optional<std::string> parseChar1StringExpr(const ExprPtr& expr) {
     if (!lit) return std::nullopt;
     auto* s = std::get_if<std::string>(&lit->value);
     if (!s || s->empty()) return std::nullopt;
-    // CHAR1 comparison: use first character of the string literal
+    // CHAR(1) comparisons use the first literal byte.
     return std::string("'") + s->front() + "'";
 }
 
@@ -77,7 +77,7 @@ std::string fixedStringEqMetal(const ColRef& col,
                                 const SchemaProvider* schema = nullptr) {
     int width = 0;
     if (schema) width = schema->columnFixedWidth(col.table, col.column);
-    if (width <= 0) width = col.fixedWidth; // fallback: ColRef carries width from subquery aliases
+    if (width <= 0) width = col.fixedWidth; // Subquery aliases carry fixed width.
     if (width <= 0) return "false";
 
     int cmpLen = std::min(static_cast<int>(literal.size()), width);
@@ -168,7 +168,7 @@ std::optional<std::string> fixedStringLikeMetal(const Like& like,
     if (schema) width = schema->columnFixedWidth(col->table, col->column);
     if (width <= 0) return std::nullopt;
 
-    // Build LIKE Metal expression using column width
+    // Generate LIKE helper call for the fixed-width string column.
 
     if (like.pattern.find('%') == std::string::npos) {
         std::string exact = fixedStringEqMetal(*col, like.pattern, idxVar, schema);
@@ -256,8 +256,7 @@ std::string exprToMetalForPredicate(const ExprPtr& expr,
                 if (auto charValue = parseChar1StringExpr(expr)) return *charValue;
             }
         }
-        // Handle string literal compared against non-ColRef (e.g. substring
-        // result IN ('13', '31', ...)): convert string to integer literal.
+        // Convert string literals used with numeric expressions.
         if (auto* lit = expr ? std::get_if<Literal>(&expr->node) : nullptr) {
             if (auto* sv = std::get_if<std::string>(&lit->value)) {
                 try { return std::to_string(std::stoi(*sv)); }
@@ -332,11 +331,9 @@ std::optional<std::string> fixedStringLikeDataMetal(
     return negated ? "!(" + match + ")" : match;
 }
 
-// ===================================================================
-// Helper: expression to Metal code string (columnar access: col[idx])
-// ===================================================================
+// --- Expression Lowering ---
 
-// Collect all column references in an expression
+// Collect all column references in an expression.
 void collectColumns(const ExprPtr& expr, std::set<std::string>& cols) {
     if (!expr) return;
     std::visit([&](auto&& node) {
@@ -439,7 +436,6 @@ std::string exprToMetal(const ExprPtr& expr, const std::string& idxVar,
         using T = std::decay_t<decltype(node)>;
 
         if constexpr (std::is_same_v<T, ColRef>) {
-            // Columnar access: column_name[idx]
             std::string aliasPrefix;
             if (!node.tableAlias.empty()) aliasPrefix = "/*" + node.tableAlias + "*/";
             return aliasPrefix + node.column + "[" + idxVar + "]";
@@ -468,8 +464,7 @@ std::string exprToMetal(const ExprPtr& expr, const std::string& idxVar,
         }
         else if constexpr (std::is_same_v<T, FuncCall>) {
             if (node.name == "date_part" || node.name == "extract") {
-                // EXTRACT(YEAR/MONTH/DAY FROM date_col)
-                // args[0] = unit string, args[1] = column expression
+                // EXTRACT(unit FROM date_col), with args[0]=unit and args[1]=column.
                 std::string unit;
                 if (!node.args.empty() && node.args[0]) {
                     if (auto* lit = std::get_if<Literal>(&node.args[0]->node)) {
@@ -480,7 +475,7 @@ std::string exprToMetal(const ExprPtr& expr, const std::string& idxVar,
                 if (unit == "year")   return "(" + col + " / 10000)";
                 if (unit == "month") return "((" + col + " / 100) % 100)";
                 if (unit == "day")    return "(" + col + " % 100)";
-                return col; // fallback
+                return col;
             }
             if (node.name == "substring") {
                 int start = 1, len = 1;
@@ -494,7 +489,7 @@ std::string exprToMetal(const ExprPtr& expr, const std::string& idxVar,
                         if (auto* sv = std::get_if<int>(&lit->value)) len = *sv;
                     }
                 }
-                // Look up the column's fixed width and name for proper row offset.
+                // Fixed-width strings need a row offset before substring extraction.
                 std::string colName;
                 int fw = 1;
                 if (node.args.size() > 0 && node.args[0]) {
@@ -507,7 +502,7 @@ std::string exprToMetal(const ExprPtr& expr, const std::string& idxVar,
                     }
                 }
                 if (colName.empty()) return "0";
-                // Emit: ((col[idx*fw + offset] - '0') * weight + ...)
+                // Emit integer packing from decimal substring bytes.
                 std::string result = "(";
                 for (int i = 0; i < len; ++i) {
                     if (i > 0) result += " + ";
@@ -524,8 +519,7 @@ std::string exprToMetal(const ExprPtr& expr, const std::string& idxVar,
                 result += ")";
                 return result;
             }
-            // Strip aggregate function calls (sum, count, avg, min, max)
-            // — these are emitted as raw inner expressions for materialize/agg.
+            // Aggregates lower their input expression here.
             if (node.name == "sum" || node.name == "count" || node.name == "avg" ||
                 node.name == "min" || node.name == "max") {
                 if (!node.args.empty()) return exprToMetal(node.args[0], idxVar, schema);
@@ -595,7 +589,7 @@ std::string predToMetal(const PredPtr& pred, const std::string& idxVar,
             return "(" + e + " >= " + lo + " && " + e + " <= " + hi + ")";
         }
         else if constexpr (std::is_same_v<T, InList>) {
-            if (node.values.empty()) return "true";  // placeholder for unsupported subquery
+            if (node.values.empty()) return "true";  // Subquery was expanded elsewhere.
             if (auto* col = fixedStringCol(node.expr)) {
                 std::string cond;
                 for (const auto& value : node.values) {
@@ -606,7 +600,7 @@ std::string predToMetal(const PredPtr& pred, const std::string& idxVar,
                 }
                 return cond.empty() ? "false" : "(" + cond + ")";
             }
-            // CHAR1 column InList — compare first character of each literal value
+            // CHAR(1) IN lists compare the first byte of each literal.
             if (auto* col = std::get_if<ColRef>(&node.expr->node)) {
                 if (col->dataType == DataType::CHAR1) {
                     std::string cond;
@@ -661,8 +655,7 @@ std::string predToMetal(const PredPtr& pred, const std::string& idxVar,
     }, pred->node);
 }
 
-// Combine all filter predicates into a single Metal condition string.
-// For readability and Metal compiler efficiency, use line breaks with multiple filters.
+// Combine filter predicates into one Metal condition.
 std::string combineFilters(const std::vector<PredPtr>& filters, const std::string& idxVar,
                            const SchemaProvider* schema) {
     if (filters.empty()) return "";
@@ -677,7 +670,7 @@ std::string combineFilters(const std::vector<PredPtr>& filters, const std::strin
     return cond;
 }
 
-// Map column name to Metal type.
+// Map schema type to Metal scalar type.
 static std::string colMetalType(const std::string& table, const std::string& colName,
                                 const SchemaProvider* schema = nullptr) {
     DataType type = DataType::INT;
@@ -738,18 +731,18 @@ void addGpuSortToPlan(MetalQueryPlan& plan,
                       bool sortDesc,
                       const std::string& sortKeyBuf,
                       const std::string& sortIdxBuf) {
-    // Phase: init sort keys from the materialized column buffer
+    // Initialize sort keys from the materialized column buffer.
     auto initSort = std::make_unique<MetalInitSortKeys>(
         sortColBuffer, sortColType, sortKeyBuf, sortIdxBuf, nResultsExpr, sortDesc);
     appendPhase(plan, "GPU_sort_init", std::move(initSort));
 
-    // Phase: bitonic sort step with post-dispatch (k,j) hook
+    // Run the bitonic sort step with its post-dispatch (k,j) hook.
     auto sortStep = std::make_unique<MetalBitonicSortStep>(sortKeyBuf, sortIdxBuf, nResultsExpr);
     auto& sortPhase = appendPhase(plan, "GPU_sort_step", std::move(sortStep));
     sortPhase.postDispatchHook = MetalInitSortKeys::makeBitonicHook(
         "GPU_sort_step", sortKeyBuf, sortIdxBuf, nResultsExpr);
 
-    // Mark plan for sorted-index remapping during result collection
+    // Enable sorted-index remapping during result collection.
     plan.gpuSort = MetalQueryPlan::GpuSort{sortIdxBuf, nResultsExpr, sortDesc, -1};
 }
 
@@ -789,7 +782,7 @@ std::string exprToMetalForHaving(const ExprPtr& expr,
                     }
                 }
             }
-            // Fallback: match by funcName only (skip innerColumn check)
+            // Match by function when the HAVING expression omits the inner column.
             for (const auto& slot : slots) {
                 if (slot.funcName == funcUpper) {
                     return "((float)(_tg_" + slot.name + "))";

@@ -1,7 +1,6 @@
 #pragma once
-// ===================================================================
-// TPCH Catalog — populates a Catalog from TPCHSchema
-// ===================================================================
+// --- TPC-H Catalog ---
+// Populate a Catalog from TPCHSchema metadata.
 
 #include "catalog.hpp"
 #include "tpch_schema.h"
@@ -27,7 +26,7 @@ inline Catalog makeTPCHCatalog() {
             cc.domainMin = col.domainMin;
             cc.domainMax = col.domainMax;
             cc.charDomain = col.charDomain;
-            cc.isKey = false; // TPCHSchema doesn't explicitly mark keys
+            cc.isKey = false; // TPCHSchema does not mark keys explicitly.
             ct.columns.push_back(cc);
         }
         cat.addTable(std::move(ct));

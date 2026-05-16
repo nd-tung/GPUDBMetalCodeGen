@@ -13,17 +13,17 @@
 
 namespace codegen {
 
-class SchemaProvider;  // fwd (already included)
+class SchemaProvider;
 
 using ColumnList = std::initializer_list<std::pair<const char*, const char*>>;
 
 void collectColumns(const ExprPtr& expr, std::set<std::string>& cols);
 void collectColumns(const PredPtr& pred, std::set<std::string>& cols);
-// Collect column→table mapping directly from AST ColRef nodes.
+// Collect column -> table mapping directly from ColRef nodes.
 void collectColumnTables(const ExprPtr& expr, std::map<std::string, std::string>& colToTable);
 void collectColumnTables(const PredPtr& pred, std::map<std::string, std::string>& colToTable);
 
-// `schema` is optional; TPC-H singleton used as fallback when nullptr.
+// Uses the default schema when schema is nullptr.
 std::string exprToMetal(const ExprPtr& expr, const std::string& idxVar,
                         const SchemaProvider* schema = nullptr);
 std::string predToMetal(const PredPtr& pred, const std::string& idxVar,
@@ -38,11 +38,11 @@ std::optional<std::string> fixedStringLikeDataMetal(
     bool negated);
 
 struct MetalKeyedAggSlotForHaving {
-    std::string name;       // aggregate slot display name (e.g. "sum(l_quantity)")
+    std::string name;       // Aggregate slot display name.
     bool isFloatSum = false;
     bool isLongPair = false;
-    std::string funcName;   // aggregate function name ("SUM", "COUNT", "AVG", "MIN", "MAX")
-    std::string innerColumn; // referenced column (empty for COUNT(*))
+    std::string funcName;   // SUM, COUNT, AVG, MIN, or MAX.
+    std::string innerColumn; // Referenced column; empty for COUNT(*).
 };
 
 std::string exprToMetalForHaving(const ExprPtr& expr,
@@ -57,8 +57,7 @@ std::unique_ptr<MetalGridStrideScan> makeScanForCols(const std::string& table,
                                                       const std::string& idxVar,
                                                       const std::set<std::string>& cols,
                                                       const SchemaProvider* schema = nullptr);
-// Create a scan with no explicit columns — columns are auto-discovered
-// at produce time via the IU chain (requires ColumnTypeResolver on codegen).
+// Create a scan whose columns are discovered from the IU chain at produce time.
 std::unique_ptr<MetalGridStrideScan> makeAutoScan(const std::string& table,
                                                    const std::string& idxVar = "i");
 
@@ -70,10 +69,7 @@ MetalQueryPlan::Phase& appendPhase(MetalQueryPlan& plan,
                                     std::unique_ptr<MetalOperator> root,
                                     int threadgroupSize = 1024);
 
-// Add GPU bitonic sort phases to a plan.  Emits MetalInitSortKeys +
-// MetalBitonicSortStep phases with the post-dispatch (k,j) hook.
-// Sets plan.gpuSort so post-processing can remap rows using the
-// sorted index buffer.
+// Add GPU bitonic sort phases and record sorted-index result remapping.
 void addGpuSortToPlan(MetalQueryPlan& plan,
                       const std::string& sortColBuffer,
                       const std::string& sortColType,

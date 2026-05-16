@@ -10,6 +10,8 @@ std::optional<MetalQueryPlan> buildQ12PlanForDateFilter(const std::string& dateC
     plan.name = "Q12";
     std::string idxVar = "i";
 
+    // --- Priority Bitmap ---
+    // Mark high-priority orders before scanning lineitem.
     {
         auto scan = makeAutoScan("orders", idxVar);
         auto filter = std::make_unique<MetalSelection>(std::move(scan),
@@ -20,6 +22,8 @@ std::optional<MetalQueryPlan> buildQ12PlanForDateFilter(const std::string& dateC
         appendPhase(plan, "Q12_build_bitmap", std::move(bitmapBuild));
     }
 
+    // --- Shipmode Counts ---
+    // Four buckets encode shipmode and high/low priority.
     {
         auto scan = makeAutoScan("lineitem", idxVar);
 
@@ -48,13 +52,9 @@ std::optional<MetalQueryPlan> buildQ12PlanForDateFilter(const std::string& dateC
 
 } // namespace
 
-// ===================================================================
-// Q12 Plan Builder — Shipping Modes and Order Priority
-// Pattern: BitmapBuild(orders, priority) → Filter+KeyedAgg(lineitem)
-// ===================================================================
-
+// Q12: Shipping Modes and Order Priority.
 std::optional<MetalQueryPlan> buildQ12Plan(const AnalyzedQuery& aq) {
-    // Q12: lineitem + orders, GROUP BY l_shipmode, SUM(CASE priority)
+    // Match lineitem/orders grouped by shipmode with order priority buckets.
     if (aq.tables.size() != 2) return std::nullopt;
     bool hasLineitem = false, hasOrders = false;
     for (auto& t : aq.tables) {
@@ -64,7 +64,6 @@ std::optional<MetalQueryPlan> buildQ12Plan(const AnalyzedQuery& aq) {
     if (!hasLineitem || !hasOrders) return std::nullopt;
     if (!aq.hasGroupBy()) return std::nullopt;
 
-    // Check GROUP BY l_shipmode (not o_orderpriority — that's Q4)
     bool groupByShipmode = false;
     for (auto& g : aq.groupBy) {
         std::visit([&](auto&& node) {
@@ -91,8 +90,5 @@ std::optional<MetalQueryPlan> buildQ12Plan(const AnalyzedQuery& aq) {
 std::optional<MetalQueryPlan> buildQ12Plan_byName() {
     return buildQ12PlanForDateFilter("l_receiptdate[i] >= 19940101 && l_receiptdate[i] < 19950101");
 }
-
-// ===================================================================
-// Dispatch: try all known patterns
 
 } // namespace codegen

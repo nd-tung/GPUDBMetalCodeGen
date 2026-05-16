@@ -117,9 +117,9 @@ std::optional<MetalQueryPlan> lowerSingleTableHashGroupedAggregateIRToMetal(
                                    aggFuncName(agg->func) + "' requires an argument.");
             inputExpr = agg->arg;
             if (agg->func == AggFunc::COUNT_DISTINCT) {
+                if (agg->arg->type.type == DataType::CHAR_FIXED)
+                    return fail(error, "IR single-table hash group lowerer: COUNT(DISTINCT) over fixed strings is not supported yet.");
                 distinctDomainSymbol = distinctDomainSymbolForExpr(agg->arg);
-                if (distinctDomainSymbol.empty())
-                    return fail(error, "IR single-table hash group lowerer: COUNT(DISTINCT) has no schema distinct-domain metadata.");
                 inputType = agg->arg->type;
                 funcName = "COUNT_DISTINCT";
             } else if (agg->func == AggFunc::SUM || agg->func == AggFunc::AVG) {
@@ -154,6 +154,7 @@ std::optional<MetalQueryPlan> lowerSingleTableHashGroupedAggregateIRToMetal(
     gbSpec.inputRowsSymbol = "n_gpu_gb_" + groupTag + "_input";
     gbSpec.capacityExpr = "next_pow2(" + outputSize + " * 2)";
     gbSpec.capacitySymbol = "n_gpu_gb_" + groupTag + "_cap";
+    gbSpec.maxOutputRowsExpr = outputSize;
     gbSpec.outputCounter = "d_gpu_gb_" + groupTag + "_count";
     gbSpec.inputColumns = std::move(materializedCols);
     gbSpec.groupBy = std::move(groupSpec);
@@ -177,7 +178,7 @@ std::optional<MetalQueryPlan> lowerSingleTableHashGroupedAggregateIRToMetal(
 
     if (!sortSpec.keys.empty() || sortSpec.limit >= 0) {
         if (!appendGenericGpuSort(plan, "group_" + groupTag,
-                                  sortRowsSym, gbSpec.capacityExpr,
+                                  sortRowsSym, gbSpec.maxOutputRowsExpr,
                                   genericGpuGroupOutputColumns(gbSpec),
                                   sortSpec, error)) {
             return std::nullopt;

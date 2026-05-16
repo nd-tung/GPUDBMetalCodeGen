@@ -6,25 +6,13 @@
 
 namespace codegen {
 
-// ===================================================================
-// Common Metal header — now maintained in metal_common_header.h
-// ===================================================================
-
 std::string MetalCodegen::commonHeader() {
     return kMetalCommonHeader;
 }
 
-// ===================================================================
-// Indentation
-// ===================================================================
-
 std::string MetalCodegen::indent() const {
     return std::string(indentLevel_ * INDENT_SIZE, ' ');
 }
-
-// ===================================================================
-// Code emission
-// ===================================================================
 
 void MetalCodegen::addLine(const std::string& line) {
     if (!currentPhase_)
@@ -65,10 +53,6 @@ void MetalCodegen::addRawCode(const std::string& code) {
 void MetalCodegen::addHelper(const std::string& code) {
     helperCode_ += code + "\n";
 }
-
-// ===================================================================
-// Phase management
-// ===================================================================
 
 void MetalCodegen::beginPhase(const std::string& phaseName) {
     if (currentPhase_)
@@ -121,10 +105,6 @@ void MetalCodegen::setPhasePostDispatchHook(PostDispatchHook hook) {
     currentPhase_->postDispatchHook = std::move(hook);
 }
 
-// ===================================================================
-// Parameter registration
-// ===================================================================
-
 void MetalCodegen::pushBinding(const char* op, MetalParamBinding b, bool dedup) {
     if (!currentPhase_)
         throw std::runtime_error(std::string(op) + ": no active phase");
@@ -132,17 +112,13 @@ void MetalCodegen::pushBinding(const char* op, MetalParamBinding b, bool dedup) 
         for (const auto& existing : currentPhase_->bindings)
             if (existing.name == b.name) return;
     }
-    // Only register sizes for buffers we actually allocate (writeable
-    // DeviceBuffers). Read-only views describe a buffer registered (and
-    // sized) elsewhere; recording their sizeExpr here could clobber the
-    // authoritative entry.
+    // Only writable buffers own their size registration.
     if (!b.sizeExpr.empty() && b.kind == MetalParamKind::DeviceBuffer && !b.readOnly)
         globalBufferSizes_[b.name] = b.sizeExpr;
     currentPhase_->bindings.push_back(std::move(b));
 }
 
 void MetalCodegen::addTableParam(const std::string& table, const std::string& metalType) {
-    // Data pointer
     {
         MetalParamBinding b;
         b.name = "d_" + table;
@@ -153,7 +129,6 @@ void MetalCodegen::addTableParam(const std::string& table, const std::string& me
         b.readOnly = true;
         pushBinding("addTableParam", std::move(b), /*dedup=*/false);
     }
-    // Size
     {
         MetalParamBinding b;
         b.name = "n_" + table;
@@ -176,7 +151,7 @@ void MetalCodegen::addColumnParam(const std::string& paramName, const std::strin
     b.tableName = tableName.empty() ? paramName : tableName;
     b.elementType = metalType;
     b.readOnly = true;
-    pushBinding("addColumnParam", std::move(b), /*dedup=*/false);
+    pushBinding("addColumnParam", std::move(b), /*dedup=*/true);
 }
 
 void MetalCodegen::addTableSizeParam(const std::string& table) {
@@ -279,15 +254,12 @@ void MetalCodegen::addHashMapReadParam(const std::string& mapName,
                                         const std::string& keysName,
                                         const std::string& valuesLoName,
                                         const std::string& valuesHiName) {
+    // Empty sizes bind build-phase storage instead of allocating.
     addBufferParam(keysName, "uint", "", false);
     addBufferParam(valuesLoName, "uint", "", false);
     addBufferParam(valuesHiName, "uint", "", false);
     addScalarParam("n_" + mapName, "uint");
 }
-
-// ===================================================================
-// Global buffer sizes
-// ===================================================================
 
 void MetalCodegen::setBufferSize(const std::string& name, const std::string& sizeExpr) {
     globalBufferSizes_[name] = sizeExpr;
@@ -297,18 +269,11 @@ const std::unordered_map<std::string, std::string>& MetalCodegen::getGlobalBuffe
     return globalBufferSizes_;
 }
 
-// ===================================================================
-// Output schema registration
-// ===================================================================
-
 void MetalCodegen::registerScalarAggOutput(const std::string& loBuffer,
                                             const std::string& hiBuffer,
                                             const std::string& type) {
     resultSchema_.kind = MetalResultSchema::SCALAR_AGG;
-    // Store the buffer names for the next scalarAgg entry
-    // (will be associated with the column added by registerScalarAggColumn)
-    // We store lo/hi buffers temporarily — they'll be set on the scalarAggs entry
-    // by registerScalarAggColumn which is called right after
+    // Paired with the next registerScalarAggColumn call.
     scalarAggPendingLo_ = loBuffer;
     scalarAggPendingHi_ = hiBuffer;
     scalarAggPendingType_ = type;
@@ -356,6 +321,7 @@ void MetalCodegen::registerScalarAggAverageColumn(const std::string& displayName
 void MetalCodegen::registerMaterializeOutput(const std::string& counterBuffer) {
     if (resultSchema_.kind != MetalResultSchema::MATERIALIZE ||
         resultSchema_.counterBuffer != counterBuffer) {
+        // A new materialize counter starts a separate output schema.
         resultSchema_.columns.clear();
     }
     resultSchema_.kind = MetalResultSchema::MATERIALIZE;
@@ -408,32 +374,25 @@ MetalResultSchema& MetalCodegen::getResultSchemaMutable() {
     return resultSchema_;
 }
 
-// ===================================================================
-// Buffer index assignment
-// ===================================================================
-
 void MetalCodegen::assignBufferIndices(PhaseInfo& phase) {
+    // Buffer indices are phase-local and follow binding order.
     int nextIndex = 0;
     for (auto& b : phase.bindings) {
         b.bufferIndex = nextIndex++;
     }
 }
 
-// ===================================================================
-// Kernel signature generation
-// ===================================================================
-
 std::string MetalCodegen::generateSignature(const PhaseInfo& phase) const {
     std::ostringstream sig;
     sig << "kernel void " << phase.name << "(\n";
 
-    bool needsThreadPos = !phase.isSingleThread;
+    bool hasThreadParams = true;
 
     for (size_t i = 0; i < phase.bindings.size(); i++) {
         const auto& b = phase.bindings[i];
         sig << "    " << b.metalTypeDecl << " " << b.name
             << " [[buffer(" << b.bufferIndex << ")]]";
-        if (i + 1 < phase.bindings.size() || needsThreadPos)
+        if (i + 1 < phase.bindings.size() || hasThreadParams)
             sig << ",";
         sig << "\n";
     }
@@ -447,7 +406,6 @@ std::string MetalCodegen::generateSignature(const PhaseInfo& phase) const {
         sig << "    uint simd_lane [[thread_index_in_simdgroup]],\n";
         sig << "    uint simd_id [[simdgroup_index_in_threadgroup]]\n";
     } else {
-        // Single-thread kernel still needs thread_position_in_grid
         sig << "    uint tid [[thread_position_in_grid]]\n";
     }
 
@@ -455,28 +413,21 @@ std::string MetalCodegen::generateSignature(const PhaseInfo& phase) const {
     return sig.str();
 }
 
-// ===================================================================
-// Final output assembly
-// ===================================================================
-
 std::string MetalCodegen::print() {
     std::ostringstream out;
 
-    // 1. Common header (SIMD reductions, bitmap, atomics)
     out << commonHeader();
 
-    // 2. Helper / device functions
     if (!helperCode_.empty()) {
         out << "// --- Helper functions ---\n";
         out << helperCode_ << "\n";
     }
 
-    // 3. Assign buffer indices and emit each phase as one kernel function
     for (size_t pi = 0; pi < phases_.size(); pi++) {
         assignBufferIndices(phases_[pi]);
 
         const auto& phase = phases_[pi];
-        out << "\n// === Phase " << pi << ": " << phase.name << " ===\n";
+        out << "\n// --- Phase " << pi << ": " << phase.name << " ---\n";
         out << generateSignature(phase) << " {\n";
         out << phase.code;
         out << "}\n";
@@ -484,10 +435,6 @@ std::string MetalCodegen::print() {
 
     return out.str();
 }
-
-// ===================================================================
-// Phase info accessors
-// ===================================================================
 
 const std::vector<MetalCodegen::PhaseInfo>& MetalCodegen::getPhases() const {
     return phases_;
@@ -500,6 +447,7 @@ std::vector<MetalCodegen::PhaseInfo>& MetalCodegen::getPhasesMutable() {
 std::vector<MetalParamBinding> MetalCodegen::getAllBindings() const {
     std::vector<MetalParamBinding> all;
     std::unordered_set<std::string> seen;
+    // Allocation planning only needs each named binding once.
     for (const auto& phase : phases_) {
         for (const auto& b : phase.bindings) {
             if (seen.insert(b.name).second) {

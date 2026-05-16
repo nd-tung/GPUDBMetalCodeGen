@@ -9,6 +9,7 @@
 
 namespace codegen {
 
+// Materialized GPU column metadata shared by group, sort, and collection.
 struct GenericMatColumnDesc {
     GenericMatColumnDesc() = default;
     GenericMatColumnDesc(std::string displayName,
@@ -17,22 +18,33 @@ struct GenericMatColumnDesc {
                          int stringLen = 0,
                          int scaleDown = 0,
                          bool isLongPair = false,
-                         std::string distinctDomainSymbol = {})
+                         std::string distinctDomainSymbol = {},
+                         bool stringRowRef = false,
+                         std::string stringSourceTable = {},
+                         std::string stringSourceColumn = {})
         : displayName(std::move(displayName)),
           bufferName(std::move(bufferName)),
           metalType(std::move(metalType)),
           stringLen(stringLen),
           scaleDown(scaleDown),
           isLongPair(isLongPair),
-          distinctDomainSymbol(std::move(distinctDomainSymbol)) {}
+          distinctDomainSymbol(std::move(distinctDomainSymbol)),
+          stringRowRef(stringRowRef),
+          stringSourceTable(std::move(stringSourceTable)),
+          stringSourceColumn(std::move(stringSourceColumn)) {}
 
     std::string displayName;
     std::string bufferName;
     std::string metalType;
+    // stringLen > 0 marks fixed-width char data.
     int stringLen = 0;
     int scaleDown = 0;
     bool isLongPair = false;
     std::string distinctDomainSymbol;
+    // stringRowRef stores source row ids instead of copied bytes.
+    bool stringRowRef = false;
+    std::string stringSourceTable;
+    std::string stringSourceColumn;
 };
 
 struct GenericSortSpec {
@@ -63,8 +75,10 @@ struct GenericGpuGroupSpec {
     std::string tag;
     std::string inputCounter;
     std::string inputRowsSymbol;
+    // capacityExpr sizes hash storage; maxOutputRowsExpr sizes output.
     std::string capacityExpr;
     std::string capacitySymbol;
+    std::string maxOutputRowsExpr;
     std::string outputCounter;
     std::vector<GenericMatColumnDesc> inputColumns;
     GenericGroupSpec groupBy;
@@ -83,6 +97,7 @@ struct KeyedCompactKeySpec {
 struct KeyedCompactAggSpec {
     std::string displayName;
     int offset = 0;
+    // Result collection uses these flags to reconstruct aggregate values.
     bool isLongPair = false;
     int scaleDown = 0;
     bool isFloatSum = false;
@@ -101,6 +116,7 @@ void attachMaterializedCountHook(MetalQueryPlan::Phase& phase,
                                  std::string counterName,
                                  std::string symbolName);
 
+// Appends build, aggregate, optional HAVING, and materialize phases.
 void appendGenericGpuGroupBy(MetalQueryPlan& plan,
                              const GenericGpuGroupSpec& spec);
 
@@ -120,5 +136,29 @@ bool appendGenericGpuSort(MetalQueryPlan& plan,
                           const std::vector<GenericMatColumnDesc>& columns,
                           const GenericSortSpec& sortSpec,
                           std::string* error);
+
+bool appendGenericGpuSmallSort(MetalQueryPlan& plan,
+                               const std::string& tag,
+                               const std::string& nRowsSymbol,
+                               int maxRows,
+                               const std::vector<GenericMatColumnDesc>& columns,
+                               const GenericSortSpec& sortSpec,
+                               std::string* error);
+
+bool appendGenericGpuTopK(MetalQueryPlan& plan,
+                          const std::string& tag,
+                          const std::string& nRowsSymbol,
+                          const std::string& capacityExpr,
+                          const std::vector<GenericMatColumnDesc>& columns,
+                          const GenericSortSpec& sortSpec,
+                          std::string* error);
+
+bool appendGenericGpuTopKSelection(MetalQueryPlan& plan,
+                                   const std::string& tag,
+                                   const std::string& nRowsSymbol,
+                                   const std::string& capacityExpr,
+                                   const std::vector<GenericMatColumnDesc>& columns,
+                                   const GenericSortSpec& sortSpec,
+                                   std::string* error);
 
 } // namespace codegen

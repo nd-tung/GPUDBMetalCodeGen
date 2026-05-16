@@ -8,25 +8,23 @@
 
 namespace codegen {
 
-class SchemaProvider;  // fwd
-class Catalog;          // fwd
+class SchemaProvider;
+class Catalog;
 
-// ===================================================================
-// ANALYZED QUERY — Extracted from SQL AST
-// ===================================================================
+// --- Analyzed Query ---
 
 struct JoinClause {
     std::string leftTable, rightTable;
     std::string leftCol, rightCol;
-    bool anti = false;       // true for NOT EXISTS → anti-semi-join
-    bool leftOuter = false;  // true for LEFT OUTER JOIN
-    bool semi = false;       // true for EXISTS → semi-join (inner table = child)
-    std::string innerTable;  // for semi joins: the EXISTS inner table
+    bool anti = false;       // NOT EXISTS anti-semi join.
+    bool leftOuter = false;  // LEFT OUTER JOIN.
+    bool semi = false;       // EXISTS semi join.
+    std::string innerTable;  // EXISTS/NOT EXISTS inner table.
 };
 
 struct AggTarget {
     AggFunc func;
-    ExprPtr innerExpr;  // the expression inside the aggregate
+    ExprPtr innerExpr;  // Aggregate input expression.
     std::string alias;
     bool isStar = false; // COUNT(*)
 };
@@ -39,7 +37,7 @@ struct SelectTarget {
 };
 
 struct FromSubqueryAggInfo {
-    std::string alias;  // FROM-subquery alias
+    std::string alias;  // FROM-subquery alias.
     std::vector<std::string> tables;
     std::vector<std::string> tableAliases;
     std::vector<JoinClause> joins;
@@ -58,33 +56,28 @@ struct AnalyzedQuery {
     std::vector<std::string> tables;
     std::vector<std::string> tableAliases;
 
-    // JOIN conditions (equi-joins extracted from WHERE or explicit JOIN ON)
+    // Equi-joins extracted from WHERE or explicit JOIN ON.
     std::vector<JoinClause> joins;
 
-    // WHERE predicates (non-join predicates, per-table filters)
+    // Non-join WHERE predicates.
     std::vector<PredPtr> filters;
 
-    // Per-instance filters keyed by alias (e.g. l3-specific filters from
-    // NOT EXISTS subquery — should NOT apply to other instances of same base table).
+    // Alias-scoped filters for duplicate table instances.
     std::map<std::string, std::vector<PredPtr>> instanceFilters;
 
-    // IN subquery with GROUP BY + HAVING (e.g. Q18): aggregate metadata
-    // so the builder creates an AtomicAgg build phase instead of a plain bitmap.
+    // IN subqueries with GROUP BY/HAVING need aggregate build metadata.
     struct InSubqueryAggInfo {
-        std::string alias;        // table alias (e.g. "lineitem" duplicate)
-        std::string baseTable;    // base table name
-        int tableIndex = -1;      // index in aq.tables (to identify the dup)
-        std::string groupCol;     // GROUP BY column
-        std::string aggFunc;      // "SUM", "COUNT", "AVG"
-        std::string aggExpr;      // expression inside aggregate (e.g. "l_quantity")
-        PredPtr havingPred;       // HAVING predicate (e.g. SUM > 300)
+        std::string alias;        // Duplicate table alias.
+        std::string baseTable;    // Base table name.
+        int tableIndex = -1;      // Index in tables.
+        std::string groupCol;     // GROUP BY column.
+        std::string aggFunc;      // SUM, COUNT, AVG, MIN, or MAX.
+        std::string aggExpr;      // Aggregate input column.
+        PredPtr havingPred;       // HAVING predicate.
     };
     std::vector<InSubqueryAggInfo> inSubAggs;
 
-    // Grouped FROM-clause subqueries retain their aggregation boundary here.
-    // The legacy flattened maps below are still used for simple FROM views,
-    // but grouped subqueries need this metadata so the generic planner does
-    // not treat an inner aggregate as a carried raw column.
+    // Grouped FROM subqueries keep their aggregate boundary here.
     std::vector<FromSubqueryAggInfo> fromSubqueryAggs;
 
     // SELECT target list
@@ -106,24 +99,24 @@ struct AnalyzedQuery {
     struct Subquery {
         enum Type { IN_SUBQUERY, EXISTS_SUBQUERY, NOT_EXISTS_SUBQUERY, SCALAR_SUBQUERY };
         Type type;
-        std::string sql; // raw SQL for re-parsing
-        ExprPtr outerExpr; // for IN: the outer expression being tested
-        AnalyzedQuery* analyzed = nullptr; // filled later
+        std::string sql; // Raw SQL or serialized AST for re-analysis.
+        ExprPtr outerExpr; // IN subquery test expression.
+        AnalyzedQuery* analyzed = nullptr; // Filled by later planning.
     };
     std::vector<Subquery> subqueries;
 
-    // Schema provider (injected — defaults to TPCHSchemaProvider).
+    // Schema provider selected for this analysis.
     const SchemaProvider* schema = nullptr;
 
-    // Catalog built from the schema provider (provides table/column metadata).
+    // Catalog derived from the schema provider.
     const Catalog* catalog = nullptr;
 
-    // FROM-clause subquery column aliases → source column (for simple col refs).
+    // FROM-subquery column aliases -> source column.
     std::unordered_map<std::string, ColRef> subqueryColMap;
-    // FROM-clause subquery column aliases → source expression (for computed cols).
+    // FROM-subquery column aliases -> source expression.
     std::unordered_map<std::string, ExprPtr> subqueryExprMap;
 
-    // Table alias → real table name mapping (e.g. "n1" → "nation").
+    // Table alias -> base table name.
     std::unordered_map<std::string, std::string> aliasMap;
 
     // Helpers
@@ -135,17 +128,13 @@ struct AnalyzedQuery {
     bool hasGroupBy() const { return !groupBy.empty(); }
 };
 
-// ===================================================================
-// PUBLIC API
-// ===================================================================
+// --- Public API ---
 
-// Parse a SQL string and extract structural information.
-// Returns an AnalyzedQuery, or throws std::runtime_error on parse failure.
-// `schema` selects the schema provider; defaults to TPCHSchemaProvider.
+// Parse SQL into planner-facing structure; throws std::runtime_error on failure.
 AnalyzedQuery analyzeSQL(const std::string& sql,
                          const SchemaProvider* schema = nullptr);
 
-// Default schema provider used when no schema is specified.
+// Default schema provider for callers that do not inject one.
 extern SchemaProvider& defaultSchemaProvider();
 
 } // namespace codegen

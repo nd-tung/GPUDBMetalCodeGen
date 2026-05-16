@@ -8,11 +8,7 @@
 
 namespace codegen {
 
-// Builds a logical, GPU-neutral relational IR from the analyzer output.
-//
-// Phase 1 uses this as compile-only infrastructure. The existing generic
-// Metal builder remains the execution path until individual routes are
-// migrated to IR lowering.
+// Builds the GPU-neutral relational IR used by generic lowering routes.
 std::optional<GenericRelPlan> buildGenericRelationalIR(const AnalyzedQuery& aq,
                                                        std::string* error = nullptr);
 

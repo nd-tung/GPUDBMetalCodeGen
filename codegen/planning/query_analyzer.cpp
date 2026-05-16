@@ -19,44 +19,37 @@ using json = nlohmann::json;
 
 namespace codegen {
 
-// ===================================================================
-// INTERNAL HELPERS
-// ===================================================================
+// --- Internal Helpers ---
 
 namespace {
 
-// File-scope alias map: alias -> real table name (e.g. "l1" -> "lineitem")
+// Alias -> base table name for the active analysis.
 std::unordered_map<std::string, std::string> g_aliasMap;
 
-// Default schema provider (TPC-H).
+// Default schema provider for ad-hoc analysis.
 static TPCHSchemaProvider g_defaultSchema;
 
-// Subquery column alias → source ColRef.  Populated when a RangeSubselect's
-// targetList aliases a column reference (e.g. "n2.n_name AS nation").
+// FROM-subquery column aliases -> source columns.
 std::unordered_map<std::string, ColRef> g_subqueryAliasMap;
-// Subquery column alias → source expression (for non-column expressions).
+// FROM-subquery column aliases -> source expressions.
 std::unordered_map<std::string, ExprPtr> g_subqueryExprMap;
 
-// File-scope: view definitions inlined during analysis.
+// View definitions available for inlining during analysis.
 std::map<std::string, std::pair<json, std::vector<std::string>>> g_views;
 
-// Schema provider injected by analyzeSQL(); used by AST walkers for column
-// resolution instead of hard-coded TPCHSchema::instance().
+// Active schema/catalog used by AST walkers.
 static const SchemaProvider* g_analyzeSchema = nullptr;
 static const Catalog* g_analyzeCatalog = nullptr;
 
-// Resolve an unqualified column name to (table, column).
-// If multiple tables have the column, we need the table list to disambiguate.
-// Returns ("", colName) if not found in any table (could be a SELECT alias).
+// Resolve an unqualified column; unknown names may be SELECT aliases.
 std::pair<std::string, std::string> resolveColumn(const std::string& colName,
                                                     const std::vector<std::string>& tables) {
-    // Use the Catalog when available (resolves qualified+unqualified).
+    // Prefer Catalog metadata when it is populated.
     if (g_analyzeCatalog) {
         for (auto& t : tables) {
             if (g_analyzeCatalog->hasColumn(t, colName)) return {t, colName};
         }
-        // Catalog may be empty (fromSchemaProvider builds no columns);
-        // fall back to SchemaProvider for column existence checks.
+        // Some Catalog instances only carry schema identity; use SchemaProvider columns.
         if (g_analyzeSchema) {
             for (auto& t : tables) {
                 if (g_analyzeSchema->hasColumn(t, colName)) return {t, colName};
@@ -64,7 +57,7 @@ std::pair<std::string, std::string> resolveColumn(const std::string& colName,
         }
         return {"", colName};
     }
-    // Fallback: SchemaProvider
+    // SchemaProvider-only path.
     for (auto& t : tables) {
         if (g_analyzeSchema && g_analyzeSchema->hasColumn(t, colName)) return {t, colName};
     }
@@ -89,10 +82,9 @@ bool isInlinedSubqueryPlaceholder(const PredPtr& pred) {
 
 } // anonymous namespace
 
-// File-scope: scalar subqueries encountered during walkExpr.
-// After analysis, these are moved into aq.subqueries.
+// Scalar subqueries collected by walkExpr and transferred to AnalyzedQuery.
 struct ScalarSubqueryInfo {
-    std::string sql; // JSON dump of subselect
+    std::string sql; // Serialized subselect AST.
 };
 static std::vector<ScalarSubqueryInfo> g_scalarSubqueries;
 
@@ -101,9 +93,8 @@ SchemaProvider& defaultSchemaProvider() {
     return s;
 }
 
-// Parse a date string like "1994-01-01" to YYYYMMDD integer
+// Parse YYYY-MM-DD into YYYYMMDD.
 int parseDateLiteral(const std::string& s) {
-    // Expecting YYYY-MM-DD
     if (s.size() >= 10 && s[4] == '-' && s[7] == '-') {
         int y = std::stoi(s.substr(0, 4));
         int m = std::stoi(s.substr(5, 2));
@@ -113,9 +104,7 @@ int parseDateLiteral(const std::string& s) {
     throw std::runtime_error("Invalid date literal: " + s);
 }
 
-// ===================================================================
-// AST WALKING
-// ===================================================================
+// --- AST Walking ---
 
 // Forward declarations
 ExprPtr walkExpr(const json& node, const std::vector<std::string>& tables);
@@ -143,7 +132,7 @@ ExprPtr walkColumnRef(const json& node, const std::vector<std::string>& tables) 
         }
     }
 
-    // Fallback: SchemaProvider-based resolution (no Catalog loaded).
+    // SchemaProvider path when Catalog resolution cannot identify the table.
     if (resolvedTable.empty() && !tblQualifier.empty()) {
         auto ait = g_aliasMap.find(tblQualifier);
         resolvedTable = (ait != g_aliasMap.end()) ? ait->second : tblQualifier;
@@ -153,16 +142,16 @@ ExprPtr walkColumnRef(const json& node, const std::vector<std::string>& tables) 
     }
 
     if (resolvedTable.empty()) {
-        // Check subquery column aliases (FROM-clause subquery SELECT list).
+        // FROM-subquery SELECT-list aliases.
         auto sqit = g_subqueryAliasMap.find(colName);
         if (sqit != g_subqueryAliasMap.end())
             return Expr::col(sqit->second.table, sqit->second.column,
                              sqit->second.colIndex, sqit->second.dataType,
                              sqit->second.fixedWidth, sqit->second.tableAlias);
-        // Check subquery expression aliases for WHERE/HAVING contexts.
+        // Computed aliases visible to WHERE/HAVING.
         auto eqit = g_subqueryExprMap.find(colName);
         if (eqit != g_subqueryExprMap.end()) return eqit->second;
-        // Unresolvable — SELECT alias or derived column
+        // Preserve unresolved SELECT aliases and derived columns.
         return Expr::col("", colName, -1, DataType::INT);
     }
 
@@ -175,7 +164,7 @@ ExprPtr walkColumnRef(const json& node, const std::vector<std::string>& tables) 
         fw = g_analyzeSchema->columnFixedWidth(resolvedTable, colName);
     std::string alias;
     if (!tblQualifier.empty() && g_aliasMap.find(tblQualifier) != g_aliasMap.end())
-        alias = tblQualifier; // e.g. "n1" → stored for join disambiguation
+        alias = tblQualifier; // Keep alias for self-join disambiguation.
     return Expr::col(resolvedTable, colName, -1, dt, fw, alias);
 }
 
@@ -213,7 +202,7 @@ ExprPtr walkTypeCast(const json& node, const std::vector<std::string>& tables) {
     }
 
     auto arg = walkExpr(node["arg"], tables);
-    // DATE cast: convert string literal to integer
+    // DATE casts normalize string literals to YYYYMMDD.
     if (typStr == "date") {
         if (auto* lit = std::get_if<Literal>(&arg->node)) {
             if (auto* sv = std::get_if<std::string>(&lit->value)) {
@@ -221,9 +210,7 @@ ExprPtr walkTypeCast(const json& node, const std::vector<std::string>& tables) {
             }
         }
     }
-    // INTERVAL cast: return raw integer value (NOT scaled to YYYYMMDD offset).
-    // The unit (YEAR/MONTH/DAY) is resolved at the point of use in walkAExpr
-    // by re-inspecting the AST node's typmods.
+    // INTERVAL casts keep the raw value; walkAExpr reads typmods for the unit.
     if (typStr == "interval") {
         int intervalValue = 0;
         if (auto* lit = std::get_if<Literal>(&arg->node)) {
@@ -234,10 +221,10 @@ ExprPtr walkTypeCast(const json& node, const std::vector<std::string>& tables) {
         }
         return Expr::lit(intervalValue);
     }
-    return arg; // For other casts, pass through
+    return arg;
 }
 
-// Helper: proper date arithmetic in YYYYMMDD format for DAY intervals
+// Apply day offsets while preserving YYYYMMDD encoding.
 static int computeDateArithDays(int yyyymmdd, int days, bool isAdd) {
     int dir = isAdd ? 1 : -1;
     int y = yyyymmdd / 10000;
@@ -266,10 +253,9 @@ static int computeDateArithDays(int yyyymmdd, int days, bool isAdd) {
     return y * 10000 + m * 100 + d;
 }
 
-// Interval unit enum
 enum class IntervalUnit { UNKNOWN, YEAR, MONTH, DAY };
 
-// Extract interval unit from a TypeCast AST node's typmods
+// Extract interval unit from TypeCast typmods.
 static IntervalUnit extractIntervalUnit(const json& typeCastNode) {
     if (!typeCastNode.contains("typeName")) return IntervalUnit::UNKNOWN;
     auto& tn = typeCastNode["typeName"];
@@ -291,15 +277,14 @@ static IntervalUnit extractIntervalUnit(const json& typeCastNode) {
                 typmods = tm["A_Const"]["ival"]["ival"].get<int>();
         }
     }
-    // PostgreSQL datetime.h: YEAR=2, MONTH=1, DAY=3
-    // INTERVAL_MASK(X) = 1 << X → YEAR=4, MONTH=2, DAY=8
+    // PostgreSQL interval mask: YEAR=4, MONTH=2, DAY=8.
     if (typmods & 4) return IntervalUnit::YEAR;
     if (typmods & 2) return IntervalUnit::MONTH;
     if (typmods & 8) return IntervalUnit::DAY;
     return IntervalUnit::UNKNOWN;
 }
 
-// Compute DATE ± INTERVAL with proper unit handling (YEAR/MONTH/DAY)
+// Compute DATE +/- INTERVAL for YEAR, MONTH, and DAY units.
 static int computeDateArith(int yyyymmdd, int intervalVal, bool isAdd, IntervalUnit unit) {
     int dir = isAdd ? 1 : -1;
     int y = yyyymmdd / 10000;
@@ -362,8 +347,7 @@ ExprPtr walkAExpr(const json& node, const std::vector<std::string>& tables) {
         else if (opName == "*") exOp = ExprOp::MUL;
         else if (opName == "/") exOp = ExprOp::DIV;
         else {
-            // Comparison operators — shouldn't be called from walkExpr, but handle gracefully
-            // Return a dummy expression
+            // Comparisons belong in walkPredicate; keep expression walking tolerant.
             if (node.contains("lexpr"))
                 return walkExpr(node["lexpr"], tables);
             return Expr::lit(0);
@@ -371,7 +355,7 @@ ExprPtr walkAExpr(const json& node, const std::vector<std::string>& tables) {
         auto left = node.contains("lexpr") ? walkExpr(node["lexpr"], tables) : Expr::lit(0);
         auto right = node.contains("rexpr") ? walkExpr(node["rexpr"], tables) : Expr::lit(0);
 
-        // Pre-compute date ± interval when both sides are literals
+        // Fold DATE +/- INTERVAL when both sides are literals.
         if (exOp == ExprOp::ADD || exOp == ExprOp::SUB) {
             auto* litL = std::get_if<Literal>(&left->node);
             auto* litR = std::get_if<Literal>(&right->node);
@@ -380,8 +364,7 @@ ExprPtr walkAExpr(const json& node, const std::vector<std::string>& tables) {
                 auto* intVal  = std::get_if<int>(&litR->value);
                 if (dateVal && intVal && *dateVal > 19000101 && *dateVal < 21001231) {
                     bool isAdd = (exOp == ExprOp::ADD);
-                    // Determine interval unit from the original AST rexpr
-                    IntervalUnit unit = IntervalUnit::DAY; // default
+                    IntervalUnit unit = IntervalUnit::DAY;
                     if (node.contains("rexpr") && node["rexpr"].contains("TypeCast"))
                         unit = extractIntervalUnit(node["rexpr"]["TypeCast"]);
                     int result = computeDateArith(*dateVal, *intVal, isAdd, unit);
@@ -392,8 +375,7 @@ ExprPtr walkAExpr(const json& node, const std::vector<std::string>& tables) {
 
         return Expr::binary(exOp, left, right);
     }
-    // Non-arithmetic A_Expr types (LIKE, BETWEEN, IN) in expression context
-    // Return lexpr as a pass-through — the planner doesn't inspect these deeply
+    // Predicate-style expressions pass through their left expression here.
     if (node.contains("lexpr"))
         return walkExpr(node["lexpr"], tables);
     return Expr::lit(0);
@@ -416,7 +398,7 @@ ExprPtr walkExpr(const json& node, const std::vector<std::string>& tables) {
     if (node.contains("A_Expr"))
         return walkAExpr(node["A_Expr"], tables);
     if (node.contains("SubLink")) {
-        // Scalar subquery expression (EXPR_SUBLINK) — store for later evaluation
+        // Scalar subqueries are materialized later.
         auto& sl = node["SubLink"];
         std::string subType = sl.value("subLinkType", "EXISTS_SUBLINK");
         if (subType == "EXPR_SUBLINK" && sl.contains("subselect")) {
@@ -424,14 +406,11 @@ ExprPtr walkExpr(const json& node, const std::vector<std::string>& tables) {
             ScalarSubqueryInfo sq;
             sq.sql = sl["subselect"].dump();
             g_scalarSubqueries.push_back(sq);
-            return Expr::lit(INT_MIN + idx); // sentinel: negative value encodes subquery index
+            return Expr::lit(INT_MIN + idx); // Negative sentinel encodes subquery index.
         }
-        // Subquery expression — return placeholder
         return Expr::lit(0);
     }
     if (node.contains("BoolExpr")) {
-        // Boolean expression in expression context (e.g., in CASE WHEN)
-        // Return a placeholder literal
         return Expr::lit(0);
     }
     if (node.contains("CaseExpr")) {
@@ -458,9 +437,7 @@ ExprPtr walkExpr(const json& node, const std::vector<std::string>& tables) {
     return Expr::lit(0);
 }
 
-// ===================================================================
-// PREDICATE WALKING
-// ===================================================================
+// --- Predicate Walking ---
 
 CmpOp parseCmpOp(const std::string& op) {
     if (op == "=")  return CmpOp::EQ;
@@ -520,13 +497,12 @@ PredPtr walkAExprPred(const json& node, const std::vector<std::string>& tables) 
         return Predicate::like(expr, pat, negated);
     }
     if (kind == "AEXPR_NOT_DISTINCT") {
-        // Treat as equality
         auto left = walkExpr(node["lexpr"], tables);
         auto right = walkExpr(node["rexpr"], tables);
         return Predicate::cmp(CmpOp::EQ, left, right);
     }
 
-    // Fallback: treat as comparison
+    // Unknown predicate expression kinds are treated as equality.
     auto left = node.contains("lexpr") ? walkExpr(node["lexpr"], tables) : Expr::lit(0);
     auto right = node.contains("rexpr") ? walkExpr(node["rexpr"], tables) : Expr::lit(0);
     return Predicate::cmp(CmpOp::EQ, left, right);
@@ -564,16 +540,14 @@ PredPtr walkPredicate(const json& node, const std::vector<std::string>& tables) 
         return Predicate::cmp(CmpOp::EQ, expr, Expr::lit(0)); // approximate
     }
     if (node.contains("SubLink")) {
-        // EXISTS / NOT EXISTS / IN subquery — store subquery SQL for later inlining
+        // Subquery predicates are expanded into joins after WHERE extraction.
         auto& sl = node["SubLink"];
         std::string subType = sl.value("subLinkType", "EXISTS_SUBLINK");
         bool isExists = (subType == "EXISTS_SUBLINK");
         if (isExists || subType == "ALL_SUBLINK" || subType == "ANY_SUBLINK") {
-            // Extract subquery SQL from the SubLink's subselect field
             std::string subSql;
             if (sl.contains("subselect")) {
-                // Reconstruct SQL from the subquery's AST. For simplicity,
-                // store the raw subselect JSON so it can be re-analyzed later.
+                // The inliner reads the AST directly from this SubLink node.
             }
             if (isExists) {
                 auto p = std::make_shared<Predicate>();
@@ -583,7 +557,7 @@ PredPtr walkPredicate(const json& node, const std::vector<std::string>& tables) 
             if (subType == "ALL_SUBLINK" || subType == "ANY_SUBLINK") {
                 if (sl.contains("testexpr")) {
                     auto expr = walkExpr(sl["testexpr"], tables);
-                    return Predicate::inList(expr, {}); // placeholder
+                    return Predicate::inList(expr, {}); // Marker for expanded ANY_SUBLINK.
                 }
             }
         }
@@ -594,22 +568,20 @@ PredPtr walkPredicate(const json& node, const std::vector<std::string>& tables) 
     throw std::runtime_error("Unknown predicate node: " + node.dump().substr(0, 100));
 }
 
-// ===================================================================
-// EXTRACT TABLES FROM FROM CLAUSE
-// ===================================================================
+// --- FROM Clause Extraction ---
 
 void extractTables(const json& fromItem, std::vector<std::string>& tables,
                    std::vector<std::string>& aliases) {
     if (fromItem.contains("RangeVar")) {
         auto& rv = fromItem["RangeVar"];
         std::string name = rv["relname"].get<std::string>();
-        // Inline CREATE VIEW definitions: extract view's FROM tables.
+        // Inline CREATE VIEW definitions by exposing their base tables.
         auto vit = g_views.find(name);
         if (vit != g_views.end()) {
             auto& [viewBody, viewCols] = vit->second;
             if (viewBody.contains("fromClause")) {
                 for (auto& item : viewBody["fromClause"]) {
-                    // Only add tables not already present (dedup for scalar subqueries).
+                    // Keep scalar subquery view expansion from duplicating base tables.
                     std::vector<std::string> newTables, newAliases;
                     extractTables(item, newTables, newAliases);
                     for (size_t ni = 0; ni < newTables.size(); ++ni) {
@@ -667,11 +639,9 @@ void extractTables(const json& fromItem, std::vector<std::string>& tables,
     }
 }
 
-// ===================================================================
-// EXTRACT JOIN CONDITIONS FROM WHERE
-// ===================================================================
+// --- Join Extraction ---
 
-// Check if a predicate is a join condition (column = column across different tables)
+// Column equality predicates become join clauses.
 bool isJoinCondition(const PredPtr& pred, JoinClause& jc) {
     auto* cmp = std::get_if<Comparison>(&pred->node);
     if (!cmp || cmp->op != CmpOp::EQ) return false;
@@ -679,8 +649,7 @@ bool isJoinCondition(const PredPtr& pred, JoinClause& jc) {
     auto* leftCol = std::get_if<ColRef>(&cmp->left->node);
     auto* rightCol = std::get_if<ColRef>(&cmp->right->node);
     if (!leftCol || !rightCol) return false;
-    // Self-joins are valid (e.g. l1.l_orderkey = l2.l_orderkey in EXISTS subqueries).
-    // The multi-table builder disambiguates via the visited-node BFS.
+    // Self-joins rely on aliases for instance disambiguation.
 
     jc.leftTable = leftCol->tableAlias.empty() ? leftCol->table : leftCol->tableAlias;
     jc.leftCol = leftCol->column;
@@ -689,7 +658,7 @@ bool isJoinCondition(const PredPtr& pred, JoinClause& jc) {
     return true;
 }
 
-// Flatten AND predicates and separate join conditions from filters
+// Flatten AND predicates and split joins from filters.
 void separatePredicates(const PredPtr& pred, const std::vector<std::string>& tables,
                         std::vector<JoinClause>& joins, std::vector<PredPtr>& filters) {
     if (auto* la = std::get_if<LogicalAnd>(&pred->node)) {
@@ -698,16 +667,15 @@ void separatePredicates(const PredPtr& pred, const std::vector<std::string>& tab
         return;
     }
     if (auto* lo = std::get_if<LogicalOr>(&pred->node)) {
-        // OR branches: extract join conditions that appear in ALL branches
-        // (e.g. Q19: all branches have p_partkey = l_partkey).
+        // Only joins present in every OR branch can be hoisted.
         std::vector<JoinClause> commonJoins;
-        std::vector<PredPtr> strippedBranches; // branches with joins removed
+        std::vector<PredPtr> strippedBranches;
         bool first = true;
         for (auto& child : lo->children) {
             std::vector<JoinClause> branchJoins;
             std::vector<PredPtr> branchFilters;
             separatePredicates(child, tables, branchJoins, branchFilters);
-            // Reconstruct branch without extracted joins.
+            // Rebuild each branch after removing hoisted joins.
             if (!branchFilters.empty()) {
                 if (branchFilters.size() == 1)
                     strippedBranches.push_back(branchFilters[0]);
@@ -746,9 +714,7 @@ void separatePredicates(const PredPtr& pred, const std::vector<std::string>& tab
         filters.push_back(pred);
 }
 
-// ===================================================================
-// EXTRACT TARGET LIST
-// ===================================================================
+// --- Target Extraction ---
 
 AggFunc parseAggFunc(const std::string& name) {
     if (name == "sum")   return AggFunc::SUM;
@@ -759,7 +725,7 @@ AggFunc parseAggFunc(const std::string& name) {
     throw std::runtime_error("Unknown aggregate: " + name);
 }
 
-// Check if a JSON value node contains aggregate functions (recursive).
+// Recursively detect aggregate functions in a target expression.
 static bool containsAggregateJson(const json& node) {
     if (node.contains("FuncCall")) {
         auto& fc = node["FuncCall"];
@@ -809,9 +775,7 @@ SelectTarget extractTarget(const json& resTarget, const std::vector<std::string>
         return "";
     };
     if (st.alias.empty()) {
-        // Preserve the SQL-visible name of a direct SELECT column before
-        // resolution rewrites FROM-subquery aliases to their source
-        // expressions (e.g. `supp_nation` -> `n1.n_name`).
+        // Preserve display names before subquery aliases are resolved.
         st.alias = sqlVisibleColumnName(val);
     }
     if (val.contains("FuncCall")) {
@@ -823,7 +787,7 @@ SelectTarget extractTarget(const json& resTarget, const std::vector<std::string>
                     funcName = n["String"]["sval"].get<std::string>();
         std::transform(funcName.begin(), funcName.end(), funcName.begin(), ::tolower);
 
-        // Check if it's an aggregate function
+        // Top-level aggregate target.
         if (funcName == "sum" || funcName == "count" || funcName == "avg" ||
             funcName == "min" || funcName == "max") {
             st.isAgg = true;
@@ -844,15 +808,14 @@ SelectTarget extractTarget(const json& resTarget, const std::vector<std::string>
             st.expr = walkExpr(val, tables);
         }
     } else {
-        // A_Expr or other non-FuncCall top-level — check for nested aggregates
+        // Non-FuncCall targets may still contain nested aggregates.
         st.expr = walkExpr(val, tables);
         if (containsAggregateJson(val)) {
             st.isAgg = true;
             AggTarget at;
             at.alias = st.alias;
             at.isStar = false;
-            // Try to extract the inner expression from a simple FuncCall aggregate
-            // (e.g. SUM(x)/7.0 → innerExpr = x, func = SUM)
+            // Extract the first aggregate call inside a computed target.
             std::function<bool(const ExprPtr&)> tryExtract;
             tryExtract = [&](const ExprPtr& e) -> bool {
                 if (!e) return false;
@@ -878,9 +841,7 @@ SelectTarget extractTarget(const json& resTarget, const std::vector<std::string>
     return st;
 }
 
-// ===================================================================
-// EXTRACT JOIN CONDITIONS FROM EXPLICIT JOIN ON
-// ===================================================================
+// --- Explicit JOIN ON Extraction ---
 
 void extractJoinOns(const json& fromItem, const std::vector<std::string>& tables,
                     std::vector<JoinClause>& joins, std::vector<PredPtr>& filters) {
@@ -901,7 +862,7 @@ void extractJoinOns(const json& fromItem, const std::vector<std::string>& tables
             auto pred = walkPredicate(je["quals"], tables);
             separatePredicates(pred, tables, joins, filters);
         }
-        // Detect LEFT OUTER JOIN: mark newly added join clauses.
+        // Mark join clauses produced by LEFT OUTER JOIN.
         if (je.contains("jointype")) {
             try {
                 bool isLeftJoin = false;
@@ -1014,9 +975,7 @@ void collectReferencedViews(const json& fromItem, std::set<std::string>& views) 
     }
 }
 
-// ===================================================================
-// PUBLIC: analyzeSQL
-// ===================================================================
+// --- Public Analysis Entry Point ---
 
 AnalyzedQuery analyzeSQL(const std::string& sql, const SchemaProvider* schema) {
     PgQueryParseResult result = pg_query_parse(sql.c_str());
@@ -1039,7 +998,7 @@ AnalyzedQuery analyzeSQL(const std::string& sql, const SchemaProvider* schema) {
     aq.schema = schema ? schema : &g_defaultSchema;
     g_analyzeSchema = aq.schema;
 
-    // Build a catalog from the schema provider (cached per schema).
+    // Reuse Catalog metadata for repeated calls with the same schema.
     static const SchemaProvider* s_catFor = nullptr;
     static Catalog s_catalog;
     if (s_catFor != aq.schema) {
@@ -1055,9 +1014,7 @@ AnalyzedQuery analyzeSQL(const std::string& sql, const SchemaProvider* schema) {
     g_views.clear();
     g_scalarSubqueries.clear();
 
-    // Navigate to the SelectStmt.  Handle CREATE VIEW statements by
-    // inlining the view definition into the main query's FROM clause.
-    // Find the last SelectStmt; also collect ViewStmt definitions.
+    // Collect view definitions and use the last SELECT as the main query.
     json* selPtr = nullptr;
     struct ViewDef { std::string name; json selectBody; std::vector<std::string> cols; };
     std::vector<ViewDef> views;
@@ -1088,23 +1045,20 @@ AnalyzedQuery analyzeSQL(const std::string& sql, const SchemaProvider* schema) {
         throw std::runtime_error("Expected SELECT statement");
     auto& sel = *selPtr;
 
-    // 1. Extract tables from FROM clause
+    // Extract FROM tables and explicit JOIN ON predicates.
     if (sel.contains("fromClause")) {
         for (auto& item : sel["fromClause"])
             extractTables(item, aq.tables, aq.tableAliases);
-        // Build alias -> real table name map
+        // Build alias -> base table map.
         g_aliasMap.clear();
         for (size_t i = 0; i < aq.tables.size(); ++i) {
             if (i < aq.tableAliases.size() && aq.tableAliases[i] != aq.tables[i])
                 g_aliasMap[aq.tableAliases[i]] = aq.tables[i];
         }
-        // Extract explicit JOIN ON conditions
         for (auto& item : sel["fromClause"])
             extractJoinOns(item, aq.tables, aq.joins, aq.filters);
 
-        // Extract WHERE conditions from RangeSubselect subqueries
-        // (e.g. Q8/Q9/Q13/Q19 — FROM-clause subqueries whose join
-        //  conditions and filters reside in the inner WHERE clause).
+        // Pull filters and aliases out of FROM-subqueries.
         std::function<void(const json&)> extractSubWhere = [&](const json& fromItem) {
             if (fromItem.contains("RangeSubselect")) {
                 auto& rs = fromItem["RangeSubselect"];
@@ -1116,8 +1070,7 @@ AnalyzedQuery analyzeSQL(const std::string& sql, const SchemaProvider* schema) {
                         auto pred = walkPredicate(sub["whereClause"], aq.tables);
                         separatePredicates(pred, aq.tables, aq.joins, aq.filters);
                     }
-                    // Extract subquery column aliases for outer-query resolution.
-                    // e.g. "n2.n_name AS nation" → g_subqueryAliasMap["nation"] = ColRef(nation, n_name)
+                    // Make FROM-subquery target aliases visible to outer clauses.
                     if (sub.contains("targetList")) {
                         for (auto& t : sub["targetList"]) {
                             if (!t.contains("ResTarget")) continue;
@@ -1132,7 +1085,6 @@ AnalyzedQuery analyzeSQL(const std::string& sql, const SchemaProvider* schema) {
                                     g_subqueryAliasMap[alias] = *cr;
                                 }
                             } else {
-                                // Non-column expression (FuncCall, BinaryExpr, etc.)
                                 auto expr = walkExpr(val, aq.tables);
                                 if (expr) g_subqueryExprMap[alias] = expr;
                             }
@@ -1161,15 +1113,13 @@ AnalyzedQuery analyzeSQL(const std::string& sql, const SchemaProvider* schema) {
         }
     }
 
-    // 1c. Process inlined view definitions: extract view's WHERE clause
-    // and map view column aliases to their source expressions.
+    // Process inlined view filters and target aliases.
     for (auto& [name, vp] : g_views) {
         auto& [viewBody, viewCols] = vp;
         if (viewBody.contains("whereClause")) {
             auto pred = walkPredicate(viewBody["whereClause"], aq.tables);
             separatePredicates(pred, aq.tables, aq.joins, aq.filters);
         }
-        // Map view column aliases to SELECT target expressions.
         if (viewBody.contains("targetList")) {
             size_t ci = 0;
             for (auto& t : viewBody["targetList"]) {
@@ -1190,16 +1140,13 @@ AnalyzedQuery analyzeSQL(const std::string& sql, const SchemaProvider* schema) {
         }
     }
 
-    // 2. Extract WHERE clause predicates
+    // Extract top-level WHERE predicates.
     if (sel.contains("whereClause")) {
         auto wherePred = walkPredicate(sel["whereClause"], aq.tables);
         separatePredicates(wherePred, aq.tables, aq.joins, aq.filters);
     }
 
-    // 2b. Inline EXISTS subqueries: extract inner tables and correlation joins.
-    // Walk the JSON AST for EXISTS_SUBLINK nodes, extract the inner query's
-    // FROM table and WHERE correlation predicate, and merge into the main query.
-    // Then remove the placeholder ExistsPred from filters.
+    // Inline EXISTS and IN subqueries into join/filter metadata.
     {
         std::function<void(const json&, bool)> inlineExists = [&](const json& node, bool negated) {
             if (node.is_object() && node.contains("SubLink")) {
@@ -1207,20 +1154,19 @@ AnalyzedQuery analyzeSQL(const std::string& sql, const SchemaProvider* schema) {
                 std::string subType = sl.value("subLinkType", "");
                 if (subType == "EXISTS_SUBLINK" && sl.contains("subselect")) {
                     auto& sub = sl["subselect"]["SelectStmt"];
-                    // Track tables before adding inner tables — these come from EXISTS
+                    // Newly added tables belong to this EXISTS branch.
                     size_t tablesBefore = aq.tables.size();
                     if (sub.contains("fromClause")) {
                         for (auto& item : sub["fromClause"]) {
                             extractTables(item, aq.tables, aq.tableAliases);
                         }
-                        // Rebuild alias map so column refs in the inner WHERE
-                        // can resolve qualified names (e.g. l2.l_orderkey).
+                        // Inner WHERE resolution needs the updated alias map.
                         g_aliasMap.clear();
                         for (size_t i = 0; i < aq.tables.size() && i < aq.tableAliases.size(); ++i) {
                             g_aliasMap[aq.tableAliases[i]] = aq.tables[i];
                         }
                     }
-                    // Track which tables are the EXISTS inner tables
+                    // Identify inner tables so generated joins can be marked.
                     std::set<std::string> existsTables;
                     for (size_t ti = tablesBefore; ti < aq.tables.size(); ++ti) {
                         existsTables.insert(aq.tables[ti]);
@@ -1228,16 +1174,12 @@ AnalyzedQuery analyzeSQL(const std::string& sql, const SchemaProvider* schema) {
                             existsTables.insert(aq.tableAliases[ti]);
                     }
                     if (sub.contains("whereClause")) {
-                        // Record join count before adding: new joins from NOT EXISTS
-                        // are anti-joins; EXISTS joins are semi-joins.
+                        // Only joins added by this branch get EXISTS semantics.
                         size_t joinCountBefore = aq.joins.size();
                         size_t filterCountBefore = aq.filters.size();
                         auto innerPred = walkPredicate(sub["whereClause"], aq.tables);
                         separatePredicates(innerPred, aq.tables, aq.joins, aq.filters);
-                        // Move single-table inner filters to instance-specific storage
-                        // so they don't leak to other instances of the same base table.
-                        // Only move if the predicate doesn't cross instance boundaries
-                        // (e.g. l3.l_suppkey <> l1.l_suppkey stays in aq.filters).
+                        // Keep single-table inner filters scoped to the new alias.
                         for (size_t ti = tablesBefore; ti < aq.tables.size(); ++ti) {
                             const std::string& alias = (ti < aq.tableAliases.size()) ? aq.tableAliases[ti] : aq.tables[ti];
                             const std::string& innerTable = aq.tables[ti];
@@ -1245,7 +1187,6 @@ AnalyzedQuery analyzeSQL(const std::string& sql, const SchemaProvider* schema) {
                                 std::map<std::string, std::string> colToTable;
                                 collectColumnTables(aq.filters[fi], colToTable);
                                 if (colToTable.size() == 1 && colToTable.begin()->second == innerTable) {
-                                    // Check for cross-instance: walk predicate for aliases
                                     std::set<std::string> filterAliases;
                                     std::function<void(const PredPtr&)> collAliases;
                                     collAliases = [&](const PredPtr& p) {
@@ -1288,10 +1229,8 @@ AnalyzedQuery analyzeSQL(const std::string& sql, const SchemaProvider* schema) {
                                     aq.joins[j].innerTable = aq.joins[j].rightTable;
                             }
                         } else {
-                            // EXISTS: mark new joins as semi-joins
                             for (size_t j = joinCountBefore; j < aq.joins.size(); ++j) {
                                 aq.joins[j].semi = true;
-                                // Set innerTable to the EXISTS inner table
                                 if (existsTables.count(aq.joins[j].leftTable))
                                     aq.joins[j].innerTable = aq.joins[j].leftTable;
                                 else if (existsTables.count(aq.joins[j].rightTable))
@@ -1300,13 +1239,11 @@ AnalyzedQuery analyzeSQL(const std::string& sql, const SchemaProvider* schema) {
                         }
                     }
                 }
-                // IN subquery (ANY_SUBLINK): o_orderkey IN (SELECT l_orderkey FROM ...)
-                // Convert to: add inner tables + WHERE + join on testexpr = inner col.
+                // Convert ANY_SUBLINK into inner tables plus a semi-join.
                 if (subType == "ANY_SUBLINK" && sl.contains("subselect") && sl.contains("testexpr")) {
                     auto& sub = sl["subselect"]["SelectStmt"];
                     size_t tablesBefore = aq.tables.size();
-                    // Extract inner FROM tables — allow duplicates since this
-                    // table instance needs its own build phase (e.g. GROUP BY).
+                    // Allow duplicate inner tables; each instance gets its own build phase.
                     if (sub.contains("fromClause")) {
                         for (auto& item : sub["fromClause"]) {
                             std::vector<std::string> newTables, newAliases;
@@ -1314,7 +1251,7 @@ AnalyzedQuery analyzeSQL(const std::string& sql, const SchemaProvider* schema) {
                             for (size_t ni = 0; ni < newTables.size(); ++ni) {
                                 aq.tables.push_back(newTables[ni]);
                                 std::string alias = ni < newAliases.size() ? newAliases[ni] : newTables[ni];
-                                // Use unique alias to distinguish from existing instance
+                                // Keep duplicate instances addressable in later phases.
                                 if (tablesBefore < aq.tables.size())
                                     alias += "_IN";
                                 aq.tableAliases.push_back(alias);
@@ -1325,10 +1262,9 @@ AnalyzedQuery analyzeSQL(const std::string& sql, const SchemaProvider* schema) {
                             g_aliasMap[aq.tableAliases[i]] = aq.tables[i];
                         }
                     }
-                    // Walk the outer test expression (column on outer query side)
                     auto testExpr = walkExpr(sl["testexpr"], aq.tables);
                     auto* testCol = testExpr ? std::get_if<ColRef>(&testExpr->node) : nullptr;
-                    // Find the first column in the inner SELECT target list
+                    // The first inner SELECT column is the semi-join key.
                     ColRef innerCol;
                     if (sub.contains("targetList")) {
                         for (auto& t : sub["targetList"]) {
@@ -1342,7 +1278,6 @@ AnalyzedQuery analyzeSQL(const std::string& sql, const SchemaProvider* schema) {
                             }
                         }
                     }
-                    // Add join: outer_col = inner_col
                     if (testCol && !innerCol.table.empty()) {
                         std::string innerJoinName = innerCol.tableAlias;
                         if (innerJoinName.empty()) {
@@ -1364,7 +1299,7 @@ AnalyzedQuery analyzeSQL(const std::string& sql, const SchemaProvider* schema) {
                         jc.innerTable = innerJoinName;
                         aq.joins.push_back(jc);
                     }
-                    // Extract inner WHERE conditions as joins/filters
+                    // Attach inner WHERE predicates to the duplicate table instance.
                     if (sub.contains("whereClause")) {
                         size_t filterCountBefore = aq.filters.size();
                         auto innerPred = walkPredicate(sub["whereClause"], aq.tables);
@@ -1409,15 +1344,13 @@ AnalyzedQuery analyzeSQL(const std::string& sql, const SchemaProvider* schema) {
                             }
                         }
                     }
-                    // Handle inner GROUP BY + HAVING (e.g. Q18)
+                    // Preserve grouped IN-subquery aggregate metadata.
                     if (sub.contains("groupClause") && sub.contains("havingClause")) {
-                        // Find the alias of the inner table added by this subquery
                         std::string innerAlias;
                         for (size_t ti = tablesBefore; ti < aq.tables.size() && ti < aq.tableAliases.size(); ++ti) {
                             if (aq.tables[ti] == innerCol.table) { innerAlias = aq.tableAliases[ti]; break; }
                         }
                         if (innerAlias.empty()) innerAlias = innerCol.table;
-                        // Extract GROUP BY column
                         std::string groupCol;
                         const auto& gb = sub["groupClause"];
                         if (gb.is_array() && !gb.empty()) {
@@ -1431,7 +1364,7 @@ AnalyzedQuery analyzeSQL(const std::string& sql, const SchemaProvider* schema) {
                                 }
                             }
                         }
-                        // Extract aggregate: find FuncCall in HAVING (e.g. SUM(l_quantity))
+                        // Find the aggregate referenced by HAVING.
                         std::string aggFunc, aggExpr;
                         PredPtr havingPred;
                         {
@@ -1456,7 +1389,6 @@ AnalyzedQuery analyzeSQL(const std::string& sql, const SchemaProvider* schema) {
                                                 }
                                             }
                                         }
-                                        // other predicate types: not relevant
                                     }, p->node);
                                 };
                                 findAgg(havingPred);
@@ -1476,7 +1408,7 @@ AnalyzedQuery analyzeSQL(const std::string& sql, const SchemaProvider* schema) {
                     }
                 }
             }
-            // Track negated context: BoolExpr(NOT_EXPR) toggles the flag.
+            // NOT flips EXISTS/IN join semantics.
             bool innerNegated = negated;
             if (node.is_object() && node.contains("BoolExpr")) {
                 auto& be = node["BoolExpr"];
@@ -1484,8 +1416,7 @@ AnalyzedQuery analyzeSQL(const std::string& sql, const SchemaProvider* schema) {
                     innerNegated = !negated;
                 }
             }
-            // Recurse into RangeSubselect inner WHERE clauses (e.g. Q22's
-            // NOT EXISTS inside a FROM-clause subquery).
+            // FROM-subquery WHERE clauses can contain nested EXISTS/IN.
             if (node.is_object() && node.contains("RangeSubselect")) {
                 auto& rs = node["RangeSubselect"];
                 if (rs.contains("subquery") && rs["subquery"].contains("SelectStmt")) {
@@ -1499,7 +1430,7 @@ AnalyzedQuery analyzeSQL(const std::string& sql, const SchemaProvider* schema) {
                         }
                     }
                 }
-                return; // Don't recurse into children twice
+                return;
             }
             if (node.is_object()) {
                 for (auto& [k, v] : node.items()) inlineExists(v, innerNegated);
@@ -1509,18 +1440,12 @@ AnalyzedQuery analyzeSQL(const std::string& sql, const SchemaProvider* schema) {
         };
         if (sel.contains("whereClause"))
             inlineExists(sel["whereClause"], false);
-        // Also inline EXISTS subqueries from FROM-clause subqueries
-        // (e.g. Q22's NOT EXISTS inside a FROM subquery).
         if (sel.contains("fromClause")) {
             for (auto& item : sel["fromClause"])
                 inlineExists(item, false);
         }
 
-        // Remove placeholder ExistsPred entries from filters (they've been inlined).
-        // Also handle NOT EXISTS: LogicalNot(ExistsPred) must be removed too since
-        // the negation will be applied as an anti-join or anti-bitmap-probe.
-        // Also remove empty InList placeholders from ANY_SUBLINK inlining.
-        // Also remove LogicalNot(InList) wrappers around empty InLists.
+        // Drop predicates that were replaced by join metadata.
         aq.filters.erase(
             std::remove_if(aq.filters.begin(), aq.filters.end(),
                 isInlinedSubqueryPlaceholder),
@@ -1533,14 +1458,13 @@ AnalyzedQuery analyzeSQL(const std::string& sql, const SchemaProvider* schema) {
         }
     }
 
-    // Rebuild alias map after inlineExists may have added new tables
-    // with aliases (e.g. Q21's l2, l3 from EXISTS subqueries).
+    // Rebuild alias map after subquery inlining adds table instances.
     for (size_t i = 0; i < aq.tables.size() && i < aq.tableAliases.size(); ++i) {
         g_aliasMap[aq.tableAliases[i]] = aq.tables[i];
     }
     aq.aliasMap = g_aliasMap;
 
-    // 3. Extract SELECT targets
+    // Extract SELECT targets.
     if (sel.contains("targetList")) {
         for (auto& t : sel["targetList"]) {
             if (t.contains("ResTarget"))
@@ -1553,11 +1477,9 @@ AnalyzedQuery analyzeSQL(const std::string& sql, const SchemaProvider* schema) {
             aq.groupBy.push_back(walkExpr(g, aq.tables));
     }
 
-    // 5. Extract HAVING
     if (sel.contains("havingClause"))
         aq.having = walkPredicate(sel["havingClause"], aq.tables);
 
-    // 6. Extract ORDER BY
     if (sel.contains("sortClause")) {
         for (auto& s : sel["sortClause"]) {
             if (s.contains("SortBy")) {
@@ -1573,20 +1495,19 @@ AnalyzedQuery analyzeSQL(const std::string& sql, const SchemaProvider* schema) {
         }
     }
 
-    // 7. Extract LIMIT
     if (sel.contains("limitCount")) {
         auto& lc = sel["limitCount"];
         if (lc.contains("A_Const") && lc["A_Const"].contains("ival"))
             aq.limit = lc["A_Const"]["ival"]["ival"].get<int>();
     }
 
-    // Copy subquery alias maps to AnalyzedQuery for builder access.
+    // Move alias maps into the analyzed query for builder access.
     aq.subqueryColMap = std::move(g_subqueryAliasMap);
     aq.subqueryExprMap = std::move(g_subqueryExprMap);
     g_subqueryAliasMap.clear();
     g_subqueryExprMap.clear();
 
-    // Recursively resolve subquery aliases in an expression tree.
+    // Resolve subquery aliases inside target expressions.
     auto resolveRecursive = [&](ExprPtr& expr, auto&& self) -> void {
         if (!expr) return;
         if (auto* cr = std::get_if<ColRef>(&expr->node)) {
@@ -1631,11 +1552,9 @@ AnalyzedQuery analyzeSQL(const std::string& sql, const SchemaProvider* schema) {
         if (!origAlias.empty() && t.alias.empty())
             t.alias = origAlias;
     }
-    // GROUP BY and ORDER BY keep their original ColRef — the subquery alias
-    // name is used for display-name matching in orderColumnForExpr and
-    // materialize column naming; the resolved expression is used in targets.
+    // GROUP BY/ORDER BY keep display aliases; targets use resolved expressions.
 
-    // Transfer scalar subqueries from file-scope to AnalyzedQuery.
+    // Transfer scalar subqueries into the analyzed query.
     for (auto& sq : g_scalarSubqueries) {
         AnalyzedQuery::Subquery aqSq;
         aqSq.type = AnalyzedQuery::Subquery::SCALAR_SUBQUERY;

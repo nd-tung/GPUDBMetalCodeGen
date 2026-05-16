@@ -12,10 +12,13 @@
 #include "metal_plan_common.h"
 
 #include <algorithm>
+#include <cctype>
 #include <iterator>
 #include <limits>
+#include <map>
 #include <memory>
 #include <optional>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -262,6 +265,426 @@ std::optional<std::vector<std::string>> finiteStringDomainForPredicate(
     }, pred->node);
 }
 
+std::string lowerAsciiLocal(std::string value) {
+    std::transform(value.begin(), value.end(), value.begin(),
+                   [](unsigned char c) { return (char)std::tolower(c); });
+    return value;
+}
+
+std::string columnKey(const GenericColumnExpr& col) {
+    return std::to_string(col.relationInstance.value) + ":" + col.column;
+}
+
+class ColumnEquivalence {
+public:
+    void add(const GenericColumnExpr& col) {
+        const std::string key = columnKey(col);
+        parent_.try_emplace(key, key);
+        if (seen_.insert(key).second) columns_.push_back(col);
+    }
+
+    void unite(const GenericColumnExpr& left, const GenericColumnExpr& right) {
+        add(left);
+        add(right);
+        const std::string a = find(columnKey(left));
+        const std::string b = find(columnKey(right));
+        if (a != b) parent_[a] = b;
+    }
+
+    bool equivalent(const GenericColumnExpr& left,
+                    const GenericColumnExpr& right) {
+        if (columnKey(left) == columnKey(right)) return true;
+        add(left);
+        add(right);
+        return find(columnKey(left)) == find(columnKey(right));
+    }
+
+    bool equivalentToRelationColumn(const GenericColumnExpr& target,
+                                    int relationInstance) {
+        add(target);
+        const size_t n = columns_.size();
+        for (size_t i = 0; i < n; ++i) {
+            const auto& col = columns_[i];
+            if (col.relationInstance.value != relationInstance) continue;
+            if (equivalent(target, col)) return true;
+        }
+        return false;
+    }
+
+private:
+    std::string find(const std::string& key) {
+        auto it = parent_.find(key);
+        if (it == parent_.end()) {
+            parent_[key] = key;
+            return key;
+        }
+        if (it->second == key) return key;
+        it->second = find(it->second);
+        return it->second;
+    }
+
+    std::map<std::string, std::string> parent_;
+    std::set<std::string> seen_;
+    std::vector<GenericColumnExpr> columns_;
+};
+
+void collectConjunctiveEqColumns(const GenericPredicatePtr& pred,
+                                 ColumnEquivalence& eq) {
+    if (!pred) return;
+    std::visit([&](const auto& node) {
+        using T = std::decay_t<decltype(node)>;
+        if constexpr (std::is_same_v<T, GenericComparisonPred>) {
+            if (node.op != CmpOp::EQ) return;
+            auto* left = node.left
+                ? std::get_if<GenericColumnExpr>(&node.left->node)
+                : nullptr;
+            auto* right = node.right
+                ? std::get_if<GenericColumnExpr>(&node.right->node)
+                : nullptr;
+            if (left && right) eq.unite(*left, *right);
+        } else if constexpr (std::is_same_v<T, GenericLogicalPred>) {
+            if (node.op != GenericLogicalPred::Op::And) return;
+            for (const auto& child : node.children)
+                collectConjunctiveEqColumns(child, eq);
+        }
+    }, pred->node);
+}
+
+ColumnEquivalence buildJoinColumnEquivalence(
+        const std::vector<const GenericRelNode*>& joins,
+        const GenericRelNode* filterNode) {
+    ColumnEquivalence eq;
+    for (const auto* joinNode : joins) {
+        auto* join = joinNode ? std::get_if<GenericJoinDetail>(&joinNode->detail) : nullptr;
+        if (!join) continue;
+        collectConjunctiveEqColumns(join->predicate, eq);
+    }
+    if (auto* filter = filterNode
+            ? std::get_if<GenericFilterDetail>(&filterNode->detail)
+            : nullptr) {
+        collectConjunctiveEqColumns(filter->predicate, eq);
+    }
+    return eq;
+}
+
+void collectExprColumns(const GenericExprPtr& expr,
+                        std::vector<GenericColumnExpr>& out) {
+    if (!expr) return;
+    std::visit([&](const auto& node) {
+        using T = std::decay_t<decltype(node)>;
+        if constexpr (std::is_same_v<T, GenericColumnExpr>) {
+            out.push_back(node);
+        } else if constexpr (std::is_same_v<T, GenericBinaryExpr>) {
+            collectExprColumns(node.left, out);
+            collectExprColumns(node.right, out);
+        } else if constexpr (std::is_same_v<T, GenericCaseExpr>) {
+            for (const auto& branch : node.branches)
+                collectExprColumns(branch.result, out);
+            collectExprColumns(node.elseResult, out);
+        } else if constexpr (std::is_same_v<T, GenericFunctionExpr>) {
+            for (const auto& arg : node.args)
+                collectExprColumns(arg, out);
+        } else if constexpr (std::is_same_v<T, GenericAggregateExpr>) {
+            collectExprColumns(node.arg, out);
+        } else if constexpr (std::is_same_v<T, GenericScalarLookupExpr>) {
+            for (const auto& key : node.keys)
+                collectExprColumns(key, out);
+        }
+    }, expr->node);
+}
+
+struct DateBounds {
+    std::optional<int64_t> minValue;
+    std::optional<int64_t> maxValue;
+};
+
+DateBounds intersectDateBounds(DateBounds left, const DateBounds& right) {
+    if (right.minValue)
+        left.minValue = left.minValue
+            ? std::max(*left.minValue, *right.minValue)
+            : right.minValue;
+    if (right.maxValue)
+        left.maxValue = left.maxValue
+            ? std::min(*left.maxValue, *right.maxValue)
+            : right.maxValue;
+    return left;
+}
+
+DateBounds unionDateBounds(DateBounds left, const DateBounds& right) {
+    if (right.minValue)
+        left.minValue = left.minValue
+            ? std::min(*left.minValue, *right.minValue)
+            : right.minValue;
+    if (right.maxValue)
+        left.maxValue = left.maxValue
+            ? std::max(*left.maxValue, *right.maxValue)
+            : right.maxValue;
+    return left;
+}
+
+std::optional<DateBounds> dateBoundsForPredicate(
+        const GenericPredicatePtr& pred,
+        const GenericExprPtr& target) {
+    if (!pred || !target) return std::nullopt;
+    return std::visit([&](const auto& node) -> std::optional<DateBounds> {
+        using T = std::decay_t<decltype(node)>;
+        if constexpr (std::is_same_v<T, GenericBetweenPred>) {
+            if (!genericExprEquivalent(node.expr, target)) return std::nullopt;
+            auto low = integerLiteralForDomain(node.low);
+            auto high = integerLiteralForDomain(node.high);
+            if (!low || !high) return std::nullopt;
+            return DateBounds{*low, *high};
+        } else if constexpr (std::is_same_v<T, GenericComparisonPred>) {
+            CmpOp op = node.op;
+            std::optional<int64_t> lit;
+            if (genericExprEquivalent(node.left, target)) {
+                lit = integerLiteralForDomain(node.right);
+            } else if (genericExprEquivalent(node.right, target)) {
+                lit = integerLiteralForDomain(node.left);
+                if (op == CmpOp::LT) op = CmpOp::GT;
+                else if (op == CmpOp::LE) op = CmpOp::GE;
+                else if (op == CmpOp::GT) op = CmpOp::LT;
+                else if (op == CmpOp::GE) op = CmpOp::LE;
+            }
+            if (!lit) return std::nullopt;
+            DateBounds out;
+            switch (op) {
+                case CmpOp::EQ:
+                    out.minValue = *lit;
+                    out.maxValue = *lit;
+                    break;
+                case CmpOp::LT:
+                    out.maxValue = *lit - 1;
+                    break;
+                case CmpOp::LE:
+                    out.maxValue = *lit;
+                    break;
+                case CmpOp::GT:
+                    out.minValue = *lit + 1;
+                    break;
+                case CmpOp::GE:
+                    out.minValue = *lit;
+                    break;
+                case CmpOp::NE:
+                    return std::nullopt;
+            }
+            return out;
+        } else if constexpr (std::is_same_v<T, GenericLogicalPred>) {
+            if (node.children.empty()) return std::nullopt;
+            if (node.op == GenericLogicalPred::Op::And) {
+                std::optional<DateBounds> out;
+                for (const auto& child : node.children) {
+                    auto childBounds = dateBoundsForPredicate(child, target);
+                    if (!childBounds) continue;
+                    out = out
+                        ? intersectDateBounds(*out, *childBounds)
+                        : *childBounds;
+                }
+                return out;
+            }
+            if (node.op == GenericLogicalPred::Op::Or) {
+                std::optional<DateBounds> out;
+                for (const auto& child : node.children) {
+                    auto childBounds = dateBoundsForPredicate(child, target);
+                    if (!childBounds) return std::nullopt;
+                    out = out
+                        ? unionDateBounds(*out, *childBounds)
+                        : *childBounds;
+                }
+                return out;
+            }
+            return std::nullopt;
+        } else {
+            return std::nullopt;
+        }
+    }, pred->node);
+}
+
+std::optional<int64_t> datePartDomainSizeForPredicate(
+        const GenericPredicatePtr& pred,
+        const GenericExprPtr& dateExpr,
+        const std::string& unit) {
+    auto bounds = dateBoundsForPredicate(pred, dateExpr);
+    if (!bounds || !bounds->minValue || !bounds->maxValue ||
+        *bounds->minValue > *bounds->maxValue) {
+        return std::nullopt;
+    }
+    if (unit == "year") {
+        int64_t minYear = *bounds->minValue / 10000;
+        int64_t maxYear = *bounds->maxValue / 10000;
+        if (maxYear >= minYear) return maxYear - minYear + 1;
+    }
+    if (unit == "month") return 12;
+    if (unit == "day") return 31;
+    return std::nullopt;
+}
+
+std::optional<int64_t> finiteGroupExprCardinality(
+        const GenericExprPtr& expr,
+        const GenericPredicatePtr& pred) {
+    if (!expr) return std::nullopt;
+    return std::visit([&](const auto& node) -> std::optional<int64_t> {
+        using T = std::decay_t<decltype(node)>;
+        if constexpr (std::is_same_v<T, GenericColumnExpr>) {
+            if (auto ints = finiteIntDomainForPredicate(pred, expr);
+                ints && !ints->empty()) {
+                return static_cast<int64_t>(ints->size());
+            }
+            if (auto strings = finiteStringDomainForPredicate(pred, expr);
+                strings && !strings->empty()) {
+                return static_cast<int64_t>(strings->size());
+            }
+            if (!node.charDomain.empty())
+                return static_cast<int64_t>(node.charDomain.size());
+            if (node.hasGroupDomain && node.domainMax >= node.domainMin) {
+                int64_t size = (int64_t)node.domainMax - (int64_t)node.domainMin + 1;
+                if (size > 0 && size <= 4096) return size;
+            }
+            return std::nullopt;
+        } else if constexpr (std::is_same_v<T, GenericFunctionExpr>) {
+            std::string name = lowerAsciiLocal(node.name);
+            if ((name == "date_part" || name == "extract") &&
+                node.args.size() >= 2 && node.args[0]) {
+                std::string unit;
+                if (auto* lit = std::get_if<GenericLiteralExpr>(&node.args[0]->node)) {
+                    if (auto* s = std::get_if<std::string>(&lit->value))
+                        unit = lowerAsciiLocal(*s);
+                }
+                if (!unit.empty())
+                    return datePartDomainSizeForPredicate(pred, node.args[1], unit);
+            }
+            return std::nullopt;
+        } else {
+            return std::nullopt;
+        }
+    }, expr->node);
+}
+
+std::optional<int64_t> finiteGroupOutputBound(
+        const GenericAggregateDetail& aggregate,
+        const GenericPredicatePtr& pred) {
+    int64_t total = 1;
+    for (const auto& group : aggregate.groupBy) {
+        auto card = finiteGroupExprCardinality(group, pred);
+        if (!card || *card <= 0) return std::nullopt;
+        if (total > std::numeric_limits<int64_t>::max() / *card)
+            return std::nullopt;
+        total *= *card;
+    }
+    return total;
+}
+
+std::optional<std::string> primaryKeyGroupOutputBound(
+        const GenericRelPlan& ir,
+        const GenericAggregateDetail& aggregate,
+        const ColumnEquivalence& baseEq,
+        const IrCarryMap& carryMap) {
+    auto makePkColumn = [&](const GenericRelationInstance& inst,
+                            const GenericRelation& rel) {
+        GenericColumnExpr pk;
+        pk.relationInstance = inst.id;
+        pk.table = inst.baseName;
+        pk.alias = inst.alias;
+        pk.column = rel.primaryKeyColumn;
+        return pk;
+    };
+
+    for (const auto& inst : ir.relationInstances) {
+        const auto* rel = ir.findRelation(inst.relation);
+        if (!rel || rel->primaryKeyColumn.empty() ||
+            rel->primaryKeyDomainSymbol.empty()) {
+            continue;
+        }
+
+        ColumnEquivalence eq = baseEq;
+        GenericColumnExpr pk = makePkColumn(inst, *rel);
+        bool pkInGroup = false;
+        for (const auto& group : aggregate.groupBy) {
+            std::vector<GenericColumnExpr> cols;
+            collectExprColumns(group, cols);
+            for (const auto& col : cols) {
+                if (eq.equivalent(col, pk)) {
+                    pkInGroup = true;
+                    break;
+                }
+            }
+            if (pkInGroup) break;
+        }
+        if (!pkInGroup) continue;
+
+        std::set<int> determinedRelations{inst.id.value};
+        bool changed = true;
+        while (changed) {
+            changed = false;
+            for (const auto& otherInst : ir.relationInstances) {
+                if (determinedRelations.count(otherInst.id.value)) continue;
+                const auto* otherRel = ir.findRelation(otherInst.relation);
+                if (!otherRel || otherRel->primaryKeyColumn.empty()) continue;
+                GenericColumnExpr otherPk = makePkColumn(otherInst, *otherRel);
+                for (int determined : determinedRelations) {
+                    if (eq.equivalentToRelationColumn(otherPk, determined)) {
+                        determinedRelations.insert(otherInst.id.value);
+                        changed = true;
+                        break;
+                    }
+                }
+            }
+        }
+
+        bool allDetermined = true;
+        for (const auto& group : aggregate.groupBy) {
+            std::vector<GenericColumnExpr> cols;
+            collectExprColumns(group, cols);
+            if (cols.empty()) {
+                allDetermined = false;
+                break;
+            }
+            for (const auto& col : cols) {
+                bool determined = determinedRelations.count(
+                    col.relationInstance.value) > 0;
+                if (!determined) {
+                    for (int relation : determinedRelations) {
+                        if (eq.equivalentToRelationColumn(col, relation)) {
+                            determined = true;
+                            break;
+                        }
+                    }
+                }
+                if (!determined) {
+                    auto relIt = carryMap.find(col.relationInstance.value);
+                    auto colIt = relIt == carryMap.end()
+                        ? std::map<std::string, IrCarryColumn>::const_iterator{}
+                        : relIt->second.find(col.column);
+                    if (relIt != carryMap.end() && colIt != relIt->second.end()) {
+                        const auto& carried = colIt->second.column;
+                        determined = determinedRelations.count(
+                            carried.relationInstance.value) > 0;
+                        if (!determined) {
+                            for (int relation : determinedRelations) {
+                                if (eq.equivalentToRelationColumn(carried, relation)) {
+                                    determined = true;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+                if (!determined) {
+                    allDetermined = false;
+                    break;
+                }
+            }
+            if (!allDetermined) break;
+        }
+        if (allDetermined) {
+            if (!rel->virtualRelation && !inst.baseName.empty())
+                return tableSizeName(inst.baseName);
+            return rel->primaryKeyDomainSymbol;
+        }
+    }
+    return std::nullopt;
+}
+
 class MetalMaterializedRangeScan : public MetalOperator {
 public:
     MetalMaterializedRangeScan(std::string rowsSymbol,
@@ -368,19 +791,36 @@ std::optional<MetalQueryPlan> lowerMultiTableGroupedAggregateIRToMetalImpl(
                          displayName + "' is not supported yet.";
             return false;
         }
+        const IrCarryColumn* carriedFixedString = nullptr;
+        if (auto* col = expr ? std::get_if<GenericColumnExpr>(&expr->node) : nullptr) {
+            auto relIt = lowering->carryMap.find(col->relationInstance.value);
+            if (relIt != lowering->carryMap.end()) {
+                auto colIt = relIt->second.find(col->column);
+                if (colIt != relIt->second.end() &&
+                    col->type.type == DataType::CHAR_FIXED) {
+                    carriedFixedString = &colIt->second;
+                }
+            }
+        }
         int stringLen = materializedStringLenForExpr(expr, lowering->carryMap);
         std::string sizeExpr = lowering->outputSize;
-        if (stringLen > 0) sizeExpr += " * " + std::to_string(stringLen);
         std::string bufferName = "d_ir_multi_group_" + std::to_string(matColIdx++) +
                                  "_" + sanitizeIdentifier(displayName);
-        std::string metalType = metalTypeForType(type);
+        std::string metalType = carriedFixedString ? "uint" : metalTypeForType(type);
+        if (stringLen > 0 && !carriedFixedString)
+            sizeExpr += " * " + std::to_string(stringLen);
         materialize->addColumn(bufferName, metalType,
-                               materializeExprToMetalWithCarryMap(
-                                   expr, idxVar, lowering->carryMap),
-                               displayName, sizeExpr, stringLen);
+                               carriedFixedString
+                                   ? carriedFixedString->rowVarName
+                                   : materializeExprToMetalWithCarryMap(
+                                         expr, idxVar, lowering->carryMap),
+                               displayName, sizeExpr,
+                               carriedFixedString ? 0 : stringLen);
         materializedCols.push_back(GenericMatColumnDesc{
             displayName, bufferName, metalType, stringLen, scaleDown, false,
-            distinctDomainSymbol});
+            distinctDomainSymbol, carriedFixedString != nullptr,
+            carriedFixedString ? carriedFixedString->column.table : std::string{},
+            carriedFixedString ? carriedFixedString->column.column : std::string{}});
         return true;
     };
 
@@ -426,9 +866,9 @@ std::optional<MetalQueryPlan> lowerMultiTableGroupedAggregateIRToMetalImpl(
                                    aggFuncName(agg->func) + "' requires an argument.");
             inputExpr = agg->arg;
             if (agg->func == AggFunc::COUNT_DISTINCT) {
+                if (agg->arg->type.type == DataType::CHAR_FIXED)
+                    return fail(error, "IR multi-table grouped aggregate lowerer: COUNT(DISTINCT) over fixed strings is not supported yet.");
                 distinctDomainSymbol = distinctDomainSymbolForExpr(agg->arg);
-                if (distinctDomainSymbol.empty())
-                    return fail(error, "IR multi-table grouped aggregate lowerer: COUNT(DISTINCT) has no schema distinct-domain metadata.");
                 inputType = agg->arg->type;
                 funcName = "COUNT_DISTINCT";
             } else if (agg->func == AggFunc::SUM || agg->func == AggFunc::AVG) {
@@ -775,13 +1215,27 @@ std::optional<MetalQueryPlan> lowerMultiTableGroupedAggregateIRToMetalImpl(
         }
     }
 
+    std::string groupOutputBoundExpr = lowering->outputSize;
+    const auto* fd = shape->filter ? filterDetail(shape->filter) : nullptr;
+    auto eq = buildJoinColumnEquivalence(shape->joins, shape->filter);
+    if (auto pkBound = primaryKeyGroupOutputBound(
+            ir, *aggregate, eq, lowering->carryMap)) {
+        groupOutputBoundExpr = *pkBound;
+    } else if (auto finiteBound = finiteGroupOutputBound(
+            *aggregate, fd ? fd->predicate : GenericPredicatePtr{})) {
+        groupOutputBoundExpr = std::to_string(*finiteBound);
+    }
+
     const std::string groupTag = "ir_multi_table_group";
     GenericGpuGroupSpec gbSpec;
     gbSpec.tag = groupTag;
     gbSpec.inputCounter = resultCounter;
     gbSpec.inputRowsSymbol = "n_gpu_gb_" + groupTag + "_input";
-    gbSpec.capacityExpr = "next_pow2(" + lowering->outputSize + " * 2)";
+    gbSpec.capacityExpr = groupOutputBoundExpr == lowering->outputSize
+        ? "next_pow2(" + lowering->outputSize + " * 2)"
+        : "next_pow2(" + groupOutputBoundExpr + " * 2 + 16)";
     gbSpec.capacitySymbol = "n_gpu_gb_" + groupTag + "_cap";
+    gbSpec.maxOutputRowsExpr = groupOutputBoundExpr;
     gbSpec.outputCounter = "d_gpu_gb_" + groupTag + "_count";
     gbSpec.inputColumns = std::move(materializedCols);
     gbSpec.groupBy = std::move(groupSpec);
@@ -794,7 +1248,7 @@ std::optional<MetalQueryPlan> lowerMultiTableGroupedAggregateIRToMetalImpl(
 
     if (!sortSpec.keys.empty() || sortSpec.limit >= 0) {
         if (!appendGenericGpuSort(lowering->plan, "group_" + groupTag,
-                                  sortRowsSym, gbSpec.capacityExpr,
+                                  sortRowsSym, gbSpec.maxOutputRowsExpr,
                                   genericGpuGroupOutputColumns(gbSpec),
                                   sortSpec, error)) {
             return std::nullopt;
@@ -993,6 +1447,8 @@ std::optional<MetalQueryPlan> lowerMultiTableScalarAggregateIRToMetalImpl(
                                     std::move(reduce));
     if (!scalarLookups.empty())
         attachGenericScalarLookupBuffers(scalarPhase, scalarLookups);
+    if (scalarLookups.empty())
+        lowering->plan.chunkable = true;
     return std::move(lowering->plan);
 }
 

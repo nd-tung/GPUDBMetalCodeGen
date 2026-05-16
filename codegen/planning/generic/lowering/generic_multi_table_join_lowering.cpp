@@ -112,6 +112,10 @@ std::string carryVarName(const GenericColumnExpr& col) {
            sanitizeIdentifier(col.column);
 }
 
+std::string carryRowVarName(const GenericColumnExpr& col) {
+    return carryVarName(col) + "_row";
+}
+
 std::string carryBufferName(const GenericColumnExpr& col) {
     std::string scope = !col.alias.empty() ? col.alias : col.table;
     return "d_ir_carry_" + sanitizeIdentifier(scope) + "_" +
@@ -395,6 +399,58 @@ private:
     std::string varName_;
 };
 
+class MetalFixedStringRowCarryLookup : public MetalUnaryOperator {
+public:
+    MetalFixedStringRowCarryLookup(std::unique_ptr<MetalOperator> child,
+                                   std::string rowBuffer,
+                                   std::string keyExpr,
+                                   std::string rowVar,
+                                   std::string ptrVar,
+                                   std::string sourceTable,
+                                   std::string sourceColumn,
+                                   int width)
+        : MetalUnaryOperator(std::move(child)),
+          rowBuffer_(std::move(rowBuffer)),
+          keyExpr_(std::move(keyExpr)),
+          rowVar_(std::move(rowVar)),
+          ptrVar_(std::move(ptrVar)),
+          sourceTable_(std::move(sourceTable)),
+          sourceColumn_(std::move(sourceColumn)),
+          width_(width) {}
+
+    void produce(MetalCodegen& cg, ConsumerFn consume) override {
+        cg.addBufferParam(rowBuffer_, "uint", "", false);
+        cg.addColumnParam(sourceColumn_, "char", sourceTable_);
+        child_->produce(cg, [&]() {
+            cg.addLine("uint " + rowVar_ + " = " + rowBuffer_ + "[" +
+                       keyExpr_ + "];");
+            cg.addIf(rowVar_ + " != 0xFFFFFFFFu", [&]() {
+                cg.addLine("const device char* " + ptrVar_ + " = " +
+                           sourceColumn_ + " + " + rowVar_ + " * " +
+                           std::to_string(width_) + "u;");
+                consume();
+            });
+        });
+    }
+
+    std::string describe() const override {
+        return "FixedStringRowCarryLookup(" + ptrVar_ + ")";
+    }
+
+    void iusUsed(std::vector<IU>& out) const override {
+        appendIUsFromExpr(keyExpr_, out);
+    }
+
+private:
+    std::string rowBuffer_;
+    std::string keyExpr_;
+    std::string rowVar_;
+    std::string ptrVar_;
+    std::string sourceTable_;
+    std::string sourceColumn_;
+    int width_ = 0;
+};
+
 std::unique_ptr<MetalOperator> appendScalarLookupLoads(
         std::unique_ptr<MetalOperator> pipe,
         const std::vector<GenericScalarLookupInfo>* scalarLookups,
@@ -449,9 +505,10 @@ std::unique_ptr<MetalOperator> appendCarryLookup(
         const std::string& keyExpr) {
     if (carry.column.type.type == DataType::CHAR_FIXED) {
         int width = carry.column.type.fixedWidth > 0 ? carry.column.type.fixedWidth : 1;
-        return std::make_unique<MetalArraySliceLookup>(
+        return std::make_unique<MetalFixedStringRowCarryLookup>(
             std::move(pipe), carryStorageBufferName(storage, carry.column),
-            keyExpr, carry.varName, width);
+            keyExpr, carry.rowVarName, carry.varName,
+            carry.column.table, carry.column.column, width);
     }
     return std::make_unique<MetalArrayLookup>(
         std::move(pipe), carryStorageBufferName(storage, carry.column),
@@ -468,15 +525,12 @@ std::unique_ptr<MetalOperator> appendCarryStore(
         const std::string& keyDomain) {
     std::string valueExpr = carryValueExpr(carry, currentRelationInstance, idxVar);
     if (carry.column.type.type == DataType::CHAR_FIXED) {
-        int width = carry.column.type.fixedWidth > 0 ? carry.column.type.fixedWidth : 1;
-        return std::make_unique<MetalArraySliceStore>(
+        std::string rowExpr = carry.column.relationInstance.value == currentRelationInstance
+            ? "(uint)(" + idxVar + ")"
+            : carry.rowVarName;
+        return std::make_unique<MetalArrayStore>(
             std::move(pipe), carryStorageBufferName(storage, carry.column),
-            keyExpr, valueExpr, width, "char",
-            "(" + keyDomain + ") * " + std::to_string(width), 0,
-            carry.column.relationInstance.value == currentRelationInstance
-                ? carry.column.column : std::string{},
-            carry.column.relationInstance.value == currentRelationInstance
-                ? idxVar : std::string{});
+            keyExpr, rowExpr, "uint", keyDomain, 0xFF);
     }
     return std::make_unique<MetalArrayStore>(
         std::move(pipe), carryStorageBufferName(storage, carry.column),
@@ -923,8 +977,8 @@ std::optional<MultiTableJoinLowering> buildMultiTableJoinLowering(
             if (!typeCanUseArrayCarry(col.type.type))
                 return shapeFail<MultiTableJoinLowering>(
                     error, "IR multi-table join lowerer: required carried column type is not supported.");
-            build.localCarries[name] = IrCarryColumn{col, carryVarName(col),
-                                                     carryBufferName(col)};
+            build.localCarries[name] = IrCarryColumn{
+                col, carryVarName(col), carryRowVarName(col), carryBufferName(col)};
         }
     }
 

@@ -7,32 +7,28 @@
 
 namespace codegen {
 
-// ===================================================================
-// DATA TYPES
-// ===================================================================
+// --- Data Types ---
 
 enum class DataType { INT, FLOAT, DATE, CHAR1, CHAR_FIXED };
 
 struct TypeInfo {
     DataType type;
-    int fixedWidth = 0; // only for CHAR_FIXED
+    int fixedWidth = 0; // CHAR_FIXED width.
 };
 
-// ===================================================================
-// EXPRESSIONS
-// ===================================================================
+// --- Expressions ---
 
 enum class ExprOp { ADD, SUB, MUL, DIV };
 enum class AggFunc { SUM, COUNT, AVG, MIN, MAX, COUNT_DISTINCT };
 enum class CmpOp { EQ, NE, LT, LE, GT, GE };
 
 struct ColRef {
-    std::string table;      // e.g. "lineitem" (base table for schema lookups)
-    std::string column;     // e.g. "l_shipdate"
-    int         colIndex;   // resolved TPC-H column index
+    std::string table;      // Base table for schema lookup.
+    std::string column;     // Source column name.
+    int         colIndex;   // Resolved schema column index.
     DataType    dataType;
-    int         fixedWidth = 0; // for CHAR_FIXED — carried through subquery aliases
-    std::string tableAlias; // e.g. "n1" — used for disambiguation in joins
+    int         fixedWidth = 0; // CHAR_FIXED width.
+    std::string tableAlias; // Alias used for join disambiguation.
 };
 
 struct Literal {
@@ -54,7 +50,7 @@ struct CaseWhen {
 };
 
 struct FuncCall {
-    std::string name; // EXTRACT, SUBSTRING, etc.
+    std::string name;
     std::vector<ExprPtr> args;
 };
 
@@ -88,9 +84,7 @@ struct Expr {
     }
 };
 
-// ===================================================================
-// PREDICATES
-// ===================================================================
+// --- Predicates ---
 
 struct Predicate;
 using PredPtr = std::shared_ptr<Predicate>;
@@ -121,7 +115,7 @@ struct LogicalNot { PredPtr child; };
 
 struct ExistsPred {
     bool negated = false;
-    // child query index in AnalyzedQuery::subqueries
+    // Child query index in AnalyzedQuery::subqueries.
     int subqueryIdx = -1;
 
     ExistsPred() = default;
@@ -170,13 +164,11 @@ struct Predicate {
     }
 };
 
-// ===================================================================
-// AGGREGATION SPEC
-// ===================================================================
+// --- Aggregation Spec ---
 
 struct AggSpec {
     AggFunc   func;
-    ExprPtr   expr;       // null for COUNT(*)
+    ExprPtr   expr;       // Null for COUNT(*).
     std::string alias;
 };
 

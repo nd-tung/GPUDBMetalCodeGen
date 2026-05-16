@@ -3,23 +3,13 @@
 
 namespace codegen {
 
-// ===================================================================
-// Q8: National Market Share — 6 phases
-// ===================================================================
-// Phase 0: Build nation bitmap (AMERICA nations)
-// Phase 1: Build part bitmap (p_type = 'ECONOMY ANODIZED STEEL')
-// Phase 2: Build customer nation map (AMERICA customers only)
-// Phase 3: Build supplier nation map (all suppliers)
-// Phase 4: Build orders year map (date-filtered, AMERICA customer)
-// Phase 5: Probe lineitem → part bitmap → orders year → supp nation
-//          → aggregate total revenue and Brazil revenue into 4 bins
-// Result bins: [brazil_95, brazil_96, total_95, total_96]
-
+// Q8: National Market Share.
 std::optional<MetalQueryPlan> buildQ8Plan_byName() {
     std::string idx = "i";
     MetalQueryPlan plan;
 
-    // Phase 0: Build nation bitmap for AMERICA region
+    // --- Region And Part Filters ---
+    // Build AMERICA nation bitmap.
     {
         auto scan = makeAutoScan("nation", idx);
 
@@ -34,11 +24,11 @@ std::optional<MetalQueryPlan> buildQ8Plan_byName() {
         phase.scalarParams = {{"america_rk", "int"}};
     }
 
-    // Phase 1: Build part bitmap for 'ECONOMY ANODIZED STEEL'
+    // Build target part-type bitmap.
     {
         auto scan = makeAutoScan("part", idx);
 
-        // Compare 22 chars of p_type (CHAR_FIXED stride 25)
+        // Compare the fixed-width p_type prefix.
         std::string cond =
             "p_type[" + idx + " * 25] == 'E' && "
             "p_type[" + idx + " * 25 + 1] == 'C' && "
@@ -72,7 +62,8 @@ std::optional<MetalQueryPlan> buildQ8Plan_byName() {
         appendPhase(plan, "Q8_build_part_bitmap", std::move(bitmap), 256);
     }
 
-    // Phase 2: Build customer nation map (only AMERICA customers)
+    // --- Join Maps ---
+    // Build customer nation map for AMERICA customers.
     {
         auto scan = makeAutoScan("customer", idx);
 
@@ -87,7 +78,7 @@ std::optional<MetalQueryPlan> buildQ8Plan_byName() {
         appendPhase(plan, "Q8_build_cust_map", std::move(store), 256);
     }
 
-    // Phase 3: Build supplier nation map (all suppliers)
+    // Build supplier nation map.
     {
         auto scan = makeAutoScan("supplier", idx);
 
@@ -99,7 +90,7 @@ std::optional<MetalQueryPlan> buildQ8Plan_byName() {
         appendPhase(plan, "Q8_build_supp_map", std::move(store), 256);
     }
 
-    // Phase 4: Build orders year map (date-filtered, AMERICA customer)
+    // Build date-filtered order year map.
     {
         auto scan = makeAutoScan("orders", idx);
 
@@ -119,8 +110,8 @@ std::optional<MetalQueryPlan> buildQ8Plan_byName() {
         appendPhase(plan, "Q8_build_orders_map", std::move(store));
     }
 
-    // Phase 5: Probe lineitem — dual aggregation into result_bins
-    // [0]=brazil_95, [1]=brazil_96, [2]=total_95, [3]=total_96
+    // --- Market Share Aggregate ---
+    // Aggregate total and Brazil revenue by year.
     {
         auto scan = makeAutoScan("lineitem", idx);
 
@@ -139,13 +130,12 @@ std::optional<MetalQueryPlan> buildQ8Plan_byName() {
 
         std::string revenue = "l_extendedprice[" + idx + "] * (1.0f - l_discount[" + idx + "])";
 
-        // Total aggregation (always): result_bins[2 + (year - 1995)]
+        // Bins 0-1 hold Brazil revenue; bins 2-3 hold total revenue.
         auto totalAgg = std::make_unique<MetalAtomicAgg>(
             std::move(lookupSupp), "d_result_bins",
             "2 + (_year - 1995)", revenue, "4",
             "atomic_float", "float");
 
-        // Brazil aggregation (conditional): result_bins[year - 1995]
         auto brazilFilter = std::make_unique<MetalSelection>(std::move(totalAgg),
             "_supp_nk == brazil_nk");
 

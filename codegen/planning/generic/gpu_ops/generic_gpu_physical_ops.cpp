@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <optional>
 #include <set>
 #include <utility>
 
@@ -63,19 +64,27 @@ public:
 
         for (const auto& col : spec_.inputColumns) {
             cg.addBufferParam(col.bufferName, col.metalType, "", false);
+            if (col.stringRowRef && !col.stringSourceColumn.empty()) {
+                cg.addColumnParam(col.stringSourceColumn, "char",
+                                  col.stringSourceTable);
+            }
         }
 
         const std::string state = stateName();
         cg.addAtomicBufferParam(state, "atomic_uint", spec_.capacityExpr);
         const std::string hash = hashName();
         cg.addAtomicBufferParam(hash, "atomic_uint", spec_.capacityExpr);
+        const std::string hash2 = hash2Name();
+        cg.addAtomicBufferParam(hash2, "atomic_uint", spec_.capacityExpr);
+        if (hasStringGroupKey()) {
+            cg.addBufferParam(repRowName(), "uint", spec_.capacityExpr, false);
+        }
 
         for (const auto& key : spec_.groupBy.keyColumns) {
             const auto* col = findMatColumn(spec_.inputColumns, key);
             if (!col) continue;
+            if (col->stringLen > 0) continue;
             std::string sizeExpr = spec_.capacityExpr;
-            if (col->stringLen > 0)
-                sizeExpr += " * " + std::to_string(col->stringLen);
             cg.addBufferParam(keyStoreName(key), col->metalType, sizeExpr, false);
         }
 
@@ -85,11 +94,13 @@ public:
             if (fn == "COUNT_DISTINCT") {
                 const auto* col = findMatColumn(spec_.inputColumns, spec_.groupBy.aggColumns[ai]);
                 if (!col) continue;
-                cg.addResolvedScalarParam(distinctDomainParamName(ai), "uint",
-                                          distinctDomainExpr(ai));
                 cg.addAtomicBufferParam(aggName(ai), "atomic_uint", spec_.capacityExpr);
-                cg.addAtomicBufferParam(distinctBitmapName(ai), "atomic_uint",
-                                        distinctBitmapSizeExpr(ai));
+                cg.addAtomicBufferParam(distinctStateName(ai), "atomic_uint",
+                                        spec_.capacityExpr);
+                cg.addBufferParam(distinctGroupName(ai), "uint", spec_.capacityExpr,
+                                  false);
+                cg.addBufferParam(distinctValueName(ai), "uint", spec_.capacityExpr,
+                                  false);
             } else if (fn == "AVG") {
                 cg.addAtomicBufferParam(aggName(ai), "atomic_uint", aggSizeExpr(ai));
                 cg.addAtomicBufferParam(avgCountName(ai), "atomic_uint", spec_.capacityExpr);
@@ -103,7 +114,9 @@ public:
 
         cg.addBlock("for (uint _r = tid; _r < " + spec_.inputRowsSymbol + "; _r += tpg)", [&]() {
             emitHashExpr(cg, "_r", "_hash");
+            emitHashExpr2(cg, "_r", "_hash2");
             cg.addLine("uint _fp = _hash | 1u;");
+            cg.addLine("uint _fp2 = _hash2 | 1u;");
             cg.addLine("uint _slot = _hash & (" + spec_.capacitySymbol + " - 1u);");
             cg.addLine("uint _found = 0xFFFFFFFFu;");
             cg.addBlock("for (uint _probe = 0u; _probe < " + spec_.capacitySymbol + "; ++_probe)", [&]() {
@@ -124,6 +137,7 @@ public:
                     cg.addIf("_claimed", [&]() {
                         emitStoreKeys(cg, "_slot", "_r");
                         cg.addLine("atomic_store_explicit(&" + hash + "[_slot], _fp, memory_order_relaxed);");
+                        cg.addLine("atomic_store_explicit(&" + hash2 + "[_slot], _fp2, memory_order_relaxed);");
                         cg.addLine("atomic_store_explicit(&" + state + "[_slot], 2u, memory_order_relaxed);");
                         cg.addLine("_found = _slot;");
                     });
@@ -134,15 +148,17 @@ public:
                 cg.addBlock("while (atomic_load_explicit(&" + state + "[_slot], memory_order_relaxed) == 1u)", [&]() {});
                 cg.addIf("atomic_load_explicit(&" + state + "[_slot], memory_order_relaxed) == 2u", [&]() {
                     cg.addLine("uint _slot_fp = atomic_load_explicit(&" + hash + "[_slot], memory_order_relaxed);");
+                    cg.addLine("uint _slot_fp2 = atomic_load_explicit(&" + hash2 + "[_slot], memory_order_relaxed);");
                     cg.addBlock("for (uint _hvis = 0u; _slot_fp == 0u && _hvis < 256u; ++_hvis)", [&]() {
                         cg.addLine("_slot_fp = atomic_load_explicit(&" + hash + "[_slot], memory_order_relaxed);");
+                        cg.addLine("_slot_fp2 = atomic_load_explicit(&" + hash2 + "[_slot], memory_order_relaxed);");
                     });
                     const std::string keyEq = keyEqualsExpr("_slot", "_r");
                     cg.addLine("bool _key_eq = " + keyEq + ";");
-                    cg.addBlock("for (uint _vis = 0u; !_key_eq && _vis < 256u; ++_vis)", [&]() {
+                    cg.addBlock("for (uint _vis = 0u; !_key_eq && _vis < 4096u; ++_vis)", [&]() {
                         cg.addLine("_key_eq = " + keyEq + ";");
                     });
-                    cg.addIf("_key_eq || _slot_fp == _fp", [&]() {
+                    cg.addIf("_key_eq || (_slot_fp == _fp && _slot_fp2 == _fp2)", [&]() {
                         cg.addLine("_found = _slot;");
                         cg.addLine("break;");
                     });
@@ -164,6 +180,8 @@ private:
     std::string suffix() const { return sanitizeIdentifier(spec_.tag); }
     std::string stateName() const { return "d_gpu_gb_" + suffix() + "_state"; }
     std::string hashName() const { return "d_gpu_gb_" + suffix() + "_hash"; }
+    std::string hash2Name() const { return "d_gpu_gb_" + suffix() + "_hash2"; }
+    std::string repRowName() const { return "d_gpu_gb_" + suffix() + "_rep_row"; }
     std::string keyStoreName(const std::string& display) const {
         return "d_gpu_gb_" + suffix() + "_key_" + sanitizeIdentifier(display);
     }
@@ -173,25 +191,24 @@ private:
     std::string avgCountName(size_t ai) const {
         return "d_gpu_gb_" + suffix() + "_agg_" + std::to_string(ai) + "_count";
     }
-    std::string distinctBitmapName(size_t ai) const {
-        return "d_gpu_gb_" + suffix() + "_distinct_" + std::to_string(ai);
+    std::string distinctStateName(size_t ai) const {
+        return "d_gpu_gb_" + suffix() + "_distinct_state_" + std::to_string(ai);
     }
-    std::string distinctDomainParamName(size_t ai) const {
-        return "n_gpu_gb_" + suffix() + "_distinct_domain_" + std::to_string(ai);
+    std::string distinctGroupName(size_t ai) const {
+        return "d_gpu_gb_" + suffix() + "_distinct_group_" + std::to_string(ai);
     }
-    std::string distinctDomainExpr(size_t ai) const {
-        const auto* col = ai < spec_.groupBy.aggColumns.size()
-            ? findMatColumn(spec_.inputColumns, spec_.groupBy.aggColumns[ai])
-            : nullptr;
-        return (col && !col->distinctDomainSymbol.empty())
-            ? col->distinctDomainSymbol
-            : "0";
-    }
-    std::string distinctBitmapSizeExpr(size_t ai) const {
-        return spec_.capacityExpr + " * " + distinctDomainExpr(ai) + " / 32 + " +
-               spec_.capacityExpr + " * 2";
+    std::string distinctValueName(size_t ai) const {
+        return "d_gpu_gb_" + suffix() + "_distinct_value_" + std::to_string(ai);
     }
     std::string totalName() const { return "d_gpu_gb_" + suffix() + "_having_total"; }
+
+    bool hasStringGroupKey() const {
+        for (const auto& key : spec_.groupBy.keyColumns) {
+            const auto* col = findMatColumn(spec_.inputColumns, key);
+            if (col && col->stringLen > 0) return true;
+        }
+        return false;
+    }
 
     std::string fnAt(size_t ai) const {
         return ai < spec_.groupBy.aggFuncs.size() ? spec_.groupBy.aggFuncs[ai] : "SUM";
@@ -219,18 +236,42 @@ private:
                aggScale((size_t)spec_.groupBy.havingAggIdx) > 0 ? "2" : "1";
     }
 
-    std::string distinctStrideExpr(size_t ai) const {
-        return "((" + distinctDomainParamName(ai) + " + 32) / 32)";
-    }
-
     std::string valueAt(const GenericMatColumnDesc& col, const std::string& row) const {
         if (col.stringLen > 0) return col.bufferName + " + " + row + " * " + std::to_string(col.stringLen);
         return col.bufferName + "[" + row + "]";
     }
 
+    std::string stringPtrAt(const GenericMatColumnDesc& col,
+                            const std::string& row) const {
+        if (col.stringRowRef) {
+            return col.stringSourceColumn + " + " + col.bufferName + "[" + row +
+                   "] * " + std::to_string(col.stringLen);
+        }
+        return col.bufferName + " + " + row + " * " +
+               std::to_string(col.stringLen);
+    }
+
+    std::string stringByteAt(const GenericMatColumnDesc& col,
+                             const std::string& row,
+                             const std::string& offset) const {
+        if (col.stringRowRef) {
+            return col.stringSourceColumn + "[" + col.bufferName + "[" + row +
+                   "] * " + std::to_string(col.stringLen) + "u + " + offset + "]";
+        }
+        return col.bufferName + "[" + row + " * " +
+               std::to_string(col.stringLen) + "u + " + offset + "]";
+    }
+
     void emitHashMix(MetalCodegen& cg, const std::string& hashVar, const std::string& valueExpr) const {
         cg.addLine(hashVar + " ^= (uint)(" + valueExpr + ");");
         cg.addLine(hashVar + " *= 16777619u;");
+    }
+
+    void emitHashMix2(MetalCodegen& cg, const std::string& hashVar, const std::string& valueExpr) const {
+        cg.addLine(hashVar + " += (uint)(" + valueExpr + ") + 0x9e3779b9u + (" +
+                   hashVar + " << 6) + (" + hashVar + " >> 2);");
+        cg.addLine(hashVar + " ^= " + hashVar + " >> 15;");
+        cg.addLine(hashVar + " *= 2246822519u;");
     }
 
     void emitHashExpr(MetalCodegen& cg, const std::string& row, const std::string& hashVar) const {
@@ -240,8 +281,7 @@ private:
             if (!col) continue;
             if (col->stringLen > 0) {
                 cg.addBlock("for (uint _hc = 0; _hc < " + std::to_string(col->stringLen) + "u; ++_hc)", [&]() {
-                    emitHashMix(cg, hashVar, col->bufferName + "[" + row + " * " +
-                                std::to_string(col->stringLen) + "u + _hc]");
+                    emitHashMix(cg, hashVar, stringByteAt(*col, row, "_hc"));
                 });
             } else if (col->metalType == "float") {
                 emitHashMix(cg, hashVar, "as_type<uint>(" + valueAt(*col, row) + ")");
@@ -253,17 +293,30 @@ private:
         }
     }
 
+    void emitHashExpr2(MetalCodegen& cg, const std::string& row, const std::string& hashVar) const {
+        cg.addLine("uint " + hashVar + " = 0x85ebca6bu;");
+        for (const auto& key : spec_.groupBy.keyColumns) {
+            const auto* col = findMatColumn(spec_.inputColumns, key);
+            if (!col) continue;
+            if (col->stringLen > 0) {
+                cg.addBlock("for (uint _hc2 = 0; _hc2 < " + std::to_string(col->stringLen) + "u; ++_hc2)", [&]() {
+                    emitHashMix2(cg, hashVar, stringByteAt(*col, row, "_hc2"));
+                });
+            } else if (col->metalType == "float") {
+                emitHashMix2(cg, hashVar, "as_type<uint>(" + valueAt(*col, row) + ")");
+            } else {
+                emitHashMix2(cg, hashVar, valueAt(*col, row));
+            }
+        }
+    }
+
     void emitStoreKeys(MetalCodegen& cg, const std::string& slot, const std::string& row) const {
         for (const auto& key : spec_.groupBy.keyColumns) {
             const auto* col = findMatColumn(spec_.inputColumns, key);
             if (!col) continue;
             const std::string dst = keyStoreName(key);
             if (col->stringLen > 0) {
-                cg.addBlock("for (uint _kc = 0; _kc < " + std::to_string(col->stringLen) + "u; ++_kc)", [&]() {
-                    cg.addLine(dst + "[" + slot + " * " + std::to_string(col->stringLen) +
-                               "u + _kc] = " + col->bufferName + "[" + row + " * " +
-                               std::to_string(col->stringLen) + "u + _kc];");
-                });
+                cg.addLine(repRowName() + "[" + slot + "] = (uint)(" + row + ");");
             } else {
                 cg.addLine(dst + "[" + slot + "] = " + valueAt(*col, row) + ";");
             }
@@ -278,9 +331,9 @@ private:
             const std::string dst = keyStoreName(key);
             std::string part;
             if (col->stringLen > 0) {
-                part = "gpu_generic_fixed_eq(" + dst + " + " + slot + " * " +
-                       std::to_string(col->stringLen) + ", " + col->bufferName + " + " +
-                       row + " * " + std::to_string(col->stringLen) + ", " +
+                const std::string repRow = repRowName() + "[" + slot + "]";
+                part = "gpu_generic_fixed_eq(" + stringPtrAt(*col, repRow) + ", " +
+                       stringPtrAt(*col, row) + ", " +
                        std::to_string(col->stringLen) + ")";
             } else {
                 part = "(" + dst + "[" + slot + "] == " + valueAt(*col, row) + ")";
@@ -305,6 +358,13 @@ private:
                std::to_string(scale) + ".0f)";
     }
 
+    std::string distinctValueExpr(const GenericMatColumnDesc& col,
+                                  const std::string& row) const {
+        if (col.metalType == "float")
+            return "as_type<uint>(" + valueAt(col, row) + ")";
+        return "(uint)(" + valueAt(col, row) + ")";
+    }
+
     void emitAtomicAddScaled(MetalCodegen& cg,
                              const std::string& buffer,
                              const std::string& slotExpr,
@@ -323,11 +383,63 @@ private:
             } else if (fn == "COUNT_DISTINCT") {
                 const auto* col = findMatColumn(spec_.inputColumns, spec_.groupBy.aggColumns[ai]);
                 if (!col) continue;
-                const std::string v = col->bufferName + "[" + row + "]";
-                const std::string stride = distinctStrideExpr(ai);
-                cg.addLine("atomic_fetch_or_explicit(&" + distinctBitmapName(ai) + "[" +
-                           slot + " * " + stride + " + (((uint)(" + v + ")) >> 5)], "
-                           "1u << (((uint)(" + v + ")) & 31u), memory_order_relaxed);");
+                const std::string suffix = std::to_string(ai);
+                const std::string dv = "_distinct_value_" + suffix;
+                const std::string dh = "_distinct_hash_" + suffix;
+                const std::string ds = "_distinct_slot_" + suffix;
+                const std::string st = "_distinct_state_" + suffix;
+                cg.addLine("uint " + dv + " = " + distinctValueExpr(*col, row) + ";");
+                cg.addLine("uint " + dh + " = ((uint)(" + slot + ") * 16777619u) ^ (" +
+                           dv + " * 2166136261u);");
+                cg.addLine(dh + " ^= " + dh + " >> 16;");
+                cg.addLine(dh + " *= 2246822519u;");
+                cg.addLine(dh + " ^= " + dh + " >> 13;");
+                cg.addLine("uint " + ds + " = " + dh + " & (" +
+                           spec_.capacitySymbol + " - 1u);");
+                cg.addBlock("for (uint _dprobe_" + suffix + " = 0u; _dprobe_" +
+                            suffix + " < " + spec_.capacitySymbol + "; ++_dprobe_" +
+                            suffix + ")", [&]() {
+                    cg.addLine("uint " + st + " = atomic_load_explicit(&" +
+                               distinctStateName(ai) + "[" + ds +
+                               "], memory_order_relaxed);");
+                    cg.addIf(st + " == 0u", [&]() {
+                        cg.addLine("bool _dclaimed_" + suffix + " = false;");
+                        cg.addBlock("while (true)", [&]() {
+                            cg.addLine("uint _dexpected_" + suffix + " = 0u;");
+                            cg.addIf("atomic_compare_exchange_weak_explicit(&" +
+                                     distinctStateName(ai) + "[" + ds + "], &_dexpected_" +
+                                     suffix + ", 1u, memory_order_relaxed, memory_order_relaxed)", [&]() {
+                                cg.addLine("_dclaimed_" + suffix + " = true;");
+                                cg.addLine("break;");
+                            });
+                            cg.addIf("_dexpected_" + suffix + " != 0u", [&]() {
+                                cg.addLine("break;");
+                            });
+                        });
+                        cg.addIf("_dclaimed_" + suffix, [&]() {
+                            cg.addLine(distinctGroupName(ai) + "[" + ds + "] = (uint)(" +
+                                       slot + ");");
+                            cg.addLine(distinctValueName(ai) + "[" + ds + "] = " + dv + ";");
+                            cg.addLine("atomic_store_explicit(&" + distinctStateName(ai) +
+                                       "[" + ds + "], 2u, memory_order_relaxed);");
+                            cg.addLine("atomic_fetch_add_explicit(&" + aggName(ai) + "[" +
+                                       slot + "], 1u, memory_order_relaxed);");
+                            cg.addLine("break;");
+                        });
+                    });
+                    cg.addBlock("while (atomic_load_explicit(&" + distinctStateName(ai) +
+                                "[" + ds + "], memory_order_relaxed) == 1u)", [&]() {});
+                    cg.addIf("atomic_load_explicit(&" + distinctStateName(ai) + "[" + ds +
+                             "], memory_order_relaxed) == 2u", [&]() {
+                        cg.addIf(distinctGroupName(ai) + "[" + ds + "] == (uint)(" +
+                                 slot + ") && " + distinctValueName(ai) + "[" + ds +
+                                 "] == " + dv, [&]() {
+                            cg.addLine("break;");
+                        });
+                    });
+                    cg.addLine(ds + " = (" + ds + " + 1u) & (" +
+                               spec_.capacitySymbol + " - 1u);");
+                });
             } else if (fn == "MIN") {
                 cg.addLine("atomic_min_float(&" + aggName(ai) + "[" + slot + "], " +
                            numericInputExpr(ai, row) + ");");
@@ -375,9 +487,17 @@ public:
         for (const auto& key : spec_.groupBy.keyColumns) {
             const auto* col = findMatColumn(spec_.inputColumns, key);
             if (!col) continue;
-            std::string sizeExpr = spec_.capacityExpr;
-            if (col->stringLen > 0) sizeExpr += " * " + std::to_string(col->stringLen);
-            cg.addBufferParam(keyStoreName(key), col->metalType, sizeExpr, false);
+            if (col->stringLen > 0) {
+                cg.addBufferParam(repRowName(), "uint", spec_.capacityExpr, false);
+                cg.addBufferParam(col->bufferName, col->metalType, "", false);
+                if (col->stringRowRef && !col->stringSourceColumn.empty()) {
+                    cg.addColumnParam(col->stringSourceColumn, "char",
+                                      col->stringSourceTable);
+                }
+            } else {
+                cg.addBufferParam(keyStoreName(key), col->metalType,
+                                  spec_.capacityExpr, false);
+            }
         }
         for (size_t ai = 0; ai < spec_.groupBy.aggColumns.size(); ++ai) {
             const std::string fn = ai < spec_.groupBy.aggFuncs.size()
@@ -386,19 +506,13 @@ public:
             if (fn == "AVG") {
                 cg.addBufferParam(avgCountName(ai), "atomic_uint", spec_.capacityExpr, false);
             }
-            if (fn == "COUNT_DISTINCT") {
-                cg.addResolvedScalarParam(distinctDomainParamName(ai), "uint",
-                                          distinctDomainExpr(ai));
-                cg.addBufferParam(distinctBitmapName(ai), "atomic_uint",
-                                  distinctBitmapSizeExpr(ai), false);
-            }
         }
         if (spec_.groupBy.havingAggIdx >= 0) {
             cg.addBufferParam(totalName(), "atomic_uint", havingTotalSizeExpr(), false);
         }
 
         for (const auto& out : outputColumns()) {
-            std::string sizeExpr = spec_.capacityExpr;
+            std::string sizeExpr = outputCapacityExpr();
             if (out.stringLen > 0) sizeExpr += " * " + std::to_string(out.stringLen);
             if (out.isLongPair) sizeExpr += " * 2";
             cg.addBufferParam(out.bufferName, out.metalType, sizeExpr, false);
@@ -406,7 +520,7 @@ public:
 
         cg.registerMaterializeOutput(spec_.outputCounter);
         for (const auto& out : outputColumns()) {
-            cg.registerOutputColumn(out.displayName, out.bufferName, out.metalType,
+        cg.registerOutputColumn(out.displayName, out.bufferName, out.metalType,
                                     out.stringLen, out.scaleDown, out.isLongPair);
         }
 
@@ -460,6 +574,7 @@ private:
 
     std::string suffix() const { return sanitizeIdentifier(spec_.tag); }
     std::string stateName() const { return "d_gpu_gb_" + suffix() + "_state"; }
+    std::string repRowName() const { return "d_gpu_gb_" + suffix() + "_rep_row"; }
     std::string keyStoreName(const std::string& display) const {
         return "d_gpu_gb_" + suffix() + "_key_" + sanitizeIdentifier(display);
     }
@@ -469,27 +584,11 @@ private:
     std::string avgCountName(size_t ai) const {
         return "d_gpu_gb_" + suffix() + "_agg_" + std::to_string(ai) + "_count";
     }
-    std::string distinctBitmapName(size_t ai) const {
-        return "d_gpu_gb_" + suffix() + "_distinct_" + std::to_string(ai);
-    }
-    std::string distinctDomainParamName(size_t ai) const {
-        return "n_gpu_gb_" + suffix() + "_distinct_domain_" + std::to_string(ai);
-    }
-    std::string distinctDomainExpr(size_t ai) const {
-        const auto* col = ai < spec_.groupBy.aggColumns.size()
-            ? findMatColumn(spec_.inputColumns, spec_.groupBy.aggColumns[ai])
-            : nullptr;
-        return (col && !col->distinctDomainSymbol.empty())
-            ? col->distinctDomainSymbol
-            : "0";
-    }
-    std::string distinctBitmapSizeExpr(size_t ai) const {
-        return spec_.capacityExpr + " * " + distinctDomainExpr(ai) + " / 32 + " +
-               spec_.capacityExpr + " * 2";
-    }
     std::string totalName() const { return "d_gpu_gb_" + suffix() + "_having_total"; }
-    std::string distinctStrideExpr(size_t ai) const {
-        return "((" + distinctDomainParamName(ai) + " + 32) / 32)";
+    std::string outputCapacityExpr() const {
+        return spec_.maxOutputRowsExpr.empty()
+            ? spec_.capacityExpr
+            : spec_.maxOutputRowsExpr;
     }
 
     std::string fnAt(size_t ai) const {
@@ -530,15 +629,26 @@ private:
         return genericGpuGroupOutputColumns(spec_);
     }
 
+    std::string stringByteAt(const GenericMatColumnDesc& col,
+                             const std::string& row,
+                             const std::string& offset) const {
+        if (col.stringRowRef) {
+            return col.stringSourceColumn + "[" + col.bufferName + "[" + row +
+                   "] * " + std::to_string(col.stringLen) + "u + " + offset + "]";
+        }
+        return col.bufferName + "[" + row + " * " +
+               std::to_string(col.stringLen) + "u + " + offset + "]";
+    }
+
     void emitCopyKey(MetalCodegen& cg, const GenericMatColumnDesc& out,
                      const GenericMatColumnDesc& keyCol,
                      const std::string& slot, const std::string& pos) const {
         const std::string src = keyStoreName(keyCol.displayName);
         if (keyCol.stringLen > 0) {
+            const std::string row = repRowName() + "[" + slot + "]";
             cg.addBlock("for (uint _oc = 0; _oc < " + std::to_string(keyCol.stringLen) + "u; ++_oc)", [&]() {
                 cg.addLine(out.bufferName + "[" + pos + " * " + std::to_string(keyCol.stringLen) +
-                           "u + _oc] = " + src + "[" + slot + " * " +
-                           std::to_string(keyCol.stringLen) + "u + _oc];");
+                           "u + _oc] = " + stringByteAt(keyCol, row, "_oc") + ";");
             });
         } else {
             cg.addLine(out.bufferName + "[" + pos + "] = " + src + "[" + slot + "];");
@@ -589,12 +699,8 @@ private:
 
     void emitDistinctCount(MetalCodegen& cg, size_t ai, const std::string& slot) const {
         const std::string var = "_distinct_val_" + std::to_string(ai);
-        const std::string stride = distinctStrideExpr(ai);
-        cg.addLine("uint " + var + " = 0u;");
-        cg.addBlock("for (uint _dw = 0; _dw < " + stride + "; ++_dw)", [&]() {
-            cg.addLine(var + " += popcount(atomic_load_explicit(&" + distinctBitmapName(ai) +
-                       "[" + slot + " * " + stride + " + _dw], memory_order_relaxed));");
-        });
+        cg.addLine("uint " + var + " = atomic_load_explicit(&" + aggName(ai) +
+                   "[" + slot + "], memory_order_relaxed);");
     }
 
     void emitOutputWrites(MetalCodegen& cg, const std::string& slot, const std::string& pos) const {
@@ -929,6 +1035,419 @@ private:
     }
 };
 
+class MetalGenericSmallSort : public MetalOperator {
+public:
+    MetalGenericSmallSort(std::string idxBuffer,
+                          std::vector<GenericSortKeySpec> keys,
+                          std::string nRowsSymbol,
+                          int maxRows)
+        : idxBuffer_(std::move(idxBuffer)),
+          keys_(std::move(keys)),
+          nRowsSymbol_(std::move(nRowsSymbol)),
+          maxRows_(maxRows) {}
+
+    void produce(MetalCodegen& cg, ConsumerFn consume) override {
+        cg.setPhaseMaxThreadgroups(1);
+        cg.addScalarParam(nRowsSymbol_, "uint");
+        cg.addBufferParam(idxBuffer_, "int", std::to_string(maxRows_), true, 0xFF);
+        for (const auto& key : keys_) {
+            std::string sizeExpr = std::to_string(maxRows_);
+            if (key.column.stringLen > 0)
+                sizeExpr += " * " + std::to_string(key.column.stringLen);
+            if (key.column.isLongPair)
+                sizeExpr += " * 2";
+            cg.addBufferParam(key.column.bufferName, key.column.metalType,
+                              sizeExpr, false);
+        }
+
+        cg.addLine("threadgroup int _idx[" + std::to_string(maxRows_) + "];");
+        cg.addLine("uint _n = min((uint)" + nRowsSymbol_ + ", " +
+                   std::to_string(maxRows_) + "u);");
+        cg.addLine("uint _np2 = 1u;");
+        cg.addBlock("while (_np2 < _n)", [&]() {
+            cg.addLine("_np2 <<= 1u;");
+        });
+        cg.addBlock("for (uint _i = lid; _i < _np2; _i += tg_size)", [&]() {
+            cg.addLine("_idx[_i] = (_i < _n) ? (int)_i : -1;");
+        });
+        cg.addLine("threadgroup_barrier(mem_flags::mem_threadgroup);");
+        cg.addBlock("for (uint _k = 2u; _k <= _np2; _k <<= 1u)", [&]() {
+            cg.addBlock("for (uint _j = _k >> 1u; _j > 0u; _j >>= 1u)", [&]() {
+                cg.addBlock("for (uint _i = lid; _i < _np2; _i += tg_size)", [&]() {
+                    cg.addLine("uint _ixj = _i ^ _j;");
+                    cg.addIf("_ixj > _i && _ixj < _np2", [&]() {
+                        cg.addLine("bool _asc = (_i & _k) == 0u;");
+                        cg.addLine("int _a = _idx[_i];");
+                        cg.addLine("int _b = _idx[_ixj];");
+                        cg.addLine("int _cmp = 0;");
+                        cg.addIf("_a < 0 && _b >= 0", [&]() { cg.addLine("_cmp = 1;"); });
+                        cg.addIf("_a >= 0 && _b < 0", [&]() { cg.addLine("_cmp = -1;"); });
+                        cg.addIf("_a >= 0 && _b >= 0", [&]() {
+                            for (const auto& key : keys_) emitKeyCompare(cg, key);
+                        });
+                        cg.addLine("bool _swap = _asc ? (_cmp > 0) : (_cmp < 0);");
+                        cg.addIf("_swap", [&]() {
+                            cg.addLine("_idx[_i] = _b;");
+                            cg.addLine("_idx[_ixj] = _a;");
+                        });
+                    });
+                });
+                cg.addLine("threadgroup_barrier(mem_flags::mem_threadgroup);");
+            });
+        });
+        cg.addBlock("for (uint _i = lid; _i < _n; _i += tg_size)", [&]() {
+            cg.addLine(idxBuffer_ + "[_i] = _idx[_i];");
+        });
+        consume();
+    }
+
+    std::string describe() const override { return "GenericSmallSort"; }
+
+private:
+    std::string idxBuffer_;
+    std::vector<GenericSortKeySpec> keys_;
+    std::string nRowsSymbol_;
+    int maxRows_ = 0;
+
+    void emitKeyCompare(MetalCodegen& cg, const GenericSortKeySpec& key) const {
+        const auto& c = key.column;
+        cg.addIf("_cmp == 0", [&]() {
+            if (c.stringLen > 0) {
+                cg.addBlock("for (uint _sc = 0; _sc < " + std::to_string(c.stringLen) + "u; ++_sc)", [&]() {
+                    cg.addLine("char _ca = " + c.bufferName + "[(uint)_a * " +
+                               std::to_string(c.stringLen) + "u + _sc];");
+                    cg.addLine("char _cb = " + c.bufferName + "[(uint)_b * " +
+                               std::to_string(c.stringLen) + "u + _sc];");
+                    cg.addIf("_ca < _cb", [&]() {
+                        cg.addLine("_cmp = " + std::string(key.descending ? "1" : "-1") + ";");
+                        cg.addLine("break;");
+                    });
+                    cg.addIf("_ca > _cb", [&]() {
+                        cg.addLine("_cmp = " + std::string(key.descending ? "-1" : "1") + ";");
+                        cg.addLine("break;");
+                    });
+                });
+            } else if (c.metalType == "float") {
+                cg.addLine("float _ka = " + c.bufferName + "[(uint)_a];");
+                cg.addLine("float _kb = " + c.bufferName + "[(uint)_b];");
+                cg.addIf("_ka < _kb", [&]() {
+                    cg.addLine("_cmp = " + std::string(key.descending ? "1" : "-1") + ";");
+                });
+                cg.addIf("_ka > _kb", [&]() {
+                    cg.addLine("_cmp = " + std::string(key.descending ? "-1" : "1") + ";");
+                });
+            } else if (c.isLongPair) {
+                cg.addLine("long _ka = (((long)" + c.bufferName +
+                           "[(uint)_a * 2u + 1u]) << 32) | (long)" +
+                           c.bufferName + "[(uint)_a * 2u];");
+                cg.addLine("long _kb = (((long)" + c.bufferName +
+                           "[(uint)_b * 2u + 1u]) << 32) | (long)" +
+                           c.bufferName + "[(uint)_b * 2u];");
+                cg.addIf("_ka < _kb", [&]() {
+                    cg.addLine("_cmp = " + std::string(key.descending ? "1" : "-1") + ";");
+                });
+                cg.addIf("_ka > _kb", [&]() {
+                    cg.addLine("_cmp = " + std::string(key.descending ? "-1" : "1") + ";");
+                });
+            } else {
+                cg.addLine(c.metalType + " _ka = " + c.bufferName + "[(uint)_a];");
+                cg.addLine(c.metalType + " _kb = " + c.bufferName + "[(uint)_b];");
+                cg.addIf("_ka < _kb", [&]() {
+                    cg.addLine("_cmp = " + std::string(key.descending ? "1" : "-1") + ";");
+                });
+                cg.addIf("_ka > _kb", [&]() {
+                    cg.addLine("_cmp = " + std::string(key.descending ? "-1" : "1") + ";");
+                });
+            }
+        });
+    }
+};
+
+class MetalGenericTopKSelection : public MetalOperator {
+public:
+    MetalGenericTopKSelection(std::string idxBuffer,
+                              std::vector<GenericSortKeySpec> keys,
+                              std::string nRowsSymbol,
+                              std::string capacityExpr,
+                              int limit)
+        : idxBuffer_(std::move(idxBuffer)),
+          keys_(std::move(keys)),
+          nRowsSymbol_(std::move(nRowsSymbol)),
+          capacityExpr_(std::move(capacityExpr)),
+          limit_(limit) {}
+
+    void produce(MetalCodegen& cg, ConsumerFn consume) override {
+        cg.setPhaseMaxThreadgroups(1);
+        cg.addScalarParam(nRowsSymbol_, "uint");
+        cg.addBufferParam(idxBuffer_, "int", std::to_string(limit_), true, 0xFF);
+        for (const auto& key : keys_) {
+            std::string sizeExpr = capacityExpr_;
+            if (key.column.stringLen > 0)
+                sizeExpr += " * " + std::to_string(key.column.stringLen);
+            if (key.column.isLongPair)
+                sizeExpr += " * 2";
+            cg.addBufferParam(key.column.bufferName, key.column.metalType,
+                              sizeExpr, false);
+        }
+
+        cg.addLine("threadgroup int _topk_indices[256];");
+        cg.addLine("threadgroup int _prev_idx_tg;");
+        cg.addLine("threadgroup int _done_tg;");
+        cg.addIf("lid == 0", [&]() {
+            cg.addLine("_prev_idx_tg = -1;");
+            cg.addLine("_done_tg = 0;");
+        });
+        cg.addLine("threadgroup_barrier(mem_flags::mem_threadgroup);");
+        cg.addBlock("for (uint _out = 0; _out < " + std::to_string(limit_) +
+                    "u; ++_out)", [&]() {
+            cg.addLine("int _local_idx = -1;");
+            cg.addIf("_done_tg == 0", [&]() {
+                cg.addBlock("for (uint _i = lid; _i < " + nRowsSymbol_ +
+                            "; _i += tg_size)", [&]() {
+                    cg.addLine("bool _eligible = true;");
+                    cg.addIf("_prev_idx_tg >= 0", [&]() {
+                        emitRowCompare(cg, "_prev_idx_tg", "_i", "_cmp_prev");
+                        cg.addLine("_eligible = (_cmp_prev < 0);");
+                    });
+                    cg.addIf("_eligible", [&]() {
+                        cg.addIf("_local_idx < 0", [&]() {
+                            cg.addLine("_local_idx = (int)_i;");
+                        });
+                        cg.addIf("_local_idx >= 0", [&]() {
+                            emitRowCompare(cg, "_i", "_local_idx", "_cmp_local");
+                            cg.addIf("_cmp_local < 0", [&]() {
+                                cg.addLine("_local_idx = (int)_i;");
+                            });
+                        });
+                    });
+                });
+            });
+            cg.addLine("_topk_indices[lid] = _local_idx;");
+            cg.addLine("threadgroup_barrier(mem_flags::mem_threadgroup);");
+            for (int stride = 128; stride > 0; stride >>= 1) {
+                cg.addIf("lid < " + std::to_string(stride) + "u", [&]() {
+                    cg.addLine("int _cand_idx = _topk_indices[lid + " +
+                               std::to_string(stride) + "u];");
+                    cg.addIf("_cand_idx >= 0", [&]() {
+                        cg.addIf("_topk_indices[lid] < 0", [&]() {
+                            cg.addLine("_topk_indices[lid] = _cand_idx;");
+                        });
+                        cg.addIf("_topk_indices[lid] >= 0", [&]() {
+                            emitRowCompare(cg, "_cand_idx", "_topk_indices[lid]",
+                                           "_cmp_reduce");
+                            cg.addIf("_cmp_reduce < 0", [&]() {
+                                cg.addLine("_topk_indices[lid] = _cand_idx;");
+                            });
+                        });
+                    });
+                });
+                cg.addLine("threadgroup_barrier(mem_flags::mem_threadgroup);");
+            }
+            cg.addIf("lid == 0", [&]() {
+                cg.addLine(idxBuffer_ + "[_out] = _topk_indices[0];");
+                cg.addIf("_topk_indices[0] >= 0", [&]() {
+                    cg.addLine("_prev_idx_tg = _topk_indices[0];");
+                });
+                cg.addIf("_topk_indices[0] < 0", [&]() {
+                    cg.addLine("_done_tg = 1;");
+                });
+            });
+            cg.addLine("threadgroup_barrier(mem_flags::mem_threadgroup);");
+        });
+        consume();
+    }
+
+    std::string describe() const override { return "GenericTopKSelection"; }
+
+private:
+    std::string idxBuffer_;
+    std::vector<GenericSortKeySpec> keys_;
+    std::string nRowsSymbol_;
+    std::string capacityExpr_;
+    int limit_ = 0;
+
+    void emitRowCompare(MetalCodegen& cg,
+                        const std::string& aExpr,
+                        const std::string& bExpr,
+                        const std::string& cmpVar) const {
+        cg.addLine("int " + cmpVar + " = 0;");
+        for (const auto& key : keys_) {
+            emitKeyCompare(cg, key, aExpr, bExpr, cmpVar);
+        }
+        cg.addIf(cmpVar + " == 0", [&]() {
+            cg.addIf("(uint)(" + aExpr + ") < (uint)(" + bExpr + ")", [&]() {
+                cg.addLine(cmpVar + " = -1;");
+            });
+            cg.addIf("(uint)(" + aExpr + ") > (uint)(" + bExpr + ")", [&]() {
+                cg.addLine(cmpVar + " = 1;");
+            });
+        });
+    }
+
+    void emitKeyCompare(MetalCodegen& cg,
+                        const GenericSortKeySpec& key,
+                        const std::string& aExpr,
+                        const std::string& bExpr,
+                        const std::string& cmpVar) const {
+        const auto& c = key.column;
+        const std::string aIdx = "(uint)(" + aExpr + ")";
+        const std::string bIdx = "(uint)(" + bExpr + ")";
+        cg.addIf(cmpVar + " == 0", [&]() {
+            if (c.stringLen > 0) {
+                cg.addBlock("for (uint _sc = 0; _sc < " + std::to_string(c.stringLen) + "u; ++_sc)", [&]() {
+                    cg.addLine("char _ca = " + c.bufferName + "[" + aIdx + " * " +
+                               std::to_string(c.stringLen) + "u + _sc];");
+                    cg.addLine("char _cb = " + c.bufferName + "[" + bIdx + " * " +
+                               std::to_string(c.stringLen) + "u + _sc];");
+                    cg.addIf("_ca < _cb", [&]() {
+                        cg.addLine(cmpVar + " = " +
+                                   std::string(key.descending ? "1" : "-1") + ";");
+                        cg.addLine("break;");
+                    });
+                    cg.addIf("_ca > _cb", [&]() {
+                        cg.addLine(cmpVar + " = " +
+                                   std::string(key.descending ? "-1" : "1") + ";");
+                        cg.addLine("break;");
+                    });
+                });
+            } else if (c.metalType == "float") {
+                cg.addLine("float _ka = " + c.bufferName + "[" + aIdx + "];");
+                cg.addLine("float _kb = " + c.bufferName + "[" + bIdx + "];");
+                cg.addIf("_ka < _kb", [&]() {
+                    cg.addLine(cmpVar + " = " +
+                               std::string(key.descending ? "1" : "-1") + ";");
+                });
+                cg.addIf("_ka > _kb", [&]() {
+                    cg.addLine(cmpVar + " = " +
+                               std::string(key.descending ? "-1" : "1") + ";");
+                });
+            } else if (c.isLongPair) {
+                cg.addLine("long _ka = (((long)" + c.bufferName +
+                           "[" + aIdx + " * 2u + 1u]) << 32) | (long)" +
+                           c.bufferName + "[" + aIdx + " * 2u];");
+                cg.addLine("long _kb = (((long)" + c.bufferName +
+                           "[" + bIdx + " * 2u + 1u]) << 32) | (long)" +
+                           c.bufferName + "[" + bIdx + " * 2u];");
+                cg.addIf("_ka < _kb", [&]() {
+                    cg.addLine(cmpVar + " = " +
+                               std::string(key.descending ? "1" : "-1") + ";");
+                });
+                cg.addIf("_ka > _kb", [&]() {
+                    cg.addLine(cmpVar + " = " +
+                               std::string(key.descending ? "-1" : "1") + ";");
+                });
+            } else {
+                cg.addLine(c.metalType + " _ka = " + c.bufferName + "[" + aIdx + "];");
+                cg.addLine(c.metalType + " _kb = " + c.bufferName + "[" + bIdx + "];");
+                cg.addIf("_ka < _kb", [&]() {
+                    cg.addLine(cmpVar + " = " +
+                               std::string(key.descending ? "1" : "-1") + ";");
+                });
+                cg.addIf("_ka > _kb", [&]() {
+                    cg.addLine(cmpVar + " = " +
+                               std::string(key.descending ? "-1" : "1") + ";");
+                });
+            }
+        });
+    }
+};
+
+class MetalGenericTopKFloatInt : public MetalOperator {
+public:
+    MetalGenericTopKFloatInt(std::string idxBuffer,
+                             GenericSortKeySpec primary,
+                             std::optional<GenericSortKeySpec> tie,
+                             std::string nRowsSymbol,
+                             std::string capacityExpr,
+                             int limit)
+        : idxBuffer_(std::move(idxBuffer)),
+          primary_(std::move(primary)),
+          tie_(std::move(tie)),
+          nRowsSymbol_(std::move(nRowsSymbol)),
+          capacityExpr_(std::move(capacityExpr)),
+          limit_(limit) {}
+
+    void produce(MetalCodegen& cg, ConsumerFn consume) override {
+        cg.setPhaseMaxThreadgroups(1);
+        cg.addScalarParam(nRowsSymbol_, "uint");
+        cg.addBufferParam(idxBuffer_, "int", std::to_string(limit_), true, 0xFF);
+        cg.addBufferParam(primary_.column.bufferName, primary_.column.metalType,
+                          capacityExpr_, false);
+        if (tie_) {
+            cg.addBufferParam(tie_->column.bufferName, tie_->column.metalType,
+                              capacityExpr_, false);
+        }
+
+        cg.addLine("threadgroup ulong _topk_keys[256];");
+        cg.addLine("threadgroup int _topk_indices[256];");
+        cg.addLine("ulong _prev_key = 0xfffffffffffffffful;");
+        cg.addBlock("for (uint _out = 0; _out < " + std::to_string(limit_) +
+                    "u; ++_out)", [&]() {
+            cg.addLine("ulong _local_key = 0ul;");
+            cg.addLine("int _local_idx = -1;");
+            cg.addBlock("for (uint _i = lid; _i < " + nRowsSymbol_ +
+                        "; _i += tg_size)", [&]() {
+                emitCandidateKey(cg);
+                cg.addIf("_key < _prev_key && (_local_idx < 0 || _key > _local_key)", [&]() {
+                    cg.addLine("_local_key = _key;");
+                    cg.addLine("_local_idx = (int)_i;");
+                });
+            });
+            cg.addLine("_topk_keys[lid] = (_local_idx >= 0 ? _local_key : 0ul);");
+            cg.addLine("_topk_indices[lid] = _local_idx;");
+            cg.addLine("threadgroup_barrier(mem_flags::mem_threadgroup);");
+            for (int stride = 128; stride > 0; stride >>= 1) {
+                cg.addIf("lid < " + std::to_string(stride) + "u", [&]() {
+                    cg.addLine("ulong _cand_key = _topk_keys[lid + " +
+                               std::to_string(stride) + "u];");
+                    cg.addLine("int _cand_idx = _topk_indices[lid + " +
+                               std::to_string(stride) + "u];");
+                    cg.addIf("_cand_idx >= 0 && (_topk_indices[lid] < 0 || "
+                             "_cand_key > _topk_keys[lid])", [&]() {
+                        cg.addLine("_topk_keys[lid] = _cand_key;");
+                        cg.addLine("_topk_indices[lid] = _cand_idx;");
+                    });
+                });
+                cg.addLine("threadgroup_barrier(mem_flags::mem_threadgroup);");
+            }
+            cg.addIf("lid == 0", [&]() {
+                cg.addLine(idxBuffer_ + "[_out] = _topk_indices[0];");
+            });
+            cg.addLine("threadgroup_barrier(mem_flags::mem_threadgroup);");
+            cg.addLine("_prev_key = _topk_keys[0];");
+            cg.addLine("threadgroup_barrier(mem_flags::mem_threadgroup);");
+        });
+        consume();
+    }
+
+    std::string describe() const override { return "GenericTopKFloatInt"; }
+
+private:
+    std::string idxBuffer_;
+    GenericSortKeySpec primary_;
+    std::optional<GenericSortKeySpec> tie_;
+    std::string nRowsSymbol_;
+    std::string capacityExpr_;
+    int limit_ = 0;
+
+    void emitCandidateKey(MetalCodegen& cg) const {
+        cg.addLine("float _primary_v = " + primary_.column.bufferName + "[_i];");
+        cg.addLine("uint _primary_bits = as_type<uint>(_primary_v);");
+        cg.addLine("uint _primary_rank = ((_primary_bits & 0x80000000u) != 0u) ? "
+                   "(~_primary_bits) : (_primary_bits ^ 0x80000000u);");
+        if (!primary_.descending) cg.addLine("_primary_rank = ~_primary_rank;");
+        if (tie_) {
+            cg.addLine("uint _tie_raw = uint(" + tie_->column.bufferName + "[_i]);");
+        } else {
+            cg.addLine("uint _tie_raw = _i;");
+        }
+        cg.addLine("uint _tie_rank = (_tie_raw ^ 0x80000000u);");
+        const bool tieDescending = tie_ && tie_->descending;
+        if (!tieDescending) cg.addLine("_tie_rank = ~_tie_rank;");
+        cg.addLine("ulong _key = ((ulong)_primary_rank << 32) | (ulong)_tie_rank;");
+    }
+};
+
 PostDispatchHook makeGenericSortHook(
         const std::string& sortPhaseName,
         const std::string& sortIdxBufName,
@@ -1009,8 +1528,9 @@ std::vector<GenericMatColumnDesc> genericGpuGroupOutputColumns(
         if (display.rfind("__hidden_", 0) == 0 || fn == "RATIO_DEN") return;
         if (seen.count(display)) return;
         if (isGroupKey(display)) {
+            const std::string outType = col->stringLen > 0 ? "char" : col->metalType;
             out.push_back({display, "d_gpu_gb_" + suffix + "_out_" + sanitizeIdentifier(display),
-                           col->metalType, col->stringLen});
+                           outType, col->stringLen});
         } else if (ai >= 0) {
             bool longPair = false;
             int scaleDown = 0;
@@ -1101,6 +1621,152 @@ bool appendGenericGpuSort(MetalQueryPlan& plan,
             std::make_unique<MetalGenericSortStep>(idxBuf, keys, capacityExpr));
         sortPhase.postDispatchHook = makeGenericSortHook(phaseName, idxBuf, nRowsSymbol, keys);
     }
+    plan.gpuSort = MetalQueryPlan::GpuSort{idxBuf, nRowsSymbol, false, sortSpec.limit};
+    return true;
+}
+
+bool appendGenericGpuSmallSort(MetalQueryPlan& plan,
+                               const std::string& tag,
+                               const std::string& nRowsSymbol,
+                               int maxRows,
+                               const std::vector<GenericMatColumnDesc>& columns,
+                               const GenericSortSpec& sortSpec,
+                               std::string* error) {
+    if (maxRows <= 0 || (maxRows & (maxRows - 1)) != 0) {
+        if (error) *error = "GPU small sort requires a positive power-of-two maxRows.";
+        return false;
+    }
+    if (sortSpec.keys.empty()) {
+        if (error) *error = "GPU small sort requires at least one ORDER BY key.";
+        return false;
+    }
+
+    std::vector<GenericSortKeySpec> keys;
+    for (const auto& sk : sortSpec.keys) {
+        const auto* col = findMatColumn(columns, sk.column);
+        if (!col) {
+            if (error) *error = "GPU small sort key not present in materialized output: " +
+                                sk.column;
+            return false;
+        }
+        if (!col->isLongPair && col->stringLen <= 0 &&
+            col->metalType != "uint" && col->metalType != "int" &&
+            col->metalType != "float") {
+            if (error) *error = "GPU small sort currently supports int/uint/float, long-pair, and fixed string keys.";
+            return false;
+        }
+        keys.push_back({*col, sk.descending});
+    }
+
+    const std::string suffix = sanitizeIdentifier(tag);
+    const std::string idxBuf = "d_gpu_smallsort_idx_" + suffix;
+    appendPhase(plan, "GENERIC_gpu_smallsort_" + suffix,
+                std::make_unique<MetalGenericSmallSort>(
+                    idxBuf, std::move(keys), nRowsSymbol, maxRows),
+                256);
+    plan.gpuSort = MetalQueryPlan::GpuSort{idxBuf, nRowsSymbol, false, sortSpec.limit};
+    return true;
+}
+
+bool appendGenericGpuTopKSelection(MetalQueryPlan& plan,
+                                   const std::string& tag,
+                                   const std::string& nRowsSymbol,
+                                   const std::string& capacityExpr,
+                                   const std::vector<GenericMatColumnDesc>& columns,
+                                   const GenericSortSpec& sortSpec,
+                                   std::string* error) {
+    if (sortSpec.limit <= 0) {
+        if (error) *error = "GPU selection top-k requires a positive LIMIT.";
+        return false;
+    }
+    if (sortSpec.limit > 256) {
+        if (error) *error = "GPU selection top-k currently supports LIMIT <= 256.";
+        return false;
+    }
+    if (sortSpec.keys.empty()) {
+        if (error) *error = "GPU selection top-k requires at least one ORDER BY key.";
+        return false;
+    }
+
+    std::vector<GenericSortKeySpec> keys;
+    for (const auto& sk : sortSpec.keys) {
+        const auto* col = findMatColumn(columns, sk.column);
+        if (!col) {
+            if (error) *error = "GPU selection top-k key not present in materialized output: " +
+                                sk.column;
+            return false;
+        }
+        if (!col->isLongPair && col->stringLen <= 0 &&
+            col->metalType != "uint" && col->metalType != "int" &&
+            col->metalType != "float") {
+            if (error) *error = "GPU selection top-k currently supports int/uint/float, long-pair, and fixed string keys.";
+            return false;
+        }
+        keys.push_back({*col, sk.descending});
+    }
+
+    const std::string suffix = sanitizeIdentifier(tag);
+    const std::string idxBuf = "d_gpu_topk_select_idx_" + suffix;
+    appendPhase(plan, "GENERIC_gpu_topk_select_" + suffix,
+                std::make_unique<MetalGenericTopKSelection>(
+                    idxBuf, std::move(keys), nRowsSymbol, capacityExpr, sortSpec.limit),
+                256);
+    plan.gpuSort = MetalQueryPlan::GpuSort{idxBuf, nRowsSymbol, false, sortSpec.limit};
+    return true;
+}
+
+bool appendGenericGpuTopK(MetalQueryPlan& plan,
+                          const std::string& tag,
+                          const std::string& nRowsSymbol,
+                          const std::string& capacityExpr,
+                          const std::vector<GenericMatColumnDesc>& columns,
+                          const GenericSortSpec& sortSpec,
+                          std::string* error) {
+    if (sortSpec.limit <= 0) {
+        if (error) *error = "GPU top-k requires a positive LIMIT.";
+        return false;
+    }
+    if (sortSpec.keys.empty() || sortSpec.keys.size() > 2) {
+        if (error) *error = "GPU top-k currently supports one float key plus one optional integer tie key.";
+        return false;
+    }
+
+    const auto* primaryCol = findMatColumn(columns, sortSpec.keys[0].column);
+    if (!primaryCol) {
+        if (error) *error = "GPU top-k primary key not present in materialized output: " +
+                            sortSpec.keys[0].column;
+        return false;
+    }
+    if (primaryCol->metalType != "float" || primaryCol->stringLen > 0 ||
+        primaryCol->isLongPair) {
+        if (error) *error = "GPU top-k primary key must be a plain float column.";
+        return false;
+    }
+
+    std::optional<GenericSortKeySpec> tie;
+    if (sortSpec.keys.size() == 2) {
+        const auto* tieCol = findMatColumn(columns, sortSpec.keys[1].column);
+        if (!tieCol) {
+            if (error) *error = "GPU top-k tie key not present in materialized output: " +
+                                sortSpec.keys[1].column;
+            return false;
+        }
+        if ((tieCol->metalType != "int" && tieCol->metalType != "uint") ||
+            tieCol->stringLen > 0 || tieCol->isLongPair) {
+            if (error) *error = "GPU top-k tie key must be a plain integer column.";
+            return false;
+        }
+        tie = GenericSortKeySpec{*tieCol, sortSpec.keys[1].descending};
+    }
+
+    const std::string suffix = sanitizeIdentifier(tag);
+    const std::string idxBuf = "d_gpu_topk_idx_" + suffix;
+    appendPhase(plan, "GENERIC_gpu_topk_" + suffix,
+                std::make_unique<MetalGenericTopKFloatInt>(
+                    idxBuf,
+                    GenericSortKeySpec{*primaryCol, sortSpec.keys[0].descending},
+                    std::move(tie), nRowsSymbol, capacityExpr, sortSpec.limit),
+                256);
     plan.gpuSort = MetalQueryPlan::GpuSort{idxBuf, nRowsSymbol, false, sortSpec.limit};
     return true;
 }

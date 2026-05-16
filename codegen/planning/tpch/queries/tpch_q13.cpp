@@ -1,16 +1,15 @@
 #include "metal_plan_common.h"
+#include "generic/gpu_ops/generic_gpu_physical_ops.h"
 #include "tpch/metal_tpch_query_builders.h"
 
 namespace codegen {
 
-// ===================================================================
-// Q13: Customer Distribution — 2 phases
-// ===================================================================
+// Q13: Customer Distribution.
 std::optional<MetalQueryPlan> buildQ13Plan_byName() {
     std::string idx = "i";
     MetalQueryPlan plan;
 
-    // Helper: two-segment LIKE match for 'special...requests' in comment
+    // Match comments containing "special" before "requests".
     plan.helpers.push_back(R"(
 static bool q13_comment_match(const device char* comment, uint idx) {
     const device char* c = comment + idx * 79;
@@ -30,7 +29,7 @@ static bool q13_comment_match(const device char* comment, uint idx) {
 }
 )");
 
-    // Phase 1: Scan orders, filter NOT LIKE, count per custkey
+    // Count qualifying orders per customer.
     {
         auto scan = makeAutoScan("orders", idx);
 
@@ -44,7 +43,7 @@ static bool q13_comment_match(const device char* comment, uint idx) {
         appendPhase(plan, "Q13_count_orders", std::move(count));
     }
 
-    // Phase 2: Scan customers, read order count, build histogram
+    // Build customer-count histogram.
     {
         auto scan = makeAutoScan("customer", idx);
 
@@ -58,6 +57,56 @@ static bool q13_comment_match(const device char* comment, uint idx) {
             "_cnt", "256");
 
         appendPhase(plan, "Q13_build_histogram", std::move(hist), 256);
+    }
+
+    // Materialize nonzero bins for GPU sort.
+    plan.helpers.push_back(R"(
+static void q13_hist_emit(device atomic_uint* counter,
+                          device uint* out_c_count,
+                          device uint* out_custdist,
+                          const device uint* d_histogram,
+                          uint q13_hist_cap,
+                          uint bin) {
+    uint dist = d_histogram[bin];
+    if (dist == 0u) return;
+    uint slot = atomic_fetch_add_explicit(counter, 1u, memory_order_relaxed);
+    if (slot >= q13_hist_cap) return;
+    out_c_count[slot] = bin;
+    out_custdist[slot] = dist;
+}
+)");
+    const std::string resultRows = "q13_result_rows";
+    {
+        auto rscan = std::make_unique<MetalRangeScan>("q13_hist_bins", idx);
+        auto sideEffect = std::make_unique<MetalComputeExpr>(
+            std::move(rscan), "_q13_hist_unused", "int",
+            "(q13_hist_emit(d_q13_result_count, d_q13_result_c_count, "
+            "d_q13_result_custdist, d_histogram, q13_hist_cap, " + idx + "), 0)");
+        auto& phase = appendPhase(plan, "Q13_materialize_histogram", std::move(sideEffect), 256);
+        phase.extraBuffers.push_back({"d_q13_result_count",    "atomic_uint", false, true});
+        phase.extraBuffers.push_back({"d_q13_result_c_count",  "uint",        false, false});
+        phase.extraBuffers.push_back({"d_q13_result_custdist", "uint",        false, false});
+        phase.extraBuffers.push_back({"d_histogram",           "uint",        true,  false});
+        phase.scalarParams.push_back({"q13_hist_cap", "uint"});
+        attachMaterializedCountHook(phase, "d_q13_result_count", resultRows);
+    }
+
+    // --- Result Order ---
+    // Sort compact histogram bins by distribution, then count.
+    {
+        std::vector<GenericMatColumnDesc> columns = {
+            GenericMatColumnDesc("c_count", "d_q13_result_c_count", "uint"),
+            GenericMatColumnDesc("custdist", "d_q13_result_custdist", "uint"),
+        };
+        GenericSortSpec sortSpec;
+        sortSpec.keys.push_back({"custdist", true});
+        sortSpec.keys.push_back({"c_count", true});
+        std::string sortError;
+        if (!appendGenericGpuSmallSort(plan, "q13_result", resultRows,
+                                       256, columns, sortSpec, &sortError)) {
+            appendGenericGpuSort(plan, "q13_result", resultRows,
+                                 "256", columns, sortSpec, &sortError);
+        }
     }
 
     return plan;

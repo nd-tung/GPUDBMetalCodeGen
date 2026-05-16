@@ -206,6 +206,7 @@ std::optional<MetalQueryPlan> lowerSingleTableGroupedAggregateIRToMetal(
 
     MetalQueryPlan plan;
     plan.name = "GENERIC_IR_SINGLE_TABLE_GROUP";
+    plan.chunkable = true;
     auto keyed = std::make_unique<MetalKeyedAgg>(
         std::move(pipe), "d_ir_group_aggs", bucketExpr,
         totalBuckets, valuesPerBucket, std::to_string(totalBuckets * valuesPerBucket));

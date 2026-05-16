@@ -10,9 +10,8 @@ namespace codegen {
 
 struct AnalyzedQuery;
 
-// Phase 2 migration entry point. Lowers the narrow single-table
-// materialize/order/limit IR shape to the existing GPU operator stack.
-// Returns nullopt when the IR shape is not handled by this lowerer.
+// Lower supported single-table materialize/order/limit IR shapes to Metal.
+// Returns nullopt when this route does not handle the shape.
 std::optional<MetalQueryPlan> lowerSingleTableMaterializeIRToMetal(
     const GenericRelPlan& ir,
     std::string* error = nullptr);
