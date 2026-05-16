@@ -23,6 +23,14 @@ std::unique_ptr<MetalOperator> makeScalarDirectFloatAgg(
     std::string value,
     std::string size);
 
+std::unique_ptr<MetalOperator> makeScalarDirectAvgAgg(
+    std::unique_ptr<MetalOperator> child,
+    std::string countBuffer,
+    std::string sumBuffer,
+    std::string key,
+    std::string value,
+    std::string size);
+
 std::unique_ptr<MetalOperator> makeScalarFillFloatBuffer(
     std::string buffer,
     std::string size,

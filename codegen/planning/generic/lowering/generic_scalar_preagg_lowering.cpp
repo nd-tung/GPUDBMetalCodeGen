@@ -129,25 +129,30 @@ static std::optional<ScalarLookupInfo> buildDecorrelatedScalarPreAgg(
         dsq.filtersByTable;
     std::vector<ResolvedCorrelation> resolvedCorrelations;
     std::set<const Predicate*> copiedOuterFilters;
+    // Bitmap state is one path per column; keep outer-filter seeding to
+    // correlation-only subqueries so inner join constraints stay intact.
+    const bool canSeedOuterFilters = dsq.joins.empty();
     for (const auto& c : dsq.correlations) {
         DecorrCol outer = c.outer;
         if (auto binding = resolveOuterFilterBinding(c.outer, aq)) {
             outer.table = binding->table;
             relevantCols[outer.table].insert(outer.column);
 
-            for (const auto& pred : aq.filters) {
-                if (!pred || copiedOuterFilters.count(pred.get())) continue;
-                if (!predicateOnlyReferencesTable(pred, binding->table)) continue;
-                filtersByTable[binding->table].push_back(pred);
-                copiedOuterFilters.insert(pred.get());
-            }
-            if (!binding->alias.empty()) {
-                auto instIt = aq.instanceFilters.find(binding->alias);
-                if (instIt != aq.instanceFilters.end()) {
-                    for (const auto& pred : instIt->second) {
-                        if (!pred || copiedOuterFilters.count(pred.get())) continue;
-                        filtersByTable[binding->table].push_back(pred);
-                        copiedOuterFilters.insert(pred.get());
+            if (canSeedOuterFilters) {
+                for (const auto& pred : aq.filters) {
+                    if (!pred || copiedOuterFilters.count(pred.get())) continue;
+                    if (!predicateOnlyReferencesTable(pred, binding->table)) continue;
+                    filtersByTable[binding->table].push_back(pred);
+                    copiedOuterFilters.insert(pred.get());
+                }
+                if (!binding->alias.empty()) {
+                    auto instIt = aq.instanceFilters.find(binding->alias);
+                    if (instIt != aq.instanceFilters.end()) {
+                        for (const auto& pred : instIt->second) {
+                            if (!pred || copiedOuterFilters.count(pred.get())) continue;
+                            filtersByTable[binding->table].push_back(pred);
+                            copiedOuterFilters.insert(pred.get());
+                        }
                     }
                 }
             }
@@ -373,14 +378,12 @@ static std::optional<ScalarLookupInfo> buildDecorrelatedScalarPreAgg(
             info.sumBuffer = base + "_sum";
             info.cntVar = "_scalar_" + std::to_string(dsq.sqIdx) + "_cnt";
             info.sumVar = "_scalar_" + std::to_string(dsq.sqIdx) + "_sum";
-            auto count = std::make_unique<MetalAtomicCount>(
-                makeAggInput(), info.countBuffer, keyExpr, info.sizeSymbol);
-            appendPhase(plan, "GENERIC_scalar_decorrelate_" + std::to_string(dsq.sqIdx) + "_avg_count",
-                        std::move(count));
-            auto sum = makeScalarDirectFloatAgg(
-                makeAggInput(), "sum", info.sumBuffer, "", keyExpr, valueExpr, info.sizeSymbol);
-            appendPhase(plan, "GENERIC_scalar_decorrelate_" + std::to_string(dsq.sqIdx) + "_avg_sum",
-                        std::move(sum));
+            auto avg = makeScalarDirectAvgAgg(
+                makeAggInput(), info.countBuffer, info.sumBuffer, keyExpr,
+                valueExpr, info.sizeSymbol);
+            appendPhase(plan, "GENERIC_scalar_decorrelate_" +
+                              std::to_string(dsq.sqIdx) + "_avg",
+                        std::move(avg));
             return info;
         }
         if (dsq.func == AggFunc::SUM) {

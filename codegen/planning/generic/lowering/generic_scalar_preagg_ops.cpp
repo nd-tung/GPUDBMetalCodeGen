@@ -124,6 +124,51 @@ private:
     std::string size_;
 };
 
+class ScalarDirectAvgAgg : public MetalUnaryOperator {
+public:
+    ScalarDirectAvgAgg(std::unique_ptr<MetalOperator> child,
+                       std::string countBuffer,
+                       std::string sumBuffer,
+                       std::string key,
+                       std::string value,
+                       std::string size)
+        : MetalUnaryOperator(std::move(child)),
+          countBuffer_(std::move(countBuffer)),
+          sumBuffer_(std::move(sumBuffer)),
+          key_(std::move(key)),
+          value_(std::move(value)),
+          size_(std::move(size)) {}
+
+    void produce(MetalCodegen& cg, ConsumerFn) override {
+        cg.addAtomicBufferParam(countBuffer_, "atomic_uint", size_);
+        cg.addAtomicBufferParam(sumBuffer_, "atomic_uint", size_);
+        child_->produce(cg, [&]() {
+            const std::string key = "(uint)(" + key_ + ")";
+            const std::string value = "(float)(" + value_ + ")";
+            cg.addLine("atomic_fetch_add_explicit(&" + countBuffer_ +
+                       "[" + key + "], 1u, memory_order_relaxed);");
+            cg.addLine("atomic_add_float(&" + sumBuffer_ +
+                       "[" + key + "], " + value + ");");
+        });
+    }
+
+    std::string describe() const override {
+        return "ScalarDirectAvgAgg";
+    }
+
+    void iusUsed(std::vector<IU>& out) const override {
+        appendIUsFromExpr(key_, out);
+        appendIUsFromExpr(value_, out);
+    }
+
+private:
+    std::string countBuffer_;
+    std::string sumBuffer_;
+    std::string key_;
+    std::string value_;
+    std::string size_;
+};
+
 class ScalarFillFloatBuffer : public MetalOperator {
 public:
     ScalarFillFloatBuffer(std::string buffer, std::string size, std::string fill)
@@ -347,6 +392,18 @@ std::unique_ptr<MetalOperator> makeScalarDirectFloatAgg(
         std::move(child), std::move(op), std::move(buffer),
         std::move(state), std::move(key), std::move(value),
         std::move(size));
+}
+
+std::unique_ptr<MetalOperator> makeScalarDirectAvgAgg(
+    std::unique_ptr<MetalOperator> child,
+    std::string countBuffer,
+    std::string sumBuffer,
+    std::string key,
+    std::string value,
+    std::string size) {
+    return std::make_unique<ScalarDirectAvgAgg>(
+        std::move(child), std::move(countBuffer), std::move(sumBuffer),
+        std::move(key), std::move(value), std::move(size));
 }
 
 std::unique_ptr<MetalOperator> makeScalarFillFloatBuffer(
