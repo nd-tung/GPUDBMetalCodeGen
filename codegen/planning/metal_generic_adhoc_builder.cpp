@@ -1,4 +1,4 @@
-#include "metal_generic_adhoc_builder.h"
+#include "generic_scalar_lookup_helpers.h"
 #include "metal_generic_sql_physical_ops.h"
 #include "metal_plan_common.h"
 #include "metal_generic_executor.h"
@@ -1135,37 +1135,10 @@ std::optional<MetalQueryPlan> buildMaterializePlan(const AnalyzedQuery& aq, std:
 
     if (aq.having) return fail("Materialization: HAVING requires aggregation.");
     if (aq.targets.empty()) return fail("Materialization: no SELECT targets.");
-
-    bool needsCpuGroupBy = aq.hasGroupBy() && aq.hasAggregation();
-    MetalQueryPlan::CpuGroupBy cpuGB;
-    if (needsCpuGroupBy) {
-        for (const auto& g : aq.groupBy) {
-            auto* gcRef = std::get_if<ColRef>(&g->node);
-            if (gcRef) cpuGB.keyColumns.push_back(displayNameForTargetByCol(aq, *gcRef));
-        }
-        for (size_t ti = 0; ti < aq.targets.size(); ++ti) {
-            const auto& target = aq.targets[ti];
-            if (target.isAgg && target.agg) {
-                cpuGB.aggColumns.push_back(displayNameForTarget(target, ti));
-                cpuGB.aggFuncs.push_back(aggFuncName(target.agg->func));
-            }
-        }
-    } else if (aq.hasAggregation()) {
-        return fail("Materialization: scalar aggregates use scalar aggregation path.");
-    } else if (aq.hasGroupBy()) {
-        return fail("Materialization: GROUP BY without aggregates not supported.");
-    }
-
-    MetalQueryPlan::CpuSort cpuSort;
-    cpuSort.limit = aq.limit;
-    for (const auto& order : aq.orderBy) {
-        auto column = orderColumnForExpr(order.expr, aq.targets);
-        if (!column) {
-            std::string orderStr = order.expr ? "expression" : "?";
-            return fail("Materialization: ORDER BY " + orderStr + " could not be resolved to a SELECT target.");
-        }
-        cpuSort.keys.push_back({*column, order.descending});
-    }
+    if (aq.hasAggregation())
+        return fail("Materialization: aggregates use aggregation paths.");
+    if (aq.hasGroupBy())
+        return fail("Materialization: GROUP BY requires an aggregation path.");
 
     std::set<std::string> usedColumns;
     for (const auto& target : aq.targets) {
@@ -1184,6 +1157,7 @@ std::optional<MetalQueryPlan> buildMaterializePlan(const AnalyzedQuery& aq, std:
         std::move(filtered), "d_adhoc_result_count", "1");
 
     const std::string outputSize = tableSizeName(aq.tables[0]);
+    std::vector<GenericMatColumnDesc> materializedCols;
     for (size_t targetIndex = 0; targetIndex < aq.targets.size(); ++targetIndex) {
         const auto& target = aq.targets[targetIndex];
         DataType type = inferExprDataType(target.expr);
@@ -1193,86 +1167,31 @@ std::optional<MetalQueryPlan> buildMaterializePlan(const AnalyzedQuery& aq, std:
         std::string sizeExpr = outputSize;
         if (stringLen > 0) sizeExpr += " * " + std::to_string(stringLen);
 
-        std::string expr;
-        if (needsCpuGroupBy && target.isAgg && target.agg) {
-            if (target.agg->func == AggFunc::COUNT || target.agg->isStar) {
-                expr = "1.0f";
-                type = DataType::FLOAT;
-            } else if (target.agg->innerExpr) {
-                expr = exprToMetal(target.agg->innerExpr, idxVar, aq.schema);
-                type = DataType::FLOAT;
-            } else {
-                expr = "0";
-            }
-        } else {
-            expr = materializeValueExpr(target.expr, idxVar, aq.schema);
-        }
-
+        std::string expr = materializeValueExpr(target.expr, idxVar, aq.schema);
         materialize->addColumn(bufferName, metalTypeForDataType(type),
                                expr, displayName, sizeExpr, stringLen);
+        materializedCols.push_back({displayName, bufferName,
+                                    metalTypeForDataType(type), stringLen,
+                                    0, false});
     }
 
-    if (needsCpuGroupBy) {
-        plan.cpuGroupBy = cpuGB;
+    auto& matPhase = appendPhase(plan, "ADHOC_single_table_materialize", std::move(materialize));
+
+    GenericSortSpec sortSpec;
+    sortSpec.limit = aq.limit;
+    for (int oi = 0; oi < (int)aq.orderBy.size(); ++oi) {
+        auto column = resolveOrderColumn(aq.orderBy[oi].expr, oi, aq.orderBy, aq.targets);
+        if (!column)
+            return fail("Materialization: ORDER BY expression could not be resolved to a SELECT target.");
+        sortSpec.keys.push_back({*column, aq.orderBy[oi].descending});
     }
-
-    appendPhase(plan, "ADHOC_single_table_materialize", std::move(materialize));
-
-    // ── GPU Sort (if ORDER BY is on a single numeric column) ──
-    bool useGpuSort = false;
-    std::string sortSourceCol;  // materialized output buffer to sort on
-    std::string sortType;       // "int" or "float"
-    bool sortDesc = false;
-
-    if (!cpuSort.keys.empty() && cpuSort.keys.size() == 1) {
-        const auto& sk = cpuSort.keys[0];
-        for (size_t ti = 0; ti < aq.targets.size(); ++ti) {
-            if (displayNameForTarget(aq.targets[ti], ti) == sk.column) {
-                DataType dt = inferExprDataType(aq.targets[ti].expr);
-                if (dt == DataType::INT || dt == DataType::DATE || dt == DataType::FLOAT) {
-                    sortSourceCol = "d_adhoc_" + std::to_string(ti) + "_" + sanitizeIdentifier(sk.column);
-                    sortType = (dt == DataType::FLOAT) ? "float" : "int";
-                    sortDesc = sk.descending;
-                    useGpuSort = true;
-                }
-                break;
-            }
+    if (!sortSpec.keys.empty() || sortSpec.limit >= 0) {
+        const std::string sortRowsSym = "n_gpu_sort_single_materialize_legacy_rows";
+        attachMaterializedCountHook(matPhase, "d_adhoc_result_count", sortRowsSym);
+        if (!appendGenericGpuSort(plan, "single_materialize_legacy", sortRowsSym,
+                                  outputSize, materializedCols, sortSpec, error)) {
+            return std::nullopt;
         }
-    }
-
-    if (useGpuSort) {
-        // Hook on the materialize phase: read the atomic counter and register
-        // it as a scalar for the sort phases that follow.
-        const std::string cntName = "d_adhoc_result_count";
-        const std::string nSym = "n_sort_results";
-        auto& matPhase = plan.phases.back();
-        matPhase.postDispatchHook = [cntName, nSym](MetalGenericExecutor& executor) {
-            auto* buf = executor.getAllocatedBuffer(cntName);
-            if (buf) {
-                uint32_t n = *static_cast<const uint32_t*>(buf->contents());
-                executor.registerScalarInt(nSym, (int)n);
-                executor.registerSymbol(nSym, n);
-            }
-        };
-
-        // Init sort keys phase: encodes materialized output column → sort keys
-        auto initSort = std::make_unique<MetalInitSortKeys>(
-            sortSourceCol, sortType, "d_sortKey", "d_sortIdx", nSym, sortDesc,
-            outputSize);
-        appendPhase(plan, "ADHOC_sort_init", std::move(initSort));
-
-        // Sort step phase with PostDispatchHook for (k,j) bitonic loop
-        auto sortStep = std::make_unique<MetalBitonicSortStep>("d_sortKey", "d_sortIdx",
-                                                               nSym, outputSize);
-        const std::string sortPhaseName = "ADHOC_sort_step";
-        auto& sortPhase = appendPhase(plan, sortPhaseName, std::move(sortStep));
-        sortPhase.postDispatchHook = MetalInitSortKeys::makeBitonicHook(
-            sortPhaseName, "d_sortKey", "d_sortIdx", nSym);
-
-        // Tell post-processing to use sorted indices
-        plan.gpuSort = MetalQueryPlan::GpuSort{"d_sortIdx", nSym, sortDesc, cpuSort.limit};
-    } else if (!cpuSort.keys.empty() || cpuSort.limit >= 0) {
-        plan.cpuSort = cpuSort;
     }
 
     return plan;
@@ -3446,535 +3365,6 @@ static std::optional<MetalQueryPlan> buildSingleTableScalarLookupMaterializePlan
     return plan;
 }
 
-static std::string fromSubqueryBaseForKey(const FromSubqueryAggInfo& info,
-                                          const std::string& tableKey) {
-    for (size_t i = 0; i < info.tables.size(); ++i) {
-        if (info.tables[i] == tableKey)
-            return info.tables[i];
-        if (i < info.tableAliases.size() && info.tableAliases[i] == tableKey)
-            return info.tables[i];
-    }
-    return tableKey;
-}
-
-static bool fromSubqueryColMatches(const FromSubqueryAggInfo& info,
-                                   const ColRef& col,
-                                   const std::string& tableKey,
-                                   const std::string& column) {
-    if (col.column != column) return false;
-    if (col.table == tableKey) return true;
-    if (!col.tableAlias.empty() && col.tableAlias == tableKey) return true;
-    return fromSubqueryBaseForKey(info, tableKey) == col.table;
-}
-
-struct FromSubqueryScalarExtremum {
-    int sqIdx = -1;
-    AggFunc func = AggFunc::MAX;
-    std::string argAlias;
-};
-
-static bool exprIsIntLiteral(const ExprPtr& expr, int value) {
-    auto* lit = expr ? std::get_if<Literal>(&expr->node) : nullptr;
-    if (!lit) return false;
-    auto* iv = std::get_if<int>(&lit->value);
-    return iv && *iv == value;
-}
-
-static bool predicateReferencesIntLiteral(const PredPtr& pred, int value) {
-    if (!pred) return false;
-    return std::visit([&](auto&& node) -> bool {
-        using T = std::decay_t<decltype(node)>;
-        if constexpr (std::is_same_v<T, Comparison>) {
-            return exprIsIntLiteral(node.left, value) || exprIsIntLiteral(node.right, value);
-        } else if constexpr (std::is_same_v<T, Between>) {
-            return exprIsIntLiteral(node.expr, value) ||
-                   exprIsIntLiteral(node.low, value) ||
-                   exprIsIntLiteral(node.high, value);
-        } else if constexpr (std::is_same_v<T, InList>) {
-            if (exprIsIntLiteral(node.expr, value)) return true;
-            for (const auto& v : node.values)
-                if (exprIsIntLiteral(v, value)) return true;
-            return false;
-        } else if constexpr (std::is_same_v<T, LogicalAnd> || std::is_same_v<T, LogicalOr>) {
-            for (const auto& c : node.children)
-                if (predicateReferencesIntLiteral(c, value)) return true;
-            return false;
-        } else if constexpr (std::is_same_v<T, LogicalNot>) {
-            return predicateReferencesIntLiteral(node.child, value);
-        } else {
-            return false;
-        }
-    }, pred->node);
-}
-
-static bool filtersReferenceScalarSentinel(const AnalyzedQuery& aq, int sqIdx) {
-    const int sentinel = INT_MIN + sqIdx;
-    for (const auto& filter : aq.filters) {
-        if (predicateReferencesIntLiteral(filter, sentinel))
-            return true;
-    }
-    return false;
-}
-
-static std::optional<FromSubqueryScalarExtremum> parseFromSubqueryScalarExtremum(
-        const AnalyzedQuery& aq,
-        const FromSubqueryAggInfo& fsq,
-        const std::string& aggregateAlias) {
-    if (fsq.alias.empty() || aggregateAlias.empty()) return std::nullopt;
-    for (size_t sqIdx = 0; sqIdx < aq.subqueries.size(); ++sqIdx) {
-        const auto& sq = aq.subqueries[sqIdx];
-        if (sq.type != AnalyzedQuery::Subquery::SCALAR_SUBQUERY) continue;
-        if (!filtersReferenceScalarSentinel(aq, static_cast<int>(sqIdx))) continue;
-
-        nlohmann::json root;
-        try { root = nlohmann::json::parse(sq.sql); } catch (...) { continue; }
-        if (!root.contains("SelectStmt")) continue;
-        const auto& ss = root["SelectStmt"];
-        if (!ss.contains("fromClause") || !ss["fromClause"].is_array()) continue;
-
-        bool scansView = false;
-        for (const auto& from : ss["fromClause"]) {
-            if (!from.contains("RangeVar")) continue;
-            const auto& rv = from["RangeVar"];
-            if (rv.value("relname", "") == fsq.alias) {
-                scansView = true;
-                break;
-            }
-        }
-        if (!scansView) continue;
-        if (!ss.contains("targetList") || !ss["targetList"].is_array() ||
-            ss["targetList"].empty()) {
-            continue;
-        }
-
-        for (const auto& target : ss["targetList"]) {
-            if (!target.contains("ResTarget")) continue;
-            const auto& rt = target["ResTarget"];
-            if (!rt.contains("val") || !rt["val"].contains("FuncCall")) continue;
-            const auto& fc = rt["val"]["FuncCall"];
-            std::string func = jsonFuncName(fc);
-            if (func != "max" && func != "min") continue;
-            if (!fc.contains("args") || !fc["args"].is_array() || fc["args"].empty())
-                continue;
-            auto arg = jsonRawColumnRef(fc["args"][0]);
-            if (!arg || arg->column != aggregateAlias) continue;
-            FromSubqueryScalarExtremum out;
-            out.sqIdx = static_cast<int>(sqIdx);
-            out.func = (func == "max") ? AggFunc::MAX : AggFunc::MIN;
-            out.argAlias = aggregateAlias;
-            return out;
-        }
-    }
-    return std::nullopt;
-}
-
-static void collectColumnsForTable(const ExprPtr& expr,
-                                   const std::string& table,
-                                   std::set<std::string>& cols) {
-    if (!expr) return;
-    std::visit([&](auto&& node) {
-        using T = std::decay_t<decltype(node)>;
-        if constexpr (std::is_same_v<T, ColRef>) {
-            if (node.table == table) cols.insert(node.column);
-        } else if constexpr (std::is_same_v<T, BinaryExpr>) {
-            collectColumnsForTable(node.left, table, cols);
-            collectColumnsForTable(node.right, table, cols);
-        } else if constexpr (std::is_same_v<T, FuncCall>) {
-            for (const auto& arg : node.args)
-                collectColumnsForTable(arg, table, cols);
-        } else if constexpr (std::is_same_v<T, CaseWhen>) {
-            for (const auto& branch : node.branches) {
-                collectColumnsForTable(branch.result, table, cols);
-            }
-            collectColumnsForTable(node.elseResult, table, cols);
-        }
-    }, expr->node);
-}
-
-class MetalAtomicExtremumFloatArray : public MetalUnaryOperator {
-public:
-    MetalAtomicExtremumFloatArray(std::unique_ptr<MetalOperator> child,
-                                  std::string inputArray,
-                                  std::string outputScalar,
-                                  std::string stateScalar,
-                                  std::string indexExpr,
-                                  bool useMax)
-        : MetalUnaryOperator(std::move(child)),
-          inputArray_(std::move(inputArray)),
-          outputScalar_(std::move(outputScalar)),
-          stateScalar_(std::move(stateScalar)),
-          indexExpr_(std::move(indexExpr)),
-          useMax_(useMax) {}
-
-    void produce(MetalCodegen& cg, ConsumerFn consume) override {
-        cg.addBufferParam(inputArray_, "const atomic_float", "", false, 0);
-        cg.addAtomicBufferParam(outputScalar_, "atomic_uint", "1");
-        cg.addAtomicBufferParam(stateScalar_, "atomic_uint", "1");
-        child_->produce(cg, [&]() {
-            cg.addLine("float _from_subquery_value = atomic_load_explicit(&" +
-                       inputArray_ + "[" + indexExpr_ + "], memory_order_relaxed);");
-            cg.addIf("_from_subquery_value != 0.0f", [&]() {
-                if (useMax_) {
-                    cg.addLine("atomic_max_float(&" + outputScalar_ +
-                               "[0], _from_subquery_value);");
-                    cg.addLine("atomic_store_explicit(&" + stateScalar_ +
-                               "[0], 2u, memory_order_relaxed);");
-                } else {
-                    cg.addLine("atomic_min_float_seen(&" + outputScalar_ +
-                               "[0], &" + stateScalar_ +
-                               "[0], _from_subquery_value);");
-                }
-            });
-            consume();
-        });
-    }
-
-    std::string describe() const override {
-        return std::string(useMax_ ? "AtomicMax" : "AtomicMin") +
-               "FloatArray(" + inputArray_ + ")";
-    }
-
-private:
-    std::string inputArray_;
-    std::string outputScalar_;
-    std::string stateScalar_;
-    std::string indexExpr_;
-    bool useMax_ = true;
-};
-
-static std::optional<MetalQueryPlan> buildFromSubqueryAggTopScalarJoinPlan(
-    const AnalyzedQuery& aq, std::string* error) {
-    auto fail = [&](const std::string& msg) -> std::optional<MetalQueryPlan> {
-        if (error) *error = msg;
-        return std::nullopt;
-    };
-
-    if (aq.fromSubqueryAggs.size() != 1) return std::nullopt;
-    if (aq.hasAggregation() || aq.hasGroupBy()) return std::nullopt;
-
-    const auto& fsq = aq.fromSubqueryAggs[0];
-    if (fsq.tables.size() != 1 || fsq.groupBy.size() != 1) return std::nullopt;
-    auto* groupCol = fsq.groupBy[0] ? std::get_if<ColRef>(&fsq.groupBy[0]->node) : nullptr;
-    if (!groupCol) return std::nullopt;
-
-    const SelectTarget* innerAgg = nullptr;
-    size_t innerAggIndex = 0;
-    FromSubqueryScalarExtremum scalarExtremum;
-    for (size_t ti = 0; ti < fsq.targets.size(); ++ti) {
-        const auto& target = fsq.targets[ti];
-        if (!target.isAgg || !target.agg) continue;
-        std::string alias = displayNameForTarget(target, ti);
-        auto parsed = parseFromSubqueryScalarExtremum(aq, fsq, alias);
-        if (!parsed) continue;
-        innerAgg = &target;
-        innerAggIndex = ti;
-        scalarExtremum = *parsed;
-        break;
-    }
-    if (!innerAgg || !innerAgg->agg) return std::nullopt;
-    if (scalarExtremum.func != AggFunc::MAX)
-        return fail("Grouped FROM-view scalar plan currently supports scalar MAX.");
-    if (innerAgg->agg->func != AggFunc::SUM)
-        return fail("Grouped FROM-view scalar plan currently supports SUM aggregate values.");
-    if (!innerAgg->agg->innerExpr || !isNumericLike(inferExprDataType(innerAgg->agg->innerExpr)))
-        return fail("Grouped FROM-view scalar plan requires a numeric aggregate expression.");
-
-    std::string viewBase = fromSubqueryBaseForKey(fsq, groupCol->tableAlias.empty()
-        ? groupCol->table : groupCol->tableAlias);
-    if (viewBase.empty()) viewBase = groupCol->table;
-    if (viewBase.empty()) return std::nullopt;
-
-    const JoinClause* outerJoin = nullptr;
-    std::string outerTable;
-    std::string outerKeyCol;
-    for (const auto& jc : aq.joins) {
-        bool leftIsViewKey = fromSubqueryColMatches(fsq, *groupCol, jc.leftTable, jc.leftCol);
-        bool rightIsViewKey = fromSubqueryColMatches(fsq, *groupCol, jc.rightTable, jc.rightCol);
-        if (leftIsViewKey == rightIsViewKey) continue;
-        const std::string candidateTable = leftIsViewKey
-            ? fromSubqueryBaseForKey(fsq, jc.rightTable)
-            : fromSubqueryBaseForKey(fsq, jc.leftTable);
-        const std::string candidateKey = leftIsViewKey ? jc.rightCol : jc.leftCol;
-        if (std::find(fsq.tables.begin(), fsq.tables.end(), candidateTable) != fsq.tables.end())
-            continue;
-        outerJoin = &jc;
-        outerTable = candidateTable;
-        outerKeyCol = candidateKey;
-        break;
-    }
-    if (!outerJoin || outerTable.empty() || outerKeyCol.empty())
-        return std::nullopt;
-
-    const std::string sizeSymbol = maxKeySymbolForColumn(viewBase, groupCol->column, aq.schema);
-    if (sizeSymbol.empty()) return std::nullopt;
-
-    MetalQueryPlan plan;
-    plan.name = "ADHOC_FROM_SUBQUERY_TOP_SCALAR";
-    const std::string idxVar = "i";
-    const std::string tag = sanitizeIdentifier(fsq.alias.empty() ? "from_subquery" : fsq.alias);
-    const std::string aggAlias = displayNameForTarget(*innerAgg, innerAggIndex);
-    const std::string aggBuffer = "d_adhoc_" + tag + "_" + sanitizeIdentifier(aggAlias);
-    const std::string extremumBuffer = aggBuffer + "_" +
-        (scalarExtremum.func == AggFunc::MAX ? "max" : "min");
-    const std::string extremumState = extremumBuffer + "_seen";
-
-    {
-        std::set<std::string> scanCols{groupCol->column};
-        collectColumns(innerAgg->agg->innerExpr, scanCols);
-        for (const auto& filter : fsq.filters)
-            collectColumns(filter, scanCols);
-        auto scan = makeScanForCols(viewBase, idxVar, scanCols, aq.schema);
-        auto filtered = maybeSelect(std::move(scan), combineFilters(fsq.filters, idxVar, aq.schema));
-        std::string valueExpr = exprToMetal(innerAgg->agg->innerExpr, idxVar, aq.schema);
-        auto agg = std::make_unique<MetalAtomicAgg>(
-            std::move(filtered), aggBuffer, groupCol->column + "[" + idxVar + "]",
-            valueExpr, sizeSymbol, "atomic_float", "float");
-        appendPhase(plan, "ADHOC_from_subquery_aggregate_" + tag, std::move(agg));
-    }
-
-    {
-        auto range = std::make_unique<MetalRangeScan>(sizeSymbol, idxVar);
-        auto extremum = std::make_unique<MetalAtomicExtremumFloatArray>(
-            std::move(range), aggBuffer, extremumBuffer, extremumState, idxVar,
-            scalarExtremum.func == AggFunc::MAX);
-        appendPhase(plan, "ADHOC_from_subquery_extremum_" + tag, std::move(extremum));
-    }
-
-    {
-        std::set<std::string> scanCols{outerKeyCol};
-        for (size_t ti = 0; ti < aq.targets.size(); ++ti) {
-            if (displayNameForTarget(aq.targets[ti], ti) == aggAlias) continue;
-            collectColumnsForTable(aq.targets[ti].expr, outerTable, scanCols);
-        }
-        auto scan = makeScanForCols(outerTable, idxVar, scanCols, aq.schema);
-        const std::string outerKeyExpr = outerKeyCol + "[" + idxVar + "]";
-        const std::string aggValueExpr = "atomic_load_explicit(&" + aggBuffer +
-            "[" + outerKeyExpr + "], memory_order_relaxed)";
-        const std::string extremumExpr = "as_type<float>(atomic_load_explicit(&" +
-            extremumBuffer + "[0], memory_order_relaxed))";
-        const std::string stateReady = "(atomic_load_explicit(&" + extremumState +
-            "[0], memory_order_relaxed) == 2u)";
-        auto filtered = maybeSelect(std::move(scan),
-            stateReady + " && (" + aggValueExpr + " == " + extremumExpr + ")");
-
-        auto materialize = std::make_unique<MetalMaterialize>(
-            std::move(filtered), "d_adhoc_" + tag + "_result_count", "1");
-        const std::string outputSize = tableSizeName(outerTable);
-        std::vector<GenericMatColumnDesc> materializedCols;
-
-        for (size_t ti = 0; ti < aq.targets.size(); ++ti) {
-            const auto& target = aq.targets[ti];
-            const std::string displayName = displayNameForTarget(target, ti);
-            const std::string bufferName = "d_adhoc_" + tag + "_" +
-                std::to_string(ti) + "_" + sanitizeIdentifier(displayName);
-            if (displayName == aggAlias) {
-                materialize->addColumn(bufferName, "float", aggValueExpr,
-                                       displayName, outputSize, 0);
-                materializedCols.push_back({displayName, bufferName, "float", 0});
-                continue;
-            }
-            if (!target.expr || !materializeExprSupported(target.expr))
-                return fail("Grouped FROM-view scalar plan target expression is not supported.");
-            DataType type = inferExprDataType(target.expr);
-            int stringLen = fixedStringLenForExpr(target.expr, aq.schema);
-            std::string sizeExpr = outputSize;
-            if (stringLen > 0) sizeExpr += " * " + std::to_string(stringLen);
-            std::string expr = materializeValueExpr(target.expr, idxVar, aq.schema);
-            materialize->addColumn(bufferName, metalTypeForDataType(type),
-                                   expr, displayName, sizeExpr, stringLen);
-            materializedCols.push_back({displayName, bufferName,
-                                        metalTypeForDataType(type), stringLen});
-        }
-
-        auto& phase = appendPhase(plan, "ADHOC_from_subquery_materialize_" + tag,
-                                  std::move(materialize));
-        phase.extraBuffers.push_back({aggBuffer, "atomic_float", true, false});
-        phase.extraBuffers.push_back({extremumBuffer, "atomic_uint", true, false});
-        phase.extraBuffers.push_back({extremumState, "atomic_uint", true, false});
-
-        GenericSortSpec sortSpec;
-        sortSpec.limit = aq.limit;
-        for (int oi = 0; oi < (int)aq.orderBy.size(); ++oi) {
-            auto column = resolveOrderColumn(aq.orderBy[oi].expr, oi, aq.orderBy, aq.targets);
-            if (!column) return fail("ORDER BY column not found in SELECT targets.");
-            sortSpec.keys.push_back({*column, aq.orderBy[oi].descending});
-        }
-        if (!sortSpec.keys.empty() || sortSpec.limit >= 0) {
-            const std::string sortRowsSym = "n_gpu_sort_from_subquery_" + tag + "_rows";
-            attachMaterializedCountHook(phase, "d_adhoc_" + tag + "_result_count", sortRowsSym);
-            if (!appendGenericGpuSort(plan, "from_subquery_" + tag, sortRowsSym,
-                                      outputSize, materializedCols, sortSpec, error)) {
-                return std::nullopt;
-            }
-        }
-    }
-
-    return plan;
-}
-
-static std::optional<MetalQueryPlan> buildFromSubqueryAggHistogramPlan(
-    const AnalyzedQuery& aq, std::string* error) {
-    (void)error;
-    if (aq.fromSubqueryAggs.size() != 1) return std::nullopt;
-    if (aq.groupBy.size() != 1) return std::nullopt;
-
-    const auto& fsq = aq.fromSubqueryAggs[0];
-    auto* outerGroupCol = aq.groupBy[0] ? std::get_if<ColRef>(&aq.groupBy[0]->node) : nullptr;
-    std::string innerAggAlias = outerGroupCol ? outerGroupCol->column : "";
-    if (innerAggAlias.empty()) {
-        for (size_t ti = 0; ti < aq.targets.size(); ++ti) {
-            if (!aq.targets[ti].isAgg) {
-                if (!innerAggAlias.empty()) return std::nullopt;
-                innerAggAlias = displayNameForTarget(aq.targets[ti], ti);
-            }
-        }
-    }
-    if (innerAggAlias.empty()) return std::nullopt;
-
-    const SelectTarget* outerCount = nullptr;
-    size_t outerCountIndex = 0;
-    bool hasOuterGroupProjection = false;
-    for (size_t ti = 0; ti < aq.targets.size(); ++ti) {
-        const auto& target = aq.targets[ti];
-        const std::string display = displayNameForTarget(target, ti);
-        if (!target.isAgg && display == innerAggAlias) {
-            hasOuterGroupProjection = true;
-        } else if (target.isAgg && target.agg && target.agg->func == AggFunc::COUNT) {
-            outerCount = &target;
-            outerCountIndex = ti;
-        }
-    }
-    if (!hasOuterGroupProjection || !outerCount) return std::nullopt;
-
-    const SelectTarget* innerAgg = nullptr;
-    for (size_t ti = 0; ti < fsq.targets.size(); ++ti) {
-        const auto& target = fsq.targets[ti];
-        if (target.isAgg && target.agg &&
-            displayNameForTarget(target, ti) == innerAggAlias) {
-            innerAgg = &target;
-            break;
-        }
-    }
-    if (!innerAgg || !innerAgg->agg || innerAgg->agg->func != AggFunc::COUNT)
-        return std::nullopt;
-    if (fsq.groupBy.size() != 1) return std::nullopt;
-    auto* innerGroupCol = fsq.groupBy[0] ? std::get_if<ColRef>(&fsq.groupBy[0]->node) : nullptr;
-    if (!innerGroupCol) return std::nullopt;
-
-    const JoinClause* leftOuterJoin = nullptr;
-    for (const auto& jc : fsq.joins) {
-        if (!jc.leftOuter) continue;
-        if (fromSubqueryColMatches(fsq, *innerGroupCol, jc.leftTable, jc.leftCol)) {
-            leftOuterJoin = &jc;
-            break;
-        }
-    }
-    if (!leftOuterJoin) return std::nullopt;
-
-    const std::string groupBase = fromSubqueryBaseForKey(fsq, leftOuterJoin->leftTable);
-    const std::string aggBase = fromSubqueryBaseForKey(fsq, leftOuterJoin->rightTable);
-    const std::string groupJoinCol = leftOuterJoin->leftCol;
-    const std::string aggJoinCol = leftOuterJoin->rightCol;
-    if (groupBase.empty() || aggBase.empty() || groupJoinCol.empty() || aggJoinCol.empty())
-        return std::nullopt;
-
-    std::vector<PredPtr> aggFilters;
-    for (const auto& filter : fsq.filters) {
-        std::set<std::string> filterTables;
-        collectPredTables(filter, filterTables);
-        bool appliesToAgg = filterTables.empty();
-        if (!filterTables.empty()) {
-            appliesToAgg = std::all_of(filterTables.begin(), filterTables.end(),
-                [&](const std::string& table) { return table == aggBase; });
-        }
-        if (!appliesToAgg) return std::nullopt;
-        aggFilters.push_back(filter);
-    }
-
-    std::string countSize = maxKeySymbolForColumn(groupBase, groupJoinCol, aq.schema);
-    if (countSize.empty()) return std::nullopt;
-
-    MetalQueryPlan plan;
-    plan.name = "ADHOC_FROM_SUBQUERY_AGG";
-    const std::string idxVar = "i";
-    const std::string tag = sanitizeIdentifier(fsq.alias.empty() ? "from_subquery" : fsq.alias);
-    const std::string countBuffer = "d_adhoc_" + tag + "_count";
-
-    {
-        std::set<std::string> scanCols{aggJoinCol};
-        for (const auto& filter : aggFilters) collectColumns(filter, scanCols);
-        auto scan = makeScanForCols(aggBase, idxVar, scanCols, aq.schema);
-        auto filtered = maybeSelect(std::move(scan), combineFilters(aggFilters, idxVar, aq.schema));
-        auto count = std::make_unique<MetalAtomicCount>(
-            std::move(filtered), countBuffer, aggJoinCol + "[" + idxVar + "]", countSize);
-        appendPhase(plan, "ADHOC_from_subquery_count_" + tag, std::move(count));
-    }
-
-    {
-        std::set<std::string> scanCols{groupJoinCol};
-        auto scan = makeScanForCols(groupBase, idxVar, scanCols, aq.schema);
-        auto materialize = std::make_unique<MetalMaterialize>(
-            std::move(scan), "d_adhoc_" + tag + "_result_count", "1");
-
-        const std::string outputSize = tableSizeName(groupBase);
-        const std::string groupKeyExpr = groupJoinCol + "[" + idxVar + "]";
-        const std::string countExpr = "(int)atomic_load_explicit(&" + countBuffer +
-            "[" + groupKeyExpr + "], memory_order_relaxed)";
-        const std::string outerCountName = displayNameForTarget(*outerCount, outerCountIndex);
-        std::vector<GenericMatColumnDesc> materializedCols;
-
-        const std::string countCol = "d_adhoc_" + tag + "_0_" + sanitizeIdentifier(innerAggAlias);
-        const std::string outerCountCol = "d_adhoc_" + tag + "_1_" + sanitizeIdentifier(outerCountName);
-        materialize->addColumn(countCol, "int", countExpr, innerAggAlias, outputSize);
-        materializedCols.push_back({innerAggAlias, countCol, "int", 0, 0, false});
-        materialize->addColumn(outerCountCol, "float", "1.0f", outerCountName, outputSize);
-        materializedCols.push_back({outerCountName, outerCountCol, "float", 0, 0, false});
-
-        auto& phase = appendPhase(plan, "ADHOC_from_subquery_materialize_" + tag,
-                                  std::move(materialize));
-        phase.extraBuffers.push_back({countBuffer, "atomic_uint", true, false});
-
-        GenericGroupSpec groupSpec;
-        groupSpec.keyColumns.push_back(innerAggAlias);
-        groupSpec.aggColumns.push_back(outerCountName);
-        groupSpec.aggFuncs.push_back("COUNT");
-
-        const std::string groupTag = "from_subquery_hist_" + tag;
-        GenericGpuGroupSpec gbSpec;
-        gbSpec.tag = groupTag;
-        gbSpec.inputCounter = "d_adhoc_" + tag + "_result_count";
-        gbSpec.inputRowsSymbol = "n_gpu_gb_" + groupTag + "_input";
-        gbSpec.capacityExpr = "next_pow2(" + outputSize + " * 2)";
-        gbSpec.capacitySymbol = "n_gpu_gb_" + groupTag + "_cap";
-        gbSpec.outputCounter = "d_gpu_gb_" + groupTag + "_count";
-        gbSpec.inputColumns = materializedCols;
-        gbSpec.groupBy = groupSpec;
-        attachMaterializedCountHook(phase, gbSpec.inputCounter, gbSpec.inputRowsSymbol);
-        appendGenericGpuGroupBy(plan, gbSpec);
-        attachMaterializedCountHook(plan.phases.back(), gbSpec.outputCounter,
-                                    "n_gpu_sort_" + groupTag + "_rows");
-
-        GenericSortSpec sortSpec;
-        sortSpec.limit = aq.limit;
-        for (int oi = 0; oi < (int)aq.orderBy.size(); ++oi) {
-            auto column = resolveOrderColumn(aq.orderBy[oi].expr, oi, aq.orderBy, aq.targets);
-            if (!column) return std::nullopt;
-            sortSpec.keys.push_back({*column, aq.orderBy[oi].descending});
-        }
-        if (!sortSpec.keys.empty() || sortSpec.limit >= 0) {
-            if (!appendGenericGpuSort(plan, "group_" + groupTag,
-                                      "n_gpu_sort_" + groupTag + "_rows",
-                                      gbSpec.capacityExpr,
-                                      genericGpuGroupOutputColumns(gbSpec),
-                                      sortSpec, error)) {
-                return std::nullopt;
-            }
-        }
-    }
-
-    return plan;
-}
-
 std::optional<MetalQueryPlan> buildGenericMultiTableAdhocPlan_impl(
     const AnalyzedQuery& aq, std::string* error) {
 
@@ -3983,12 +3373,8 @@ std::optional<MetalQueryPlan> buildGenericMultiTableAdhocPlan_impl(
         return std::nullopt;
     };
 
-    if (auto fromSubqueryPlan = buildFromSubqueryAggHistogramPlan(aq, error))
-        return fromSubqueryPlan;
-    if (auto fromSubqueryPlan = buildFromSubqueryAggTopScalarJoinPlan(aq, error))
-        return fromSubqueryPlan;
     if (!aq.fromSubqueryAggs.empty())
-        return fail("Multi-table planner: grouped FROM-subquery shape is not supported by the generic decomposition path.");
+        return fail("Multi-table planner: grouped FROM-subquery shapes are handled by the generic IR route.");
 
     if (aq.tables.size() < 2) return fail("Multi-table planner: query references fewer than 2 tables.");
     for (const auto& t : aq.tables) {
@@ -5213,9 +4599,8 @@ std::optional<MetalQueryPlan> buildGenericMultiTableAdhocPlan_impl(
         for (auto& [c, t] : crossExtraCols) {
             phaseRef.extraBuffers.push_back({c, "char", true, false});
         }
-        if (aq.limit >= 0) {
-            plan.cpuSort = MetalQueryPlan::CpuSort{{}, aq.limit};
-        }
+        if (aq.limit == 0)
+            return fail("Scalar aggregation: LIMIT 0 is not supported without CPU post-processing.");
         return finalizePlan();
     }
 
@@ -5861,15 +5246,8 @@ std::optional<MetalQueryPlan> buildGenericMultiTableAdhocPlan_impl(
         appendPhase(plan, "ADHOC_multi_popcount_" + std::to_string(di), std::move(popcnt));
     }
 
-    // CPU-side ORDER BY + LIMIT for grouped results.
     if (!aq.orderBy.empty() || aq.limit >= 0) {
-        MetalQueryPlan::CpuSort cpuSort;
-        cpuSort.limit = aq.limit;
-        for (int oi = 0; oi < (int)aq.orderBy.size(); ++oi) {
-            auto column = resolveOrderColumn(aq.orderBy[oi].expr, oi, aq.orderBy, aq.targets);
-            if (column) cpuSort.keys.push_back({*column, aq.orderBy[oi].descending});
-        }
-        plan.cpuSort = cpuSort;
+        return fail("Grouped aggregation: ORDER BY/LIMIT on legacy keyed aggregation requires the IR GPU sort route.");
     }
     return finalizePlan();
 }
