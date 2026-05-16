@@ -7,12 +7,16 @@
 
 namespace codegen {
 
+// Carries preserve values after a join advances past their source row.
 struct IrCarryColumn {
     GenericColumnExpr column;
     std::string varName;
+    // Fixed strings carry source row ids for later byte reads.
+    std::string rowVarName;
     std::string bufferName;
 };
 
+// Relation-instance id -> source column name -> carried value.
 using IrCarryMap = std::map<int, std::map<std::string, IrCarryColumn>>;
 
 int materializedStringLenForExpr(const GenericExprPtr& expr,

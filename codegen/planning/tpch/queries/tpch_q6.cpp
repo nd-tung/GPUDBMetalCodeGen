@@ -12,6 +12,8 @@ std::optional<MetalQueryPlan> buildQ6PlanForShape(const std::set<std::string>& /
     MetalQueryPlan plan;
     plan.name = "Q6";
 
+    // --- Revenue Reduction ---
+    // Scale revenue to fixed-point before the long accumulator.
     std::string idxVar = "i";
     auto filtered = maybeSelect(makeAutoScan("lineitem", idxVar), filterCond);
 
@@ -25,17 +27,13 @@ std::optional<MetalQueryPlan> buildQ6PlanForShape(const std::set<std::string>& /
 
 } // namespace
 
-// ===================================================================
-// Q6 Plan Builder
-// ===================================================================
-
+// Q6: Forecasting Revenue Change.
 std::optional<MetalQueryPlan> buildQ6Plan(const AnalyzedQuery& aq) {
-    // Q6: single-table lineitem, SUM aggregate, no GROUP BY
+    // Match single-table lineitem SUM with no GROUP BY.
     if (!aq.isSingleTable()) return std::nullopt;
     if (aq.tables[0] != "lineitem") return std::nullopt;
     if (!aq.hasAggregation() || aq.hasGroupBy()) return std::nullopt;
 
-    // Should have exactly 1 SUM aggregate
     bool hasSumAgg = false;
     for (const auto& t : aq.targets) {
         if (t.isAgg && t.agg && t.agg->func == AggFunc::SUM)
@@ -43,14 +41,12 @@ std::optional<MetalQueryPlan> buildQ6Plan(const AnalyzedQuery& aq) {
     }
     if (!hasSumAgg) return std::nullopt;
 
-    // Collect all referenced columns from filters and aggregates
     std::set<std::string> usedCols;
     for (const auto& f : aq.filters) collectColumns(f, usedCols);
     for (const auto& t : aq.targets) {
         if (t.agg && t.agg->innerExpr) collectColumns(t.agg->innerExpr, usedCols);
     }
 
-    // Build the aggregate expression using columnar indexing
     std::string idxVar = "i";
     std::string aggExpr;
     std::string alias = "revenue";
@@ -61,7 +57,6 @@ std::optional<MetalQueryPlan> buildQ6Plan(const AnalyzedQuery& aq) {
         }
     }
 
-    // Build filter predicate using columnar indexing
     std::string filterCond = combineFilters(aq.filters, idxVar);
 
     return buildQ6PlanForShape(usedCols, filterCond, aggExpr, alias);

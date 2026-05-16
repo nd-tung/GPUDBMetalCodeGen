@@ -97,6 +97,7 @@ std::optional<MetalQueryPlan> lowerSingleTableScalarAggregateIRToMetal(
 
     MetalQueryPlan plan;
     plan.name = "GENERIC_IR_SINGLE_TABLE_SCALAR";
+    plan.chunkable = true;
     appendPhase(plan, "GENERIC_ir_single_table_scalar", std::move(reduce));
     return plan;
 }

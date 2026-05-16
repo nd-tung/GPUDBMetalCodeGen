@@ -1,28 +1,16 @@
 #include "metal_plan_common.h"
+#include "generic/gpu_ops/generic_gpu_physical_ops.h"
 #include "tpch/metal_tpch_query_builders.h"
 
 namespace codegen {
 
-// ===================================================================
-// Q20: Potential Part Promotion
-// Phase 0 (GPU): Scan part → build forest% bitmap on `d_q20_part_bitmap`.
-// Phase 1 (GPU): Scan partsupp gated by bitmap → CAS-insert
-//                (key=pk*supp_mul+sk, ps_idx) into 64-bit HT and zero-init
-//                d_q20_ht_vals; the row's partsupp index is recorded so
-//                CPU post can read availqty.
-// Phase 2 (GPU): Scan lineitem (date filter 1994) → bitmap probe →
-//                hash probe (q20_ht_add) → atomic_float add into ht_vals.
-// CPU pre: tiny CANADA-nation lookup + supplier/partsupp mirrors for post;
-//          q20HtSize/d_q20_ht_mask/supp_mul scalars.
-// CPU post: walk HT slots reading d_q20_ht_keys/_vals/_psidx (all GPU
-//           shared buffers) and check availqty > 0.5 * sum_qty against
-//           ps_availqty mirror; filter CANADA suppliers.
-// ===================================================================
+// Q20: Potential Part Promotion.
 std::optional<MetalQueryPlan> buildQ20Plan_byName() {
     std::string idx = "i";
     MetalQueryPlan plan;
 
-    // Helper: hash probe + atomic add (read-only key view, used in agg phase).
+    // --- Hash Helpers ---
+    // Hash probe used by the lineitem aggregation phase.
     plan.helpers.push_back(R"(
 static void q20_ht_add(const device ulong* ht_keys, device atomic_float* ht_vals,
                         uint ht_mask, ulong key, float qty) {
@@ -34,17 +22,12 @@ static void q20_ht_add(const device ulong* ht_keys, device atomic_float* ht_vals
             atomic_fetch_add_explicit(&ht_vals[slot], qty, memory_order_relaxed);
             return;
         }
-        if (k == 0xFFFFFFFFFFFFFFFFul) return; // not in HT = not qualifying partsupp
+        if (k == 0xFFFFFFFFFFFFFFFFul) return; // not qualifying partsupp
     }
 }
 )");
 
-    // Helper: CAS-based insert for the build phase. Metal M1 does not
-    // support 64-bit atomic CAS, so we use atomic_int CAS on the ps_idx
-    // slot (-1 sentinel) for ownership and write the 64-bit key
-    // non-atomically afterwards. The agg phase that probes ht_keys runs
-    // in a separate command buffer (waitUntilCompleted barrier), so
-    // build-phase writes are fully visible at probe time.
+    // Build-phase insert: atomic ps_idx claims ownership, then key is written.
     plan.helpers.push_back(R"(
 static void q20_ht_insert(device atomic_int* ht_psidx, device ulong* ht_keys,
                            uint ht_mask, ulong key, int ps_idx) {
@@ -58,16 +41,16 @@ static void q20_ht_insert(device atomic_int* ht_psidx, device ulong* ht_keys,
             ht_keys[slot] = key;
             return;
         }
-        // Slot taken by another insert. partsupp rows have unique (pk,sk)
-        // so duplicates cannot occur; just probe the next slot.
+        // Unique (pk, sk) rows mean collisions only need linear probing.
     }
 }
 )");
 
-    // Phase 0: forest% bitmap from `part`.
+    // --- Part Filter ---
+    // Build forest% part bitmap.
     {
         auto scan = makeAutoScan("part", idx);
-        // p_name is fixed-width 55 chars; "forest" check at offset 0 of each row.
+        // p_name is fixed-width; "forest" starts at byte 0.
         std::string base = "p_name[" + idx + "*55";
         std::string pred =
             "(" + base + "+0]=='f' && " + base + "+1]=='o' && " +
@@ -80,7 +63,8 @@ static void q20_ht_insert(device atomic_int* ht_psidx, device ulong* ht_keys,
         appendPhase(plan, "Q20_build_part_bitmap", std::move(bmp));
     }
 
-    // Phase 1: build (pk,sk)→ps_idx HT from partsupp gated by bitmap.
+    // --- Partsupp Hash Table ---
+    // Build (pk, sk) to partsupp-index hash table.
     {
         auto scan = makeAutoScan("partsupp", idx);
         auto gated = std::make_unique<MetalSelection>(std::move(scan),
@@ -99,8 +83,7 @@ static void q20_ht_insert(device atomic_int* ht_psidx, device ulong* ht_keys,
                                   /*zeroInit=*/true, /*fillByte=*/0xFF);
                 cg.addBufferParam("d_q20_ht_psidx", "atomic_int", "q20HtSize",
                                   /*zeroInit=*/true, /*fillByte=*/0xFF);
-                // Allocate ht_vals here so the agg phase's extraBuffer
-                // (empty sizeExpr) finds an existing buffer. zero-init.
+                // Allocate ht_vals for the later read-only extra buffer.
                 cg.addBufferParam("d_q20_ht_vals", "float", "q20HtSize",
                                   /*zeroInit=*/true, /*fillByte=*/0);
                 child_->produce(cg, [&]() {
@@ -118,20 +101,18 @@ static void q20_ht_insert(device atomic_int* ht_psidx, device ulong* ht_keys,
         phase.scalarParams.push_back({"supp_mul", "uint"});
     }
 
-    // Phase 2: lineitem aggregation (existing logic).
+    // --- Quantity Aggregate ---
+    // Aggregate 1994 lineitem quantity into hash-table values.
     {
         auto scan = makeAutoScan("lineitem", idx);
 
-        // Date filter: 1994-01-01 to 1994-12-31
         auto dateFilter = std::make_unique<MetalSelection>(
             std::move(scan),
             "l_shipdate[" + idx + "] >= 19940101 && l_shipdate[" + idx + "] < 19950101");
 
-        // BitmapProbe: forest% parts
         auto bmpProbe = std::make_unique<MetalBitmapProbe>(
             std::move(dateFilter), "d_q20_part_bitmap", "l_partkey[" + idx + "]");
 
-        // ComputeExpr: hash probe + atomic add (side-effect only)
         auto hashAgg = std::make_unique<MetalComputeExpr>(
             std::move(bmpProbe), "_unused", "int",
             "(q20_ht_add(d_q20_ht_keys, d_q20_ht_vals, d_q20_ht_mask, "
@@ -139,18 +120,15 @@ static void q20_ht_insert(device atomic_int* ht_psidx, device ulong* ht_keys,
             "l_quantity[" + idx + "]), 0)");
 
         auto& phase = appendPhase(plan, "Q20_lineitem_agg", std::move(hashAgg));
-        // Extra buffers: HT keys read-only; vals as atomic_float for adds.
+        // Reuse HT keys read-only; write quantities through atomic_float values.
         phase.extraBuffers.push_back({"d_q20_ht_keys", "ulong", true, false});
         phase.extraBuffers.push_back({"d_q20_ht_vals", "atomic_float", false, false});
         phase.scalarParams.push_back({"d_q20_ht_mask", "uint"});
         phase.scalarParams.push_back({"supp_mul", "uint"});
     }
 
-    // Phase 3: GPU-build the qualifying-supplier bitmap. Range scan
-    // over [0, n_q20_ht_slots) reads ht_keys/ht_vals/ht_psidx and
-    // ps_availqty/ps_suppkey, then atomic-OR sets a bit for each
-    // qualifying suppkey. Replaces the q20HtSize-row CPU scan + std::set
-    // build that previously dominated Q20 post.
+    // --- Qualifying Supplier Bitmap ---
+    // Build qualifying-supplier bitmap from hash-table slots.
     plan.helpers.push_back(R"(
 static void q20_qual_emit(const device ulong* ht_keys,
                            const device float* ht_vals,
@@ -182,21 +160,74 @@ static void q20_qual_emit(const device ulong* ht_keys,
             "(q20_qual_emit(d_q20_ht_keys, d_q20_ht_vals, d_q20_ht_psidx, "
             "ps_availqty, ps_suppkey, d_q20_qual_supp_bitmap, " + idx + "), 0)");
         auto& phase = appendPhase(plan, "Q20_filter_ht_to_bitmap", std::move(sideEffect));
-        // Re-bind the same MTL::Buffer for ht_keys/ht_vals/ht_psidx
-        // under their original names but as non-atomic read-only types
-        // (atomic-backed storage is bit-identical to its plain twin, and
-        // a queue barrier between phases makes the build-phase writes
-        // visible).
+        // Re-bind HT buffers as read-only views after the phase barrier.
         phase.extraBuffers.push_back({"d_q20_ht_keys",          "ulong", true,  false});
         phase.extraBuffers.push_back({"d_q20_ht_vals",          "float", true,  false});
         phase.extraBuffers.push_back({"d_q20_ht_psidx",         "int",   true,  false});
         phase.extraBuffers.push_back({"d_q20_qual_supp_bitmap", "atomic_uint", false, true});
     }
 
+    // --- Compact Results ---
+    // Materialize qualifying CANADA suppliers on GPU.
+    plan.helpers.push_back(R"(
+static void q20_result_emit(device atomic_uint* counter,
+                            device char* out_name,
+                            device char* out_address,
+                            const device atomic_uint* qual_supp_bitmap,
+                            const device int* s_suppkey,
+                            const device char* s_name,
+                            const device char* s_address,
+                            const device int* s_nationkey,
+                            uint q20_result_cap,
+                            int canada_nk,
+                            uint i) {
+    if (s_nationkey[i] != canada_nk) return;
+    int sk = s_suppkey[i];
+    if (sk < 0) return;
+    if (!bitmap_test_atomic(qual_supp_bitmap, sk)) return;
+    uint slot = atomic_fetch_add_explicit(counter, 1u, memory_order_relaxed);
+    if (slot >= q20_result_cap) return;
+    for (uint c = 0; c < 25u; ++c) out_name[slot * 25u + c] = s_name[i * 25u + c];
+    for (uint c = 0; c < 40u; ++c) out_address[slot * 40u + c] = s_address[i * 40u + c];
+}
+)");
+    const std::string resultRows = "q20_result_rows";
+    {
+        auto scan = makeAutoScan("supplier", idx);
+        scan->addColumn("s_suppkey", "int");
+        scan->addColumn("s_name", "char");
+        scan->addColumn("s_address", "char");
+        scan->addColumn("s_nationkey", "int");
+        auto sideEffect = std::make_unique<MetalComputeExpr>(
+            std::move(scan), "_q20_result_unused", "int",
+            "(q20_result_emit(d_q20_result_count, d_q20_result_name, "
+            "d_q20_result_address, d_q20_qual_supp_bitmap, s_suppkey, "
+            "s_name, s_address, s_nationkey, q20_result_cap, canada_nk, " +
+            idx + "), 0)");
+        auto& phase = appendPhase(plan, "Q20_materialize_suppliers", std::move(sideEffect));
+        phase.extraBuffers.push_back({"d_q20_result_count",   "atomic_uint", false, true});
+        phase.extraBuffers.push_back({"d_q20_result_name",    "char",        false, false});
+        phase.extraBuffers.push_back({"d_q20_result_address", "char",        false, false});
+        phase.extraBuffers.push_back({"d_q20_qual_supp_bitmap", "atomic_uint", true, false});
+        phase.scalarParams.push_back({"q20_result_cap", "uint"});
+        phase.scalarParams.push_back({"canada_nk", "int"});
+        attachMaterializedCountHook(phase, "d_q20_result_count", resultRows);
+    }
+
+    // --- Result Order ---
+    {
+        std::vector<GenericMatColumnDesc> columns = {
+            GenericMatColumnDesc("s_name", "d_q20_result_name", "char", 25),
+            GenericMatColumnDesc("s_address", "d_q20_result_address", "char", 40),
+        };
+        GenericSortSpec sortSpec;
+        sortSpec.keys.push_back({"s_name", false});
+        std::string sortError;
+        appendGenericGpuSort(plan, "q20_result", resultRows,
+                             "n_supplier", columns, sortSpec, &sortError);
+    }
+
     return plan;
 }
-
-// ===================================================================
-// Dispatch: try all known patterns
 
 } // namespace codegen

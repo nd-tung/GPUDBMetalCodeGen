@@ -85,7 +85,7 @@ GIT_COMMIT="$(git rev-parse --short HEAD 2>/dev/null || echo none)"
     echo "# binary=$REPO_ROOT/$BIN"
     echo "# check_dir=${CHECK_DIR:-none}"
     echo "# timestamp=$TS"
-    # NOTE: gpu/gpu_budget extracted from first SYSINFO_CSV line below
+    # gpu fields come from the first SYSINFO_CSV line below.
     echo "scale_factor,query,status,analyze_ms,plan_ms,codegen_ms,compile_ms,pso_ms,dataload_ms,bufalloc_ms,gpu_compute_ms,cpu_compute_ms,compile_overhead_ms,cpu_total_ms,end2end_ms,load_source,load_bytes,load_mibps,ingest_ms,query_compute_ms,gpu_trials_n,gpu_p10_ms,gpu_p90_ms,gpu_mad_ms,io_ms,preprocess_ms,query_execution_ms,gpu_name,gpu_budget_bytes"
 } > "$OUTPUT"
 

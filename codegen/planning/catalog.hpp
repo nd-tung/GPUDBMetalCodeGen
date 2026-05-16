@@ -1,16 +1,7 @@
 #pragma once
-// ===================================================================
-// Catalog — generic table/column registry
-// ===================================================================
-//
-// Ported from CUDACodeGeneral/sql/catalog.hpp. Schema layers populate
-// the Catalog via addTable(). The catalog itself has zero built-in
-// knowledge of any particular schema.
-//
-// Provides findTable(), findColumn(), resolveColumn() for the query
-// analyst and planner.  Copperates with SchemaProvider for deeper
-// metadata (domains, max key symbols, row counts).
-// ===================================================================
+// --- Catalog ---
+// Generic table/column registry used by the analyzer and planner.
+// Schema-specific metadata stays behind SchemaProvider.
 
 #include "../core/schema_provider.h"
 #include <string>
@@ -21,13 +12,13 @@
 namespace codegen {
 
 struct CatColumn {
-    std::string name;       // "l_shipdate"
-    DataType    type;       // DataType::INT, etc.
-    int         fixedWidth = 0;  // for CHAR_FIXED
-    int         domainMin  = -1; // for INT/DATE GROUP BY
-    int         domainMax  = -1; // for INT/DATE GROUP BY
-    std::vector<char> charDomain; // for CHAR1 GROUP BY
-    bool        isKey = false;   // primary/foreign key
+    std::string name;
+    DataType    type;
+    int         fixedWidth = 0;  // CHAR_FIXED width.
+    int         domainMin  = -1; // INT/DATE GROUP BY domain.
+    int         domainMax  = -1; // INT/DATE GROUP BY domain.
+    std::vector<char> charDomain; // CHAR(1) GROUP BY domain.
+    bool        isKey = false;
 };
 
 struct CatTable {
@@ -56,9 +47,7 @@ public:
         ref = std::move(t);
     }
 
-    // Build a Catalog from a SchemaProvider.  Useful when the schema
-    // layer exposes metadata via the provider but the planner/analyzer
-    // needs table/column structural info from a Catalog.
+    // Build a minimal Catalog view from a SchemaProvider.
     static Catalog fromSchemaProvider(const SchemaProvider& sp) {
         Catalog cat;
         for (const auto& tn : sp.tableNames()) {
@@ -68,8 +57,6 @@ public:
             if (pk) ct.primaryKey = pk->first;
             ct.maxKeySymbol = sp.maxKeySymbol(tn);
 
-            // We can't enumerate columns from SchemaProvider alone,
-            // so we build a minimal view from known metadata.
             // Columns are discovered lazily during query analysis.
             cat.addTable(std::move(ct));
         }
@@ -90,9 +77,7 @@ public:
         return t && t->nameToIdx.count(col) > 0;
     }
 
-    // Resolve a possibly-qualified column reference to (table, column).
-    // aliasToTable maps query aliases → real table names.
-    // Returns empty strings if not found.
+    // Resolve a possibly qualified column; returns empty strings when unknown.
     struct Resolved {
         std::string table;
         std::string column;
@@ -112,7 +97,7 @@ public:
             if (!c) return {};
             return {t->name, colName, c->type, c->fixedWidth};
         }
-        // Unqualified: search all tables in aliasToTable
+        // Unqualified lookup searches all query table aliases.
         Resolved result;
         for (auto& [alias, tname] : aliasToTable) {
             auto* t = findTable(tname);

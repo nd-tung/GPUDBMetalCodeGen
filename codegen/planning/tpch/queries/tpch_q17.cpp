@@ -3,20 +3,13 @@
 
 namespace codegen {
 
-// ===================================================================
-// Q17: Small-Quantity-Order Revenue
-// GPU preprocessing (3 phases): build qualifying-parts bitmap from `part`,
-// accumulate per-partkey sum + count of l_quantity from `lineitem` gated
-// by the bitmap, then the existing reduce phase reads sum & count and
-// applies the `l_quantity * cnt < 0.2 * sum` predicate inline (avoids
-// a per-key divide and a finalize phase).
-// ===================================================================
+// Q17: Small-Quantity-Order Revenue.
 std::optional<MetalQueryPlan> buildQ17Plan_byName() {
     std::string idx = "i";
     MetalQueryPlan plan;
 
-    // Phase 1: build d_q17_bitmap from `part` (Brand#23 + MED BOX).
-    // Inline char compare matches the original CPU predicate byte-for-byte.
+    // --- Part Filter ---
+    // Build qualifying-parts bitmap.
     {
         auto scan = makeAutoScan("part", idx);
 
@@ -35,9 +28,8 @@ std::optional<MetalQueryPlan> buildQ17Plan_byName() {
         appendPhase(plan, "Q17_build_bitmap", std::move(bmp));
     }
 
-    // Phase 2: scan lineitem gated by bitmap, accumulate sum + count of
-    // l_quantity per partkey into d_q17_sumQty (atomic_float) and
-    // d_q17_cntQty (atomic_uint).
+    // --- Average Quantity Inputs ---
+    // Accumulate per-part quantity sum and count.
     {
         auto scan = makeAutoScan("lineitem", idx);
         auto gated = std::make_unique<MetalSelection>(std::move(scan),
@@ -53,10 +45,8 @@ std::optional<MetalQueryPlan> buildQ17Plan_byName() {
         phase.bitmapReads.push_back({"d_q17_bitmap", ""});
     }
 
-    // Phase 3: existing revenue reduce, modified to read sum & count from
-    // the GPU-built buffers and apply the threshold predicate inline as
-    // l_quantity * cnt < 0.2 * sum (mathematically equivalent to the
-    // original l_quantity < 0.2 * sum / cnt; avoids a divide).
+    // --- Revenue Reduction ---
+    // Reduce revenue using the inline average-quantity threshold.
     {
         auto scan = makeAutoScan("lineitem", idx);
 
@@ -80,6 +70,7 @@ std::optional<MetalQueryPlan> buildQ17Plan_byName() {
 
         auto reduce = std::make_unique<MetalTGReduce>(std::move(thrFilt), "d_q17");
         reduce->addAccumulator("revenue", "l_extendedprice[" + idx + "]", "float");
+        reduce->setResultAlias("avg_yearly", 7);
 
         auto& phase = appendPhase(plan, "Q17_reduce", std::move(reduce));
         phase.bitmapReads.push_back({"d_q17_bitmap", ""});

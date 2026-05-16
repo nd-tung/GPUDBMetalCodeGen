@@ -1,6 +1,6 @@
 #pragma once
 
-// Metal-cpp headers (no PRIVATE_IMPLEMENTATION here — that lives in infra.cpp)
+// Metal-cpp headers; PRIVATE_IMPLEMENTATION lives in infra.cpp.
 #include "Metal/Metal.hpp"
 #include "Foundation/Foundation.hpp"
 
@@ -20,15 +20,13 @@
 #include <atomic>
 #include <sys/sysctl.h>
 
-// mmap for binary loaders and large text-file fallback
+// mmap support for binary loaders and large text files.
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <unistd.h>
 
-// ===================================================================
-// SYSTEM INFO (chip name + memory)
-// ===================================================================
+// --- System Info ---
 struct SystemInfo {
     std::string chip;
     std::string os;
@@ -78,14 +76,14 @@ inline void printSystemInfo(const SystemInfo& s) {
            s.ramBytes, s.gpuWorkingSet);
 }
 
-// Round up to next power of 2 (host-side, must match GPU-side next_pow2)
+// Host-side next_pow2 equivalent used by generated kernels.
 inline uint nextPow2(uint v) {
     v--;
     v |= v >> 1; v |= v >> 2; v |= v >> 4; v |= v >> 8; v |= v >> 16;
     return v + 1;
 }
 
-// Global dataset configuration
+// Global dataset configuration.
 extern std::string g_dataset_path;
 
 // --- Memory-mapped file helper ---
@@ -114,9 +112,7 @@ struct MappedFile {
     ~MappedFile() { close(); }
 };
 
-// ===================================================================
-// REUSABLE HELPERS
-// ===================================================================
+// --- Reusable Helpers ---
 
 // --- String Trimming ---
 inline std::string trimFixed(const char* chars, size_t index, int width) {
@@ -134,16 +130,14 @@ inline std::map<int, std::string> buildNationNames(const std::vector<int>& natio
     return names;
 }
 
-// ===================================================================
-// MULTI-COLUMN SINGLE-PASS LOADER (for SF1/SF10)
-// ===================================================================
+// --- Multi-Column Single-Pass Loader ---
 
 enum class ColType { INT, FLOAT, DATE, CHAR1, CHAR_FIXED };
 
 struct ColSpec {
     int          columnIndex;
     ColType      type;
-    int          fixedWidth;  // only for CHAR_FIXED
+    int          fixedWidth;  // CHAR_FIXED width.
     
     ColSpec(int idx, ColType t, int fw = 0) : columnIndex(idx), type(t), fixedWidth(fw) {}
 };
@@ -153,7 +147,7 @@ struct LoadedColumns {
     std::vector<std::vector<float>> floatCols;
     std::vector<std::vector<char>>  charCols;
     
-    // Maps from (columnIndex, type) → index into intCols/floatCols/charCols
+    // Maps (columnIndex, type) to intCols/floatCols/charCols storage.
     std::unordered_map<int, size_t> intMap, floatMap, charMap;
     
     const std::vector<int>&   ints(int col)   const { return intCols[intMap.at(col)]; }
@@ -266,17 +260,10 @@ inline LoadedColumns loadColumnsMulti(const std::string& filePath, const std::ve
     return result;
 }
 
-// ===================================================================
-// OUT-OF-CORE LOADER (mmap + parallel-parse, exact pre-size)
-// -------------------------------------------------------------------
-// Drop-in replacement for loadColumnsMulti() when file size is large.
-// - mmap'd file: avoids loading the whole .tbl into the heap (page
-//   cache is recyclable by the OS; no anonymous RSS for raw text).
-// - Pre-sized vectors: no geometric-growth 2x spike during parse.
-// - Parallel parse: N threads carve up row ranges independently.
-// This keeps peak RSS ~= (final columns only) instead of
-// (raw .tbl + final columns + growth overhead).
-// ===================================================================
+// --- Out-of-Core Loader ---
+// mmap + parallel parsing for large .tbl files, with exact pre-sizing.
+// This keeps peak RSS close to final column storage instead of raw text
+// plus vector growth overhead.
 inline size_t countLinesParallel(const char* base, size_t size, int nThreads) {
     if (nThreads < 1) nThreads = 1;
     std::vector<size_t> parts(nThreads, 0);
@@ -297,12 +284,12 @@ inline size_t countLinesParallel(const char* base, size_t size, int nThreads) {
     return total;
 }
 
-// Build line start index in parallel (offsets[i] = file offset of line i, offsets.size() == nLines)
+// Build line start offsets in parallel.
 inline std::vector<size_t> buildLineIndexParallel(const char* base, size_t size,
                                                    size_t nLines, int nThreads) {
     std::vector<size_t> offsets(nLines);
     if (nThreads < 1) nThreads = 1;
-    // First pass: per-thread count to compute start index
+    // First pass counts each thread's lines to compute its output range.
     std::vector<size_t> threadCounts(nThreads, 0);
     std::vector<size_t> threadStarts(nThreads, 0);
     std::vector<size_t> threadLo(nThreads, 0), threadHi(nThreads, 0);
@@ -478,16 +465,13 @@ inline LoadedColumns loadColumnsMultiMmap(const std::string& filePath,
     return result;
 }
 
-// Dispatcher: use mmap+parallel path for large files; keep ifstream path
-// for small files (fast startup, no mmap setup overhead).
-// Threshold: 1 GB.
-// Per-thread load-source tracker. Populated by loadColumnsMultiAuto.
-// Reset with loadStats().reset() at the start of each query.
+// Dispatcher uses mmap+parallel parsing for files at least 1 GiB.
+// Per-thread load-source tracker populated by loadColumnsMultiAuto.
 struct LoadStats {
     size_t bytes       = 0;
     int    tblCalls    = 0;
     int    colbinCalls = 0;
-    double excludedMs  = 0.0;   // one-time .tbl->column ingest, subtracted from e2e
+    double excludedMs  = 0.0;   // One-time .tbl->column ingest, excluded from e2e.
     void reset() { bytes = 0; tblCalls = 0; colbinCalls = 0; excludedMs = 0.0; }
     void recordBinary(size_t b) { bytes += b; colbinCalls++; }
     void recordText(size_t b)   { bytes += b; tblCalls++; }
@@ -501,20 +485,18 @@ struct LoadStats {
 };
 inline LoadStats& loadStats() { thread_local LoadStats s; return s; }
 
-// Forward decl so binary-format utilities below can be inlined before the definition.
+// Forward declaration for inline binary-format utilities.
 inline LoadedColumns loadColumnsMultiAuto(const std::string& filePath,
                                            const std::vector<ColSpec>& specs);
 
-// ===================================================================
-// COLUMNAR BINARY FORMAT (.colbin) — primary on-disk column store.
-// -------------------------------------------------------------------
+// --- Columnar Binary Format ---
+// Primary on-disk column store.
 // Layout:
 //   [magic 8B "TPCHCB01"]
 //   [u32 version][u32 n_cols][u64 n_rows]
 //   [u64 source_size][i64 source_mtime_ns][u64 pad]  -> 48 B header
 //   n_cols * ColDesc (each 32 B)
 //   [payloads, each aligned to 16 B]
-// ===================================================================
 
 namespace colbin {
 static constexpr char     MAGIC[8]   = {'T','P','C','H','C','B','0','1'};
@@ -778,17 +760,11 @@ inline bool writeColbin(const std::string& tblPath,
 
 } // namespace colbin
 
-// ===================================================================
-// ZERO-COPY COLUMN BUFFERS (requires .colbin v2 with page-aligned payloads)
-// -------------------------------------------------------------------
-// Instead of memcpy'ing column data through std::vector and then a second
-// memcpy into an MTLBuffer, we mmap the .colbin file once and ask Metal to
-// wrap each page-aligned payload directly as an MTL::Buffer (via
-// newBufferWithBytesNoCopy). On Apple Silicon the GPU shares page tables
-// with the CPU, so these buffers are immediately GPU-readable without any
-// copy or coherence pass. This eliminates both the tbl-parse cost and the
-// host->buffer staging cost on the warm path.
-// ===================================================================
+// --- Zero-Copy Column Buffers ---
+// Requires .colbin v2 with page-aligned payloads.
+// The loader mmaps .colbin once and wraps each payload directly as an
+// MTL::Buffer. On Apple Silicon, the GPU can read the shared pages without
+// host->buffer staging.
 struct MappedColumns {
     std::unordered_map<int, MTL::Buffer*> buffers;
     size_t nRows = 0;
@@ -919,11 +895,9 @@ inline bool binaryEnabled() {
     return !(e && e[0] == '1');
 }
 
-// ===================================================================
-// QueryColumns — unified column source for GPU queries.
-// Backed by either zero-copy mmap (default) or copy-path fallback.
-// GPUDB_NO_ZEROCOPY=1 forces the legacy copy path for A/B testing.
-// ===================================================================
+// --- Query Columns ---
+// Unified column source for GPU queries.
+// Uses zero-copy mmap by default; GPUDB_NO_ZEROCOPY=1 forces copy mode.
 class QueryColumns {
 public:
     QueryColumns() = default;
@@ -1061,7 +1035,7 @@ inline QueryColumns loadQueryColumns(MTL::Device* device,
 
 inline LoadedColumns loadColumnsMultiAuto(const std::string& filePath,
                                            const std::vector<ColSpec>& specs) {
-    // .colbin is the preferred load path; .tbl parsing is the fallback.
+    // Prefer .colbin; parse .tbl when binary columns are unavailable.
     // Set GPUDB_NO_BINARY=1 to force the .tbl parser (useful for diagnostics).
     if (binaryEnabled()) {
         LoadedColumns fromBinary;
@@ -1099,9 +1073,7 @@ inline LoadedColumns loadColumnsMultiAuto(const std::string& filePath,
               << " ms (one-time, excluded from e2e)\n";
     return _out;
 }
-// ===================================================================
-// SHARED TABLE LOADERS
-// ===================================================================
+// --- Shared Table Loaders ---
 
 // --- Nation Table ---
 struct NationData {
@@ -1158,9 +1130,7 @@ inline int findNationKey(const NationData& nat, const std::string& target) {
     return -1;
 }
 
-// ===================================================================
-// TIMING & BUFFER HELPERS
-// ===================================================================
+// --- Timing and Buffer Helpers ---
 
 // --- Detailed Timing Summary (codegen pipeline breakdown) ---
 struct DetailedTiming {
@@ -1171,19 +1141,17 @@ struct DetailedTiming {
     double codegenMs     = 0.0;
     double compileMs     = 0.0;
     double psoMs         = 0.0;
-    double dataLoadMs    = 0.0;  // ioMs + preprocessMs (umbrella, back-compat)
-    double ioMs          = 0.0;  // pure file I/O: mmap/read of .colbin/.tbl into host buffers
-    double preprocessMs  = 0.0;  // CPU prep: max-key scans, per-query preprocessing kernels
+    double dataLoadMs    = 0.0;  // ioMs + preprocessMs.
+    double ioMs          = 0.0;  // File I/O: mmap/read of .colbin/.tbl into host buffers.
+    double preprocessMs  = 0.0;  // CPU prep: max-key scans and preprocessing kernels.
     double bufferAllocMs = 0.0;
     double gpuTotalMs    = 0.0;
     double postMs        = 0.0;
     std::string loadSource;
     size_t loadBytes     = 0;
-    double ingestMs      = 0.0;  // one-time .tbl->column ingest (excluded from e2e)
+    double ingestMs      = 0.0;  // One-time .tbl->column ingest excluded from e2e.
     std::vector<std::pair<std::string, double>> phaseKernelMs; // per-kernel GPU time
-    // C1: per-trial GPU-time distribution (set when --repeat N>1).
-    // Reported as p10/p50/p90 + MAD (median absolute deviation).
-    // gpuTotalMs is the p50 (median) for back-compat.
+    // Per-trial GPU-time distribution, reported when --repeat N>1.
     int    gpuTrialsN  = 0;
     double gpuMsP10    = 0.0;
     double gpuMsP90    = 0.0;
@@ -1191,7 +1159,7 @@ struct DetailedTiming {
 };
 
 inline void printDetailedTimingSummary(const DetailedTiming& t, bool quiet = false) {
-    // Terminology (used in the table and the CSV):
+    // Timing table and CSV terminology:
     //   Compile Overhead = SQL analyze + plan + metal codegen/compile + PSO
     //                      (one-time per query; independent of input size)
     //   Data Load        = Pure I/O + CPU Preprocess
@@ -1199,7 +1167,7 @@ inline void printDetailedTimingSummary(const DetailedTiming& t, bool quiet = fal
     //     CPU Preprocess = max-key scans, per-query preprocessing kernels
     //   Buffer Setup     = Metal buffer allocation (pointers only, no copy)
     //   GPU Compute      = GPU kernel execution time
-    //   CPU Compute      = CPU post-processing (sort/merge/format)
+    //   CPU Compute      = host post-processing (sort/merge/format)
     //   Query Compute    = GPU Compute + CPU Compute  (kernel-only query work)
     //   Query Execution  = CPU Preprocess + Buffer Setup + Query Compute
     //                      (everything actually executing the query, EXCLUDING pure I/O)
@@ -1209,8 +1177,7 @@ inline void printDetailedTimingSummary(const DetailedTiming& t, bool quiet = fal
     const double cpuComputeMs      = t.postMs;
     const double gpuComputeMs      = t.gpuTotalMs;
     const double queryComputeMs    = cpuComputeMs + gpuComputeMs;
-    // Back-compat: if ioMs/preprocessMs weren't populated, attribute the
-    // whole dataLoadMs window to I/O (matches legacy behavior).
+    // If split timings are unavailable, attribute dataLoadMs to I/O.
     const double ioMs              = (t.ioMs > 0.0 || t.preprocessMs > 0.0)
                                      ? t.ioMs : t.dataLoadMs;
     const double preprocessMs      = (t.ioMs > 0.0 || t.preprocessMs > 0.0)
@@ -1307,7 +1274,6 @@ inline void printDetailedTimingSummary(const DetailedTiming& t, bool quiet = fal
         rowMsHi("Query Execution",   queryExecutionMs);
         bar();
 
-        // --- 4. Totals --------------------------------------------------
         head("Totals");
         bar();
         rowMs("Compile Overhead",  compileOverheadMs);
@@ -1317,21 +1283,20 @@ inline void printDetailedTimingSummary(const DetailedTiming& t, bool quiet = fal
         bar();
     }
 
-    // Machine-readable single line for CSV harvesting (always emitted).
-    // Kept back-compatible with prior field order. Renamed fields (same slot):
+    // Machine-readable single line for CSV harvesting.
+    // Field order remains stable for downstream consumers. Renamed fields use the same slot:
     //   gpu_ms      -> gpu_compute_ms
     //   post_ms     -> cpu_compute_ms
     //   cpu_codegen -> compile_overhead_ms
     //   cpu_total   -> compile_overhead + data_load + buffer_setup + cpu_compute
-    //                  (retained for legacy scripts; excludes GPU)
+    //                  (retained for CSV consumers; excludes GPU)
     // Appended: query_compute_ms = cpu_compute_ms + gpu_compute_ms
     double loadMibps = (ioMs > 0.0 && t.loadBytes > 0)
         ? ((double)t.loadBytes / (1024.0*1024.0)) / (ioMs / 1000.0)
         : 0.0;
     const double cpuTotalLegacy = compileOverheadMs + t.dataLoadMs +
                                   t.bufferAllocMs + cpuComputeMs;
-    // CSV trailer (appended fields, back-compat preserved): io_ms,
-    // preprocess_ms, query_execution_ms.
+    // CSV trailer fields: io_ms, preprocess_ms, query_execution_ms.
     printf("TIMING_CSV,%s,%s,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%s,%zu,%.3f,%.3f,%.3f,%d,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f\n",
            t.scaleFactor.c_str(), t.queryName.c_str(),
            t.analyzeMs, t.planMs, t.codegenMs, t.compileMs, t.psoMs,
@@ -1344,4 +1309,3 @@ inline void printDetailedTimingSummary(const DetailedTiming& t, bool quiet = fal
            // I/O vs preprocess split + query-execution metric
            ioMs, preprocessMs, queryExecutionMs);
 }
-

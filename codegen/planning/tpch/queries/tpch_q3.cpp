@@ -1,16 +1,16 @@
 #include "metal_plan_common.h"
+#include "generic/gpu_ops/generic_gpu_physical_ops.h"
 #include "tpch/metal_tpch_query_builders.h"
 
 namespace codegen {
 
-// ===================================================================
-// Q3: Shipping Priority — 3 phases
-// ===================================================================
+// Q3: Shipping Priority.
 std::optional<MetalQueryPlan> buildQ3Plan_byName() {
     std::string idx = "i";
     MetalQueryPlan plan;
 
-    // Phase 1: Build customer bitmap (BUILDING segment)
+    // --- Customer Filter ---
+    // Build customer bitmap for BUILDING segment.
     {
         auto scan = makeAutoScan("customer", idx);
 
@@ -24,7 +24,8 @@ std::optional<MetalQueryPlan> buildQ3Plan_byName() {
         appendPhase(plan, "Q3_build_cust_bitmap", std::move(bitmap), 256);
     }
 
-    // Phase 2: Build orders maps (date + priority, dual ArrayStore)
+    // --- Order Maps ---
+    // Build order date and priority maps.
     {
         auto scan = makeAutoScan("orders", idx);
 
@@ -47,7 +48,8 @@ std::optional<MetalQueryPlan> buildQ3Plan_byName() {
         appendPhase(plan, "Q3_build_orders_maps", std::move(storePrio), 256);
     }
 
-    // Phase 3: Probe lineitem → aggregate revenue per orderkey
+    // --- Revenue Aggregate ---
+    // Aggregate lineitem revenue per orderkey.
     {
         auto scan = makeAutoScan("lineitem", idx);
 
@@ -68,16 +70,17 @@ std::optional<MetalQueryPlan> buildQ3Plan_byName() {
         appendPhase(plan, "Q3_probe_aggregate", std::move(agg));
     }
 
-    // Phase 4: GPU compact-emit qualifying (orderkey, revenue) pairs.
-    // Range scan over [0, n_q3_oks) reads dense d_order_revenue and
-    // atomic-appends to a compact list. CPU joins with the existing
-    // d_orders_date_map / d_orders_prio_map for date+prio and partial-
-    // sorts to top 10.
+    // --- Compact Results ---
+    // Compact qualifying orders for GPU top-k.
     plan.helpers.push_back(R"(
 static void q3_compact_emit(device atomic_uint* counter,
                              device uint* out_ok,
                              device float* out_rev,
+                             device int* out_date,
+                             device int* out_prio,
                              const device float* d_order_revenue,
+                             const device int* d_orders_date_map,
+                             const device int* d_orders_prio_map,
                              uint q3_compact_cap,
                              uint ok) {
     float r = d_order_revenue[ok];
@@ -86,21 +89,51 @@ static void q3_compact_emit(device atomic_uint* counter,
     if (slot < q3_compact_cap) {
         out_ok[slot] = ok;
         out_rev[slot] = r;
+        out_date[slot] = d_orders_date_map[ok];
+        out_prio[slot] = d_orders_prio_map[ok];
     }
 }
 )");
+    const std::string resultRows = "q3_result_rows";
     {
         auto rscan = std::make_unique<MetalRangeScan>("q3_oks", idx);
         auto sideEffect = std::make_unique<MetalComputeExpr>(
             std::move(rscan), "_q3_unused", "int",
             "(q3_compact_emit(d_q3_compact_count, d_q3_compact_ok, "
-            "d_q3_compact_rev, d_order_revenue, q3_compact_cap, " + idx + "), 0)");
+            "d_q3_compact_rev, d_q3_compact_date, d_q3_compact_prio, "
+            "d_order_revenue, d_orders_date_map, d_orders_prio_map, "
+            "q3_compact_cap, " + idx + "), 0)");
         auto& phase = appendPhase(plan, "Q3_compact", std::move(sideEffect));
         phase.extraBuffers.push_back({"d_q3_compact_count", "atomic_uint", false, true});
         phase.extraBuffers.push_back({"d_q3_compact_ok",    "uint",        false, false});
         phase.extraBuffers.push_back({"d_q3_compact_rev",   "float",       false, false});
+        phase.extraBuffers.push_back({"d_q3_compact_date",  "int",         false, false});
+        phase.extraBuffers.push_back({"d_q3_compact_prio",  "int",         false, false});
         phase.extraBuffers.push_back({"d_order_revenue",    "float",       true,  false});
+        phase.extraBuffers.push_back({"d_orders_date_map",  "int",         true,  false});
+        phase.extraBuffers.push_back({"d_orders_prio_map",  "int",         true,  false});
         phase.scalarParams.push_back({"q3_compact_cap", "uint"});
+        attachMaterializedCountHook(phase, "d_q3_compact_count", resultRows);
+    }
+
+    // --- Result Order ---
+    {
+        std::vector<GenericMatColumnDesc> columns = {
+            GenericMatColumnDesc("l_orderkey", "d_q3_compact_ok", "uint"),
+            GenericMatColumnDesc("revenue", "d_q3_compact_rev", "float"),
+            GenericMatColumnDesc("o_orderdate", "d_q3_compact_date", "int"),
+            GenericMatColumnDesc("o_shippriority", "d_q3_compact_prio", "int"),
+        };
+        GenericSortSpec sortSpec;
+        sortSpec.keys.push_back({"revenue", true});
+        sortSpec.keys.push_back({"o_orderdate", false});
+        sortSpec.limit = 10;
+        std::string topKError;
+        if (!appendGenericGpuTopK(plan, "q3_result", resultRows,
+                                  "maxOrderkey", columns, sortSpec, &topKError)) {
+            appendGenericGpuSort(plan, "q3_result", resultRows,
+                                 "maxOrderkey", columns, sortSpec, &topKError);
+        }
     }
 
     return plan;

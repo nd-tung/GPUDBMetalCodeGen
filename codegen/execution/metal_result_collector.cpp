@@ -10,11 +10,11 @@
 
 namespace codegen {
 
-// CHAR1 display map: maps a single-char TPC-H CHAR1 value to its full display string.
+// Display labels for compact one-character TPC-H values.
 static const std::unordered_map<std::string, std::unordered_map<char, std::string>> kChar1DisplayMap = {
     {"o_orderpriority", {{'1',"1-URGENT"},{'2',"2-HIGH"},{'3',"3-MEDIUM"},{'4',"4-NOT SPECIFIED"},{'5',"5-LOW"}}},
     {"c_mktsegment", {{'A',"AUTOMOBILE"},{'B',"BUILDING"},{'F',"FURNITURE"},{'M',"MACHINERY"},{'H',"HOUSEHOLD"}}},
-    {"l_shipmode", {{'M',"MAIL"},{'S',"SHIP"}}}, // l_shipmode is CHAR_FIXED(2) but stored first char
+    {"l_shipmode", {{'M',"MAIL"},{'S',"SHIP"}}},
 };
 
 static std::string char1Display(const std::string& colName, const std::string& value) {
@@ -26,14 +26,9 @@ static std::string char1Display(const std::string& colName, const std::string& v
     return ci->second;
 }
 
-// ===================================================================
-// GenericResult::print
-// ===================================================================
-
 void GenericResult::print(int limit) const {
     if (columns.empty()) return;
 
-    // Compute column widths
     std::vector<size_t> widths(columns.size());
     for (size_t c = 0; c < columns.size(); c++)
         widths[c] = columns[c].name.size();
@@ -52,10 +47,8 @@ void GenericResult::print(int limit) const {
             widths[c] = std::max(widths[c], w + 2);
         }
     }
-    // Minimum width
     for (auto& w : widths) w = std::max(w, (size_t)10);
 
-    // Print header separator
     auto printSep = [&]() {
         std::cout << "+";
         for (size_t c = 0; c < columns.size(); c++) {
@@ -72,7 +65,6 @@ void GenericResult::print(int limit) const {
     std::cout << "\n";
     printSep();
 
-    // Print rows
     for (size_t r = 0; r < rowCount; r++) {
         std::cout << "|";
         for (size_t c = 0; c < columns.size() && c < rows[r].size(); c++) {
@@ -108,10 +100,6 @@ void GenericResult::print(int limit) const {
         std::cout << "... (" << rows.size() - limit << " more rows)\n";
 }
 
-// ===================================================================
-// GenericResult::toCanonical
-// ===================================================================
-
 std::string GenericResult::toCanonical() const {
     std::ostringstream os;
     for (size_t c = 0; c < columns.size(); c++) {
@@ -123,7 +111,7 @@ std::string GenericResult::toCanonical() const {
         for (size_t c = 0; c < row.size(); c++) {
             if (c) os << ",";
             const std::string& colName = columns[c].name;
-            // Detect date columns by name suffix (e.g. o_orderdate, l_shipdate)
+            // Date columns are stored as YYYYMMDD integers.
             bool isDateCol = colName.size() >= 4 &&
                              colName.substr(colName.size() - 4) == "date";
             std::visit([&](auto&& v) {
@@ -142,13 +130,12 @@ std::string GenericResult::toCanonical() const {
                     snprintf(buf, sizeof(buf), "%.4f", v);
                     os << buf;
                 } else {
-                    // Quote string fields that contain commas, quotes, or newlines
                     std::string sv = char1Display(colName, v);
                     bool needsQuote = sv.find_first_of(",\"\n\r") != std::string::npos;
                     if (needsQuote) {
                         os << '"';
                         for (char ch : sv) {
-                            if (ch == '"') os << '"'; // escape embedded quote
+                            if (ch == '"') os << '"';
                             os << ch;
                         }
                         os << '"';
@@ -163,18 +150,10 @@ std::string GenericResult::toCanonical() const {
     return os.str();
 }
 
-// ===================================================================
-// Long reconstruction
-// ===================================================================
-
 int64_t MetalResultCollector::reconstructLong(uint32_t lo, uint32_t hi) {
     uint64_t uval = ((uint64_t)hi << 32) | (uint64_t)lo;
     return static_cast<int64_t>(uval);
 }
-
-// ===================================================================
-// collect — dispatch based on schema kind
-// ===================================================================
 
 GenericResult MetalResultCollector::collect(const MetalResultSchema& schema,
                                             const BufferMap& buffers) {
@@ -190,10 +169,6 @@ GenericResult MetalResultCollector::collect(const MetalResultSchema& schema,
             return {};
     }
 }
-
-// ===================================================================
-// collectScalarAgg
-// ===================================================================
 
 static double scalarValueAsDouble(const GenericResult::Value& value) {
     double out = 0.0;
@@ -213,6 +188,7 @@ static bool isAggregateFuncName(std::string name) {
 
 static GenericResult::Value evaluateScalarAggProjection(const ExprPtr& expr,
                                                         double aggregateValue) {
+    // Scalar projections support simple aggregate arithmetic for SELECT output.
     if (!expr) return aggregateValue;
 
     if (auto* lit = std::get_if<Literal>(&expr->node)) {
@@ -246,6 +222,7 @@ GenericResult MetalResultCollector::collectScalarAgg(const MetalResultSchema& sc
     GenericResult result;
     GenericResult::Row row;
 
+    // Float scalar aggregates are stored through atomic uint buffers.
     auto readScalar = [&](const std::string& loBuffer,
                           const std::string& hiBuffer,
                           bool isLongPair) -> double {
@@ -286,7 +263,6 @@ GenericResult MetalResultCollector::collectScalarAgg(const MetalResultSchema& sc
             value = denominator != 0.0 ? value / denominator : 0.0;
         }
 
-        // Apply scale-down (divide by the scaleDown factor, e.g. 100 → /100)
         if (entry.scaleDown > 0) {
             value /= static_cast<double>(entry.scaleDown);
         }
@@ -304,35 +280,27 @@ GenericResult MetalResultCollector::collectScalarAgg(const MetalResultSchema& sc
     return result;
 }
 
-// ===================================================================
-// HAVING Predicate Evaluation
-// ===================================================================
-
-// Context for evaluating HAVING predicates over aggregated results
 struct HavingContext {
-    const GenericResult::Row&                row;              // decoded keys + agg values
-    const std::vector<MetalResultSchema::KeyedAggSlot>& slots; // agg slot metadata
+    const GenericResult::Row& row;
+    const std::vector<MetalResultSchema::KeyedAggSlot>& slots;
     const std::vector<MetalResultSchema::KeyedAggInfo::MultiKeyInfo>& multiKeys;
     const std::string& keyDisplayName;
-    int numMultiKeys;  // count of GROUP BY keys (at front of row)
+    int numMultiKeys;
     int keyBase;
 };
 
-// Forward declare evaluateExpr
+// HAVING evaluation reads rows after CPU-side keyed aggregation decoding.
 static GenericResult::Value evaluateExpr(const ExprPtr& expr, const HavingContext& ctx);
 
-// Evaluate a predicate tree, returning true if the row satisfies it
 static bool evaluatePredicate(const PredPtr& pred, const HavingContext& ctx) {
-    if (!pred) return true;  // null predicate always true
+    if (!pred) return true;
 
     auto& node = pred->node;
 
-    // Comparison: left CMP right
     if (auto* cmp = std::get_if<Comparison>(&node)) {
         auto lval = evaluateExpr(cmp->left, ctx);
         auto rval = evaluateExpr(cmp->right, ctx);
 
-        // Extract comparable values
         double l = 0, r = 0;
         bool lIsDouble = false, rIsDouble = false;
 
@@ -350,7 +318,7 @@ static bool evaluatePredicate(const PredPtr& pred, const HavingContext& ctx) {
             else if constexpr (std::is_same_v<T, std::string>) { /* skip */ }
         }, rval);
 
-        if (!lIsDouble || !rIsDouble) return true;  // non-numeric comparison: skip
+        if (!lIsDouble || !rIsDouble) return true;
 
         bool result = false;
         switch (cmp->op) {
@@ -364,7 +332,6 @@ static bool evaluatePredicate(const PredPtr& pred, const HavingContext& ctx) {
         return result;
     }
 
-    // LogicalAnd: all children must be true
     if (auto* land = std::get_if<LogicalAnd>(&node)) {
         for (const auto& child : land->children) {
             if (!evaluatePredicate(child, ctx)) return false;
@@ -372,7 +339,6 @@ static bool evaluatePredicate(const PredPtr& pred, const HavingContext& ctx) {
         return true;
     }
 
-    // LogicalOr: any child being true means true
     if (auto* lor = std::get_if<LogicalOr>(&node)) {
         for (const auto& child : lor->children) {
             if (evaluatePredicate(child, ctx)) return true;
@@ -380,23 +346,19 @@ static bool evaluatePredicate(const PredPtr& pred, const HavingContext& ctx) {
         return false;
     }
 
-    // LogicalNot: negate the child
     if (auto* lnot = std::get_if<LogicalNot>(&node)) {
         return !evaluatePredicate(lnot->child, ctx);
     }
 
-    // Other predicate types (Between, InList, Like, ExistsPred): not supported in HAVING
-    // For now, return true (allow the row)
+    // Unsupported HAVING predicates are pass-through.
     return true;
 }
 
-// Evaluate an expression in the context of aggregated row data
 static GenericResult::Value evaluateExpr(const ExprPtr& expr, const HavingContext& ctx) {
     if (!expr) return (int64_t)0;
 
     auto& node = expr->node;
 
-    // Literal: return directly
     if (auto* lit = std::get_if<Literal>(&node)) {
         if (auto* i = std::get_if<int>(&lit->value)) {
             return (int64_t)*i;
@@ -410,10 +372,8 @@ static GenericResult::Value evaluateExpr(const ExprPtr& expr, const HavingContex
         return (int64_t)0;
     }
 
-    // ColRef: look up from GROUP BY keys (first N positions in row)
     if (auto* col = std::get_if<ColRef>(&node)) {
         if (!ctx.multiKeys.empty()) {
-            // Multi-key: look up by matching display name
             for (size_t ki = 0; ki < ctx.multiKeys.size(); ++ki) {
                 if (ctx.multiKeys[ki].displayName == col->column) {
                     if (ki < ctx.row.size()) {
@@ -422,7 +382,6 @@ static GenericResult::Value evaluateExpr(const ExprPtr& expr, const HavingContex
                 }
             }
         } else {
-            // Single key: always at position 0
             if (!ctx.row.empty()) {
                 return ctx.row[0];
             }
@@ -430,24 +389,16 @@ static GenericResult::Value evaluateExpr(const ExprPtr& expr, const HavingContex
         return (int64_t)0;
     }
 
-    // FuncCall: handle aggregate functions
     if (auto* call = std::get_if<FuncCall>(&node)) {
         std::string funcName = call->name;
         
-        // Convert function name to uppercase for comparison
         for (auto& c : funcName) c = std::toupper((unsigned char)c);
 
-        // Special handling for SUM(col), COUNT(*), etc.
-        // The function name might be "SUM", "COUNT", "AVG", "MIN", "MAX"
-        // In the slots, the name is like "SUM(o_totalprice)" or "COUNT(*)"
-        // We need to match by looking for slots that start with the function name
-        
         for (size_t si = 0; si < ctx.slots.size(); ++si) {
             const auto& slot = ctx.slots[si];
             std::string slotName = slot.name;
             for (auto& c : slotName) c = std::toupper((unsigned char)c);
 
-            // Check if this slot matches the aggregate function
             if (slotName.find(funcName) == 0) {
                 int valueIdx = ctx.numMultiKeys + si;
                 if (valueIdx < (int)ctx.row.size()) {
@@ -456,16 +407,13 @@ static GenericResult::Value evaluateExpr(const ExprPtr& expr, const HavingContex
             }
         }
 
-        // If not found, return 0
         return (int64_t)0;
     }
 
-    // BinaryExpr: evaluate both sides and apply operator
     if (auto* binexpr = std::get_if<BinaryExpr>(&node)) {
         auto lval = evaluateExpr(binexpr->left, ctx);
         auto rval = evaluateExpr(binexpr->right, ctx);
 
-        // Convert to numbers
         double l = 0, r = 0;
         std::visit([&](auto&& v) {
             using T = std::decay_t<decltype(v)>;
@@ -488,10 +436,8 @@ static GenericResult::Value evaluateExpr(const ExprPtr& expr, const HavingContex
         return result;
     }
 
-    // CaseWhen: not typically in HAVING, return 0
     if (auto* casewhen = std::get_if<CaseWhen>(&node)) {
         for (const auto& branch : casewhen->branches) {
-            // For simplicity, just evaluate first branch (not a true CASE evaluation)
             if (branch.result) {
                 return evaluateExpr(branch.result, ctx);
             }
@@ -504,10 +450,6 @@ static GenericResult::Value evaluateExpr(const ExprPtr& expr, const HavingContex
 
     return (int64_t)0;
 }
-
-// ===================================================================
-// collectKeyedAgg
-// ===================================================================
 
 GenericResult MetalResultCollector::collectKeyedAgg(const MetalResultSchema& schema,
                                                     const BufferMap& buffers) {
@@ -522,9 +464,7 @@ GenericResult MetalResultCollector::collectKeyedAgg(const MetalResultSchema& sch
     const auto& slots = schema.keyedAgg.slots;
     const auto& multiKeys = schema.keyedAgg.multiKeys;
 
-    // --- Build column headers ---
     if (!multiKeys.empty()) {
-        // Multi-key: emit one column per key
         for (const auto& mk : multiKeys) {
             std::string type = mk.charMap.empty() ? "int" : "string";
             result.columns.push_back({mk.displayName, type});
@@ -539,7 +479,7 @@ GenericResult MetalResultCollector::collectKeyedAgg(const MetalResultSchema& sch
         for (size_t si = 0; si < slots.size(); ++si) {
             const auto& slot = slots[si];
             result.columns.push_back({slot.name, slot.isLongPair ? "long" : "uint"});
-            // AVG sum with scaleDown < 0 → skip the following COUNT slot
+            // AVG stores SUM followed by COUNT.
             if (slot.scaleDown < 0 && si + 1 < slots.size()) si++;
         }
     } else {
@@ -548,14 +488,12 @@ GenericResult MetalResultCollector::collectKeyedAgg(const MetalResultSchema& sch
         }
     }
 
-    // --- Helper: decode a flat bucket index into multi-key values ---
     auto decodeKeys = [&](int bucket, std::vector<GenericResult::Value>& keyValues) {
         if (multiKeys.empty()) {
             keyValues.push_back((int64_t)(bucket + schema.keyedAgg.keyBase));
             return;
         }
-        // Decode in REVERSE order: bucket = k0 + k1*N0 + k2*N0*N1 + ...
-        // So last key = bucket / stride[last]; recurse with remainder.
+        // bucket = k0 + k1*N0 + k2*N0*N1 + ...
         int remaining = bucket;
         std::vector<int> encodedValues(multiKeys.size());
         for (int ki = (int)multiKeys.size() - 1; ki >= 0; --ki) {
@@ -578,10 +516,8 @@ GenericResult MetalResultCollector::collectKeyedAgg(const MetalResultSchema& sch
         }
     };
 
-    // --- Read per-bucket data ---
     for (int bucket = 0; bucket < numBuckets; bucket++) {
         const int rowBase = bucket * valuesPerBucket;
-        // Skip empty buckets (all slots zero)
         bool hasData = false;
         for (int v = 0; v < valuesPerBucket; v++) {
             if (data[rowBase + v] != 0) { hasData = true; break; }
@@ -594,7 +530,7 @@ GenericResult MetalResultCollector::collectKeyedAgg(const MetalResultSchema& sch
         if (!slots.empty()) {
             for (size_t si = 0; si < slots.size(); ++si) {
                 const auto& slot = slots[si];
-                // AVG decomposition: scaleDown < 0 marks a SUM slot whose COUNT follows.
+                // AVG stores SUM followed by COUNT.
                 if (slot.scaleDown < 0 && si + 1 < slots.size()) {
                     const auto& cntSlot = slots[si + 1];
                     double sumVal = 0, cntVal = 0;
@@ -619,9 +555,8 @@ GenericResult MetalResultCollector::collectKeyedAgg(const MetalResultSchema& sch
                         cntVal = (double)(int64_t)data[rowBase + cntSlot.offset];
                     }
                     row.push_back(cntVal > 0 ? sumVal / cntVal : 0.0);
-                    si++; // skip COUNT slot
+                    si++;
                 } else if (slot.isMinMax && slot.atomicOp == "min") {
-                    // min aggregate: stored as raw value (int or float reinterpreted)
                     uint32_t raw = data[rowBase + slot.offset];
                     if (slot.isFloatSum) {
                         float f;
@@ -640,7 +575,6 @@ GenericResult MetalResultCollector::collectKeyedAgg(const MetalResultSchema& sch
                         row.push_back((int64_t)(int32_t)raw);
                     }
                 } else if (slot.isFloatSum) {
-                    // Float sum: stored as float in single uint slot
                     uint32_t raw = data[rowBase + slot.offset];
                     float f;
                     memcpy(&f, &raw, sizeof(float));
@@ -670,7 +604,6 @@ GenericResult MetalResultCollector::collectKeyedAgg(const MetalResultSchema& sch
             }
         }
 
-        // Apply HAVING predicate filter if present and not already evaluated on GPU
         if (schema.keyedAgg.havingPredicate && !schema.keyedAgg.havingEvaluatedOnGPU) {
             HavingContext ctx{
                 row,
@@ -682,7 +615,6 @@ GenericResult MetalResultCollector::collectKeyedAgg(const MetalResultSchema& sch
             };
 
             if (!evaluatePredicate(schema.keyedAgg.havingPredicate, ctx)) {
-                // Row does not satisfy HAVING: skip it
                 continue;
             }
         }
@@ -693,25 +625,18 @@ GenericResult MetalResultCollector::collectKeyedAgg(const MetalResultSchema& sch
     return result;
 }
 
-// ===================================================================
-// collectMaterialize
-// ===================================================================
-
 GenericResult MetalResultCollector::collectMaterialize(const MetalResultSchema& schema,
                                                        const BufferMap& buffers) {
     GenericResult result;
 
-    // Get row count
     auto cntIt = buffers.find(schema.counterBuffer);
     if (cntIt == buffers.end()) return result;
     uint32_t rowCount = *static_cast<uint32_t*>(cntIt->second->contents());
 
-    // Build columns
     for (const auto& col : schema.columns) {
         result.columns.push_back({col.displayName, col.elementType});
     }
 
-    // Read rows
     for (uint32_t r = 0; r < rowCount; r++) {
         GenericResult::Row row;
         for (const auto& col : schema.columns) {

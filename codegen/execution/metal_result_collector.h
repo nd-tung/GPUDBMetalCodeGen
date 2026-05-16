@@ -1,7 +1,5 @@
 #pragma once
-// ===================================================================
-// Metal Result Collector — generic GPU→CPU result collection
-// ===================================================================
+// Generic GPU-to-CPU result collection.
 
 #include "metal_param_binding.h"
 #include <Metal/Metal.hpp>
@@ -11,10 +9,6 @@
 #include <unordered_map>
 
 namespace codegen {
-
-// ===================================================================
-// Generic result container (variant-typed heterogeneous rows)
-// ===================================================================
 
 struct GenericResult {
     struct Column {
@@ -28,23 +22,17 @@ struct GenericResult {
     std::vector<Row> rows;
 
     void print(int limit = -1) const;
-    // Stable text serialization for golden-result comparison.
-    // Format: header row "col1,col2,...\n", then one CSV row per result row.
-    // Floats use %.4f; int64 use %lld; strings are emitted as-is.
-    // Row order is preserved (caller is responsible for any sort).
+    // Stable CSV serialization for golden-result comparison.
     std::string toCanonical() const;
     bool empty() const { return rows.empty(); }
     size_t numRows() const { return rows.size(); }
 };
 
-// ===================================================================
-// Collector
-// ===================================================================
-
 using BufferMap = std::unordered_map<std::string, MTL::Buffer*>;
 
 class MetalResultCollector {
 public:
+    // Schema selects the collection path; buffers must contain completed GPU output.
     static GenericResult collect(const MetalResultSchema& schema,
                                  const BufferMap& buffers);
 

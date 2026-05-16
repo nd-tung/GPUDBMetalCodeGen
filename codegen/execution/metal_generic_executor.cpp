@@ -3,10 +3,20 @@
 #include <chrono>
 #include <cstring>
 #include <stdexcept>
+#include <sstream>
+#include <limits>
 
 namespace codegen {
 
 namespace {
+
+std::string bytesToGiB(size_t bytes) {
+    std::ostringstream os;
+    os.setf(std::ios::fixed);
+    os.precision(2);
+    os << (static_cast<double>(bytes) / (1024.0 * 1024.0 * 1024.0));
+    return os.str();
+}
 
 void checkCommandBufferStatus(MTL::CommandBuffer* cmdBuf,
                               const std::string& phaseName) {
@@ -26,23 +36,12 @@ void checkCommandBufferStatus(MTL::CommandBuffer* cmdBuf,
 
 } // namespace
 
-// ===================================================================
-// Construction
-// ===================================================================
-
 MetalGenericExecutor::MetalGenericExecutor(MTL::Device* device, MTL::CommandQueue* cmdQueue)
     : device_(device), cmdQueue_(cmdQueue) {}
 
 MetalGenericExecutor::~MetalGenericExecutor() {
-    // Safety net: callers should normally invoke releaseAllocatedBuffers()
-    // explicitly, but on early returns / exceptions this guarantees we don't
-    // leak GPU buffers we own.
     releaseAllocatedBuffers();
 }
-
-// ===================================================================
-// Table registration
-// ===================================================================
 
 void MetalGenericExecutor::registerTableRowCount(const std::string& tableName, size_t rowCount) {
     sizeResolver_.registerSymbol(tableSizeName(tableName), rowCount);
@@ -58,6 +57,11 @@ void MetalGenericExecutor::registerTableBuffer(const std::string& name,
 }
 
 void MetalGenericExecutor::registerAllocatedBuffer(const std::string& name, MTL::Buffer* buffer) {
+    auto it = allocatedBuffers_.find(name);
+    if (it != allocatedBuffers_.end() && it->second && it->second != buffer) {
+        it->second->release();
+    }
+    phaseAllocatedBuffers_.erase(name);
     allocatedBuffers_[name] = buffer;
 }
 
@@ -76,10 +80,6 @@ void MetalGenericExecutor::registerScalarInt(const std::string& name, int value)
 void MetalGenericExecutor::registerScalarFloat(const std::string& name, float value) {
     scalarFloats_[name] = value;
 }
-// ===================================================================
-// Find PSO by name
-// ===================================================================
-
 MTL::ComputePipelineState* MetalGenericExecutor::findPSO(
     const RuntimeCompiler::CompiledQuery& cq, const std::string& name) {
     for (size_t i = 0; i < cq.kernelNames.size(); i++)
@@ -93,10 +93,6 @@ MTL::ComputePipelineState* MetalGenericExecutor::findPSO(
     return it != pipelineStates_.end() ? it->second : nullptr;
 }
 
-// ===================================================================
-// Buffer allocation
-// ===================================================================
-
 BufferMap MetalGenericExecutor::allocatePhaseBuffers(
     const MetalCodegen::PhaseInfo& phase) {
 
@@ -105,15 +101,12 @@ BufferMap MetalGenericExecutor::allocatePhaseBuffers(
     for (const auto& b : phase.bindings) {
         switch (b.kind) {
             case MetalParamKind::TableData: {
-                // Try looking up by binding name first (columnar: "l_shipdate"),
-                // then by table name (AoS: "lineitem")
+                // Prefer column binding, then table binding.
                 auto tIt = tables_.find(b.name);
                 if (tIt == tables_.end()) tIt = tables_.find(b.tableName);
                 if (tIt != tables_.end()) {
                     buffers[b.name] = tIt->second.buffer;
                 } else {
-                    // Fail loudly here instead of letting Metal surface this as
-                    // an opaque dispatch-time crash.
                     throw std::runtime_error(
                         "MetalGenericExecutor: required table/column '" + b.name +
                         "' (table='" + b.tableName + "') is not registered");
@@ -122,15 +115,12 @@ BufferMap MetalGenericExecutor::allocatePhaseBuffers(
             }
 
             case MetalParamKind::TableSize: {
-                // Table sizes are passed via setBytes, not as buffers.
-                // We still track them in the buffer map for binding.
-                // Look up row count via registered columns or tables.
+                // Table sizes are passed via setBytes.
                 size_t rowCount = 0;
                 auto tIt = tables_.find(b.tableName);
                 if (tIt != tables_.end()) {
                     rowCount = tIt->second.rowCount;
                 } else {
-                    // Try size resolver
                     std::string symName = tableSizeName(b.tableName);
                     if (sizeResolver_.hasSymbol(symName)) {
                         rowCount = sizeResolver_.getSymbol(symName);
@@ -146,6 +136,11 @@ BufferMap MetalGenericExecutor::allocatePhaseBuffers(
                     } else {
                         auto* buf = device_->newBuffer(sizeof(uint32_t),
                                                        MTL::ResourceStorageModeShared);
+                        if (!buf) {
+                            throw std::runtime_error(
+                                "MetalGenericExecutor: failed to allocate scalar buffer '" +
+                                key + "' (4 bytes)");
+                        }
                         memcpy(buf->contents(), &sz, sizeof(uint32_t));
                         allocatedBuffers_[key] = buf;
                         buffers[key] = buf;
@@ -157,17 +152,35 @@ BufferMap MetalGenericExecutor::allocatePhaseBuffers(
             case MetalParamKind::DeviceBuffer: {
                 std::string key = b.name;
                 if (allocatedBuffers_.count(key)) {
-                    // Already allocated (shared across phases)
+                    // Reuse buffers registered by preprocessing, hooks, or earlier phases.
                     buffers[key] = allocatedBuffers_[key];
                 } else if (!b.sizeExpr.empty()) {
+                    // sizeExpr resolves to element count; elemSize converts it to bytes.
                     size_t count = sizeResolver_.resolve(b.sizeExpr);
                     size_t elemSize = b.elemSizeBytes();
 
+                    if (elemSize != 0 &&
+                        count > std::numeric_limits<size_t>::max() / elemSize) {
+                        throw std::runtime_error(
+                            "MetalGenericExecutor: buffer size overflow for '" +
+                            key + "', count=" + std::to_string(count) +
+                            ", elemSize=" + std::to_string(elemSize) +
+                            ", sizeExpr='" + b.sizeExpr + "'");
+                    }
                     size_t totalBytes = count * elemSize;
-                    if (totalBytes == 0) totalBytes = elemSize; // minimum 1 element
+                    if (totalBytes == 0) totalBytes = elemSize;
                     auto* buf = device_->newBuffer(totalBytes,
                                                    MTL::ResourceStorageModeShared);
+                    if (!buf) {
+                        throw std::runtime_error(
+                            "MetalGenericExecutor: failed to allocate buffer '" +
+                            key + "' for " + std::to_string(count) + " x " +
+                            std::to_string(elemSize) + " bytes (" +
+                            bytesToGiB(totalBytes) + " GiB), sizeExpr='" +
+                            b.sizeExpr + "'");
+                    }
                     allocatedBuffers_[key] = buf;
+                    phaseAllocatedBuffers_.insert(key);
                     buffers[key] = buf;
                 }
                 break;
@@ -175,7 +188,6 @@ BufferMap MetalGenericExecutor::allocatePhaseBuffers(
 
             case MetalParamKind::ConstantScalar:
             case MetalParamKind::ConstantData:
-                // These are set via setBytes, handled during binding
                 break;
         }
     }
@@ -183,34 +195,23 @@ BufferMap MetalGenericExecutor::allocatePhaseBuffers(
     return buffers;
 }
 
-// ===================================================================
-// Zero-init buffers
-// ===================================================================
-
 void MetalGenericExecutor::zeroInitBuffers(const MetalCodegen::PhaseInfo& phase,
                                             const BufferMap& buffers) {
-    if (skipZeroInit_) return;  // frozen mode: output buffers accumulate across chunks
+    if (skipZeroInit_) return;
     for (const auto& b : phase.bindings) {
         if (b.zeroInit && b.kind == MetalParamKind::DeviceBuffer) {
             auto it = buffers.find(b.name);
             if (it != buffers.end() && it->second) {
                 memset(it->second->contents(), b.fillByte, it->second->length());
+                it->second->didModifyRange(NS::Range::Make(0, it->second->length()));
             }
         }
     }
 }
 
-// ===================================================================
-// Collect result from current allocatedBuffers_ (used after chunk loop)
-// ===================================================================
-
 GenericResult MetalGenericExecutor::collectResult(const MetalCodegen& codegen) const {
     return MetalResultCollector::collect(codegen.getResultSchema(), allocatedBuffers_);
 }
-
-// ===================================================================
-// Bind buffers to encoder
-// ===================================================================
 
 void MetalGenericExecutor::bindPhaseBuffers(MTL::ComputeCommandEncoder* encoder,
                                              const MetalCodegen::PhaseInfo& phase,
@@ -225,9 +226,7 @@ void MetalGenericExecutor::bindPhaseBuffers(MTL::ComputeCommandEncoder* encoder,
                 if (it != buffers.end() && it->second) {
                     encoder->setBuffer(it->second, 0, b.bufferIndex);
                 } else {
-                    // Fallback: a post-dispatch hook from an earlier phase
-                    // may have registered this buffer after the executor
-                    // built its per-execute() snapshot. Look it up live.
+                    // Hooks may register buffers after the per-execute snapshot.
                     auto it2 = allocatedBuffers_.find(b.name);
                     if (it2 != allocatedBuffers_.end() && it2->second) {
                         encoder->setBuffer(it2->second, 0, b.bufferIndex);
@@ -245,7 +244,6 @@ void MetalGenericExecutor::bindPhaseBuffers(MTL::ComputeCommandEncoder* encoder,
             }
 
             case MetalParamKind::ConstantScalar: {
-                // Look up registered scalar value and set via setBytes
                 auto ii = scalarInts_.find(b.name);
                 if (ii != scalarInts_.end()) {
                     encoder->setBytes(&ii->second, sizeof(int), b.bufferIndex);
@@ -254,14 +252,11 @@ void MetalGenericExecutor::bindPhaseBuffers(MTL::ComputeCommandEncoder* encoder,
                     if (fi != scalarFloats_.end()) {
                         encoder->setBytes(&fi->second, sizeof(float), b.bufferIndex);
                     } else if (!b.sizeExpr.empty()) {
-                        // Derived scalar: resolve from sizeResolver_ (e.g.
-                        // hash-map capacity expressed as
-                        // "next_pow2(n_partsupp * 2)").
+                        // Derived scalar from sizeResolver_.
                         uint32_t v = static_cast<uint32_t>(
                             sizeResolver_.resolve(b.sizeExpr));
                         encoder->setBytes(&v, sizeof(uint32_t), b.bufferIndex);
                     } else if (sizeResolver_.hasSymbol(b.name)) {
-                        // Symbol registered directly via registerSymbol().
                         uint32_t v = static_cast<uint32_t>(
                             sizeResolver_.getSymbol(b.name));
                         encoder->setBytes(&v, sizeof(uint32_t), b.bufferIndex);
@@ -271,15 +266,10 @@ void MetalGenericExecutor::bindPhaseBuffers(MTL::ComputeCommandEncoder* encoder,
             }
 
             case MetalParamKind::ConstantData:
-                // Caller must set these manually via setBytes
                 break;
         }
     }
 }
-
-// ===================================================================
-// Encode a single phase (PSO bind, buffer bind, dispatch)
-// ===================================================================
 
 void MetalGenericExecutor::encodePhase(MTL::ComputeCommandEncoder* encoder,
                                        MTL::ComputePipelineState* pso,
@@ -298,8 +288,7 @@ void MetalGenericExecutor::encodePhase(MTL::ComputeCommandEncoder* encoder,
         return;
     }
 
-    // Floor of kMinThreadgroups ensures GPU occupancy for small tables;
-    // cap at kMaxThreadgroups (Metal grid-Y limit margin).
+    // Keep small scans occupied without exceeding Metal's grid-Y limit.
     constexpr NS::UInteger kMinThreadgroups = 1024;
     constexpr NS::UInteger kMaxThreadgroups = 65535;
     NS::UInteger numTG = kMinThreadgroups;
@@ -319,10 +308,6 @@ void MetalGenericExecutor::encodePhase(MTL::ComputeCommandEncoder* encoder,
     encoder->dispatchThreadgroups(MTL::Size::Make(numTG, 1, 1),
                                   MTL::Size::Make(tgSize, 1, 1));
 }
-
-// ===================================================================
-// Execute
-// ===================================================================
 
 MetalExecutionResult MetalGenericExecutor::execute(
     const RuntimeCompiler::CompiledQuery& compiled,
@@ -350,12 +335,16 @@ MetalExecutionResult MetalGenericExecutor::execute(
     if (lastPhase < 0) lastPhase = (int)allPhases.size();
     if (firstPhase >= lastPhase) return execResult;
 
-    // Populate pipeline state lookup for PostDispatchHooks
+    if (firstPhase == 0 && lastPhase == (int)allPhases.size()) {
+        // Full executions refresh phase-owned buffers but keep registered inputs.
+        releasePhaseAllocatedBuffers();
+    }
+
+    // Populate pipeline lookup for post-dispatch hooks.
     pipelineStates_.clear();
     for (size_t i = 0; i < compiled.kernelNames.size(); ++i)
         pipelineStates_[compiled.kernelNames[i]] = compiled.pipelines[i];
 
-    // Pre-allocate all buffers across all phases (timed)
     auto allocStart = std::chrono::high_resolution_clock::now();
     BufferMap allBuffers;
         for (int _pi = firstPhase; _pi < lastPhase; _pi++) {
@@ -373,7 +362,7 @@ MetalExecutionResult MetalGenericExecutor::execute(
     int totalRuns = warmupRuns + measuredRuns;
 
     for (int iter = 0; iter < totalRuns; iter++) {
-        // Zero-init output buffers each iteration
+        // Zero-init output buffers each iteration.
         for (int _pi = firstPhase; _pi < lastPhase; _pi++) {
             const auto& phase = allPhases[_pi];
             zeroInitBuffers(phase, allBuffers);
@@ -381,17 +370,14 @@ MetalExecutionResult MetalGenericExecutor::execute(
 
         const bool isMeasured = (iter == totalRuns - 1);
 
-        // If any phase has a postDispatchHook, the host must observe the
-        // dispatch results between phases (so the hook can register scalars
-        // consumed by later phases via setBytes). Force per-phase command
-        // buffers in that case, matching the measured-run path.
+        // Hooks require host-visible phase boundaries.
         bool hasHook = false;
         for (int _pi = firstPhase; _pi < lastPhase; _pi++) {
             if (allPhases[_pi].postDispatchHook) { hasHook = true; break; }
         }
 
         if (!isMeasured && !hasHook) {
-            // Warmup run: single command buffer for all phases (fastest path)
+            // Fast warmup path.
             auto* cmdBuf = cmdQueue_->commandBuffer();
             auto* encoder = cmdBuf->computeCommandEncoder();
 
@@ -417,8 +403,7 @@ MetalExecutionResult MetalGenericExecutor::execute(
             continue;
         }
 
-        // Measured run, or warmup with hooks: one command buffer per phase
-        // (per-kernel timing for measured; required ordering for hooks).
+        // One command buffer per phase for timing and hook ordering.
         double totalGpuSec = 0.0;
         execResult.phaseTimesMs.clear();
         execResult.phaseNames.clear();
@@ -436,10 +421,7 @@ MetalExecutionResult MetalGenericExecutor::execute(
                 continue;
             }
 
-            // Refresh allBuffers from allocatedBuffers_: a previous phase's
-            // post-dispatch hook may have replaced or newly registered a
-            // buffer (e.g. Q16's Q16_filter_compact hook allocates the
-            // exactly-sized d_q16_group_bitmaps once numGroups is known).
+            // Hooks may replace or add named buffers between phases.
             for (auto& kv : allBuffers) {
                 auto it = allocatedBuffers_.find(kv.first);
                 if (it != allocatedBuffers_.end() && it->second) kv.second = it->second;
@@ -458,11 +440,7 @@ MetalExecutionResult MetalGenericExecutor::execute(
             double phaseSec = cmdBuf->GPUEndTime() - cmdBuf->GPUStartTime();
             double hookGpuMs = 0.0;
 
-            // Invoke host-side post-dispatch hook (e.g. read GPU-computed
-            // scalar back into scalarFloats_ for later phases). Some hooks
-            // launch additional GPU work after the initial phase dispatch
-            // (notably bitonic sort step loops); fold their reported GPU time
-            // into the same phase so totals do not undercount those kernels.
+            // Fold hook-launched GPU work into the same phase total.
             if (phase.postDispatchHook) {
                 hookGpuMs = phase.postDispatchHook(*this);
                 if (hookGpuMs < 0.0) hookGpuMs = 0.0;
@@ -477,27 +455,34 @@ MetalExecutionResult MetalGenericExecutor::execute(
         execResult.totalKernelTimeMs = static_cast<float>(totalGpuSec * 1000.0);
     }
 
-    // Collect results
     execResult.result = MetalResultCollector::collect(codegen.getResultSchema(), allBuffers);
 
     return execResult;
 }
-
-// ===================================================================
-// Cleanup
-// ===================================================================
 
 void MetalGenericExecutor::releaseAllocatedBuffers() {
     for (auto& [_, buf] : allocatedBuffers_) {
         if (buf) buf->release();
     }
     allocatedBuffers_.clear();
+    phaseAllocatedBuffers_.clear();
 
     for (auto& [_, info] : tables_) {
         if (info.ownsBuffer && info.buffer)
             info.buffer->release();
     }
     tables_.clear();
+}
+
+void MetalGenericExecutor::releasePhaseAllocatedBuffers() {
+    for (const auto& name : phaseAllocatedBuffers_) {
+        auto it = allocatedBuffers_.find(name);
+        if (it != allocatedBuffers_.end()) {
+            if (it->second) it->second->release();
+            allocatedBuffers_.erase(it);
+        }
+    }
+    phaseAllocatedBuffers_.clear();
 }
 
 } // namespace codegen

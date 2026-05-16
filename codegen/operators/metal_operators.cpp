@@ -8,9 +8,7 @@
 
 namespace codegen {
 
-// ===================================================================
-// Static helper: parse colName[idxVar] references from expressions
-// ===================================================================
+// --- Expression IU Discovery ---
 
 void MetalOperator::appendIUsFromExpr(const std::string& expr,
                                        std::vector<IU>& out) {
@@ -20,7 +18,7 @@ void MetalOperator::appendIUsFromExpr(const std::string& expr,
     };
     size_t n = expr.size();
 
-    // --- Pass 1: colName[idxVar] patterns ---
+    // Pass 1: colName[idxVar] patterns.
     size_t i = 0;
     while (i < n) {
         if (!isIdent(expr[i])) { ++i; continue; }
@@ -42,7 +40,7 @@ void MetalOperator::appendIUsFromExpr(const std::string& expr,
         i = ce + 1;
     }
 
-    // --- Pass 2: fixed-string pointer expressions ---
+    // Pass 2: fixed-string pointer expressions.
     // Materialization of CHAR_FIXED/CHAR1 values passes a row pointer, e.g.
     // "o_orderpriority + i * 15". Register the bare column with the row index.
     i = 0;
@@ -62,11 +60,10 @@ void MetalOperator::appendIUsFromExpr(const std::string& expr,
         out.emplace_back(colName, expr.substr(is, p - is));
     }
 
-    // --- Pass 3: bare column refs in fixed-string helpers ---
+    // Pass 3: bare column refs in fixed-string helpers.
     // These helpers take the column buffer as first arg (bare identifier
     // without [idx]) and the row index as second arg: (uint)(idxVar).
-    // Pattern: fixed_like_one_segment(COL, (uint)(IDX), ...
-    //          fixed_like_two_segment(COL, (uint)(IDX), ...
+    // Fixed-string helpers pass the column buffer first and row index second.
     const char* helpers[] = {
         "fixed_like_one_segment(", "fixed_like_two_segment(",
         "fixed_string_segment_eq(", "fixed_string_padding_ok(",
@@ -115,7 +112,7 @@ void MetalOperator::appendIUsFromExpr(const std::string& expr,
     }
 }
 
-// JSON serialization for operator trees
+// JSON serialization for operator trees.
 nlohmann::json MetalOperator::toJSON() const {
     nlohmann::json j;
     j["type"] = describe();
@@ -129,17 +126,14 @@ nlohmann::json MetalUnaryOperator::toJSON() const {
     return j;
 }
 
-// Ablation: when GPUDB_SCALAR_ATOMIC=1, MetalTGReduce skips the
-// SIMD+threadgroup reduction and has every thread issue a global atomic.
-// This isolates the value of the existing reduction strategy.
+// GPUDB_SCALAR_ATOMIC=1 makes MetalTGReduce use per-row global atomics.
+// This isolates the value of SIMD and threadgroup reduction.
 static bool scalarAtomicMode() {
     const char* e = std::getenv("GPUDB_SCALAR_ATOMIC");
     return e && e[0] && e[0] != '0';
 }
 
-// ===================================================================
-// MetalGridStrideScan
-// ===================================================================
+// --- MetalGridStrideScan ---
 
 MetalGridStrideScan::MetalGridStrideScan(const std::string& table,
                                          const std::string& rowVar,
@@ -205,9 +199,7 @@ std::string MetalGridStrideScan::describe() const {
     return "GridStrideScan(" + tableName_ + ")";
 }
 
-// ===================================================================
-// MetalRangeScan
-// ===================================================================
+// --- MetalRangeScan ---
 
 MetalRangeScan::MetalRangeScan(const std::string& rangeName, const std::string& idxVar)
     : rangeName_(rangeName), idxVar_(idxVar) {}
@@ -234,9 +226,7 @@ std::string MetalRangeScan::describe() const {
     return "RangeScan(" + rangeName_ + ")";
 }
 
-// ===================================================================
-// MetalSelection
-// ===================================================================
+// --- MetalSelection ---
 
 MetalSelection::MetalSelection(std::unique_ptr<MetalOperator> child,
                                const std::string& predicate)
@@ -254,9 +244,7 @@ std::string MetalSelection::describe() const {
     return "Selection(" + predicate_ + ")";
 }
 
-// ===================================================================
-// MetalComputeExpr
-// ===================================================================
+// --- MetalComputeExpr ---
 
 MetalComputeExpr::MetalComputeExpr(std::unique_ptr<MetalOperator> child,
                                    const std::string& varName,
@@ -276,9 +264,7 @@ std::string MetalComputeExpr::describe() const {
     return "ComputeExpr(" + varName_ + " = " + expression_ + ")";
 }
 
-// ===================================================================
-// MetalBitmapBuild
-// ===================================================================
+// --- MetalBitmapBuild ---
 
 MetalBitmapBuild::MetalBitmapBuild(std::unique_ptr<MetalOperator> child,
                                    const std::string& bitmapName,
@@ -301,9 +287,7 @@ std::string MetalBitmapBuild::describe() const {
     return "BitmapBuild(" + bitmapName_ + ", key=" + keyExpr_ + ")";
 }
 
-// ===================================================================
-// MetalBitmapProbe
-// ===================================================================
+// --- MetalBitmapProbe ---
 
 MetalBitmapProbe::MetalBitmapProbe(std::unique_ptr<MetalOperator> child,
                                    const std::string& bitmapName,
@@ -326,9 +310,7 @@ std::string MetalBitmapProbe::describe() const {
     return "BitmapProbe(" + bitmapName_ + ", key=" + keyExpr_ + ")";
 }
 
-// ===================================================================
-// MetalAntiBitmapProbe
-// ===================================================================
+// --- MetalAntiBitmapProbe ---
 
 MetalAntiBitmapProbe::MetalAntiBitmapProbe(std::unique_ptr<MetalOperator> child,
                                            const std::string& bitmapName,
@@ -350,9 +332,7 @@ std::string MetalAntiBitmapProbe::describe() const {
     return "AntiBitmapProbe(" + bitmapName_ + ", key=" + keyExpr_ + ")";
 }
 
-// ===================================================================
-// MetalLeftOuterProbe
-// ===================================================================
+// --- MetalLeftOuterProbe ---
 
 MetalLeftOuterProbe::MetalLeftOuterProbe(std::unique_ptr<MetalOperator> child,
                                          const std::string& bitmapName,
@@ -380,9 +360,7 @@ std::string MetalLeftOuterProbe::describe() const {
     return "LeftOuterProbe(" + bitmapName_ + ", key=" + keyExpr_ + ")";
 }
 
-// ===================================================================
-// MetalArrayStore
-// ===================================================================
+// --- MetalArrayStore ---
 
 MetalArrayStore::MetalArrayStore(std::unique_ptr<MetalOperator> child,
                                  const std::string& arrayName,
@@ -410,9 +388,7 @@ std::string MetalArrayStore::describe() const {
     return "ArrayStore(" + arrayName_ + "[" + keyExpr_ + "] = " + valueExpr_ + ")";
 }
 
-// ===================================================================
-// MetalArrayLookup
-// ===================================================================
+// --- MetalArrayLookup ---
 
 MetalArrayLookup::MetalArrayLookup(std::unique_ptr<MetalOperator> child,
                                    const std::string& arrayName,
@@ -442,9 +418,7 @@ std::string MetalArrayLookup::describe() const {
     return "ArrayLookup(" + resultVar_ + " = " + arrayName_ + "[" + keyExpr_ + "])";
 }
 
-// ===================================================================
-// MetalArraySliceStore
-// ===================================================================
+// --- MetalArraySliceStore ---
 
 MetalArraySliceStore::MetalArraySliceStore(std::unique_ptr<MetalOperator> child,
                                            const std::string& arrayName,
@@ -481,9 +455,7 @@ std::string MetalArraySliceStore::describe() const {
            std::to_string(sliceLen_) + "] = " + valuePtrExpr_ + ")";
 }
 
-// ===================================================================
-// MetalArraySliceLookup
-// ===================================================================
+// --- MetalArraySliceLookup ---
 
 MetalArraySliceLookup::MetalArraySliceLookup(std::unique_ptr<MetalOperator> child,
                                              const std::string& arrayName,
@@ -511,9 +483,7 @@ std::string MetalArraySliceLookup::describe() const {
            keyExpr_ + ", width=" + std::to_string(sliceLen_) + "])";
 }
 
-// ===================================================================
-// MetalHashMapBuild
-// ===================================================================
+// --- MetalHashMapBuild ---
 
 namespace {
 inline std::string hmKeys1(const std::string& m) { return m + "_keys1"; }
@@ -552,9 +522,7 @@ std::string MetalHashMapBuild::describe() const {
            "), v=" + valueExpr_ + ")";
 }
 
-// ===================================================================
-// MetalHashMapAgg
-// ===================================================================
+// --- MetalHashMapAgg ---
 
 MetalHashMapAgg::MetalHashMapAgg(std::unique_ptr<MetalOperator> child,
                                  const std::string& mapName,
@@ -595,9 +563,7 @@ std::string MetalHashMapAgg::describe() const {
            "), +=" + valueExpr_ + ")";
 }
 
-// ===================================================================
-// MetalHashMapLookup
-// ===================================================================
+// --- MetalHashMapLookup ---
 
 MetalHashMapLookup::MetalHashMapLookup(std::unique_ptr<MetalOperator> child,
                                        const std::string& mapName,
@@ -643,9 +609,7 @@ std::string MetalHashMapLookup::describe() const {
            ") -> " + resultVar_ + ")";
 }
 
-// ===================================================================
-// MetalTGReduce
-// ===================================================================
+// --- MetalTGReduce ---
 
 MetalTGReduce::MetalTGReduce(std::unique_ptr<MetalOperator> child,
                              const std::string& outputPrefix)
@@ -694,15 +658,15 @@ void MetalTGReduce::setAverageResultAlias(const std::string& displayName,
 void MetalTGReduce::produce(MetalCodegen& cg, ConsumerFn consume) {
     const bool scalar = scalarAtomicMode();
 
-    // Register output buffers
+    // Register output buffers.
     for (const auto& acc : accumulators_) {
         if (acc.type == "float") {
-            // Float path: single atomic_uint buffer (reinterpreted as float via CAS)
+            // Float path stores bits in atomic_uint and updates via CAS.
             cg.addAtomicBufferParam(acc.loBuffer, "atomic_uint", "1");
         } else if (acc.type == "int") {
             cg.addAtomicBufferParam(acc.loBuffer, "atomic_int", "1");
         } else {
-            // Long path: lo/hi atomic_uint pair
+            // Long path uses a lo/hi atomic_uint pair.
             cg.addAtomicBufferParam(acc.loBuffer, "atomic_uint", "1");
             cg.addAtomicBufferParam(acc.hiBuffer, "atomic_uint", "1");
         }
@@ -712,9 +676,7 @@ void MetalTGReduce::produce(MetalCodegen& cg, ConsumerFn consume) {
     }
 
     if (scalar) {
-        // ===== SCALAR-ATOMIC ABLATION =====
-        // Each thread issues a global atomic per row consumed. No local
-        // accumulation, no SIMD/TG reduction, no shared memory.
+        // Scalar-atomic ablation: each consumed row issues global atomics.
         cg.addComment("--- Scalar-atomic mode: per-row global atomic ---");
         child_->produce(cg, [&]() {
             for (const auto& acc : accumulators_) {
@@ -758,7 +720,7 @@ void MetalTGReduce::produce(MetalCodegen& cg, ConsumerFn consume) {
             consume();
         });
     } else {
-        // Declare local accumulators
+        // Declare local accumulators.
         for (const auto& acc : accumulators_) {
             if (acc.type == "float") {
                 std::string init = "0.0f";
@@ -778,7 +740,7 @@ void MetalTGReduce::produce(MetalCodegen& cg, ConsumerFn consume) {
             }
         }
 
-        // Child produces rows; inside the loop we accumulate
+        // Child produces rows; inside the loop we accumulate locally.
         child_->produce(cg, [&]() {
             for (const auto& acc : accumulators_) {
                 if (acc.type == "float") {
@@ -822,7 +784,7 @@ void MetalTGReduce::produce(MetalCodegen& cg, ConsumerFn consume) {
             consume();
         });
 
-        // After the loop: SIMD + threadgroup reduction → atomic write
+        // After the loop, reduce locally accumulated values once per threadgroup.
         cg.addComment("--- Threadgroup reduction ---");
         for (const auto& acc : accumulators_) {
             std::string localVar = "local_" + acc.name;
@@ -888,7 +850,7 @@ void MetalTGReduce::produce(MetalCodegen& cg, ConsumerFn consume) {
         }
     }
 
-    // Register result schema
+    // Register result schema.
     if (!resultInfos_.empty()) {
         for (const auto& info : resultInfos_) {
             if (info.accumulatorIndex < 0 ||
@@ -915,9 +877,7 @@ std::string MetalTGReduce::describe() const {
     return "TGReduce(" + std::to_string(accumulators_.size()) + " accumulators)";
 }
 
-// ===================================================================
-// MetalKeyedAgg
-// ===================================================================
+// --- MetalKeyedAgg ---
 
 MetalKeyedAgg::MetalKeyedAgg(std::unique_ptr<MetalOperator> child,
                              const std::string& outputArrayName,
@@ -974,7 +934,7 @@ void MetalKeyedAgg::addDistinctBitmap(const std::string& outputName,
 }
 
 void MetalKeyedAgg::produce(MetalCodegen& cg, ConsumerFn consume) {
-    // Register output buffer
+    // Register output buffers.
     std::string sz = sizeExpr_.empty()
         ? std::to_string(numBuckets_ * valuesPerBucket_)
         : sizeExpr_;
@@ -987,39 +947,27 @@ void MetalKeyedAgg::produce(MetalCodegen& cg, ConsumerFn consume) {
         cg.addAtomicBufferParam(db.bitmapName, "atomic_uint", bmpSize);
     }
 
-    // --- Thread-local accumulation + TG reduction strategy ---
-    // Instead of per-row global atomics, accumulate in thread-local arrays,
-    // then do threadgroup SIMD reduction and a single atomic per TG per bucket.
-    // This reduces atomic operations from O(rows) to O(threadgroups × buckets).
+    // Thread-local keyed reduction cuts global atomics to one write per bucket per TG.
 
-    // Check if all aggregates are "add" (reduction-compatible)
+    // Only additive aggregates can use the local reduction path.
     bool allAdds = true;
     for (const auto& agg : aggregates_) {
         if (agg.atomicOp != "add") { allAdds = false; break; }
     }
 
-    // Only use TG reduction when there are enough aggregates per row to justify
-    // the reduction overhead. With few aggs (e.g. 1 count), the barrier cost
-    // exceeds the atomic savings, especially for low-selectivity joins.
-    //
-    // Tuning knobs (empirical):
-    //   - kMaxBucketsForTGReduce: per-thread accumulator array length cap.
-    //     Above this, register pressure and TG-shared memory dominate.
-    //   - kMinAggsForTGReduce: minimum aggs per row to amortise the two-level
-    //     reduction barrier cost.
+    // Empirical caps avoid cases where barrier and register pressure beat atomic savings.
     constexpr int kMaxBucketsForTGReduce = 64;
     constexpr int kMinAggsForTGReduce    = 3;
     if (allAdds && numBuckets_ <= kMaxBucketsForTGReduce &&
         (int)aggregates_.size() >= kMinAggsForTGReduce) {
-        // === OPTIMIZED PATH: thread-local + TG reduction ===
-        // When HAVING is present, force single-threadgroup dispatch so the
-        // threadgroup reduction produces global (not just per-TG) totals.
+        // Optimized path: thread-local accumulation plus TG reduction.
+        // HAVING needs one TG so the predicate sees global totals.
         if (havingPredicate_)
             cg.setPhaseMaxThreadgroups(1);
         else
             cg.setPhaseMaxThreadgroups(1024);
 
-        // Declare and initialize thread-local accumulator arrays (merged init)
+        // Declare thread-local accumulator arrays.
         for (const auto& agg : aggregates_) {
             if (agg.isFloatSum)
                 cg.addLine("float _local_" + agg.name + "[" + std::to_string(numBuckets_) + "];");
@@ -1028,7 +976,7 @@ void MetalKeyedAgg::produce(MetalCodegen& cg, ConsumerFn consume) {
             else
                 cg.addLine("uint _local_" + agg.name + "[" + std::to_string(numBuckets_) + "];");
         }
-        // Single merged init loop for all aggregates
+        // One merged init loop keeps generated code compact.
         cg.addBlock("for (int _b = 0; _b < " + std::to_string(numBuckets_) + "; _b++)", [&]() {
             for (const auto& agg : aggregates_) {
                 if (agg.isFloatSum)
@@ -1038,7 +986,7 @@ void MetalKeyedAgg::produce(MetalCodegen& cg, ConsumerFn consume) {
             }
         });
 
-        // Child produces rows; inside the loop we accumulate locally (no atomics)
+        // Child produces rows; each row updates local bucket slots.
         child_->produce(cg, [&]() {
             cg.addLine("int _bucket = " + bucketExpr_ + ";");
             for (const auto& agg : aggregates_) {
@@ -1050,7 +998,7 @@ void MetalKeyedAgg::produce(MetalCodegen& cg, ConsumerFn consume) {
                     cg.addLine("_local_" + agg.name + "[_bucket] += (uint)(" + agg.valueExpr + ");");
                 }
             }
-            // COUNT(DISTINCT): per-row atomic bit set.
+            // COUNT(DISTINCT) still sets one bit per consumed row.
             for (const auto& db : distinctBitmaps_) {
                 std::string strideExpr = "(" + db.maxValueExpr + " + 32u) / 32u";
                 cg.addLine("atomic_fetch_or_explicit(&" + db.bitmapName +
@@ -1060,15 +1008,13 @@ void MetalKeyedAgg::produce(MetalCodegen& cg, ConsumerFn consume) {
             consume();
         });
 
-        // After the loop: TG reduction per bucket per aggregate, then single atomic.
-        // When a HAVING predicate is present, restructure to per-bucket outer loop
-        // so the GPU can filter groups before writing to global memory.
+        // Reduce each bucket per aggregate, then issue one global atomic.
         cg.addComment("--- Threadgroup reduction for keyed aggregation ---");
 
         if (havingPredicate_) {
-            // === HAVING-AWARE path: per-bucket loop, reduce all aggs, filter, write ===
+            // HAVING path reduces every aggregate for a bucket before filtering it.
 
-            // Declare all TG shared arrays upfront (one per aggregate)
+            // Declare all TG shared arrays upfront.
             for (const auto& agg : aggregates_) {
                 if (agg.isFloatSum)
                     cg.addLine("threadgroup float _tg_shared_" + agg.name + "[32];");
@@ -1078,7 +1024,7 @@ void MetalKeyedAgg::produce(MetalCodegen& cg, ConsumerFn consume) {
                     cg.addLine("threadgroup uint _tg_shared_" + agg.name + "[32];");
             }
 
-            // Build slot info for HAVING expression translation
+            // Build slot info for HAVING expression translation.
             std::vector<MetalKeyedAggSlotForHaving> havingSlots;
             for (const auto& agg : aggregates_) {
                 havingSlots.push_back({agg.name, agg.isFloatSum, agg.isLongPair,
@@ -1087,7 +1033,7 @@ void MetalKeyedAgg::produce(MetalCodegen& cg, ConsumerFn consume) {
             std::string havingCond = predToMetalForHaving(havingPredicate_, havingSlots);
 
             cg.addBlock("for (int _b = 0; _b < " + std::to_string(numBuckets_) + "; _b++)", [&]() {
-                // Reduce each aggregate for this bucket
+                // Reduce each aggregate for this bucket.
                 for (const auto& agg : aggregates_) {
                     if (agg.isFloatSum) {
                         cg.addLine("float _tg_" + agg.name + " = tg_reduce_float(_local_" +
@@ -1103,7 +1049,7 @@ void MetalKeyedAgg::produce(MetalCodegen& cg, ConsumerFn consume) {
 
                 cg.addLine("threadgroup_barrier(mem_flags::mem_threadgroup);");
 
-                // HAVING check + conditional atomic write of all aggregates
+                // HAVING check controls whether reduced values are written.
                 cg.addIf("lid == 0 && " + havingCond, [&]() {
                     for (const auto& agg : aggregates_) {
                         if (agg.isFloatSum) {
@@ -1132,10 +1078,10 @@ void MetalKeyedAgg::produce(MetalCodegen& cg, ConsumerFn consume) {
                 cg.addLine("threadgroup_barrier(mem_flags::mem_threadgroup);");
             });
 
-            // Mark HAVING as evaluated on GPU so the CPU-side result collector skips it
+            // Mark HAVING as evaluated on GPU so the collector does not re-filter.
             cg.setKeyedAggHavingEvaluatedOnGPU();
         } else {
-            // === ORIGINAL path (no HAVING): per-aggregate outer loop ===
+            // No-HAVING path writes each aggregate independently.
             for (const auto& agg : aggregates_) {
                 if (agg.isFloatSum) {
                     cg.addLine("threadgroup float _tg_shared_" + agg.name + "[32];");
@@ -1176,7 +1122,7 @@ void MetalKeyedAgg::produce(MetalCodegen& cg, ConsumerFn consume) {
             }
         }
     } else {
-        // === FALLBACK: per-row global atomics (for min/max or high-cardinality) ===
+        // Per-row global atomics handle min/max and high cardinality.
         child_->produce(cg, [&]() {
             cg.addLine("int _bucket = " + bucketExpr_ + ";");
             for (const auto& agg : aggregates_) {
@@ -1209,7 +1155,7 @@ void MetalKeyedAgg::produce(MetalCodegen& cg, ConsumerFn consume) {
         });
     }
 
-    // Register result schema with slot layout
+    // Register result schema with slot layout.
     std::vector<MetalResultSchema::KeyedAggSlot> slots;
     for (const auto& agg : aggregates_) {
         slots.push_back({agg.name, agg.offset, agg.isLongPair, agg.scaleDown,
@@ -1217,11 +1163,11 @@ void MetalKeyedAgg::produce(MetalCodegen& cg, ConsumerFn consume) {
     }
     cg.registerKeyedAggOutput(outputArrayName_, numBuckets_, valuesPerBucket_, slots,
                               keyDisplayName_, keyBase_);
-    // Set HAVING predicate if present
+    // Store HAVING predicate when the collector must evaluate it.
     if (havingPredicate_) {
         cg.setKeyedAggHaving(havingPredicate_);
     }
-    // If multi-key decode info is present, set it on the schema
+    // Multi-key decode info lets the collector reconstruct display keys.
     if (!multiKeyDecode_.empty()) {
         for (const auto& mk : multiKeyDecode_) {
             MetalResultSchema::KeyedAggInfo::MultiKeyInfo info;
@@ -1240,9 +1186,7 @@ std::string MetalKeyedAgg::describe() const {
            " buckets, " + std::to_string(aggregates_.size()) + " aggs)";
 }
 
-// ===================================================================
-// MetalAtomicAgg
-// ===================================================================
+// --- MetalAtomicAgg ---
 
 MetalAtomicAgg::MetalAtomicAgg(std::unique_ptr<MetalOperator> child,
                                const std::string& arrayName,
@@ -1275,9 +1219,7 @@ std::string MetalAtomicAgg::describe() const {
     return "AtomicAgg(" + arrayName_ + "[" + bucketExpr_ + "])";
 }
 
-// ===================================================================
-// MetalAtomicCount
-// ===================================================================
+// --- MetalAtomicCount ---
 
 MetalAtomicCount::MetalAtomicCount(std::unique_ptr<MetalOperator> child,
                                    const std::string& arrayName,
@@ -1289,32 +1231,30 @@ MetalAtomicCount::MetalAtomicCount(std::unique_ptr<MetalOperator> child,
 void MetalAtomicCount::produce(MetalCodegen& cg, ConsumerFn consume) {
     cg.addAtomicBufferParam(arrayName_, "atomic_uint", sizeExpr_);
 
-    // Parse sizeExpr to determine if we can use threadgroup-local histogram.
-    // For small, statically-known bucket counts (≤ 256), use TG-local histogram
-    // to drastically reduce global atomic contention.
+    // Small static bucket counts use a TG-local histogram to reduce global atomics.
     int staticSize = 0;
     try { staticSize = std::stoi(sizeExpr_); } catch (...) {}
 
     if (staticSize > 0 && staticSize <= 256) {
-        // === OPTIMIZED: Threadgroup-local histogram ===
+        // Optimized path: threadgroup-local histogram.
         cg.setPhaseMaxThreadgroups(1024);
         std::string szStr = std::to_string(staticSize);
 
-        // Declare threadgroup-local histogram and zero-initialize
+        // Declare and zero the threadgroup-local histogram.
         cg.addLine("threadgroup uint _tg_hist_" + arrayName_ + "[" + szStr + "];");
         cg.addBlock("for (uint _h = lid; _h < " + szStr + "u; _h += tg_size)", [&]() {
             cg.addLine("_tg_hist_" + arrayName_ + "[_h] = 0;");
         });
         cg.addLine("threadgroup_barrier(mem_flags::mem_threadgroup);");
 
-        // Child scan loop — accumulate into threadgroup-local histogram
+        // Child scan loop accumulates into threadgroup-local histogram.
         child_->produce(cg, [&]() {
             cg.addLine("atomic_fetch_add_explicit((threadgroup atomic_uint*)&_tg_hist_" +
                        arrayName_ + "[" + bucketExpr_ + "], 1u, memory_order_relaxed);");
             consume();
         });
 
-        // Barrier, then flush non-zero bins to global
+        // Flush non-zero local bins to global memory.
         cg.addLine("threadgroup_barrier(mem_flags::mem_threadgroup);");
         cg.addBlock("for (uint _h = lid; _h < " + szStr + "u; _h += tg_size)", [&]() {
             cg.addIf("_tg_hist_" + arrayName_ + "[_h] > 0", [&]() {
@@ -1323,7 +1263,7 @@ void MetalAtomicCount::produce(MetalCodegen& cg, ConsumerFn consume) {
             });
         });
     } else {
-        // === FALLBACK: per-row global atomics ===
+        // Per-row global atomics handle large histograms.
         child_->produce(cg, [&]() {
             cg.addLine("atomic_fetch_add_explicit(&" + arrayName_ + "[" + bucketExpr_ +
                        "], 1u, memory_order_relaxed);");
@@ -1336,9 +1276,7 @@ std::string MetalAtomicCount::describe() const {
     return "AtomicCount(" + arrayName_ + "[" + bucketExpr_ + "])";
 }
 
-// ===================================================================
-// MetalMaterialize
-// ===================================================================
+// --- MetalMaterialize ---
 
 MetalMaterialize::MetalMaterialize(std::unique_ptr<MetalOperator> child,
                                    const std::string& counterName,
@@ -1356,25 +1294,25 @@ void MetalMaterialize::addColumn(const std::string& arrayName, const std::string
 }
 
 void MetalMaterialize::produce(MetalCodegen& cg, ConsumerFn consume) {
-    // Register counter
+    // Register counter.
     cg.addAtomicBufferParam(counterName_, "atomic_uint", counterSizeExpr_);
 
-    // Register output column buffers
+    // Register output column buffers.
     for (const auto& col : columns_) {
         cg.addBufferParam(col.arrayName, col.type, col.sizeExpr, false);
     }
 
-    // Register result schema
+    // Register result schema.
     cg.registerMaterializeOutput(counterName_);
     for (const auto& col : columns_) {
         cg.registerOutputColumn(col.displayName, col.arrayName, col.type, col.stringLen);
     }
 
     child_->produce(cg, [&]() {
-        // Atomic increment counter to get output position
+        // Atomic counter assigns the output row position.
         cg.addLine("uint _pos = atomic_fetch_add_explicit(&" + counterName_ +
                    "[0], 1u, memory_order_relaxed);");
-        // Scatter values to output arrays
+        // Scatter values to output arrays.
         for (const auto& col : columns_) {
             if (col.stringLen > 0) {
                 cg.addBlock("for (uint _ci = 0; _ci < " + std::to_string(col.stringLen) + "; _ci++)", [&]() {
@@ -1420,9 +1358,7 @@ std::string MetalBitmapPopcount::describe() const {
     return "BitmapPopcount(" + bitmapName_ + ")";
 }
 
-// ===================================================================
-// GPU Bitonic Sort — Init Sort Keys
-// ===================================================================
+// --- MetalInitSortKeys ---
 
 MetalInitSortKeys::MetalInitSortKeys(const std::string& sourceColumn, const std::string& sourceType,
                                      const std::string& sortKeyBuf, const std::string& sortIdxBuf,
@@ -1434,17 +1370,17 @@ MetalInitSortKeys::MetalInitSortKeys(const std::string& sourceColumn, const std:
       descending_(descending) {}
 
 void MetalInitSortKeys::produce(MetalCodegen& cg, ConsumerFn consume) {
-    // Size expressions
+    // Size expressions.
     std::string capacity = capacityExpr_.empty() ? nResultsExpr_ : capacityExpr_;
     std::string srckeySize = capacity;
     std::string paddedSize = "next_pow2(" + capacity + ")";
 
-    // Allocate padded sort buffers (zero-init; fills padding with 0xFF for keys, 0 for indices)
+    // Sort buffers are padded to the next power of two for bitonic steps.
     cg.addBufferParam(sortKeyBuf_, "uint64_t", paddedSize, true, 0xFF);
     cg.addBufferParam(sortIdxBuf_, "int", paddedSize, true);
     cg.addScalarParam(nResultsExpr_, "uint");
 
-    // Source buffer (read-only, already allocated by a prior phase)
+    // Source buffer is read-only and allocated by a prior phase.
     cg.addBufferParam(sourceColumn_, sourceType_, srckeySize, false);
 
     // Key encoding: grid-stride over the source column.  Keep the encoding
@@ -1468,7 +1404,7 @@ void MetalInitSortKeys::produce(MetalCodegen& cg, ConsumerFn consume) {
         cg.addLine(sortKeyBuf_ + "[" + idxVar + "] = _sort_key;");
         cg.addLine(sortIdxBuf_ + "[" + idxVar + "] = " + idxVar + ";");
     });
-    consume(); // no downstream operators
+    consume();
 }
 
 unsigned int MetalInitSortKeys::nextPow2(unsigned int n) {
@@ -1495,14 +1431,13 @@ PostDispatchHook MetalInitSortKeys::makeBitonicHook(
         auto* idxBuf = executor.getAllocatedBuffer(sortIdxBufName);
         if (!keyBuf || !idxBuf) return 0.0;
 
-        // Read n_results from a registered scalar or symbol
+        // Read n_results from a registered scalar or symbol.
         size_t n_results = 0;
         if (!executor.tryGetSymbol(nResultsExpr, n_results) && n_results == 0) return 0.0;
         unsigned int n = (unsigned int)n_results;
         unsigned int np2 = nextPow2(n);
 
-        // Pad sort buffer: fill key slots [n .. np2) with UINT64_MAX,
-        //                  fill idx slots [n .. np2) with 0
+        // Padding keys sort last; padding indices are ignored.
         if (np2 > n) {
             uint64_t* keys = static_cast<uint64_t*>(keyBuf->contents());
             int* idxs = static_cast<int*>(idxBuf->contents());
@@ -1520,7 +1455,7 @@ PostDispatchHook MetalInitSortKeys::makeBitonicHook(
                 auto* enc = cmdBuf->computeCommandEncoder();
                 enc->setComputePipelineState(pso);
 
-                // Buffer bindings match the sorted shader's [[buffer(N)]] indices:
+                // Buffer bindings match the generated shader's [[buffer(N)]] indices:
                 // 0: sortKeyBuf, 1: sortIdxBuf, 2: sort_k, 3: sort_j, 4: n_sort
                 enc->setBuffer(keyBuf, 0, 0);
                 enc->setBuffer(idxBuf, 0, 1);
@@ -1528,7 +1463,7 @@ PostDispatchHook MetalInitSortKeys::makeBitonicHook(
                 enc->setBytes(&j, sizeof(uint), 3);
                 enc->setBytes(&np2, sizeof(uint), 4);
 
-                // Grid: ceil(n / 256) threadgroups (only elements 0..n-1 have valid data)
+                // Only elements 0..n-1 contain valid rows.
                 uint tgSize = pso->maxTotalThreadsPerThreadgroup();
                 if (tgSize > 256) tgSize = 256;
                 uint numTG = (n + tgSize - 1) / tgSize;
@@ -1549,9 +1484,7 @@ std::string MetalInitSortKeys::describe() const {
     return "InitSortKeys(" + sourceColumn_ + " → " + sortKeyBuf_ + ")";
 }
 
-// ===================================================================
-// GPU Bitonic Sort — Sort Step (comparison-swap)
-// ===================================================================
+// --- MetalBitonicSortStep ---
 
 MetalBitonicSortStep::MetalBitonicSortStep(const std::string& sortKeyBuf,
                                            const std::string& sortIdxBuf,
@@ -1561,8 +1494,7 @@ MetalBitonicSortStep::MetalBitonicSortStep(const std::string& sortKeyBuf,
       nResultsExpr_(nResultsExpr), capacityExpr_(capacityExpr) {}
 
 void MetalBitonicSortStep::produce(MetalCodegen& cg, ConsumerFn consume) {
-    // Allocate sort buffers (already allocated by init phase; addBitmapReadParam
-    // tells the executor to look these up in allocatedBuffers_)
+    // Sort buffers were allocated by the init phase; this binds them read-only/writeable.
     std::string capacity = capacityExpr_.empty() ? nResultsExpr_ : capacityExpr_;
     std::string paddedSize = "next_pow2(" + capacity + ")";
     cg.addBufferParam(sortKeyBuf_, "uint64_t", paddedSize, false);
@@ -1571,7 +1503,7 @@ void MetalBitonicSortStep::produce(MetalCodegen& cg, ConsumerFn consume) {
     cg.addScalarParam("sort_j", "uint");
     cg.addScalarParam("n_sort", "uint");
 
-    // Bitonic comparison-swap step body (always ascending on encoded keys)
+    // Comparison-swap step always uses ascending encoded keys.
     cg.addLine("uint _i = tid;");
     cg.addLine("uint _ixj = _i ^ sort_j;");
     cg.addLine("if (_ixj > _i && _ixj < n_sort) {");

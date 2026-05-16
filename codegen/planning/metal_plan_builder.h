@@ -1,14 +1,7 @@
 #pragma once
-// ===================================================================
-// Metal Query Plan Builder — converts query planning decisions → operator trees
-// ===================================================================
-//
-// Produces MetalQueryPlan containing per-phase operator trees that
-// can be fed to MetalCodegen for Metal shader generation.
-//
-// Predefined TPC-H planning enters by query name; ad-hoc SQL planning enters
-// through AnalyzedQuery. Both produce this MetalQueryPlan representation.
-// ===================================================================
+// --- Metal Query Plan Builder ---
+// Converts planner decisions into per-phase operator trees for MetalCodegen.
+// Predefined TPC-H and ad-hoc SQL routes both produce MetalQueryPlan.
 
 #include "metal_operators.h"
 #include "metal_codegen_base.h"
@@ -20,42 +13,37 @@
 
 namespace codegen {
 
-class SchemaProvider;  // fwd (for generateFromPlan)
+class SchemaProvider;
 
 struct MetalQueryPlan {
-    std::string name;  // "Q1", "Q6", etc.
+    std::string name;
 
-    // Each phase is one Metal kernel
+    // Each phase is one Metal kernel.
     struct Phase {
         std::string name;
         std::unique_ptr<MetalOperator> root;
         int threadgroupSize = 1024;
         bool singleThread = false;
-        // Bitmap buffers to register as read-only params (name, sizeExpr)
-        // Used when an expression references a bitmap from a prior phase
-        // without going through a BitmapProbe operator.
+        // Read-only bitmap params referenced without a BitmapProbe operator.
         std::vector<std::pair<std::string, std::string>> bitmapReads;
-        // Scalar constant params (name, type) — registered before operator production
+        // Scalar constants registered before operator production.
         std::vector<std::pair<std::string, std::string>> scalarParams;
-        // Scalar constants whose host values are resolved from a size expression
-        // at dispatch time (name, type, sizeExpr).
+        // Scalar constants resolved from size expressions at dispatch time.
         struct ResolvedScalarParam {
             std::string name;
             std::string type;
             std::string sizeExpr;
         };
         std::vector<ResolvedScalarParam> resolvedScalarParams;
-        // Extra buffer params not added by operators (e.g., pre-built hash tables)
+        // Extra buffers not added directly by operators.
         struct ExtraBuffer { std::string name; std::string type; bool readOnly = true; bool zeroInit = false; };
         std::vector<ExtraBuffer> extraBuffers;
-        // Optional host-side callback after this phase's GPU dispatch (see
-        // PostDispatchHook in metal_codegen_base.h). Used to read back
-        // computed scalars or dispatch follow-up GPU loops such as sort steps.
+        // Optional host callback after this phase's GPU dispatch.
         PostDispatchHook postDispatchHook;
     };
     std::vector<Phase> phases;
 
-    // Helper device functions emitted before all kernels
+    // Helper device functions emitted before all kernels.
     std::vector<std::string> helpers;
 
     // Data-larger-than-memory (DLM) opt-in. When true, the driver may run
@@ -89,16 +77,11 @@ struct MetalQueryPlan {
 
 };
 
-// Legacy compatibility wrapper. New callers should prefer the explicit APIs in
-// api/metal_tpch_plan_api.h (predefined TPC-H) or api/metal_adhoc_plan_api.h
-// (ad-hoc supported SQL patterns).
+// Compatibility wrapper for callers that do not select a route explicitly.
 std::optional<MetalQueryPlan> buildMetalPlan(const AnalyzedQuery& aq,
                                               const std::string& queryName = "");
 
-// Generate Metal source from a MetalQueryPlan using the operator framework.
-// If `schema` is provided, a ColumnTypeResolver is injected into the
-// MetalCodegen to enable IU auto-projection (deduceRequiredColumns).
-// Returns the configured MetalCodegen (with bindings, result schema, etc.)
+// Generate Metal source and return the configured codegen state.
 MetalCodegen generateFromPlan(const MetalQueryPlan& plan,
                                const SchemaProvider* schema = nullptr);
 

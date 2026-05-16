@@ -1,38 +1,23 @@
 #pragma once
-// ===================================================================
-// Metal Common Header — SIMD reductions, bitmap ops, atomics
-// ===================================================================
+// --- Metal Common Header ---
 // This string is prepended to every generated Metal shader.
-// Extracted from MetalCodegen::commonHeader() for maintainability.
+// It contains shared reductions, bitmap helpers, and atomic utilities.
 //
-// 64-BIT ATOMIC REPRESENTATION (lo/hi pair scheme)
-// -------------------------------------------------
+// 64-bit atomic representation:
 // Apple Metal exposes atomics only on 32-bit lanes (atomic_uint /
 // atomic_int). To accumulate 64-bit values we store every logical
-// `long` as TWO adjacent 32-bit slots:
+// long as two adjacent 32-bit slots:
 //
-//      slot[i+0]  =  lo word  (bits  0..31, unsigned)
-//      slot[i+1]  =  hi word  (bits 32..63, signed when reconstructed)
+//      slot[i+0] = lo word, bits 0..31, unsigned
+//      slot[i+1] = hi word, bits 32..63, signed when reconstructed
 //
-//   atomic_add_long_pair(lo, hi, v)  — add the lo half, propagate the
-//       carry to the hi half via a second atomic.
-//   atomic_max_long_pair(lo, hi, v)  — CAS loop on the hi word, then
-//       store the lo word once a strictly-greater hi is observed.
-//   load_long_pair(lo, hi)           — non-atomic reconstruction
-//       (((int64_t)hi << 32) | lo) for read-back on the host.
+// atomic_add_long_pair adds the lo half and propagates carry to hi.
+// atomic_max_long_pair CASes hi, then stores lo for a greater hi.
+// load_long_pair reconstructs (((int64_t)hi << 32) | lo) for read-back.
 //
-// The same scheme is used for SIMD reductions of `long`: each lane
-// shuffles its two 32-bit halves separately and reassembles after the
-// shuffle (see simd_reduce_add_long / simd_reduce_max_long below).
+// SIMD long reductions shuffle both halves separately and reassemble them.
 //
-// SIMD WIDTH ASSUMPTION
-// ---------------------
-// All threadgroup reductions assume Apple's fixed 32-thread SIMD group
-// (hence the `& 31u` lane mask, `>> 5u` group index, and the 32-slot
-// `threadgroup` arrays in tg_reduce_*). This is correct for every
-// Apple Silicon GPU we target; it would need revisiting on a port to a
-// platform with a different SIMD width.
-// ===================================================================
+// Threadgroup reductions assume Apple's 32-thread SIMD group.
 
 namespace codegen {
 

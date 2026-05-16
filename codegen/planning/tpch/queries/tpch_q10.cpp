@@ -1,4 +1,5 @@
 #include "metal_plan_common.h"
+#include "generic/gpu_ops/generic_gpu_physical_ops.h"
 #include "tpch/metal_tpch_query_builders.h"
 
 namespace codegen {
@@ -10,6 +11,8 @@ std::optional<MetalQueryPlan> buildQ10PlanForDateFilter(const std::string& filte
     plan.name = "Q10";
     std::string idxVar = "i";
 
+    // --- Orders Map ---
+    // Map selected orders to customers before probing from lineitem.
     {
         auto scan = makeAutoScan("orders", idxVar);
 
@@ -23,6 +26,8 @@ std::optional<MetalQueryPlan> buildQ10PlanForDateFilter(const std::string& filte
         appendPhase(plan, "Q10_build_orders_map", std::move(store));
     }
 
+    // --- Revenue Aggregate ---
+    // Sum returned-line revenue by customer key.
     {
         auto scan = makeAutoScan("lineitem", idxVar);
 
@@ -43,6 +48,8 @@ std::optional<MetalQueryPlan> buildQ10PlanForDateFilter(const std::string& filte
         appendPhase(plan, "Q10_probe_aggregate", std::move(agg));
     }
 
+    // --- Compact Results ---
+    // Keep only customers with positive revenue for the final GPU order.
     plan.helpers.push_back(R"(
 static void q10_compact_emit(device atomic_uint* counter,
                               device uint* out_ck,
@@ -60,6 +67,7 @@ static void q10_compact_emit(device atomic_uint* counter,
 }
 )");
 
+    const std::string resultRows = "q10_result_rows";
     {
         auto rscan = std::make_unique<MetalRangeScan>("q10_cks", idxVar);
         auto sideEffect = std::make_unique<MetalComputeExpr>(
@@ -72,6 +80,26 @@ static void q10_compact_emit(device atomic_uint* counter,
         phase.extraBuffers.push_back({"d_q10_compact_rev",   "float",       false, false});
         phase.extraBuffers.push_back({"d_cust_revenue",      "float",       true,  false});
         phase.scalarParams.push_back({"q10_compact_cap", "uint"});
+        attachMaterializedCountHook(phase, "d_q10_compact_count", resultRows);
+    }
+
+    // --- Result Order ---
+    // Prefer TopK; fall back to full sort when the shape is unsupported.
+    {
+        std::vector<GenericMatColumnDesc> columns = {
+            GenericMatColumnDesc("c_custkey", "d_q10_compact_ck", "int"),
+            GenericMatColumnDesc("revenue", "d_q10_compact_rev", "float"),
+        };
+        GenericSortSpec sortSpec;
+        sortSpec.keys.push_back({"revenue", true});
+        sortSpec.keys.push_back({"c_custkey", false});
+        sortSpec.limit = 20;
+        std::string topKError;
+        if (!appendGenericGpuTopK(plan, "q10_result", resultRows,
+                                  "maxCustkey", columns, sortSpec, &topKError)) {
+            appendGenericGpuSort(plan, "q10_result", resultRows,
+                                 "maxCustkey", columns, sortSpec, &topKError);
+        }
     }
 
     return plan;
@@ -80,6 +108,7 @@ static void q10_compact_emit(device atomic_uint* counter,
 } // namespace
 
 std::optional<MetalQueryPlan> buildQ10Plan(const AnalyzedQuery& aq) {
+    // Match Q10 only when the analyzed shape has the required join, filter, and group key.
     if (aq.tables.size() < 2) return std::nullopt;
     bool hasLineitem = false, hasOrders = false;
     for (auto& t : aq.tables)  {

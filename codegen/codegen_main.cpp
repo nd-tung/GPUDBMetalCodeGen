@@ -1,8 +1,4 @@
-// Codegen standalone entry point
-// Usage: GPUDBCodegen [sf1|sf10|sf20|sf50|sf100] q<N>|--sql-file FILE|--sql SQL
-//
-// This binary exposes separate predefined TPC-H and ad-hoc SQL routes. Both
-// produce a MetalQueryPlan, then share operators → Metal → GPU execution.
+// Standalone SQL-to-Metal entry point.
 
 #include "core/infra.h"
 #include "query_analyzer.h"
@@ -30,10 +26,9 @@
 #include <algorithm>
 #include <memory>
 #include <optional>
+#include <cstring>
 
-// ===================================================================
-// Experiment flags (set in main, read by runCodegenQuery)
-// ===================================================================
+// Runtime flags shared by main and runCodegenQuery.
 static int  g_warmup            = 3;     // --warmup N
 static int  g_repeat            = 1;     // --repeat N
 static bool g_csv               = false; // --csv  (suppress human-readable breakdown)
@@ -50,16 +45,36 @@ static double g_checkAbsTol = 1e-2;      // --check-abs-tol N
 static double g_checkRelTol = 1e-4;      // --check-rel-tol N
 static int    g_checkExitCode = 0;       // accumulated: nonzero if any --check failed
 static size_t g_chunkRows = 0;           // --chunk N[K|M|G], 0 = full-table mode
-static size_t g_chunkRowsExplicit = 0;    // user-set --chunk value (0 = unset);
-                                          // g_chunkRows above is the *effective*
-                                          // value, possibly raised by the per-query
-                                          // auto-chunk trigger and reset between
-                                          // queries to g_chunkRowsExplicit.
+static size_t g_chunkRowsExplicit = 0;    // user-set --chunk rows; resets g_chunkRows per query
 static bool   g_chunkDoubleBuffer = true;// --no-db uses one reusable chunk slot
+static bool   g_autoChunk = true;         // --no-auto-chunk disables budget trigger
+static bool   g_forceChunk = false;       // --force-chunk disables explicit downgrade
 
 enum class QueryApiKind {
     PredefinedTPCH,
     AdhocSQL,
+};
+
+struct HostPostOpTracker {
+    std::vector<std::string> ops;
+    std::set<std::string> seen;
+
+    void mark(const std::string& op) {
+        if (seen.insert(op).second) ops.push_back(op);
+    }
+
+    bool empty() const {
+        return ops.empty();
+    }
+
+    std::string joined() const {
+        std::string out;
+        for (size_t i = 0; i < ops.size(); i++) {
+            if (i) out += ";";
+            out += ops[i];
+        }
+        return out;
+    }
 };
 
 // Compare two canonical CSV blobs with float tolerance.
@@ -127,9 +142,6 @@ static std::string compareCanonical(const std::string& got, const std::string& e
         return "got " + std::to_string(aLines.size() - 1) + " data rows, expected 0";
     }
 
-    // ---------------------------------------------------------------
-    // Parse headers and build column-name → index maps
-    // ---------------------------------------------------------------
     auto aHdr = splitCsv(aLines[0]);
     auto bHdr = splitCsv(bLines[0]);
 
@@ -147,7 +159,6 @@ static std::string compareCanonical(const std::string& got, const std::string& e
                "] expected cols=[" + joinHdr(bHdr) + "]";
     }
 
-    // Map: column name → (index-in-got, index-in-golden)
     std::vector<std::pair<size_t,size_t>> sharedCols;
     for (size_t ai = 0; ai < aHdr.size(); ai++) {
         for (size_t bi = 0; bi < bHdr.size(); bi++) {
@@ -158,7 +169,6 @@ static std::string compareCanonical(const std::string& got, const std::string& e
         }
     }
 
-    // If there are no columns in common, report schema mismatch.
     if (sharedCols.empty()) {
         char buf[256];
         snprintf(buf, sizeof(buf),
@@ -167,9 +177,6 @@ static std::string compareCanonical(const std::string& got, const std::string& e
         return buf;
     }
 
-    // ---------------------------------------------------------------
-    // Row-count check (header excluded)
-    // ---------------------------------------------------------------
     size_t aData = aLines.size() - 1;
     size_t bData = bLines.size() - 1;
     if (aData != bData) {
@@ -178,9 +185,6 @@ static std::string compareCanonical(const std::string& got, const std::string& e
         return buf;
     }
 
-    // ---------------------------------------------------------------
-    // Per-row comparison over shared columns
-    // ---------------------------------------------------------------
     for (size_t row = 0; row < aData; row++) {
         auto aRow = splitCsv(aLines[row + 1]);
         auto bRow = splitCsv(bLines[row + 1]);
@@ -206,7 +210,6 @@ static std::string compareCanonical(const std::string& got, const std::string& e
                          row + 1, aHdr[ai].c_str(), av.c_str(), bv.c_str(), diff, tol);
                 return buf;
             }
-            // Both non-numeric strings — must match exactly
             if (rtrimSpaces(av) == rtrimSpaces(bv)) continue;
             char buf[256];
             snprintf(buf, sizeof(buf), "row %zu col '%s': '%s' vs '%s'",
@@ -223,12 +226,6 @@ static std::string intDateToStr(int d) {
     snprintf(buf, sizeof(buf), "%04d-%02d-%02d", d / 10000, (d / 100) % 100, d % 100);
     return buf;
 }
-
-using codegen::g_q2Post;
-using codegen::g_q16Post;
-using codegen::g_q18Post;
-using codegen::g_q20Post;
-using codegen::g_q21Post;
 
 static bool parseRowCountWithSuffix(const std::string& text, size_t& out) {
     if (text.empty()) return false;
@@ -251,9 +248,7 @@ static bool parseRowCountWithSuffix(const std::string& text, size_t& out) {
     return out > 0;
 }
 
-// Apply GPU-sorted index remapping to materialized rows.
-// Reads d_sortIdx from the executor's allocated buffers and reorders
-// result.rows so that rows appear in the sort-order defined by the GPU.
+// Reorder materialized rows by the GPU sort index.
 static void applyGpuSortRemap(codegen::GenericResult& result,
                                const codegen::MetalQueryPlan::GpuSort& gpuSort,
                                codegen::MetalGenericExecutor& executor) {
@@ -268,31 +263,27 @@ static void applyGpuSortRemap(codegen::GenericResult& result,
     const int* indices = static_cast<const int*>(idxBuf->contents());
     if (!indices) return;
 
-    // Build remap: position in sorted order → original row index
-    std::vector<size_t> remap(n_results);
-    for (size_t i = 0; i < n_results; ++i) {
+    const size_t outRows = (gpuSort.limit >= 0)
+        ? std::min(n_results, static_cast<size_t>(gpuSort.limit))
+        : n_results;
+
+    // Remap only the visible prefix; remapping all rows would undo GPU top-k.
+    std::vector<size_t> remap(outRows);
+    for (size_t i = 0; i < outRows; ++i) {
         int src = indices[i];
         remap[i] = (src >= 0 && static_cast<size_t>(src) < result.rows.size())
                        ? static_cast<size_t>(src) : i;
     }
 
-    // Reorder rows according to sorted indices
-    auto sortedRows = result.rows;
-    for (size_t i = 0; i < n_results && i < result.rows.size(); ++i) {
-        sortedRows[i] = std::move(result.rows[remap[i]]);
+    std::vector<codegen::GenericResult::Row> sortedRows;
+    sortedRows.reserve(outRows);
+    for (size_t i = 0; i < outRows; ++i) {
+        sortedRows.push_back(std::move(result.rows[remap[i]]));
     }
     result.rows = std::move(sortedRows);
-
-    if (gpuSort.limit >= 0 && result.rows.size() > static_cast<size_t>(gpuSort.limit)) {
-        result.rows.resize(static_cast<size_t>(gpuSort.limit));
-    }
 }
 
-// ===================================================================
-// Peek at a .colbin file header to read row count + file size without
-// mapping the full file.  Returns false if file is absent / invalid.
-// ===================================================================
-
+// Read .colbin row count and file size without mapping the payload.
 static bool peekColbinHeader(const std::string& path,
                               uint64_t& out_n_rows, uint64_t& out_file_size) {
     struct stat st{};
@@ -311,8 +302,7 @@ static bool peekColbinHeader(const std::string& path,
     return true;
 }
 
-// Largest .colbin table in tableCols (by file size) becomes the stream table
-// for chunked execution. Returns empty string if no .colbin files found.
+// Use the largest referenced .colbin as the streaming table.
 static std::string autoDetectStreamTable(
         const std::map<std::string, std::set<std::string>>& tableCols) {
     std::string best;
@@ -325,7 +315,7 @@ static std::string autoDetectStreamTable(
             best = tName;
         }
     }
-    // If no .colbin found, fall back to common heuristic.
+    // Use a deterministic stream table when .colbin metadata is unavailable.
     if (best.empty()) {
         if (tableCols.count("lineitem")) return "lineitem";
         if (tableCols.count("orders"))   return "orders";
@@ -334,14 +324,11 @@ static std::string autoDetectStreamTable(
     return best;
 }
 
-// ===================================================================
 static bool runCodegenQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
                             const std::string& sql, const std::string& queryName,
                             QueryApiKind apiKind) {
     if (!g_csv) printf("\n=== Codegen: %s ===\n", queryName.c_str());
-    // Reset effective chunk size to whatever the user explicitly asked for.
-    // Without this, an earlier query's auto-chunk decision would leak into
-    // the next query when the binary is invoked with `all` or `mball`.
+    // Prevent auto-chunk decisions from leaking across `all` / `mball`.
     g_chunkRows = g_chunkRowsExplicit;
     try {
         using clk = std::chrono::high_resolution_clock;
@@ -351,7 +338,7 @@ static bool runCodegenQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
         DetailedTiming timing{};
         timing.queryName = queryName;
         {
-            // Derive short SF label from g_dataset_path (e.g. "data/SF-1/" → "SF1")
+            // Derive short SF label from g_dataset_path.
             const std::string& p = g_dataset_path;
             auto s = p.find("SF-");
             if (s != std::string::npos) {
@@ -362,8 +349,7 @@ static bool runCodegenQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
             }
         }
 
-        // 1. Analyze SQL. Predefined TPC-H does not parse/plan SQL text;
-        // only ad-hoc SQL and microbenchmarks do.
+        // Analyze SQL only for the ad-hoc route.
         codegen::AnalyzedQuery analyzed;
         bool analyzedOk = false;
         if (apiKind == QueryApiKind::AdhocSQL) {
@@ -379,7 +365,7 @@ static bool runCodegenQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
             timing.analyzeMs = elapsedMs(tAnalyze0, clk::now());
         }
 
-        // 2. Build operator-based plan
+        // Build operator-based plan.
         auto tPlan0 = clk::now();
         std::optional<codegen::MetalQueryPlan> maybePlan;
         if (apiKind == QueryApiKind::PredefinedTPCH) {
@@ -410,14 +396,7 @@ static bool runCodegenQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
         plan.name = queryName;
         timing.planMs = elapsedMs(tPlan0, clk::now());
 
-        // ----------------------------------------------------------------
-        // Data-larger-than-memory (DLM) safety gate.
-        //   * Hard error if the user explicitly passed --chunk for a query
-        //     whose plan is not yet certified chunkable (see DOCUMENTATION §9.4).
-        //   * Otherwise force g_chunkRows back to 0 so the auto-chunk
-        //     trigger below cannot silently engage and produce wrong
-        //     output for joins / sorts / non-associative aggregates.
-        // ----------------------------------------------------------------
+        // Chunking is allowed only for plans marked chunkable.
         if (!plan.chunkable) {
             if (g_chunkRowsExplicit > 0) {
                 std::cerr << "Codegen: " << queryName
@@ -426,16 +405,15 @@ static bool runCodegenQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
                              "DOCUMENTATION.md §9.4).\n";
                 return false;
             }
-            g_chunkRows = 0;  // suppress auto-chunk below
+            g_chunkRows = 0;
         }
 
-        // Experiment override: --threadgroup-size N replaces every phase's TG size.
+        // Experiment override.
         if (g_tgSizeOverride > 0) {
             for (auto& ph : plan.phases) ph.threadgroupSize = g_tgSizeOverride;
         }
 
-        // Experiment introspection: --print-plan dumps phase summary
-        // and writes operator-tree JSON for CI / debugging.
+        // Print phase summary and operator-tree JSON.
         if (g_printPlan) {
             printf("\n--- MetalQueryPlan: %s ---\n", plan.name.c_str());
             printf("  helpers           : %zu\n", plan.helpers.size());
@@ -453,7 +431,6 @@ static bool runCodegenQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
             }
             printf("---\n");
 
-            // Also write plan JSON
             try {
                 std::string planFile = "debug/codegen_debug_" + plan.name + "_plan.json";
                 std::ofstream ofs(planFile);
@@ -461,10 +438,9 @@ static bool runCodegenQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
             } catch (...) {}
         }
 
-        // 3. Generate Metal source via producer-consumer operators
+        // Generate Metal source.
         auto tCodegen0 = clk::now();
-        // Predefined TPC-H queries don't go through analyzeSQL — provide
-        // the default schema so IU auto-projection works for them too.
+        // Predefined TPC-H plans need the default schema for auto-projection.
         auto cg = codegen::generateFromPlan(plan, analyzed.schema ? analyzed.schema : &codegen::defaultSchemaProvider());
         std::string metalSource = cg.print();
         timing.codegenMs = elapsedMs(tCodegen0, clk::now());
@@ -474,7 +450,7 @@ static bool runCodegenQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
                    metalSource.size(), cg.phaseCount());
         }
 
-        // Debug: dump generated source to file
+        // Dump generated source.
         {
             std::string dumpDir = g_dumpMslDir.empty() ? "debug" : g_dumpMslDir;
             std::string path = dumpDir + "/codegen_debug_" + queryName + ".metal";
@@ -483,7 +459,7 @@ static bool runCodegenQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
             if (!g_csv) printf("  (written to %s)\n", path.c_str());
         }
 
-        // 4. Compile Metal source → MTLLibrary
+        // Compile Metal source.
         auto tCompile0 = clk::now();
         codegen::RuntimeCompiler compiler(device);
         auto* library = compiler.compile(metalSource);
@@ -493,7 +469,7 @@ static bool runCodegenQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
             return false;
         }
 
-        // Build CompiledQuery with PSOs for each phase
+        // Build one PSO per phase.
         auto tPso0 = clk::now();
         codegen::RuntimeCompiler::CompiledQuery compiled;
         compiled.library = library;
@@ -509,7 +485,7 @@ static bool runCodegenQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
         timing.psoMs = elapsedMs(tPso0, clk::now());
 
         const auto& schema = codegen::TPCHSchema::instance();
-        // Collect columns needed per table from all phases
+        // Collect columns referenced by all phases.
         std::map<std::string, std::set<std::string>> tableCols;
         for (const auto& phase : cg.getPhases()) {
             for (const auto& b : phase.bindings) {
@@ -519,45 +495,13 @@ static bool runCodegenQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
             }
         }
 
-        // 5. Load data: full-table zero-copy/copy or bounded chunked colbin.
-        loadStats().reset();  // track per-query load source + byte count
-        // Auto-enable chunked execution when dataset exceeds available RAM
-        // or the GPU working-set budget. Skip entirely for non-chunkable
-        // plans (see DLM gate above) so we never auto-engage chunking on a
-        // query that would produce wrong results.
-        //
-        // Adaptive sizing strategy:
-        //   * streamBytesPerRow = sum(elemBytes) for *projected* columns of
-        //     the stream table only — narrower projections yield wider
-        //     chunks and amortise launch overhead better.
-        //   * residentBytes     = sum(nrows * sum(elemBytes(projected)))
-        //     across non-stream tables that stay fully resident in shared
-        //     buffers + GPU side hash maps.
-        //   * budget            = min(physRAM, gpuWorkingSet) * fraction
-        //                         - residentBytes
-        //   * chunkRows         = floor(budget / (streamBytesPerRow * slots))
-        //   * Clamped to [256K, totalStreamRows].
-        //
-        // Note: the trigger uses physMemBytes (not vm_statistics64's
-        // free+inactive+speculative). On Apple Silicon the GPU shares
-        // system RAM and the kernel evicts file-backed/cached pages on
-        // demand, so reclaimable-only accounting is far too pessimistic
-        // (e.g. reports ~5 GiB on a 16 GiB Mac with normal browser/IDE
-        // usage). Likewise, the working-set estimate compares *projected*
-        // bytes (residentBytes + streamRows * streamBytesPerRow), not
-        // full .colbin file sizes, since unprojected columns are never
-        // loaded into GPU buffers.
-        // Enter the budget block whenever the plan is chunkable. We use
-        // the computed working-set both to *engage* chunking when it does
-        // not fit (auto path, g_chunkRows starts at 0) and to *downgrade*
-        // an explicit `--chunk N` request to direct load when it clearly
-        // does fit (explicit path, g_chunkRows starts > 0). The downgrade
-        // can be disabled by setting GPUDB_FORCE_CHUNK=1 — useful for
-        // benchmarking the chunked path on small datasets.
-        if (plan.chunkable) {
+        // Load data via full-table buffers or chunked .colbin streaming.
+        loadStats().reset();
+        // Chunk sizing uses projected bytes, not full file size. Physmem is
+        // the trigger on UMA because reclaimable-page accounting is too tight.
+        if (plan.chunkable && (g_autoChunk || g_chunkRows > 0)) {
             const std::string autoStreamTable = autoDetectStreamTable(tableCols);
             if (!autoStreamTable.empty()) {
-                // --- Memory budgets ---------------------------------------
                 uint64_t physMemBytes = 0;
                 {
                     size_t len = sizeof(physMemBytes);
@@ -579,13 +523,9 @@ static bool runCodegenQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
                 }
                 uint64_t gpuBudgetBytes = (uint64_t)device->recommendedMaxWorkingSetSize();
                 if (gpuBudgetBytes == 0) gpuBudgetBytes = physMemBytes;
-                // Use physMemBytes (not availMemBytes) for the trigger:
-                // on UMA, file-backed pages are evicted on demand, so the
-                // VM "free+inactive+speculative" estimate is too tight.
-                // availMemBytes is kept only for the diagnostic printout.
+                // availMemBytes is diagnostic only.
                 uint64_t totalBudget = std::min(physMemBytes, gpuBudgetBytes);
 
-                // --- Per-column elem-byte helper --------------------------
                 auto elemBytes = [&](const codegen::ColumnDef& c) -> uint64_t {
                     switch (c.type) {
                         case codegen::DataType::INT:
@@ -604,7 +544,7 @@ static bool runCodegenQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
                     return bpr;
                 };
 
-                // --- Total dataset size (full file sizes, diagnostic) ----
+                // Full file size is diagnostic; projected size drives chunking.
                 uint64_t totalDataBytes = 0;
                 for (const auto& [tName, _cols] : tableCols) {
                     uint64_t nr = 0, fsz = 0;
@@ -612,7 +552,6 @@ static bool runCodegenQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
                         totalDataBytes += fsz;
                 }
 
-                // --- Resident bytes (non-stream tables, projected only) ---
                 uint64_t residentBytes = 0;
                 for (const auto& [tName, cols] : tableCols) {
                     if (tName == autoStreamTable) continue;
@@ -622,7 +561,6 @@ static bool runCodegenQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
                     residentBytes += nr * projectedBytesPerRow(tName, cols);
                 }
 
-                // --- Projected stream bytes (stream table, projected only)
                 uint64_t streamProjectedBytes = 0;
                 {
                     uint64_t nr = 0, fsz = 0;
@@ -633,27 +571,20 @@ static bool runCodegenQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
                                                       tableCols.at(autoStreamTable));
                     }
                 }
-                // Working-set we'd allocate if we loaded the whole stream
-                // resident — this is what actually competes with the GPU
-                // budget, not the on-disk file footprint.
+                // Resident buffers plus projected stream buffers.
                 uint64_t projectedWorkingSet = residentBytes + streamProjectedBytes;
 
-                // --- Trigger: chunk only when projected working-set would
-                //              dominate the budget.
                 constexpr double kThreshold    = 0.75;
                 constexpr double kBudgetFraction = 0.50; // headroom for hash maps, output, kernels
                 const bool fitsInBudget =
                     (totalBudget > 0) &&
                     (projectedWorkingSet <= (uint64_t)(totalBudget * kThreshold));
 
-                // --- Explicit-chunk downgrade ----------------------------
-                // If the user passed --chunk N but the projected working
-                // set fits comfortably, chunking would only add the
-                // O(N) host-copy tax with no memory benefit. Downgrade
-                // to direct load unless GPUDB_FORCE_CHUNK=1.
+                // Downgrade explicit chunking when direct load fits.
                 if (g_chunkRows > 0 && fitsInBudget) {
                     const char* force = std::getenv("GPUDB_FORCE_CHUNK");
-                    bool forceChunk = (force && force[0] && force[0] != '0');
+                    bool forceChunk = g_forceChunk ||
+                        (force && force[0] && force[0] != '0');
                     if (!forceChunk) {
                         if (!g_csv) {
                             printf("[auto-chunk] %s: --chunk %zu downgraded to "
@@ -669,7 +600,7 @@ static bool runCodegenQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
                     }
                 }
 
-                if (g_chunkRows == 0 && !fitsInBudget) {
+                if (g_chunkRows == 0 && g_autoChunk && !fitsInBudget) {
                     uint64_t streamRows = 0, streamFsz = 0;
                     if (peekColbinHeader(g_dataset_path + autoStreamTable + ".colbin",
                                         streamRows, streamFsz) && streamRows > 0) {
@@ -679,11 +610,7 @@ static bool runCodegenQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
                         if (streamBytesPerRow == 0) streamBytesPerRow = 1;
                         const int slots = g_chunkDoubleBuffer ? 2 : 1;
 
-                        // Budget left for the streaming buffers after the
-                        // resident tables claim their share. Reserve at
-                        // least 1/8 of total budget for chunks even when
-                        // residents are large (probe maps are typically
-                        // much smaller than full-resident sizes).
+                        // Keep a floor for stream buffers even with large residents.
                         int64_t streamBudget =
                             (int64_t)((double)totalBudget * kBudgetFraction)
                             - (int64_t)residentBytes;
@@ -697,8 +624,7 @@ static bool runCodegenQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
                         size_t autoChunkRows = (size_t)
                             ((uint64_t)streamBudget /
                              (streamBytesPerRow * (uint64_t)slots));
-                        // Clamp: floor at 256K rows (launch-overhead amortise),
-                        // ceiling at total stream rows (no need to chunk).
+                        // Clamp to useful chunk sizes.
                         autoChunkRows = std::max<size_t>(autoChunkRows, 256u * 1024);
                         if (autoChunkRows > streamRows)
                             autoChunkRows = (size_t)streamRows;
@@ -731,15 +657,11 @@ static bool runCodegenQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
         auto parseStart = std::chrono::high_resolution_clock::now();
         codegen::MetalGenericExecutor executor(device, cmdQueue);
 
-        // For chunked execution, auto-detect stream table (largest .colbin).
         const std::string streamTable = (g_chunkRows > 0)
             ? autoDetectStreamTable(tableCols) : std::string{};
         bool didChunk = false;
 
-        // Load each table's columns. In chunked mode, skip the stream table
-        // here — it is loaded per-chunk below.
-        // Track pure I/O (file read/mmap into host buffers) separately
-        // from CPU preprocessing (max-key scans, per-query prep).
+        // Stream table columns are loaded per chunk below.
         double ioMs = 0.0;
         double preprocessMs = 0.0;
         std::vector<std::pair<std::string, QueryColumns>> loadedTables;
@@ -782,11 +704,7 @@ static bool runCodegenQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
 
         codegen::MetalExecutionResult result;
 
-        // ---------------------------------------------------------------
-        // Chunked streaming path — GPU atomic accumulation across chunks.
-        // All Metal kernels use atomic_fetch_add_explicit, so output buffers
-        // accumulate additively when zero-init is suppressed after chunk 0.
-        // ---------------------------------------------------------------
+        // Chunked path: kernels accumulate into output buffers across chunks.
         if (!streamTable.empty()) {
             std::vector<ColSpec> streamSpecs;
             for (const auto& colName : tableCols.at(streamTable))
@@ -806,10 +724,7 @@ static bool runCodegenQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
             double chunkCopyMs = 0.0, gpuMs = 0.0, bufAllocMs = 0.0;
             std::map<std::string, double> chunkPhaseSums;
 
-            // Determine stream phase range once.
-            // Pre-stream phases (scan non-stream tables before first stream phase)
-            // run ONCE before the loop. Stream phases (scan streamTable) run per
-            // chunk. Post-stream phases run ONCE after the loop.
+            // Split phases into pre-stream, stream, and post-stream ranges.
             const auto& cgPhases = cg.getPhases();
             const int totalPhases = (int)cgPhases.size();
             int firstStreamPhase = totalPhases, lastStreamPhase = 0;
@@ -819,10 +734,10 @@ static bool runCodegenQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
                     lastStreamPhase = _pi + 1;
                 }
             }
-            // If no phase scans streamTable explicitly, treat all phases as stream.
+            // If no phase scans streamTable, run all phases per chunk.
             if (firstStreamPhase == totalPhases) { firstStreamPhase = 0; lastStreamPhase = totalPhases; }
 
-            // Run pre-stream phases once (e.g. build bitmap from part/orders).
+            // Run pre-stream phases once.
             if (firstStreamPhase > 0) {
                 auto preResult = executor.execute(compiled, cg, 0, 1, 0, firstStreamPhase);
                 gpuMs      += preResult.totalKernelTimeMs;
@@ -834,7 +749,7 @@ static bool runCodegenQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
                 }
             }
 
-            // Chunk loop: stream phases run per chunk with GPU atomic accumulation.
+            // Stream phases run once per chunk.
             for (size_t startRow = 0; startRow < totalRows; startRow += chunkRows) {
                 const size_t rowsThisChunk = std::min(chunkRows, totalRows - startRow);
                 const int slot = (int)(chunkCount % (size_t)streamSlots);
@@ -869,7 +784,7 @@ static bool runCodegenQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
             }
             executor.setSkipZeroInit(false);
 
-            // Run post-stream phases once (e.g. Q4's orders count).
+            // Run post-stream phases once.
             if (lastStreamPhase < totalPhases) {
                 auto postResult = executor.execute(compiled, cg, 0, 1,
                                                    lastStreamPhase, totalPhases);
@@ -911,7 +826,7 @@ static bool runCodegenQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
             didChunk = true;
         }
         if (!didChunk) {
-        // 6. Execute (with experiment harness: warmup + repeat + optional pipeline-cache bypass)
+        // Execute with warmup/repeat and optional pipeline-cache bypass.
         auto parseEnd = std::chrono::high_resolution_clock::now();
         double parseMs = std::chrono::duration<double, std::milli>(parseEnd - parseStart).count();
         // One-time .tbl->column ingest (only when .colbin is missing) is
@@ -928,14 +843,8 @@ static bool runCodegenQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
         timing.preprocessMs = (timing.dataLoadMs > ioMs)
                               ? (timing.dataLoadMs - ioMs) : preprocessMs;
 
-        // ----- B1: --autotune-tg [--autotune-tg-per-phase] --------------
-        // Per-query TG sweep over a fixed candidate set. For each
-        // candidate, override every phase's threadgroupSize, run a quick
-        // calibration (1 untimed + 5 timed iters, drop max), and record
-        // the median GPU time -- both totals (for global autotune) and
-        // per-phase timings (for per-phase autotune). Finally apply the
-        // best candidate(s) and continue with the regular --warmup/--repeat
-        // measurement loop. The PSO is shared across candidates: tg_size
+        // Sweep threadgroup sizes, pick the best median, then continue timing.
+        // The PSO is shared across candidates: tg_size
         // is a kernel parameter ([[threads_per_threadgroup]]), so
         // changing dispatch TG does NOT require recompiling.
         if (g_autotuneTg || g_autotuneTgPerPhase) {
@@ -1156,15 +1065,16 @@ static bool runCodegenQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
         }
         } // end if (!didChunk)
 
+        HostPostOpTracker hostPostOps;
+        auto markHostPost = [&](const std::string& op) {
+            if (apiKind == QueryApiKind::PredefinedTPCH) hostPostOps.mark(op);
+        };
+
         auto postStart = std::chrono::high_resolution_clock::now();
 
-        // ---------------------------------------------------------------
-        // Per-query pre-print normalisation
-        // ---------------------------------------------------------------
+        // Per-query output normalization.
 
-        // Q14: GPU accumulates raw promo/total sums for precision; convert
-        // to the final ratio (100 * promo / total) so the result matches
-        // the standard TPC-H single-column output and DuckDB golden format.
+        // Q14: convert raw promo/total sums to the final ratio column.
         if (plan.name == "Q14" && result.result.numRows() == 1 &&
             result.result.columns.size() == 2) {
             double promo = std::get<double>(result.result.rows[0][0]);
@@ -1174,9 +1084,7 @@ static bool runCodegenQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
             result.result.rows[0] = {ratio};
         }
 
-        // Q12: GPU emits 4 buckets [(MAIL,high), (MAIL,low), (SHIP,high),
-        // (SHIP,low)]; pivot to two output rows with columns matching
-        // golden CSV (l_shipmode, high_line_count, low_line_count).
+        // Q12: pivot four GPU buckets into the two TPC-H output rows.
         if (plan.name == "Q12" && result.result.numRows() == 4 &&
             result.result.columns.size() == 2) {
             auto getCount = [&](size_t r) -> int64_t {
@@ -1197,27 +1105,21 @@ static bool runCodegenQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
             result.result.rows.push_back({std::string("SHIP"), shipHigh, shipLow});
         }
 
-        // GPU-sorted materialized output: remap rows using sorted index buffer
+        // Apply GPU sort order to materialized rows.
         if (plan.gpuSort && !result.result.columns.empty()) {
             applyGpuSortRemap(result.result, *plan.gpuSort, executor);
         }
 
-        // 7. Print generic results.
-        // Queries whose final output is assembled by CPU post-processing below
-        // leave result.result.columns empty here; those queries do their own printf.
+        // Empty columns mean a query-specific block below will assemble output.
         if (!g_csv && !result.result.columns.empty()) {
             printf("\n%s Results:\n", queryName.c_str());
             result.result.print();
         }
 
-        // ---------------------------------------------------------------
-        // Per-query post-processing — populates result.result then prints.
-        // The correctness oracle (golden check) runs AFTER all blocks below.
-        // ---------------------------------------------------------------
+        // Per-query post-processing runs before the golden check.
 
-        // Q10: GPU compact emits qualifying (custkey, revenue) pairs;
-        // CPU partial-sorts to top 20.
-        if (plan.name == "Q10") {
+        // Q10: gather GPU-sorted top-k when available.
+        if (plan.name == "Q10" && result.result.columns.empty()) {
             auto* cntBuf = executor.getAllocatedBuffer("d_q10_compact_count");
             auto* ckBuf  = executor.getAllocatedBuffer("d_q10_compact_ck");
             auto* revBuf = executor.getAllocatedBuffer("d_q10_compact_rev");
@@ -1227,31 +1129,56 @@ static bool runCodegenQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
                 if (n > cap) n = (uint32_t)cap;
                 const uint32_t* cks  = (const uint32_t*)ckBuf->contents();
                 const float*    revs = (const float*)revBuf->contents();
+
                 std::vector<std::pair<float, int>> entries;
-                entries.reserve(n);
-                for (uint32_t k = 0; k < n; k++)
-                    entries.push_back({revs[k], (int)cks[k]});
-                int show = std::min((int)entries.size(), 20);
-                if (show < (int)entries.size()) {
-                    std::partial_sort(entries.begin(), entries.begin() + show,
-                                      entries.end(),
-                                      [](auto& a, auto& b) { return a.first > b.first; });
+                if (plan.gpuSort) {
+                    auto* idxBuf = executor.getAllocatedBuffer(plan.gpuSort->sortedIndexBuffer);
+                    if (idxBuf) {
+                        const int* order = static_cast<const int*>(idxBuf->contents());
+                        int limit = plan.gpuSort->limit >= 0 ? plan.gpuSort->limit : (int)n;
+                        int show = std::min((int)n, limit);
+                        entries.reserve(show);
+                        for (int j = 0; j < show; j++) {
+                            int src = order[j];
+                            if (src < 0 || (uint32_t)src >= n) continue;
+                            entries.push_back({revs[src], (int)cks[src]});
+                        }
+                    }
+                }
+
+                if (entries.empty()) {
+                    markHostPost("hostTopKSort");
+                    entries.reserve(n);
+                    for (uint32_t k = 0; k < n; k++)
+                        entries.push_back({revs[k], (int)cks[k]});
+                    int show = std::min((int)entries.size(), 20);
+                    if (show < (int)entries.size()) {
+                        std::partial_sort(entries.begin(), entries.begin() + show,
+                                          entries.end(),
+                                          [](auto& a, auto& b) { return a.first > b.first; });
+                    } else {
+                        std::sort(entries.begin(), entries.end(),
+                                  [](auto& a, auto& b) { return a.first > b.first; });
+                    }
+                    entries.resize(show);
                 } else {
-                    std::sort(entries.begin(), entries.end(),
-                              [](auto& a, auto& b) { return a.first > b.first; });
+                    // Already gathered by GPU order.
                 }
                 result.result.columns = {{"c_custkey","int"},{"revenue","float"}};
                 result.result.rows.clear();
+                int show = (int)entries.size();
                 for (int j = 0; j < show; j++)
                     result.result.rows.push_back({(int64_t)entries[j].second, (double)entries[j].first});
-                printf("  Top-%d customers by returned-item revenue:\n", show);
-                printf("  +----------+--------------+\n");
-                printf("  | c_custkey|      revenue |\n");
-                printf("  +----------+--------------+\n");
-                for (int j = 0; j < show; j++) {
-                    printf("  | %8d | %12.2f |\n", entries[j].second, entries[j].first);
+                if (!g_csv) {
+                    printf("  Top-%d customers by returned-item revenue:\n", show);
+                    printf("  +----------+--------------+\n");
+                    printf("  | c_custkey|      revenue |\n");
+                    printf("  +----------+--------------+\n");
+                    for (int j = 0; j < show; j++) {
+                        printf("  | %8d | %12.2f |\n", entries[j].second, entries[j].first);
+                    }
+                    printf("  +----------+--------------+\n");
                 }
-                printf("  +----------+--------------+\n");
             }
         }
 
@@ -1282,29 +1209,62 @@ static bool runCodegenQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
 
         // Q5: nation revenue sorted desc
         if (plan.name == "Q5") {
-            auto* revBuf = executor.getAllocatedBuffer("d_nation_revenue");
-            if (revBuf) {
-                float* rev = (float*)revBuf->contents();
-                auto nat = loadNation(g_dataset_path);
-                auto nationNames = buildNationNames(nat.nationkey, nat.name.data(),
-                                                     NationData::NAME_WIDTH);
-                std::vector<std::pair<float, int>> entries;
-                for (int nk = 0; nk < 25; nk++) {
-                    if (rev[nk] > 0.0f) entries.push_back({rev[nk], nk});
-                }
-                std::sort(entries.begin(), entries.end(),
-                          [](auto& a, auto& b) { return a.first > b.first; });
+            auto* cntBuf = executor.getAllocatedBuffer("d_q5_result_count");
+            auto* nameBuf = executor.getAllocatedBuffer("d_q5_result_name");
+            auto* revBuf = executor.getAllocatedBuffer("d_q5_result_revenue");
+            if (cntBuf && nameBuf && revBuf) {
+                uint32_t n = *static_cast<uint32_t*>(cntBuf->contents());
+                size_t cap = revBuf->length() / sizeof(float);
+                if (n > cap) n = (uint32_t)cap;
+                const char* names = (const char*)nameBuf->contents();
+                const float* revenues = (const float*)revBuf->contents();
                 result.result.columns = {{"n_name","string"},{"revenue","float"}};
                 result.result.rows.clear();
-                for (auto& [r, nk] : entries)
-                    result.result.rows.push_back({nationNames[nk], (double)r});
-                printf("  +------------------+-----------------+\n");
-                printf("  | n_name           |         revenue |\n");
-                printf("  +------------------+-----------------+\n");
-                for (auto& [r, nk] : entries) {
-                    printf("  | %-16s | $%14.2f |\n", nationNames[nk].c_str(), r);
+                auto extractName = [](const char* base) {
+                    int len = 25;
+                    while (len > 0 && (base[len - 1] == ' ' || base[len - 1] == '\0')) len--;
+                    return std::string(base, len);
+                };
+                auto appendRow = [&](uint32_t src) {
+                    if (src >= n) return;
+                    result.result.rows.push_back({
+                        extractName(names + (size_t)src * 25),
+                        (double)revenues[src]
+                    });
+                };
+
+                if (plan.gpuSort) {
+                    auto* idxBuf = executor.getAllocatedBuffer(plan.gpuSort->sortedIndexBuffer);
+                    if (idxBuf) {
+                        const int* order = static_cast<const int*>(idxBuf->contents());
+                        for (uint32_t j = 0; j < n; j++) {
+                            int src = order[j];
+                            if (src >= 0) appendRow((uint32_t)src);
+                        }
+                    }
                 }
-                printf("  +------------------+-----------------+\n");
+
+                if (result.result.rows.empty() && n > 0) {
+                    markHostPost("hostSort");
+                    std::vector<uint32_t> order(n);
+                    for (uint32_t i = 0; i < n; i++) order[i] = i;
+                    std::sort(order.begin(), order.end(), [&](uint32_t a, uint32_t b) {
+                        return revenues[a] > revenues[b];
+                    });
+                    for (uint32_t src : order) appendRow(src);
+                }
+
+                if (!g_csv) {
+                    printf("  +------------------+-----------------+\n");
+                    printf("  | n_name           |         revenue |\n");
+                    printf("  +------------------+-----------------+\n");
+                    for (const auto& row : result.result.rows) {
+                        printf("  | %-16s | $%14.2f |\n",
+                               std::get<std::string>(row[0]).c_str(),
+                               std::get<double>(row[1]));
+                    }
+                    printf("  +------------------+-----------------+\n");
+                }
             }
         }
 
@@ -1333,85 +1293,129 @@ static bool runCodegenQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
             }
         }
 
-        // Q3: GPU compact emits qualifying (orderkey, revenue); CPU
-        // joins with date_map + prio_map and partial-sorts top 10.
+        // Q3: gather compacted rows, using GPU order when available.
         if (plan.name == "Q3") {
             auto* cntBuf  = executor.getAllocatedBuffer("d_q3_compact_count");
             auto* okBuf   = executor.getAllocatedBuffer("d_q3_compact_ok");
             auto* revBuf  = executor.getAllocatedBuffer("d_q3_compact_rev");
-            auto* dateBuf = executor.getAllocatedBuffer("d_orders_date_map");
-            auto* prioBuf = executor.getAllocatedBuffer("d_orders_prio_map");
+            auto* dateBuf = executor.getAllocatedBuffer("d_q3_compact_date");
+            auto* prioBuf = executor.getAllocatedBuffer("d_q3_compact_prio");
             if (cntBuf && okBuf && revBuf && dateBuf && prioBuf) {
                 uint32_t n = *static_cast<uint32_t*>(cntBuf->contents());
                 size_t cap = okBuf->length() / sizeof(uint32_t);
                 if (n > cap) n = (uint32_t)cap;
                 const uint32_t* oks  = (const uint32_t*)okBuf->contents();
                 const float*    revs = (const float*)revBuf->contents();
-                int* dates = (int*)dateBuf->contents();
-                int* prios = (int*)prioBuf->contents();
-                size_t mapLen = dateBuf->length() / sizeof(int);
+                const int* dates = (const int*)dateBuf->contents();
+                const int* prios = (const int*)prioBuf->contents();
                 std::vector<std::tuple<float, int, int, int>> entries;
-                entries.reserve(n);
-                for (uint32_t k = 0; k < n; k++) {
-                    int ok = (int)oks[k];
-                    int d  = ((size_t)ok < mapLen) ? dates[ok] : -1;
-                    int p  = ((size_t)ok < mapLen) ? prios[ok] : 0;
-                    entries.push_back({revs[k], d, ok, p});
+
+                if (plan.gpuSort) {
+                    auto* idxBuf = executor.getAllocatedBuffer(plan.gpuSort->sortedIndexBuffer);
+                    if (idxBuf) {
+                        const int* order = static_cast<const int*>(idxBuf->contents());
+                        int limit = plan.gpuSort->limit >= 0 ? plan.gpuSort->limit : (int)n;
+                        int show = std::min((int)n, limit);
+                        entries.reserve(show);
+                        for (int j = 0; j < show; j++) {
+                            int src = order[j];
+                            if (src < 0 || (uint32_t)src >= n) continue;
+                            entries.push_back({revs[src], dates[src], (int)oks[src], prios[src]});
+                        }
+                    }
                 }
-                int show = std::min((int)entries.size(), 10);
-                auto cmp = [](auto& a, auto& b) {
-                    if (std::get<0>(a) != std::get<0>(b)) return std::get<0>(a) > std::get<0>(b);
-                    return std::get<1>(a) < std::get<1>(b);
-                };
-                if (show < (int)entries.size()) {
-                    std::partial_sort(entries.begin(), entries.begin() + show,
-                                      entries.end(), cmp);
-                } else {
-                    std::sort(entries.begin(), entries.end(), cmp);
+
+                if (entries.empty()) {
+                    markHostPost("hostTopKSort");
+                    entries.reserve(n);
+                    for (uint32_t k = 0; k < n; k++) {
+                        entries.push_back({revs[k], dates[k], (int)oks[k], prios[k]});
+                    }
+                    int show = std::min((int)entries.size(), 10);
+                    auto cmp = [](auto& a, auto& b) {
+                        if (std::get<0>(a) != std::get<0>(b)) return std::get<0>(a) > std::get<0>(b);
+                        return std::get<1>(a) < std::get<1>(b);
+                    };
+                    if (show < (int)entries.size()) {
+                        std::partial_sort(entries.begin(), entries.begin() + show,
+                                          entries.end(), cmp);
+                    } else {
+                        std::sort(entries.begin(), entries.end(), cmp);
+                    }
+                    entries.resize(show);
                 }
                 result.result.columns = {{"l_orderkey","int"},{"revenue","float"},{"o_orderdate","string"},{"o_shippriority","int"}};
                 result.result.rows.clear();
+                int show = (int)entries.size();
                 for (int j = 0; j < show; j++) {
                     auto& [r, d, ok, p] = entries[j];
                     result.result.rows.push_back({(int64_t)ok, (double)r, intDateToStr(d), (int64_t)p});
                 }
-                printf("  +----------+--------------+------------+---------------+\n");
-                printf("  |l_orderkey|      revenue | o_orderdate|o_shippriority |\n");
-                printf("  +----------+--------------+------------+---------------+\n");
-                for (int j = 0; j < show; j++) {
-                    auto& [r, d, ok, p] = entries[j];
-                    printf("  | %8d | %12.2f | %10d | %13d |\n", ok, r, d, p);
+                if (!g_csv) {
+                    printf("  +----------+--------------+------------+---------------+\n");
+                    printf("  |l_orderkey|      revenue | o_orderdate|o_shippriority |\n");
+                    printf("  +----------+--------------+------------+---------------+\n");
+                    for (int j = 0; j < show; j++) {
+                        auto& [r, d, ok, p] = entries[j];
+                        printf("  | %8d | %12.2f | %10d | %13d |\n", ok, r, d, p);
+                    }
+                    printf("  +----------+--------------+------------+---------------+\n");
                 }
-                printf("  +----------+--------------+------------+---------------+\n");
             }
         }
 
         // Q13: histogram of order counts
         if (plan.name == "Q13") {
-            auto* histBuf = executor.getAllocatedBuffer("d_histogram");
-            if (histBuf) {
-                uint32_t* hist = (uint32_t*)histBuf->contents();
-                size_t maxBin = histBuf->length() / sizeof(uint32_t);
+            auto* cntBuf = executor.getAllocatedBuffer("d_q13_result_count");
+            auto* cCountBuf = executor.getAllocatedBuffer("d_q13_result_c_count");
+            auto* custDistBuf = executor.getAllocatedBuffer("d_q13_result_custdist");
+            if (cntBuf && cCountBuf && custDistBuf) {
+                uint32_t n = *static_cast<uint32_t*>(cntBuf->contents());
+                size_t cap = cCountBuf->length() / sizeof(uint32_t);
+                if (n > cap) n = (uint32_t)cap;
+                const uint32_t* cCounts = (const uint32_t*)cCountBuf->contents();
+                const uint32_t* custDists = (const uint32_t*)custDistBuf->contents();
                 std::vector<std::pair<uint32_t, int>> entries;
-                for (size_t c = 0; c < maxBin; c++) {
-                    if (hist[c] > 0) entries.push_back({hist[c], (int)c});
+
+                if (plan.gpuSort) {
+                    auto* idxBuf = executor.getAllocatedBuffer(plan.gpuSort->sortedIndexBuffer);
+                    if (idxBuf) {
+                        const int* order = static_cast<const int*>(idxBuf->contents());
+                        entries.reserve(n);
+                        for (uint32_t j = 0; j < n; j++) {
+                            int src = order[j];
+                            if (src < 0 || (uint32_t)src >= n) continue;
+                            entries.push_back({custDists[src], (int)cCounts[src]});
+                        }
+                    }
                 }
-                std::sort(entries.begin(), entries.end(),
-                    [](auto& a, auto& b) {
-                        if (a.first != b.first) return a.first > b.first;
-                        return a.second > b.second;
-                    });
+
+                if (entries.empty() && n > 0) {
+                    markHostPost("hostSort");
+                    entries.reserve(n);
+                    for (uint32_t k = 0; k < n; k++) {
+                        entries.push_back({custDists[k], (int)cCounts[k]});
+                    }
+                    std::sort(entries.begin(), entries.end(),
+                        [](auto& a, auto& b) {
+                            if (a.first != b.first) return a.first > b.first;
+                            return a.second > b.second;
+                        });
+                }
+
                 result.result.columns = {{"c_count","int"},{"custdist","int"}};
                 result.result.rows.clear();
                 for (auto& [dist, cnt] : entries)
                     result.result.rows.push_back({(int64_t)cnt, (int64_t)dist});
-                printf("  +--------+----------+\n");
-                printf("  | c_count|  custdist|\n");
-                printf("  +--------+----------+\n");
-                for (auto& [dist, cnt] : entries) {
-                    printf("  | %6d | %8u |\n", cnt, dist);
+                if (!g_csv) {
+                    printf("  +--------+----------+\n");
+                    printf("  | c_count|  custdist|\n");
+                    printf("  +--------+----------+\n");
+                    for (auto& [dist, cnt] : entries) {
+                        printf("  | %6d | %8u |\n", cnt, dist);
+                    }
+                    printf("  +--------+----------+\n");
                 }
-                printf("  +--------+----------+\n");
             }
         }
 
@@ -1442,10 +1446,13 @@ static bool runCodegenQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
             }
         }
 
-        // Q11: total sum → threshold → filter → sort
-        if (plan.name == "Q11") {
+        // Q11 host path: threshold, filter, and sort.
+        if (plan.name == "Q11" && result.result.columns.empty()) {
             auto* valBuf = executor.getAllocatedBuffer("d_part_value");
             if (valBuf) {
+                markHostPost("hostScalarScan");
+                markHostPost("hostFilter");
+                markHostPost("hostSort");
                 float* values = (float*)valBuf->contents();
                 size_t n = valBuf->length() / sizeof(float);
                 double globalSum = 0.0;
@@ -1476,9 +1483,11 @@ static bool runCodegenQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
         }
 
         // Q15: find max revenue supplier
-        if (plan.name == "Q15") {
+        if (plan.name == "Q15" && result.result.columns.empty()) {
             auto* revBuf = executor.getAllocatedBuffer("d_supp_revenue");
             if (revBuf) {
+                markHostPost("hostScalarScan");
+                markHostPost("hostFilter");
                 float* rev = (float*)revBuf->contents();
                 size_t n = revBuf->length() / sizeof(float);
                 float maxRev = 0.0f;
@@ -1502,129 +1511,167 @@ static bool runCodegenQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
             }
         }
 
-        // Q18: GPU compact emits qualifying (orderkey, qty) pairs; CPU
-        // joins via okLookup and partial-sorts to top 100.
+        // Q18: gather compacted rows, using GPU top-k order when available.
         if (plan.name == "Q18") {
-            auto* cntBuf    = executor.getAllocatedBuffer("d_q18_compact_count");
-            auto* okBuf     = executor.getAllocatedBuffer("d_q18_compact_ok");
-            auto* qtyBuf    = executor.getAllocatedBuffer("d_q18_compact_qty");
-            auto* lookupBuf = executor.getAllocatedBuffer("d_q18_ok_lookup");
-            if (cntBuf && okBuf && qtyBuf && lookupBuf) {
+            auto* cntBuf     = executor.getAllocatedBuffer("d_q18_compact_count");
+            auto* okBuf      = executor.getAllocatedBuffer("d_q18_compact_ok");
+            auto* custBuf    = executor.getAllocatedBuffer("d_q18_compact_custkey");
+            auto* totalBuf   = executor.getAllocatedBuffer("d_q18_compact_totalprice");
+            auto* dateBuf    = executor.getAllocatedBuffer("d_q18_compact_orderdate");
+            auto* qtyBuf     = executor.getAllocatedBuffer("d_q18_compact_qty");
+            if (cntBuf && okBuf && custBuf && totalBuf && dateBuf && qtyBuf) {
                 uint32_t n = *static_cast<uint32_t*>(cntBuf->contents());
-                // Guard against any cap overflow — kernel already drops
-                // writes past the cap, but cap the loop too.
+                // Match the kernel's compact-buffer cap.
                 size_t cap = okBuf->length() / sizeof(uint32_t);
                 if (n > cap) n = (uint32_t)cap;
-                const uint32_t* oks = (const uint32_t*)okBuf->contents();
-                const float*    qtys = (const float*)qtyBuf->contents();
-                const int*   o_custkey    = g_q18Post.o_custkey;
-                const float* o_totalprice = g_q18Post.o_totalprice;
-                const int*   o_orderdate  = g_q18Post.o_orderdate;
-                const int*   okLookup     = (const int*)lookupBuf->contents();
-                size_t okLookupLen = lookupBuf->length() / sizeof(int);
+                const uint32_t* oks       = (const uint32_t*)okBuf->contents();
+                const int*      custkeys  = (const int*)custBuf->contents();
+                const float*    totals    = (const float*)totalBuf->contents();
+                const int*      dates     = (const int*)dateBuf->contents();
+                const float*    qtys      = (const float*)qtyBuf->contents();
 
                 struct Q18Entry { int orderkey; int custkey; float totalprice; int orderdate; float qty; };
-                // Min-heap by totalprice (ascending), orderdate (descending) as tiebreaker.
-                // Pops the smallest totalprice when heap exceeds 100 entries.
-                auto cmp = [](const Q18Entry& a, const Q18Entry& b) {
-                    if (a.totalprice != b.totalprice) return a.totalprice > b.totalprice;
-                    return a.orderdate < b.orderdate;
-                };
-                std::priority_queue<Q18Entry, std::vector<Q18Entry>, decltype(cmp)> top100(cmp);
-                for (uint32_t k = 0; k < n; k++) {
-                    int ok = (int)oks[k];
-                    int idx = (ok >= 0 && (size_t)ok < okLookupLen) ? okLookup[ok] : -1;
-                    int custkey = 0; float tp = 0.0f; int od = 0;
-                    if (idx >= 0) {
-                        custkey = o_custkey[idx];
-                        tp = o_totalprice[idx];
-                        od = o_orderdate[idx];
+                std::vector<Q18Entry> results;
+                if (plan.gpuSort) {
+                    auto* idxBuf = executor.getAllocatedBuffer(plan.gpuSort->sortedIndexBuffer);
+                    if (idxBuf) {
+                        const int* order = static_cast<const int*>(idxBuf->contents());
+                        int limit = plan.gpuSort->limit >= 0 ? plan.gpuSort->limit : (int)n;
+                        int show = std::min((int)n, limit);
+                        results.reserve(show);
+                        for (int j = 0; j < show; j++) {
+                            int src = order[j];
+                            if (src < 0 || (uint32_t)src >= n) continue;
+                            results.push_back({(int)oks[src], custkeys[src], totals[src],
+                                               dates[src], qtys[src]});
+                        }
                     }
-                    top100.push({ok, custkey, tp, od, qtys[k]});
-                    if ((int)top100.size() > 100) top100.pop();
                 }
-                int show = top100.size();
-                std::vector<Q18Entry> results(show);
-                for (int j = show - 1; j >= 0; j--) { results[j] = top100.top(); top100.pop(); }
+
+                if (results.empty() && n > 0) {
+                    markHostPost("hostTopKSort");
+                    results.reserve(n);
+                    for (uint32_t k = 0; k < n; k++) {
+                        results.push_back({(int)oks[k], custkeys[k], totals[k], dates[k], qtys[k]});
+                    }
+                    int show = std::min((int)results.size(), 100);
+                    auto cmp = [](const Q18Entry& a, const Q18Entry& b) {
+                        if (a.totalprice != b.totalprice) return a.totalprice > b.totalprice;
+                        return a.orderdate < b.orderdate;
+                    };
+                    if (show < (int)results.size()) {
+                        std::partial_sort(results.begin(), results.begin() + show,
+                                          results.end(), cmp);
+                    } else {
+                        std::sort(results.begin(), results.end(), cmp);
+                    }
+                    results.resize(show);
+                }
+
+                int show = (int)results.size();
                 result.result.columns = {{"c_custkey","int"},{"o_orderkey","int"},{"o_orderdate","string"},{"o_totalprice","float"},{"sum(l_quantity)","float"}};
                 result.result.rows.clear();
                 for (int j = 0; j < show; j++) {
                     auto& r = results[j];
                     result.result.rows.push_back({(int64_t)r.custkey, (int64_t)r.orderkey, intDateToStr(r.orderdate), (double)r.totalprice, (double)r.qty});
                 }
-                printf("  Top-%d large volume orders (qty > 300):\n", show);
-                printf("  +----------+----------+---------------+------------+----------+\n");
-                printf("  | c_custkey| o_orderkey| o_totalprice |  o_orderdate| o_qty   |\n");
-                printf("  +----------+----------+---------------+------------+----------+\n");
-                for (int j = 0; j < show; j++) {
-                    auto& r = results[j];
-                    printf("  | %8d | %8d | %13.2f | %10d | %8.2f |\n",
-                           r.custkey, r.orderkey, r.totalprice, r.orderdate, r.qty);
+                if (!g_csv) {
+                    printf("  Top-%d large volume orders (qty > 300):\n", show);
+                    printf("  +----------+----------+---------------+------------+----------+\n");
+                    printf("  | c_custkey| o_orderkey| o_totalprice |  o_orderdate| o_qty   |\n");
+                    printf("  +----------+----------+---------------+------------+----------+\n");
+                    for (int j = 0; j < show; j++) {
+                        auto& r = results[j];
+                        printf("  | %8d | %8d | %13.2f | %10d | %8.2f |\n",
+                               r.custkey, r.orderkey, r.totalprice, r.orderdate, r.qty);
+                    }
+                    printf("  +----------+----------+---------------+------------+----------+\n");
                 }
-                printf("  +----------+----------+---------------+------------+----------+\n");
             }
         }
 
-        // Q9: read profit bins, sort by nation ASC, year DESC
+        // Q9: sort profit bins by nation ASC, year DESC.
         if (plan.name == "Q9") {
-            auto* profitBuf = executor.getAllocatedBuffer("d_q9_profit");
-            if (profitBuf) {
+            auto* cntBuf = executor.getAllocatedBuffer("d_q9_result_count");
+            auto* nationBuf = executor.getAllocatedBuffer("d_q9_result_nation");
+            auto* yearBuf = executor.getAllocatedBuffer("d_q9_result_year");
+            auto* profitBuf = executor.getAllocatedBuffer("d_q9_result_profit");
+            if (cntBuf && nationBuf && yearBuf && profitBuf) {
+                uint32_t n = *static_cast<uint32_t*>(cntBuf->contents());
+                size_t cap = yearBuf->length() / sizeof(int32_t);
+                if (n > cap) n = (uint32_t)cap;
+                const char* nations = (const char*)nationBuf->contents();
+                const int32_t* years = (const int32_t*)yearBuf->contents();
                 const float* profits = (const float*)profitBuf->contents();
-                auto nCols = codegen::loadPreprocessColumns(device, "nation",
-                    {{0, ColType::INT}, {1, ColType::CHAR_FIXED, 25}});
-                auto n_nk = codegen::copyIntColumn(nCols, 0);
-                auto n_nm = codegen::copyCharColumn(nCols, 1, nCols.rows() * 25);
-                std::vector<std::string> nationNames(25);
-                for (size_t i = 0; i < n_nk.size(); i++) {
-                    // Nation names are fixed-width 25-char fields; trim trailing spaces/nulls
-                    const char* base = n_nm.data() + i * 25;
+                result.result.columns = {{"nation","string"},{"o_year","int"},{"sum_profit","float"}};
+                result.result.rows.clear();
+                auto extractNation = [](const char* base) {
                     int len = 25;
-                    while (len > 0 && (base[len-1] == ' ' || base[len-1] == '\0')) len--;
-                    nationNames[n_nk[i]] = std::string(base, len);
-                }
+                    while (len > 0 && (base[len - 1] == ' ' || base[len - 1] == '\0')) len--;
+                    return std::string(base, len);
+                };
+                auto appendRow = [&](uint32_t src) {
+                    if (src >= n) return;
+                    result.result.rows.push_back({
+                        extractNation(nations + (size_t)src * 25),
+                        (int64_t)years[src],
+                        (double)profits[src]
+                    });
+                };
 
-                struct Q9Row { std::string nation; int year; float profit; };
-                std::vector<Q9Row> rows;
-                for (int nk = 0; nk < 25; nk++) {
-                    for (int yr = 1992; yr <= 1998; yr++) {
-                        int bin = nk * 8 + (yr - 1992);
-                        float p = profits[bin];
-                        if (p != 0.0f) {
-                            rows.push_back({nationNames[nk], yr, p});
+                if (plan.gpuSort) {
+                    auto* idxBuf = executor.getAllocatedBuffer(plan.gpuSort->sortedIndexBuffer);
+                    if (idxBuf) {
+                        const int* order = static_cast<const int*>(idxBuf->contents());
+                        for (uint32_t j = 0; j < n; j++) {
+                            int src = order[j];
+                            if (src >= 0) appendRow((uint32_t)src);
                         }
                     }
                 }
-                std::sort(rows.begin(), rows.end(), [](const Q9Row& a, const Q9Row& b) {
-                    if (a.nation != b.nation) return a.nation < b.nation;
-                    return a.year > b.year;
-                });
-                result.result.columns = {{"nation","string"},{"o_year","int"},{"sum_profit","float"}};
-                result.result.rows.clear();
-                for (auto& r : rows)
-                    result.result.rows.push_back({r.nation, (int64_t)r.year, (double)r.profit});
-                printf("  +------------+------+---------------+\n");
-                printf("  | Nation     | Year |        Profit |\n");
-                printf("  +------------+------+---------------+\n");
-                int show = std::min((int)rows.size(), 15);
-                for (int j = 0; j < show; j++) {
-                    printf("  | %-10s | %4d | $%13.2f |\n",
-                           rows[j].nation.c_str(), rows[j].year, rows[j].profit);
+
+                if (result.result.rows.empty() && n > 0) {
+                    markHostPost("hostSort");
+                    std::vector<uint32_t> order(n);
+                    for (uint32_t i = 0; i < n; i++) order[i] = i;
+                    std::sort(order.begin(), order.end(), [&](uint32_t a, uint32_t b) {
+                        int cmp = strncmp(nations + (size_t)a * 25,
+                                          nations + (size_t)b * 25, 25);
+                        if (cmp != 0) return cmp < 0;
+                        return years[a] > years[b];
+                    });
+                    for (uint32_t src : order) appendRow(src);
                 }
-                printf("  +------------+------+---------------+\n");
-                printf("  Total results: %d\n", (int)rows.size());
+
+                if (!g_csv) {
+                    printf("  +------------+------+---------------+\n");
+                    printf("  | Nation     | Year |        Profit |\n");
+                    printf("  +------------+------+---------------+\n");
+                    int show = std::min((int)result.result.rows.size(), 15);
+                    for (int j = 0; j < show; j++) {
+                        const auto& row = result.result.rows[j];
+                        printf("  | %-10s | %4lld | $%13.2f |\n",
+                               std::get<std::string>(row[0]).c_str(),
+                               (long long)std::get<int64_t>(row[1]),
+                               std::get<double>(row[2]));
+                    }
+                    printf("  +------------+------+---------------+\n");
+                    printf("  Total results: %zu\n", result.result.rows.size());
+                }
             }
         }
 
-        // Q20: GPU built d_q20_qual_supp_bitmap (one bit per qualifying
-        // suppkey). CPU iterates supplier mirror filtered by nation +
-        // bitmap probe — replaces the q20HtSize-row scan and std::set.
+        // Q20: gather GPU-materialized supplier rows in GPU sort order.
         if (plan.name == "Q20") {
-            auto& pd = g_q20Post;
-            auto* qualBmpBuf = executor.getAllocatedBuffer("d_q20_qual_supp_bitmap");
-            if (qualBmpBuf) {
-                const uint32_t* qualBmp = (const uint32_t*)qualBmpBuf->contents();
-                size_t qualBmpInts = qualBmpBuf->length() / sizeof(uint32_t);
-
+            auto* cntBuf  = executor.getAllocatedBuffer("d_q20_result_count");
+            auto* nameBuf = executor.getAllocatedBuffer("d_q20_result_name");
+            auto* addrBuf = executor.getAllocatedBuffer("d_q20_result_address");
+            if (cntBuf && nameBuf && addrBuf) {
+                uint32_t n = *static_cast<uint32_t*>(cntBuf->contents());
+                size_t cap = nameBuf->length() / 25;
+                if (n > cap) n = (uint32_t)cap;
+                const char* names = (const char*)nameBuf->contents();
+                const char* addresses = (const char*)addrBuf->contents();
                 struct Q20Row { std::string name; std::string address; };
                 std::vector<Q20Row> rows;
                 auto extractFixedStr = [](const char* base, int width, bool trimSpaces) {
@@ -1635,111 +1682,80 @@ static bool runCodegenQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
                     }
                     return std::string(base, len);
                 };
-                for (size_t i = 0; i < pd.nS; i++) {
-                    if (pd.s_nationkey[i] != pd.canada_nk) continue;
-                    int sk = pd.s_suppkey[i];
-                    if (sk < 0) continue;
-                    size_t w = (size_t)sk >> 5;
-                    if (w >= qualBmpInts) continue;
-                    if (!((qualBmp[w] >> ((uint32_t)sk & 31u)) & 1u)) continue;
-                    rows.push_back({extractFixedStr(pd.s_name + i * 25, 25, true),
-                                    extractFixedStr(pd.s_address + i * 40, 40, true)});
+
+                if (plan.gpuSort) {
+                    auto* idxBuf = executor.getAllocatedBuffer(plan.gpuSort->sortedIndexBuffer);
+                    if (idxBuf) {
+                        const int* order = static_cast<const int*>(idxBuf->contents());
+                        int show = (int)n;
+                        rows.reserve(show);
+                        for (int j = 0; j < show; j++) {
+                            int src = order[j];
+                            if (src < 0 || (uint32_t)src >= n) continue;
+                            rows.push_back({
+                                extractFixedStr(names + (size_t)src * 25, 25, true),
+                                extractFixedStr(addresses + (size_t)src * 40, 40, true)
+                            });
+                        }
+                    }
                 }
-                std::sort(rows.begin(), rows.end(), [](const Q20Row& a, const Q20Row& b) {
-                    return a.name < b.name;
-                });
+
+                if (rows.empty() && n > 0) {
+                    markHostPost("hostSort");
+                    rows.reserve(n);
+                    for (uint32_t k = 0; k < n; k++) {
+                        rows.push_back({
+                            extractFixedStr(names + (size_t)k * 25, 25, true),
+                            extractFixedStr(addresses + (size_t)k * 40, 40, true)
+                        });
+                    }
+                    std::sort(rows.begin(), rows.end(), [](const Q20Row& a, const Q20Row& b) {
+                        return a.name < b.name;
+                    });
+                }
+
                 result.result.columns = {{"s_name","string"},{"s_address","string"}};
                 result.result.rows.clear();
                 for (auto& r : rows)
                     result.result.rows.push_back({r.name, r.address});
-                printf("  +---------------------------+------------------------------------------+\n");
-                printf("  | s_name                    | s_address                                |\n");
-                printf("  +---------------------------+------------------------------------------+\n");
-                int show = std::min((int)rows.size(), 10);
-                for (int j = 0; j < show; j++) {
-                    printf("  | %-25s | %-40s |\n", rows[j].name.c_str(), rows[j].address.c_str());
+                if (!g_csv) {
+                    printf("  +---------------------------+------------------------------------------+\n");
+                    printf("  | s_name                    | s_address                                |\n");
+                    printf("  +---------------------------+------------------------------------------+\n");
+                    int show = std::min((int)rows.size(), 10);
+                    for (int j = 0; j < show; j++) {
+                        printf("  | %-25s | %-40s |\n", rows[j].name.c_str(), rows[j].address.c_str());
+                    }
+                    printf("  +---------------------------+------------------------------------------+\n");
+                    printf("  Total qualifying suppliers: %d\n", (int)rows.size());
                 }
-                printf("  +---------------------------+------------------------------------------+\n");
-                printf("  Total qualifying suppliers: %d\n", (int)rows.size());
             }
         }
 
-        // Q2: GPU compact emits qualifying (partkey, suppkey). CPU joins
-        // via direct-address part/supp index arrays (built once in
-        // preprocessing) and sorts the small qualifying set.
+        // Q2: gather GPU-decorated and GPU-sorted compact rows.
         if (plan.name == "Q2") {
-            auto& pd = g_q2Post;
             auto* cntBuf = executor.getAllocatedBuffer("d_q2_compact_count");
-            auto* pkBuf  = executor.getAllocatedBuffer("d_q2_compact_pk");
-            auto* skBuf  = executor.getAllocatedBuffer("d_q2_compact_sk");
-            if (cntBuf && pkBuf && skBuf) {
+            auto* acctBuf = executor.getAllocatedBuffer("d_q2_result_acctbal");
+            auto* nameBuf = executor.getAllocatedBuffer("d_q2_result_s_name");
+            auto* nationBuf = executor.getAllocatedBuffer("d_q2_result_n_name");
+            auto* partkeyBuf = executor.getAllocatedBuffer("d_q2_result_p_partkey");
+            auto* mfgrBuf = executor.getAllocatedBuffer("d_q2_result_p_mfgr");
+            auto* addrBuf = executor.getAllocatedBuffer("d_q2_result_s_address");
+            auto* phoneBuf = executor.getAllocatedBuffer("d_q2_result_s_phone");
+            auto* commentBuf = executor.getAllocatedBuffer("d_q2_result_s_comment");
+            if (cntBuf && acctBuf && nameBuf && nationBuf && partkeyBuf &&
+                mfgrBuf && addrBuf && phoneBuf && commentBuf) {
                 uint32_t n = *static_cast<uint32_t*>(cntBuf->contents());
-                size_t cap = pkBuf->length() / sizeof(uint32_t);
+                size_t cap = partkeyBuf->length() / sizeof(uint32_t);
                 if (n > cap) n = (uint32_t)cap;
-                const uint32_t* pks = (const uint32_t*)pkBuf->contents();
-                const uint32_t* sks = (const uint32_t*)skBuf->contents();
-
-                // Direct-address lookups built once in preprocessing.
-                const int* suppIdxArr = pd.suppIdxArr.data();
-                const int* partIdxArr = pd.partIdxArr.data();
-                const int  maxSk = pd.maxSuppkey;
-                const int  maxPk = pd.maxPartkey;
-
-                struct Q2Row {
-                    float s_acctbal;
-                    const char* s_name_ptr; int s_name_len;
-                    const char* n_name_ptr; int n_name_len;
-                    int p_partkey;
-                    int si; // supplier index (for deferred field extraction)
-                    int pi; // part index
-                };
-                std::vector<Q2Row> rows;
-                rows.reserve(n);
-
-                auto writeStrLen = [](const char* base, int width, int& len, bool trimSpaces) {
-                    len = 0;
-                    while (len < width && base[len] != '\0') len++;
-                    if (trimSpaces) {
-                        while (len > 0 && base[len - 1] == ' ') len--;
-                    }
-                };
-
-                for (uint32_t k = 0; k < n; k++) {
-                    int pk = (int)pks[k];
-                    int sk = (int)sks[k];
-                    if (sk < 0 || sk > maxSk || pk < 0 || pk > maxPk) continue;
-                    int si = suppIdxArr[sk];
-                    int pi = partIdxArr[pk];
-                    if (si < 0 || pi < 0) continue;
-
-                    Q2Row row;
-                    row.s_acctbal = pd.s_acctbal[si];
-                    row.p_partkey = pk;
-                    row.si = si; row.pi = pi;
-                    row.s_name_ptr = pd.s_name    + si * 25;
-                    row.n_name_ptr = (pd.s_nationkey[si] >= 0 && pd.s_nationkey[si] < (int)pd.nationNames.size())
-                        ? pd.nationNames[pd.s_nationkey[si]].data() : "";
-                    writeStrLen(row.s_name_ptr, 25, row.s_name_len, true);
-                    row.n_name_len = pd.s_nationkey[si] >= 0 && pd.s_nationkey[si] < (int)pd.nationNames.size()
-                        ? (int)pd.nationNames[pd.s_nationkey[si]].size() : 0;
-                    rows.push_back(std::move(row));
-                }
-
-                // Sort using string_view comparisons (no string copies)
-                std::sort(rows.begin(), rows.end(), [](const Q2Row& a, const Q2Row& b) {
-                    if (a.s_acctbal != b.s_acctbal) return a.s_acctbal > b.s_acctbal;
-                    // n_name compare
-                    { int cmp = strncmp(a.n_name_ptr, b.n_name_ptr, std::min(a.n_name_len, b.n_name_len));
-                      if (cmp != 0) return cmp < 0;
-                      if (a.n_name_len != b.n_name_len) return a.n_name_len < b.n_name_len; }
-                    // s_name compare
-                    { int cmp = strncmp(a.s_name_ptr, b.s_name_ptr, std::min(a.s_name_len, b.s_name_len));
-                      if (cmp != 0) return cmp < 0;
-                      if (a.s_name_len != b.s_name_len) return a.s_name_len < b.s_name_len; }
-                    return a.p_partkey < b.p_partkey;
-                });
-
-                int limit = std::min((int)rows.size(), 100);
+                const float* acct = (const float*)acctBuf->contents();
+                const char* names = (const char*)nameBuf->contents();
+                const char* nations = (const char*)nationBuf->contents();
+                const uint32_t* partkeys = (const uint32_t*)partkeyBuf->contents();
+                const char* mfgrs = (const char*)mfgrBuf->contents();
+                const char* addresses = (const char*)addrBuf->contents();
+                const char* phones = (const char*)phoneBuf->contents();
+                const char* comments = (const char*)commentBuf->contents();
                 result.result.columns = {{"s_acctbal","float"},{"s_name","string"},{"n_name","string"},{"p_partkey","int"},{"p_mfgr","string"},{"s_address","string"},{"s_phone","string"},{"s_comment","string"}};
                 result.result.rows.clear();
                 auto extractStr = [](const char* base, int width, bool trimSpaces) {
@@ -1750,130 +1766,229 @@ static bool runCodegenQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
                     }
                     return std::string(base, len);
                 };
-                for (int j = 0; j < limit; j++) {
-                    auto& r = rows[j];
+
+                auto appendRow = [&](uint32_t src) {
+                    if (src >= n) return;
                     result.result.rows.push_back({
-                        (double)r.s_acctbal,
-                        std::string(r.s_name_ptr, r.s_name_len),
-                        std::string(r.n_name_ptr, r.n_name_len),
-                        (int64_t)r.p_partkey,
-                        extractStr(pd.p_mfgr    + r.pi * 25,  25, true),
-                        extractStr(pd.s_address + r.si * 40,  40, true),
-                        extractStr(pd.s_phone   + r.si * 15,  15, false),
-                        extractStr(pd.s_comment + r.si * 101, 101, false)
+                        (double)acct[src],
+                        extractStr(names + (size_t)src * 25, 25, true),
+                        extractStr(nations + (size_t)src * 25, 25, true),
+                        (int64_t)partkeys[src],
+                        extractStr(mfgrs + (size_t)src * 25, 25, true),
+                        extractStr(addresses + (size_t)src * 40, 40, true),
+                        extractStr(phones + (size_t)src * 15, 15, false),
+                        extractStr(comments + (size_t)src * 101, 101, false)
                     });
-                }
-                printf("\nQ2 Results:\n");
-                printf("  %-10s | %-25s | %-15s | %-8s | %-25s\n",
-                       "s_acctbal", "s_name", "n_name", "p_partkey", "p_mfgr");
-                printf("  ----------+---------------------------+-----------------+----------+---------------------------\n");
-                int show = std::min(limit, 10);
-                for (int j = 0; j < show; j++) {
-                    auto& r = result.result.rows[j];
-                    printf("  %9.2f | %-25s | %-15s | %8lld | %-25s\n",
-                           std::get<double>(r[0]), std::get<std::string>(r[1]).c_str(),
-                           std::get<std::string>(r[2]).c_str(), (long long)std::get<int64_t>(r[3]),
-                           std::get<std::string>(r[4]).c_str());
-                }
-                if (limit > 10) printf("  ... (%d more rows)\n", limit - 10);
-                printf("  Total rows: %d\n", limit);
-            }
-        }
+                };
 
-        // Q16: GPU-popcounted per-group counts (Phase Q16_popcount_groups);
-        // CPU joins back to (brand,type,size) and sorts.
-        if (plan.name == "Q16") {
-            auto& pd = g_q16Post;
-            auto* cntBuf = executor.getAllocatedBuffer("d_q16_group_counts");
-            if (cntBuf && pd.numGroups > 0) {
-                const uint32_t* cnts = (const uint32_t*)cntBuf->contents();
-
-                struct Q16Result { std::string brand; std::string type; int size; int supplier_cnt; };
-                std::vector<Q16Result> results;
-                results.reserve(pd.numGroups);
-                for (uint32_t g = 0; g < pd.numGroups; g++) {
-                    int cnt = (int)cnts[g];
-                    if (cnt > 0) {
-                        results.push_back({pd.groups[g].brand, pd.groups[g].type, pd.groups[g].size, cnt});
+                int limit = std::min((int)n, 100);
+                if (plan.gpuSort) {
+                    auto* idxBuf = executor.getAllocatedBuffer(plan.gpuSort->sortedIndexBuffer);
+                    if (idxBuf) {
+                        const int* order = static_cast<const int*>(idxBuf->contents());
+                        int gpuLimit = plan.gpuSort->limit >= 0 ? plan.gpuSort->limit : limit;
+                        limit = std::min((int)n, gpuLimit);
+                        for (int j = 0; j < limit; j++) {
+                            int src = order[j];
+                            if (src >= 0) appendRow((uint32_t)src);
+                        }
                     }
                 }
 
-                std::sort(results.begin(), results.end(), [](const Q16Result& a, const Q16Result& b) {
-                    if (a.supplier_cnt != b.supplier_cnt) return a.supplier_cnt > b.supplier_cnt;
-                    if (a.brand != b.brand) return a.brand < b.brand;
-                    if (a.type != b.type) return a.type < b.type;
-                    return a.size < b.size;
-                });
+                if (result.result.rows.empty() && n > 0) {
+                    markHostPost("hostSort");
+                    std::vector<uint32_t> order(n);
+                    for (uint32_t i = 0; i < n; i++) order[i] = i;
+                    auto fixedCmp = [&](const char* base, int width, uint32_t a, uint32_t b) {
+                        return strncmp(base + (size_t)a * width,
+                                       base + (size_t)b * width,
+                                       (size_t)width);
+                    };
+                    std::sort(order.begin(), order.end(), [&](uint32_t a, uint32_t b) {
+                        if (acct[a] != acct[b]) return acct[a] > acct[b];
+                        int cmp = fixedCmp(nations, 25, a, b);
+                        if (cmp != 0) return cmp < 0;
+                        cmp = fixedCmp(names, 25, a, b);
+                        if (cmp != 0) return cmp < 0;
+                        return partkeys[a] < partkeys[b];
+                    });
+                    limit = std::min((int)order.size(), 100);
+                    for (int j = 0; j < limit; j++) appendRow(order[(size_t)j]);
+                }
 
+                if (!g_csv) {
+                    printf("\nQ2 Results:\n");
+                    printf("  %-10s | %-25s | %-15s | %-8s | %-25s\n",
+                           "s_acctbal", "s_name", "n_name", "p_partkey", "p_mfgr");
+                    printf("  ----------+---------------------------+-----------------+----------+---------------------------\n");
+                    int show = std::min((int)result.result.rows.size(), 10);
+                    for (int j = 0; j < show; j++) {
+                        auto& r = result.result.rows[j];
+                        printf("  %9.2f | %-25s | %-15s | %8lld | %-25s\n",
+                               std::get<double>(r[0]), std::get<std::string>(r[1]).c_str(),
+                               std::get<std::string>(r[2]).c_str(), (long long)std::get<int64_t>(r[3]),
+                               std::get<std::string>(r[4]).c_str());
+                    }
+                    if ((int)result.result.rows.size() > 10)
+                        printf("  ... (%zu more rows)\n", result.result.rows.size() - 10);
+                    printf("  Total rows: %zu\n", result.result.rows.size());
+                }
+            }
+        }
+
+        // Q16: gather GPU-decorated and GPU-sorted group rows.
+        if (plan.name == "Q16") {
+            auto* rowCntBuf = executor.getAllocatedBuffer("d_q16_result_count");
+            auto* brandBuf = executor.getAllocatedBuffer("d_q16_result_brand");
+            auto* typeBuf = executor.getAllocatedBuffer("d_q16_result_type");
+            auto* sizeBuf = executor.getAllocatedBuffer("d_q16_result_size");
+            auto* suppCntBuf = executor.getAllocatedBuffer("d_q16_result_supplier_cnt");
+            if (rowCntBuf && brandBuf && typeBuf && sizeBuf && suppCntBuf) {
+                uint32_t n = *static_cast<uint32_t*>(rowCntBuf->contents());
+                size_t cap = sizeBuf->length() / sizeof(int32_t);
+                if (n > cap) n = (uint32_t)cap;
+                const char* brands = (const char*)brandBuf->contents();
+                const char* types = (const char*)typeBuf->contents();
+                const int32_t* sizes = (const int32_t*)sizeBuf->contents();
+                const uint32_t* supplierCnts = (const uint32_t*)suppCntBuf->contents();
                 result.result.columns = {{"p_brand","string"},{"p_type","string"},{"p_size","int"},{"supplier_cnt","int"}};
                 result.result.rows.clear();
-                for (auto& r : results)
-                    result.result.rows.push_back({r.brand, r.type, (int64_t)r.size, (int64_t)r.supplier_cnt});
-                printf("\nQ16 Results:\n");
-                printf("  +-----------+---------------------------+------+--------------+\n");
-                printf("  | p_brand   | p_type                    |p_size| supplier_cnt |\n");
-                printf("  +-----------+---------------------------+------+--------------+\n");
-                int show = std::min((int)results.size(), 10);
-                for (int j = 0; j < show; j++) {
-                    printf("  | %-9s | %-25s | %4d | %12d |\n",
-                           results[j].brand.c_str(), results[j].type.c_str(),
-                           results[j].size, results[j].supplier_cnt);
+                auto fixedStr = [](const char* base, int width) {
+                    int len = width;
+                    while (len > 0 && (base[len - 1] == ' ' || base[len - 1] == '\0')) len--;
+                    return std::string(base, len);
+                };
+                auto appendRow = [&](uint32_t src) {
+                    if (src >= n) return;
+                    result.result.rows.push_back({
+                        fixedStr(brands + (size_t)src * 10, 10),
+                        fixedStr(types + (size_t)src * 25, 25),
+                        (int64_t)sizes[src],
+                        (int64_t)supplierCnts[src]
+                    });
+                };
+
+                if (plan.gpuSort) {
+                    auto* idxBuf = executor.getAllocatedBuffer(plan.gpuSort->sortedIndexBuffer);
+                    if (idxBuf) {
+                        const int* order = static_cast<const int*>(idxBuf->contents());
+                        for (uint32_t j = 0; j < n; j++) {
+                            int src = order[j];
+                            if (src >= 0) appendRow((uint32_t)src);
+                        }
+                    }
                 }
-                printf("  +-----------+---------------------------+------+--------------+\n");
-                printf("  Total groups: %d\n", (int)results.size());
+
+                if (result.result.rows.empty() && n > 0) {
+                    markHostPost("hostSort");
+                    std::vector<uint32_t> order(n);
+                    for (uint32_t i = 0; i < n; i++) order[i] = i;
+                    std::sort(order.begin(), order.end(), [&](uint32_t a, uint32_t b) {
+                        if (supplierCnts[a] != supplierCnts[b]) return supplierCnts[a] > supplierCnts[b];
+                        int cmp = strncmp(brands + (size_t)a * 10,
+                                          brands + (size_t)b * 10, 10);
+                        if (cmp != 0) return cmp < 0;
+                        cmp = strncmp(types + (size_t)a * 25,
+                                      types + (size_t)b * 25, 25);
+                        if (cmp != 0) return cmp < 0;
+                        return sizes[a] < sizes[b];
+                    });
+                    for (uint32_t src : order) appendRow(src);
+                }
+
+                if (!g_csv) {
+                    printf("\nQ16 Results:\n");
+                    printf("  +-----------+---------------------------+------+--------------+\n");
+                    printf("  | p_brand   | p_type                    |p_size| supplier_cnt |\n");
+                    printf("  +-----------+---------------------------+------+--------------+\n");
+                    int show = std::min((int)result.result.rows.size(), 10);
+                    for (int j = 0; j < show; j++) {
+                        const auto& row = result.result.rows[j];
+                        printf("  | %-9s | %-25s | %4lld | %12lld |\n",
+                               std::get<std::string>(row[0]).c_str(),
+                               std::get<std::string>(row[1]).c_str(),
+                               (long long)std::get<int64_t>(row[2]),
+                               (long long)std::get<int64_t>(row[3]));
+                    }
+                    printf("  +-----------+---------------------------+------+--------------+\n");
+                    printf("  Total groups: %zu\n", result.result.rows.size());
+                }
             }
         }
 
-        // Q21: read per-supp counts, join names, sort, top 100
+        // Q21: gather GPU-decorated and GPU-sorted compact rows.
         if (plan.name == "Q21") {
-            auto& pd = g_q21Post;
-            auto* buf = executor.getAllocatedBuffer("d_q21_supp_count");
-            if (buf) {
-                const uint32_t* suppCounts = (const uint32_t*)buf->contents();
-                size_t suppCountLen = buf->length() / sizeof(uint32_t);
+            auto* cntBuf = executor.getAllocatedBuffer("d_q21_result_count");
+            auto* nameBuf = executor.getAllocatedBuffer("d_q21_result_name");
+            auto* numwaitBuf = executor.getAllocatedBuffer("d_q21_result_numwait");
+            if (cntBuf && nameBuf && numwaitBuf) {
+                uint32_t n = *static_cast<uint32_t*>(cntBuf->contents());
+                size_t cap = numwaitBuf->length() / sizeof(uint32_t);
+                if (n > cap) n = (uint32_t)cap;
+                const char* names = (const char*)nameBuf->contents();
+                const uint32_t* numwait = (const uint32_t*)numwaitBuf->contents();
 
-                struct Q21Row { std::string s_name; int numwait; };
-                std::vector<Q21Row> rows;
-                // Iterate suppliers directly (nS rows) instead of scanning
-                // [0, maxSuppkey] via an unordered_map: nS << maxSuppkey
-                // at high SF and avoids the per-query hash build.
-                for (size_t i = 0; i < pd.nS; i++) {
-                    int sk = pd.s_suppkey[i];
-                    if (sk < 0 || (size_t)sk >= suppCountLen) continue;
-                    uint32_t cnt = suppCounts[sk];
-                    if (cnt == 0) continue;
-                    int len = 25;
-                    while (len > 0 && (pd.s_name[i * 25 + len - 1] == ' ' ||
-                                       pd.s_name[i * 25 + len - 1] == '\0')) len--;
-                    rows.push_back({std::string(pd.s_name + i * 25, len), (int)cnt});
-                }
-
-                std::sort(rows.begin(), rows.end(), [](const Q21Row& a, const Q21Row& b) {
-                    if (a.numwait != b.numwait) return a.numwait > b.numwait;
-                    return a.s_name < b.s_name;
-                });
-
-                int limit = std::min((int)rows.size(), 100);
                 result.result.columns = {{"s_name","string"},{"numwait","int"}};
                 result.result.rows.clear();
-                for (int j = 0; j < limit; j++)
-                    result.result.rows.push_back({rows[j].s_name, (int64_t)rows[j].numwait});
-                printf("\nQ21 Results:\n");
-                printf("  +---------------------------+----------+\n");
-                printf("  | s_name                    | numwait  |\n");
-                printf("  +---------------------------+----------+\n");
-                int show = std::min(limit, 10);
-                for (int j = 0; j < show; j++) {
-                    printf("  | %-25s | %8d |\n", rows[j].s_name.c_str(), rows[j].numwait);
+                auto extractName = [](const char* base) {
+                    int len = 25;
+                    while (len > 0 && (base[len - 1] == ' ' || base[len - 1] == '\0')) len--;
+                    return std::string(base, len);
+                };
+                auto appendRow = [&](uint32_t src) {
+                    if (src >= n) return;
+                    result.result.rows.push_back({
+                        extractName(names + (size_t)src * 25),
+                        (int64_t)numwait[src]
+                    });
+                };
+
+                int limit = std::min((int)n, 100);
+                if (plan.gpuSort) {
+                    auto* idxBuf = executor.getAllocatedBuffer(plan.gpuSort->sortedIndexBuffer);
+                    if (idxBuf) {
+                        const int* order = static_cast<const int*>(idxBuf->contents());
+                        int gpuLimit = plan.gpuSort->limit >= 0 ? plan.gpuSort->limit : limit;
+                        limit = std::min((int)n, gpuLimit);
+                        for (int j = 0; j < limit; j++) {
+                            int src = order[j];
+                            if (src >= 0) appendRow((uint32_t)src);
+                        }
+                    }
                 }
-                printf("  +---------------------------+----------+\n");
-                printf("  Total qualifying suppliers: %d\n", (int)rows.size());
+
+                if (result.result.rows.empty() && n > 0) {
+                    markHostPost("hostSort");
+                    std::vector<uint32_t> order(n);
+                    for (uint32_t i = 0; i < n; i++) order[i] = i;
+                    std::sort(order.begin(), order.end(), [&](uint32_t a, uint32_t b) {
+                        if (numwait[a] != numwait[b]) return numwait[a] > numwait[b];
+                        return strncmp(names + (size_t)a * 25,
+                                       names + (size_t)b * 25, 25) < 0;
+                    });
+                    limit = std::min((int)order.size(), 100);
+                    for (int j = 0; j < limit; j++) appendRow(order[(size_t)j]);
+                }
+
+                if (!g_csv) {
+                    printf("\nQ21 Results:\n");
+                    printf("  +---------------------------+----------+\n");
+                    printf("  | s_name                    | numwait  |\n");
+                    printf("  +---------------------------+----------+\n");
+                    int show = std::min((int)result.result.rows.size(), 10);
+                    for (int j = 0; j < show; j++) {
+                        const auto& row = result.result.rows[j];
+                        printf("  | %-25s | %8lld |\n",
+                               std::get<std::string>(row[0]).c_str(),
+                               (long long)std::get<int64_t>(row[1]));
+                    }
+                    printf("  +---------------------------+----------+\n");
+                    printf("  Total qualifying suppliers: %u\n", n);
+                }
             }
         }
 
-        // 7b. Correctness oracle — runs after CPU post-processing so all
-        // per-query result.result populations above are complete.
-        // Column matching is by name; extra/missing columns are skipped.
+        // Golden check runs after query-specific output assembly.
         if (!g_saveGoldenDir.empty() || !g_checkDir.empty()) {
             std::string canonical = result.result.toCanonical();
             std::string checkName = queryName;
@@ -1917,6 +2032,12 @@ static bool runCodegenQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
         double postMs = std::chrono::duration<double, std::milli>(postEnd - postStart).count();
         timing.postMs = postMs;
 
+        if (!hostPostOps.empty()) {
+            printf("HOST_POST_CSV,%s,%s,%s\n",
+                   timing.scaleFactor.c_str(), queryName.c_str(),
+                   hostPostOps.joined().c_str());
+        }
+
         printDetailedTimingSummary(timing, g_csv);
 
         executor.releaseAllocatedBuffers();
@@ -1926,10 +2047,6 @@ static bool runCodegenQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
         return false;
     }
 }
-
-// ===================================================================
-// main
-// ===================================================================
 
 int main(int argc, const char* argv[]) {
     std::string query;
@@ -1953,8 +2070,10 @@ int main(int argc, const char* argv[]) {
             printf("Loader flags:\n");
             printf("  --no-zerocopy        Disable zero-copy mmap path (force buffer copies)\n");
             printf("  --no-binary          Disable .colbin binary loader (force .tbl parser)\n");
-            printf("  --chunk N[K|M|G]     Stream supported queries (Q1,Q6,Q12,Q14,Q19) from .colbin\n");
-            printf("                       Auto-enabled when dataset exceeds 80%% of system RAM\n");
+            printf("  --chunk N[K|M|G]     Stream certified chunkable plans from .colbin\n");
+            printf("  --auto-chunk         Auto-enable chunking for certified chunkable plans (default)\n");
+            printf("  --no-auto-chunk      Disable budget-triggered chunking; explicit --chunk still works\n");
+            printf("  --force-chunk        Keep explicit --chunk even when the direct load fits budget\n");
             printf("  --no-db              With --chunk, use one reusable chunk slot instead of two\n");
             printf("Experiment flags:\n");
             printf("  --warmup N           Run N untimed warmup iterations (default 3)\n");
@@ -1981,6 +2100,9 @@ int main(int argc, const char* argv[]) {
         if (arg == "--no-zerocopy")       { ::setenv("GPUDB_NO_ZEROCOPY", "1", 1); continue; }
         if (arg == "--no-binary")         { ::setenv("GPUDB_NO_BINARY",   "1", 1); continue; }
         if (arg == "--no-db")             { g_chunkDoubleBuffer = false; continue; }
+        if (arg == "--auto-chunk")        { g_autoChunk = true; continue; }
+        if (arg == "--no-auto-chunk")     { g_autoChunk = false; continue; }
+        if (arg == "--force-chunk")       { g_forceChunk = true; continue; }
         if (arg.rfind("--chunk=", 0) == 0) {
             if (!parseRowCountWithSuffix(arg.substr(8), g_chunkRowsExplicit)) {
                 std::cerr << "Invalid value for --chunk: " << arg.substr(8) << "\n";

@@ -1,4 +1,5 @@
 #include "metal_plan_common.h"
+#include "generic/gpu_ops/generic_gpu_physical_ops.h"
 #include "tpch/metal_tpch_query_builders.h"
 #include "execution/query_preprocessing.h"
 
@@ -10,24 +11,15 @@
 
 namespace codegen {
 
-// ===================================================================
-// Q16: Parts/Supplier Relationship (COUNT DISTINCT)
-// Phase 0 (GPU): Scan part → filter (size in valid set, brand != #45,
-//      type doesn't start with "MEDIUM POLISHED") → atomically append
-//      (idx, key64) to compact compaction buffers. Post-dispatch hook
-//      builds the dict + d_q16_part_group_map on host from the ~12 %
-//      of qualifying rows (was a 4M-row CPU scan at SF20: ~470 ms).
-// Phase 1 (GPU): Scan supplier s_comment → build complaint bitmap
-// Phase 2 (GPU): scan partsupp → ArrayLookup(group_id) → Selection(>=0) →
-//      AntiBitmapProbe(complaint) → helper(per-group bitmap set).
-// CPU post: popcount each group's bitmap for supplier_cnt.
-// ===================================================================
+// Q16: Parts/Supplier Relationship.
 std::optional<MetalQueryPlan> buildQ16Plan_byName() {
     std::string idx = "i";
     MetalQueryPlan plan;
 
-    // Helper: FNV-1a 32-bit over a 25-byte type field, plus the
-    // filter+key+atomic-append routine emitted per qualifying row.
+    // --- Part Groups ---
+    // GPU filters qualifying parts to a compact list; a small host hook builds
+    // the low-cardinality group dictionary and label buffers. This is the
+    // measured fast path until the GPU group-build becomes genuinely parallel.
     plan.helpers.push_back(R"(
 static uint q16_fnv32_25(const device char* tp, uint base) {
     uint h = 2166136261u;
@@ -66,11 +58,9 @@ static void q16_filter_emit(device atomic_uint* counter,
 }
 )");
 
-    // Phase 0: GPU filter + compact. The ComputeExpr's value isn't used;
-    // the helper performs the atomic-append side-effect.
+    // Build the compact part list, then use the host hook for group ids.
     {
         auto scan = makeAutoScan("part", idx);
-        // Bare-pointer columns used by q16_filter_emit helper
         scan->addColumn("p_brand", "char");
         scan->addColumn("p_type", "char");
         scan->addColumn("p_size", "int");
@@ -83,80 +73,98 @@ static void q16_filter_emit(device atomic_uint* counter,
         phase.extraBuffers.push_back({"d_q16_filt_idx",   "uint",        false, false});
         phase.extraBuffers.push_back({"d_q16_filt_key",   "ulong",       false, false});
 
-        // Post-dispatch hook: read compact (idx, key) list, build dict
-        // and d_q16_part_group_map on host. Allocates d_q16_group_bitmaps
-        // sized exactly to numGroups * bvInts.
+        // Host dictionary build. It consumes the GPU-emitted compact list and
+        // fills both the direct partkey->group lookup and the GPU label buffers.
         phase.postDispatchHook = [](MetalGenericExecutor& ex) {
             auto& pd = g_q16Post;
             auto* cntBuf = ex.getAllocatedBuffer("d_q16_filt_count");
             auto* idxBuf = ex.getAllocatedBuffer("d_q16_filt_idx");
             auto* keyBuf = ex.getAllocatedBuffer("d_q16_filt_key");
             auto* mapBuf = ex.getAllocatedBuffer("d_q16_part_group_map");
-            if (!cntBuf || !idxBuf || !keyBuf || !mapBuf || !pd.p_brand) return 0.0;
+            auto* brandBuf = ex.getAllocatedBuffer("d_q16_group_brand");
+            auto* typeBuf = ex.getAllocatedBuffer("d_q16_group_type");
+            auto* sizeBuf = ex.getAllocatedBuffer("d_q16_group_size");
+            if (!cntBuf || !idxBuf || !keyBuf || !mapBuf ||
+                !brandBuf || !typeBuf || !sizeBuf ||
+                !pd.p_partkey || !pd.p_brand || !pd.p_type) {
+                return 0.0;
+            }
+
             uint32_t cnt = *static_cast<uint32_t*>(cntBuf->contents());
-            const uint32_t* fidx = static_cast<const uint32_t*>(idxBuf->contents());
-            const uint64_t* fkey = static_cast<const uint64_t*>(keyBuf->contents());
-            int* partGroupMap = static_cast<int*>(mapBuf->contents());
-            // map already pre-filled with -1 (0xFF) by preprocess.
+            const auto* fidx = static_cast<const uint32_t*>(idxBuf->contents());
+            const auto* fkey = static_cast<const uint64_t*>(keyBuf->contents());
+            auto* partGroupMap = static_cast<int32_t*>(mapBuf->contents());
+            auto* groupBrand = static_cast<char*>(brandBuf->contents());
+            auto* groupType = static_cast<char*>(typeBuf->contents());
+            auto* groupSize = static_cast<int32_t*>(sizeBuf->contents());
 
-            std::unordered_map<uint64_t, int> groupMap;
+            size_t capSym = 0;
+            ex.tryGetSymbol("q16_result_cap", capSym);
+            uint32_t groupCap = capSym > 0 ? (uint32_t)capSym : (1u << 16);
+
+            std::unordered_map<uint64_t, uint32_t> groupMap;
             groupMap.reserve(2048);
-            std::vector<Q16PostData::GroupKey> groups;
-            groups.reserve(2048);
-
             for (uint32_t k = 0; k < cnt; k++) {
-                uint32_t i = fidx[k];
+                uint32_t partRow = fidx[k];
                 uint64_t key = fkey[k];
                 auto it = groupMap.find(key);
-                int gid;
+                uint32_t gid;
                 if (it == groupMap.end()) {
-                    gid = (int)groups.size();
+                    gid = (uint32_t)groupMap.size();
+                    if (gid >= groupCap) {
+                        continue;
+                    }
                     groupMap.emplace(key, gid);
-                    const char* br = pd.p_brand + (size_t)i * 10;
-                    const char* tp = pd.p_type  + (size_t)i * 25;
-                    int brLen = 10;
-                    while (brLen > 0 && (br[brLen-1] == ' ' || br[brLen-1] == '\0')) brLen--;
-                    int tpLen = 25;
-                    while (tpLen > 0 && (tp[tpLen-1] == ' ' || tp[tpLen-1] == '\0')) tpLen--;
-                    int sz = (int)((key >> 48) & 0xFF);
-                    groups.push_back({std::string(br, brLen), std::string(tp, tpLen), sz});
+                    std::memcpy(groupBrand + (size_t)gid * 10,
+                                pd.p_brand + (size_t)partRow * 10, 10);
+                    std::memcpy(groupType + (size_t)gid * 25,
+                                pd.p_type + (size_t)partRow * 25, 25);
+                    groupSize[gid] = (int32_t)((key >> 48) & 0xFF);
                 } else {
                     gid = it->second;
                 }
-                // partkey lookup cached on pd.p_partkey (set in preprocess).
-                int pk = pd.p_partkey ? pd.p_partkey[i] : 0;
-                if (pk >= 0 && pk <= pd.maxPartkey) partGroupMap[pk] = gid;
+
+                int pk = pd.p_partkey[partRow];
+                if (pk >= 0 && pk <= pd.maxPartkey) {
+                    partGroupMap[pk] = (int32_t)gid;
+                }
             }
 
-            uint32_t numGroups = (uint32_t)groups.size();
+            uint32_t numGroups = (uint32_t)groupMap.size();
+            if (numGroups > groupCap) {
+                numGroups = groupCap;
+            }
+            mapBuf->didModifyRange(NS::Range::Make(0, ((size_t)pd.maxPartkey + 1) * sizeof(int32_t)));
+            brandBuf->didModifyRange(NS::Range::Make(0, (size_t)numGroups * 10));
+            typeBuf->didModifyRange(NS::Range::Make(0, (size_t)numGroups * 25));
+            sizeBuf->didModifyRange(NS::Range::Make(0, (size_t)numGroups * sizeof(int32_t)));
+
             uint32_t bvInts = ((uint32_t)pd.maxSk + 32) / 32;
             size_t gbmBytes = (size_t)numGroups * bvInts * sizeof(uint32_t);
-            // Allocate d_q16_group_bitmaps now that numGroups is known.
             auto* dev = ex.device();
             size_t allocBytes = std::max<size_t>(gbmBytes, 4);
             auto* gbmBuf = dev->newBuffer(allocBytes, MTL::ResourceStorageModeShared);
             std::memset(gbmBuf->contents(), 0, allocBytes);
+            gbmBuf->didModifyRange(NS::Range::Make(0, allocBytes));
             ex.registerAllocatedBuffer("d_q16_group_bitmaps", gbmBuf);
             ex.registerScalarInt("d_q16_bv_ints", (int)bvInts);
 
-            // Phase 4 (Q16_popcount_groups) reduces each group's bitmap on
-            // GPU. Allocate the count buffer and register the dispatch
-            // size symbol/scalar (one thread per word).
             size_t cntBytes = std::max<size_t>((size_t)numGroups * sizeof(uint32_t), 4);
             auto* cntBuf2 = dev->newBuffer(cntBytes, MTL::ResourceStorageModeShared);
             std::memset(cntBuf2->contents(), 0, cntBytes);
+            cntBuf2->didModifyRange(NS::Range::Make(0, cntBytes));
             ex.registerAllocatedBuffer("d_q16_group_counts", cntBuf2);
             size_t popWords = (size_t)numGroups * (size_t)bvInts;
             ex.registerSymbol("n_q16_pop_words", popWords);
             ex.registerScalarInt("n_q16_pop_words", (int)popWords);
-
-            pd.groups = std::move(groups);
-            pd.numGroups = numGroups;
+            ex.registerSymbol("q16_num_groups", numGroups);
+            ex.registerScalarInt("q16_num_groups", (int)numGroups);
             return 0.0;
         };
     }
 
-    // Helper: substring search for "Customer" ... "Complaints" in s_comment
+    // --- Complaint Suppliers ---
+    // Match supplier comments containing "Customer" before "Complaints".
     plan.helpers.push_back(R"(
 static bool q16_has_complaint(const device char* s_comment, uint idx, int width) {
     const device char* cmt = s_comment + (uint)idx * (uint)width;
@@ -179,7 +187,7 @@ static bool q16_has_complaint(const device char* s_comment, uint idx, int width)
 }
 )");
 
-    // Helper: set bit in per-group bitmap
+    // Set the supplier bit for a group.
     plan.helpers.push_back(R"(
 static void q16_bitmap_set(device atomic_uint* group_bitmaps, uint bv_ints,
                             int group_id, int suppkey) {
@@ -188,7 +196,7 @@ static void q16_bitmap_set(device atomic_uint* group_bitmaps, uint bv_ints,
 }
 )");
 
-    // Phase 1: Build complaint bitmap on GPU
+    // Build complaint-supplier bitmap.
     {
         auto scan = makeAutoScan("supplier", idx);
 
@@ -202,24 +210,21 @@ static void q16_bitmap_set(device atomic_uint* group_bitmaps, uint bv_ints,
         appendPhase(plan, "Q16_build_complaint", std::move(bitmapBuild));
     }
 
-    // Phase 2: partsupp scan with bitmap ops
+    // --- Supplier Bitmaps ---
+    // Populate per-group supplier bitmaps.
     {
         auto scan = makeAutoScan("partsupp", idx);
 
-        // ArrayLookup: part_group_map[ps_partkey] → group_id
         auto groupLookup = std::make_unique<MetalArrayLookup>(
             std::move(scan), "d_q16_part_group_map", "ps_partkey[" + idx + "]",
             "q16_group_id", "int");
 
-        // Selection: group_id >= 0 (qualifying part)
         auto filter = std::make_unique<MetalSelection>(
             std::move(groupLookup), "q16_group_id >= 0");
 
-        // AntiBitmapProbe: supplier not complained-about
         auto antiProbe = std::make_unique<MetalAntiBitmapProbe>(
             std::move(filter), "d_q16_complaint_bitmap", "ps_suppkey[" + idx + "]");
 
-        // ComputeExpr: set bit in per-group bitmap (side-effect only)
         auto bitmapSet = std::make_unique<MetalComputeExpr>(
             std::move(antiProbe), "_unused", "int",
             "(q16_bitmap_set(d_q16_group_bitmaps, d_q16_bv_ints, "
@@ -230,11 +235,8 @@ static void q16_bitmap_set(device atomic_uint* group_bitmaps, uint bv_ints,
         phase.scalarParams.push_back({"d_q16_bv_ints", "uint"});
     }
 
-    // Phase 4: GPU popcount per group → d_q16_group_counts. Replaces a
-    // CPU popcount loop over numGroups * bvInts uint32 entries (~70 ms
-    // at SF20). Dispatch is one thread per (group, word) — each thread
-    // reads one uint32, popcounts it, and atomically adds to its group
-    // counter. This keeps SIMD-group memory accesses sequential.
+    // --- Supplier Counts ---
+    // Popcount each per-group supplier bitmap.
     plan.helpers.push_back(R"(
 static void q16_popcount_word(const device uint* group_bitmaps,
                                device atomic_uint* group_counts,
@@ -254,12 +256,78 @@ static void q16_popcount_word(const device uint* group_bitmaps,
             "(q16_popcount_word(d_q16_group_bitmaps, d_q16_group_counts, "
             "d_q16_bv_ints, " + idx + "), 0)");
         auto& phase = appendPhase(plan, "Q16_popcount_groups", std::move(sideEffect));
-        // Re-bind d_q16_group_bitmaps as plain uint readonly (same MTL::Buffer
-        // as the prior phase's atomic_uint binding — bit-identical storage,
-        // queue barrier makes prior atomic-OR writes visible).
+        // Re-bind bitmaps as read-only uint after the phase barrier.
         phase.extraBuffers.push_back({"d_q16_group_bitmaps", "uint",        true,  false});
         phase.extraBuffers.push_back({"d_q16_group_counts",  "atomic_uint", false, true});
         phase.scalarParams.push_back({"d_q16_bv_ints", "uint"});
+    }
+
+    // --- Compact Results ---
+    plan.helpers.push_back(R"(
+static void q16_emit_group_result(device atomic_uint* counter,
+                                  device char* out_brand,
+                                  device char* out_type,
+                                  device int* out_size,
+                                  device uint* out_supplier_cnt,
+                                  const device char* group_brand,
+                                  const device char* group_type,
+                                  const device int* group_size,
+                                  const device uint* group_counts,
+                                  uint cap, uint gid) {
+    if (gid >= cap) return;
+    uint cnt = group_counts[gid];
+    if (cnt == 0u) return;
+    uint slot = atomic_fetch_add_explicit(counter, 1u, memory_order_relaxed);
+    if (slot < cap) {
+        for (uint c = 0; c < 10u; ++c)
+            out_brand[slot * 10u + c] = group_brand[gid * 10u + c];
+        for (uint c = 0; c < 25u; ++c)
+            out_type[slot * 25u + c] = group_type[gid * 25u + c];
+        out_size[slot] = group_size[gid];
+        out_supplier_cnt[slot] = cnt;
+    }
+}
+)");
+
+    const std::string resultRows = "q16_result_rows";
+    {
+        auto rscan = std::make_unique<MetalRangeScan>("q16_num_groups", idx);
+        auto sideEffect = std::make_unique<MetalComputeExpr>(
+            std::move(rscan), "_q16_emit_unused", "int",
+            "(q16_emit_group_result(d_q16_result_count, d_q16_result_brand, "
+            "d_q16_result_type, d_q16_result_size, d_q16_result_supplier_cnt, "
+            "d_q16_group_brand, d_q16_group_type, d_q16_group_size, "
+            "d_q16_group_counts, q16_result_cap, " + idx + "), 0)");
+        auto& phase = appendPhase(plan, "Q16_compact_results", std::move(sideEffect));
+        phase.extraBuffers.push_back({"d_q16_result_count",        "atomic_uint", false, true});
+        phase.extraBuffers.push_back({"d_q16_result_brand",        "char",        false, false});
+        phase.extraBuffers.push_back({"d_q16_result_type",         "char",        false, false});
+        phase.extraBuffers.push_back({"d_q16_result_size",         "int",         false, false});
+        phase.extraBuffers.push_back({"d_q16_result_supplier_cnt", "uint",        false, false});
+        phase.extraBuffers.push_back({"d_q16_group_brand",         "char",        true,  false});
+        phase.extraBuffers.push_back({"d_q16_group_type",          "char",        true,  false});
+        phase.extraBuffers.push_back({"d_q16_group_size",          "int",         true,  false});
+        phase.extraBuffers.push_back({"d_q16_group_counts",        "uint",        true,  false});
+        phase.scalarParams.push_back({"q16_result_cap", "uint"});
+        attachMaterializedCountHook(phase, "d_q16_result_count", resultRows);
+    }
+
+    // --- Result Order ---
+    {
+        std::vector<GenericMatColumnDesc> columns = {
+            GenericMatColumnDesc("p_brand", "d_q16_result_brand", "char", 10),
+            GenericMatColumnDesc("p_type", "d_q16_result_type", "char", 25),
+            GenericMatColumnDesc("p_size", "d_q16_result_size", "int"),
+            GenericMatColumnDesc("supplier_cnt", "d_q16_result_supplier_cnt", "uint"),
+        };
+        GenericSortSpec sortSpec;
+        sortSpec.keys.push_back({"supplier_cnt", true});
+        sortSpec.keys.push_back({"p_brand", false});
+        sortSpec.keys.push_back({"p_type", false});
+        sortSpec.keys.push_back({"p_size", false});
+        std::string sortError;
+        appendGenericGpuSort(plan, "q16_result", resultRows,
+                             "q16_result_cap", columns, sortSpec, &sortError);
     }
 
     return plan;

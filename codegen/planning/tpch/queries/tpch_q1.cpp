@@ -9,6 +9,8 @@ std::optional<MetalQueryPlan> buildQ1PlanForShape(const std::string& filterCond)
     MetalQueryPlan plan;
     plan.name = "Q1";
 
+    // --- Returnflag/Status Aggregate ---
+    // Six buckets cover returnflag and linestatus combinations.
     std::string idxVar = "i";
     auto filtered = maybeSelect(makeAutoScan("lineitem", idxVar), filterCond);
 
@@ -33,17 +35,13 @@ std::optional<MetalQueryPlan> buildQ1PlanForShape(const std::string& filterCond)
 
 } // namespace
 
-// ===================================================================
-// Q1 Plan Builder
-// ===================================================================
-
+// Q1: Pricing Summary Report.
 std::optional<MetalQueryPlan> buildQ1Plan(const AnalyzedQuery& aq) {
-    // Q1: single-table lineitem, GROUP BY l_returnflag, l_linestatus (6 bins)
+    // Match single-table lineitem aggregation grouped by returnflag and linestatus.
     if (!aq.isSingleTable()) return std::nullopt;
     if (aq.tables[0] != "lineitem") return std::nullopt;
     if (!aq.hasAggregation() || !aq.hasGroupBy()) return std::nullopt;
 
-    // Check for 2 GROUP BY columns (returnflag + linestatus)
     if (aq.groupBy.size() != 2) return std::nullopt;
 
     std::string idxVar = "i";

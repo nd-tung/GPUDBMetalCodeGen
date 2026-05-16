@@ -6,18 +6,13 @@
 
 namespace codegen {
 
-// ===================================================================
-// Q22: Global Sales Opportunity — 3 phases (GPU preprocessing for avg_bal)
-// ===================================================================
+// Q22: Global Sales Opportunity.
 std::optional<MetalQueryPlan> buildQ22Plan_byName() {
     std::string idx = "i";
     MetalQueryPlan plan;
 
-    // Phase 0 (GPU preprocessing): scan customer, compute sum + count of
-    // c_acctbal for rows whose phone prefix is in the valid set and balance
-    // is positive. The post-dispatch hook divides sum/count and registers
-    // `avg_bal` as a scalar for the final aggregate phase. Replaces the
-    // CPU-side scan formerly in query_preprocessing.cpp (Q22 block).
+    // --- Average Balance ---
+    // Compute avg_bal, then register it for the final aggregate phase.
     {
         auto scan = makeAutoScan("customer", idx);
 
@@ -54,7 +49,8 @@ std::optional<MetalQueryPlan> buildQ22Plan_byName() {
         };
     }
 
-    // Phase 1: Build orders bitmap
+    // --- Order Existence Bitmap ---
+    // Build customer-with-orders bitmap.
     {
         auto scan = makeAutoScan("orders", idx);
 
@@ -65,7 +61,8 @@ std::optional<MetalQueryPlan> buildQ22Plan_byName() {
         appendPhase(plan, "Q22_build_bitmap", std::move(bitmap));
     }
 
-    // Phase 2: Scan customer, filter, anti-bitmap, dual aggregate
+    // --- Country-Code Aggregate ---
+    // Aggregate customers above avg_bal with no orders.
     {
         auto scan = makeAutoScan("customer", idx);
 
@@ -88,6 +85,7 @@ std::optional<MetalQueryPlan> buildQ22Plan_byName() {
             "(_prefix == 13 ? 0 : _prefix == 17 ? 1 : _prefix == 18 ? 2 : "
             "_prefix == 23 ? 3 : _prefix == 29 ? 4 : _prefix == 30 ? 5 : 6)");
 
+        // Seven bins correspond to the accepted country-code prefixes.
         auto count = std::make_unique<MetalAtomicCount>(
             std::move(computeBin), "d_q22_count", "_bin", "7");
 

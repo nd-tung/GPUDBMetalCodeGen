@@ -10,6 +10,8 @@ std::optional<MetalQueryPlan> buildQ14PlanForDateFilter(const std::string& filte
     plan.name = "Q14";
     std::string idxVar = "i";
 
+    // --- Promo Part Bitmap ---
+    // Match fixed-width p_type values with the PROMO prefix.
     {
         auto scan = makeAutoScan("part", idxVar);
         std::string promoFilter =
@@ -27,6 +29,8 @@ std::optional<MetalQueryPlan> buildQ14PlanForDateFilter(const std::string& filte
         appendPhase(plan, "Q14_build_bitmap", std::move(bitmapBuild));
     }
 
+    // --- Revenue Ratio Reduction ---
+    // Reduce promo and total revenue so the collector can compute the ratio.
     {
         auto scan = makeAutoScan("lineitem", idxVar);
 
@@ -48,13 +52,9 @@ std::optional<MetalQueryPlan> buildQ14PlanForDateFilter(const std::string& filte
 
 } // namespace
 
-// ===================================================================
-// Q14 Plan Builder — Promotion Effect
-// Pattern: BitmapBuild(part, PROMO) → Filter+TGReduce(lineitem, date)
-// ===================================================================
-
+// Q14: Promotion Effect.
 std::optional<MetalQueryPlan> buildQ14Plan(const AnalyzedQuery& aq) {
-    // Q14: two tables (lineitem, part), scalar aggregate, no GROUP BY
+    // Match lineitem/part scalar aggregation with a shipdate filter.
     if (aq.tables.size() != 2) return std::nullopt;
     bool hasLineitem = false, hasPart = false;
     for (auto& t : aq.tables) {
@@ -62,9 +62,7 @@ std::optional<MetalQueryPlan> buildQ14Plan(const AnalyzedQuery& aq) {
         if (t == "part") hasPart = true;
     }
     if (!hasLineitem || !hasPart) return std::nullopt;
-    // Q14 has a complex expression 100*SUM(CASE...)/SUM(...) as a single target.
-    // The analyzer may not flag isAgg since the top-level is BinaryExpr, not FuncCall.
-    // Just require: not GROUP BY, has exactly 1 target.
+    // The target is a ratio expression, so require scalar shape instead of isAgg.
     if (aq.hasGroupBy()) return std::nullopt;
     if (aq.targets.size() != 1) return std::nullopt;
 

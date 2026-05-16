@@ -1,16 +1,15 @@
 #include "metal_plan_common.h"
+#include "generic/gpu_ops/generic_gpu_physical_ops.h"
 #include "tpch/metal_tpch_query_builders.h"
 
 namespace codegen {
 
-// ===================================================================
-// Q11: Important Stock Identification — 2 phases
-// ===================================================================
+// Q11: Important Stock Identification.
 std::optional<MetalQueryPlan> buildQ11Plan_byName() {
     std::string idx = "i";
     MetalQueryPlan plan;
 
-    // Phase 1: Build supplier bitmap for GERMANY
+    // Build supplier bitmap for GERMANY.
     {
         auto scan = makeAutoScan("supplier", idx);
 
@@ -25,7 +24,7 @@ std::optional<MetalQueryPlan> buildQ11Plan_byName() {
         phase.scalarParams = {{"germany_nk", "int"}};
     }
 
-    // Phase 2: Scan partsupp → bitmap probe → per-part value aggregation
+    // Aggregate per-part value through the supplier bitmap.
     {
         auto scan = makeAutoScan("partsupp", idx);
 
@@ -39,6 +38,51 @@ std::optional<MetalQueryPlan> buildQ11Plan_byName() {
             "atomic_float", "float");
 
         appendPhase(plan, "Q11_aggregate", std::move(agg), 256);
+    }
+
+    // --- Threshold Baseline ---
+    // Total value feeds the 0.01% materialization threshold.
+    {
+        auto scan = std::make_unique<MetalRangeScan>("maxPartkey", idx);
+        auto reduce = std::make_unique<MetalTGReduce>(std::move(scan), "d_q11_total");
+        reduce->addAccumulator("value", "d_part_value[" + idx + "]", "float");
+        auto& phase = appendPhase(plan, "Q11_total_value", std::move(reduce), 256);
+        phase.extraBuffers.push_back({"d_part_value", "float", true, false});
+    }
+
+    const std::string resultRows = "q11_result_rows";
+    // --- Threshold Materialization ---
+    // The TG reduce float is read through its raw uint storage.
+    {
+        auto scan = std::make_unique<MetalRangeScan>("maxPartkey", idx);
+        auto filtered = std::make_unique<MetalSelection>(
+            std::move(scan),
+            "d_part_value[" + idx + "] > as_type<float>(d_q11_total_value_lo[0]) * 0.0001f");
+        auto materialize = std::make_unique<MetalMaterialize>(
+            std::move(filtered), "d_q11_result_count");
+        materialize->addColumn("d_q11_result_partkey", "int",
+                               "(int)" + idx, "ps_partkey", "maxPartkey");
+        materialize->addColumn("d_q11_result_value", "float",
+                               "d_part_value[" + idx + "]", "value", "maxPartkey");
+        auto& phase = appendPhase(plan, "Q11_materialize_threshold",
+                                  std::move(materialize), 256);
+        phase.extraBuffers.push_back({"d_part_value", "float", true, false});
+        phase.extraBuffers.push_back({"d_q11_total_value_lo", "uint", true, false});
+        attachMaterializedCountHook(phase, "d_q11_result_count", resultRows);
+    }
+
+    // --- Result Order ---
+    {
+        std::vector<GenericMatColumnDesc> columns = {
+            GenericMatColumnDesc("ps_partkey", "d_q11_result_partkey", "int"),
+            GenericMatColumnDesc("value", "d_q11_result_value", "float"),
+        };
+        GenericSortSpec sortSpec;
+        sortSpec.keys.push_back({"value", true});
+        sortSpec.keys.push_back({"ps_partkey", false});
+        std::string sortError;
+        appendGenericGpuSort(plan, "q11_result", resultRows,
+                             "maxPartkey", columns, sortSpec, &sortError);
     }
 
     return plan;

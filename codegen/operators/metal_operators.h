@@ -8,9 +8,7 @@
 
 namespace codegen {
 
-// ===================================================================
-// BASE CLASSES
-// ===================================================================
+// --- Base Classes ---
 
 class MetalOperator {
 public:
@@ -49,8 +47,7 @@ public:
     explicit MetalUnaryOperator(std::unique_ptr<MetalOperator> child)
         : child_(std::move(child)) {
         if (child_) {
-            // Inherit the child's previous parent so the parent-walk
-            // can climb past temporary wrappers created during produce().
+            // Preserve parent-walk behavior through wrapper operators.
             this->parent_ = child_->parent();
             child_->setParent(this);
         }
@@ -59,18 +56,12 @@ public:
     nlohmann::json toJSON() const override;
 };
 
-// ===================================================================
-// LEAF OPERATORS — Table Scans
-// ===================================================================
+// --- Leaf Operators ---
 
-// Grid-stride loop over a table. Supports columnar layout.
-// Emits:
-//   for (uint {idxVar} = tid; {idxVar} < n_{table}; {idxVar} += tpg) {
-//       <consume()>
-//   }
+// Grid-stride table scan with columnar buffer binding.
 class MetalGridStrideScan : public MetalOperator {
 public:
-    // Column descriptor for columnar scan
+    // Column descriptor for columnar scan.
     struct ColumnDesc {
         std::string paramName;   // buffer parameter name (e.g. "l_shipdate")
         std::string metalType;   // Metal type (e.g. "int", "float", "char")
@@ -88,7 +79,7 @@ public:
     // ColumnTypeResolver on the codegen).
     std::vector<ColumnDesc> deduceRequiredColumns(MetalCodegen& cg) const;
 
-    // Add a column for columnar scan
+    // Add an explicit column read to the scan.
     void addColumn(const std::string& paramName, const std::string& metalType);
 
     const std::string& tableName() const { return tableName_; }
@@ -102,17 +93,8 @@ private:
     std::vector<ColumnDesc> columns_;
 };
 
-// Grid-stride loop over a synthetic [0, n_<rangeName>) index range.
-// Useful for scanning sparse direct-address arrays keyed by a maxKey
-// (e.g. d_order_revenue[orderkey]) without an actual table to drive
-// the scan. The caller must register `n_<rangeName>` with the executor
-// as BOTH a sizeResolver symbol (for dispatch sizing) and a scalar int
-// (for the kernel's loop bound) before this phase runs.
-//
-// Emits:
-//   for (uint {idxVar} = tid; {idxVar} < n_{rangeName}; {idxVar} += tpg) {
-//       <consume()>
-//   }
+// Grid-stride scan over synthetic [0, n_<rangeName>) ranges.
+// The caller must register n_<rangeName> as both dispatch symbol and scalar.
 class MetalRangeScan : public MetalOperator {
 public:
     MetalRangeScan(const std::string& rangeName,
@@ -134,9 +116,7 @@ private:
     std::vector<SideColumn> sideColumns_;
 };
 
-// ===================================================================
-// UNARY OPERATORS — Pipeline operators
-// ===================================================================
+// --- Unary Operators ---
 
 // Selection (WHERE filter): if (predicate) { consume(); }
 class MetalSelection : public MetalUnaryOperator {
@@ -172,11 +152,9 @@ private:
     std::string expression_;
 };
 
-// ===================================================================
-// BITMAP OPERATORS
-// ===================================================================
+// --- Bitmap Operators ---
 
-// Build a bitmap: atomic_fetch_or to set bit for key
+// Build a bitmap by atomically setting the bit for each key.
 class MetalBitmapBuild : public MetalUnaryOperator {
 public:
     MetalBitmapBuild(std::unique_ptr<MetalOperator> child,
@@ -255,11 +233,9 @@ private:
     std::vector<DefaultVar> rightVars_;
 };
 
-// ===================================================================
-// DIRECT-ADDRESS MAP OPERATORS
-// ===================================================================
+// --- Direct-Address Maps ---
 
-// Store: map[key] = value
+// Store value at direct-address map[key].
 class MetalArrayStore : public MetalUnaryOperator {
 public:
     MetalArrayStore(std::unique_ptr<MetalOperator> child,
@@ -285,7 +261,7 @@ private:
     int fillByte_;
 };
 
-// Lookup: type var = map[key]; (with optional guard for sentinel value)
+// Lookup map[key] and optionally guard against a sentinel value.
 class MetalArrayLookup : public MetalUnaryOperator {
 public:
     MetalArrayLookup(std::unique_ptr<MetalOperator> child,
@@ -308,7 +284,7 @@ private:
     int sentinel_;
 };
 
-// Store: map[key * width + byte] = value[byte]
+// Store fixed-width slices at map[key * width + byte].
 class MetalArraySliceStore : public MetalUnaryOperator {
 public:
     MetalArraySliceStore(std::unique_ptr<MetalOperator> child,
@@ -342,7 +318,7 @@ private:
     std::string sourceIdxVar_;
 };
 
-// Lookup: const device type* var = map + key * width
+// Lookup a fixed-width slice pointer at map + key * width.
 class MetalArraySliceLookup : public MetalUnaryOperator {
 public:
     MetalArraySliceLookup(std::unique_ptr<MetalOperator> child,
@@ -365,10 +341,7 @@ private:
     std::string resultType_;
 };
 
-// ===================================================================
-// HASH-MAP OPERATORS  (composite-key, linear-probing)
-// ===================================================================
-//
+// --- Hash Maps ---
 // Layout (registered via cg.addHashMapParam / addHashMapReadParam):
 //   <map>_keys1 (atomic_uint, sentinel = 0xFFFFFFFFu)
 //   <map>_keys2 (atomic_uint, sentinel = 0xFFFFFFFFu)
@@ -377,10 +350,7 @@ private:
 //                 result type)
 //   n_<map>     (uint capacity, MUST be a power of two)
 //
-// Use HashMapBuild + HashMapLookup for HashJoin (composite-key equi-
-// join carrying one value).  Use HashMapAgg + HashMapLookup for
-// HashGroupJoin (composite-key build aggregates a value per key).
-// ===================================================================
+// Build operators write the table; lookup operators bind the same storage read-only.
 
 // HashMapBuild: insert (key1, key2) -> value at hashed slot.
 // First-writer-wins on duplicate composite keys.
@@ -461,9 +431,7 @@ private:
     std::string resultType_;
 };
 
-// ===================================================================================
-// AGGREGATION OPERATORS
-// ===================================================================
+// --- Aggregation Operators ---
 
 // Threadgroup reduce using SIMD group reductions.
 // Emits per-thread local accumulation + tg_reduce_float/long + atomic to global.
@@ -490,8 +458,8 @@ public:
                        const std::string& hiBuffer = "",
                        ReduceOp op = ReduceOp::SUM);
 
-    // Register result schema for this reduce's output
-    // scaleDown: divisor for fixed-point (e.g. 100 means stored as val*100)
+    // Register the result schema for this reduce output.
+    // scaleDown is the fixed-point display divisor.
     void setResultAlias(const std::string& displayName, int scaleDown = 0);
     void setAccumulatorResultAlias(const std::string& displayName,
                                    int accumulatorIndex,
@@ -526,10 +494,7 @@ private:
     std::vector<ResultInfo> resultInfos_;
 };
 
-// Keyed aggregation using atomics.
-// For "add" with isLongPair=true, uses atomic_add_long_pair for 64-bit correctness.
-// offset/offset+1 form the lo/hi pair in the output buffer.
-// Descriptor for one group-by key in multi-key encoding.
+// Descriptor for one group-by key in multi-key bucket decoding.
 struct GroupKeyDecode {
     std::string name;   // display name (e.g. "l_returnflag")
     int numValues = 0;  // distinct values this key can take
@@ -548,15 +513,11 @@ public:
         std::string valueExpr;
         std::string atomicOp;   // "add", "min", "max"
         bool isLongPair = false; // true → uses lo/hi atomic_uint pair at offset/offset+1
-        // scaleDown is applied during result COLLECTION only (post-process),
-        // see MetalResultCollector::collectKeyedAgg. The GPU kernel always
-        // accumulates the raw fixed-point value; this divisor is for display.
+        // scaleDown is applied by the result collector; GPU buffers store raw values.
         int scaleDown = 0;      // result divisor (e.g. 100 for cents→dollars, 0=none)
         bool isFloatSum = false; // true → float value stored via atomic CAS in single uint slot
         bool isMinMax = false;   // true → min/max aggregate using special init/update logic
-        // Agg function metadata for HAVING predicate matching.
-        // funcName is uppercase ("SUM","COUNT","AVG","MIN","MAX").
-        // innerColumn is the referenced column for SUM/AVG/MIN/MAX (empty for COUNT(*) star).
+        // Aggregate metadata lets HAVING match function calls to slots.
         std::string funcName;    // aggregate function name for HAVING matching
         std::string innerColumn; // column referenced by the aggregate (empty for COUNT(*))
     };
@@ -582,16 +543,12 @@ public:
                                bool isMinMax,
                                const std::string& funcName = "",
                                const std::string& innerColumn = "");
-    // Register a COUNT(DISTINCT col) bitmap: one bit per distinct value.
-    // `valueExpr` is the column expression, `maxValueExpr` is the max possible
-    // value (e.g., "maxSuppkey"), used to compute bitmapStride.
+    // COUNT(DISTINCT) bitmap stores one bit per distinct value.
     void addDistinctBitmap(const std::string& outputName,
                            const std::string& valueExpr,
                            const std::string& maxValueExpr);
     void setKeyResult(const std::string& displayName, int base = 0);
-    // Multi-key result info: caller provides list of GroupKeyDecode descriptors
-    // (one per group-by key) so the result collector can reconstruct each
-    // key column from the flat bucket index.
+    // Multi-key decode reconstructs display columns from the flat bucket index.
     void setMultiKeyResult(const std::vector<std::string>& displayNames,
                            const std::vector<GroupKeyDecode>& keys,
                            int totalBuckets);
@@ -674,11 +631,9 @@ private:
     std::string sizeExpr_;
 };
 
-// ===================================================================
-// MATERIALIZATION
-// ===================================================================
+// --- Materialization ---
 
-// Materialize rows to output arrays via atomic counter
+// Materialize rows to output arrays via an atomic counter.
 class MetalMaterialize : public MetalUnaryOperator {
 public:
     struct Column {
@@ -728,29 +683,19 @@ private:
     std::string bitmapStrideExpr_;
 };
 
-// ===================================================================
-// GPU Bitonic Sort operators
-// ===================================================================
-//
+// --- GPU Bitonic Sort ---
 // MetalInitSortKeys: encodes a source column into sort keys (uint64_t)
 // and row indices.  Grid-strides over the source data.  Supports
 // ascending/descending direction via key encoding.
 //
-// MetalBitonicSortStep: a single comparison-swap step of the bitonic
+// MetalBitonicSortStep: one comparison-swap pass of the bitonic
 // sort network.  The kernel takes (k, j) constants and swaps elements
 // if needed.  The plan attaches a PostDispatchHook that re-dispaches
 // this kernel in the classic (k, j) nested loop.
 
 class MetalInitSortKeys : public MetalOperator {
 public:
-    // sourceColumn: name of the source buffer to sort (e.g. "d_generic_0_expr")
-    // sourceType: "int" or "float" (or "double" for Metal float)
-    // sortKeyBuf: name of output uint64_t sort key buffer
-    // sortIdxBuf: name of output int row index buffer
-    // nResultsExpr: expression for the number of source rows
-    // capacityExpr: optional allocation capacity when nResultsExpr is a
-    // runtime scalar produced by an earlier phase.
-    // descending: if true, invert sort keys so ascending sort → descending order
+    // capacityExpr is used when nResultsExpr is a runtime scalar from an earlier phase.
     MetalInitSortKeys(const std::string& sourceColumn, const std::string& sourceType,
                       const std::string& sortKeyBuf, const std::string& sortIdxBuf,
                       const std::string& nResultsExpr, bool descending,
@@ -760,8 +705,7 @@ public:
 
     // Exposed for the sort hook: the padded element count (next power of 2)
     static unsigned int nextPow2(unsigned int n);
-    // Build the PostDispatchHook that runs the (k, j) bitonic loop after the
-    // sort-step phase.  The caller attaches this to the sort-step phase.
+    // Build the PostDispatchHook that runs the (k, j) bitonic loop.
     static PostDispatchHook makeBitonicHook(
         const std::string& sortPhaseName,
         const std::string& sortKeyBufName,
