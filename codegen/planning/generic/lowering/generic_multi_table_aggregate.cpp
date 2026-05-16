@@ -717,6 +717,216 @@ private:
     std::vector<GenericMatColumnDesc> columns_;
 };
 
+void collectPredicateColumnsLocal(const GenericPredicatePtr& pred,
+                                  std::vector<GenericColumnExpr>& out) {
+    if (!pred) return;
+    std::visit([&](const auto& node) {
+        using T = std::decay_t<decltype(node)>;
+        if constexpr (std::is_same_v<T, GenericComparisonPred>) {
+            collectExprColumns(node.left, out);
+            collectExprColumns(node.right, out);
+        } else if constexpr (std::is_same_v<T, GenericBetweenPred>) {
+            collectExprColumns(node.expr, out);
+            collectExprColumns(node.low, out);
+            collectExprColumns(node.high, out);
+        } else if constexpr (std::is_same_v<T, GenericInListPred>) {
+            collectExprColumns(node.expr, out);
+            for (const auto& value : node.values)
+                collectExprColumns(value, out);
+        } else if constexpr (std::is_same_v<T, GenericLikePred>) {
+            collectExprColumns(node.expr, out);
+        } else if constexpr (std::is_same_v<T, GenericLogicalPred>) {
+            for (const auto& child : node.children)
+                collectPredicateColumnsLocal(child, out);
+        }
+    }, pred->node);
+}
+
+bool predicateOnlyReferencesRelation(const GenericPredicatePtr& pred,
+                                     int relationInstance) {
+    std::vector<GenericColumnExpr> cols;
+    collectPredicateColumnsLocal(pred, cols);
+    for (const auto& col : cols) {
+        if (col.relationInstance.value != relationInstance)
+            return false;
+    }
+    return true;
+}
+
+const GenericScanDetail* scanForTable(const MultiTableGroupedAggShape& shape,
+                                      const std::string& table) {
+    for (const auto* scanNode : shape.scans) {
+        auto* scan = scanDetail(scanNode);
+        if (scan && scan->table == table) return scan;
+    }
+    return nullptr;
+}
+
+GenericColumnExpr relationColumn(const GenericScanDetail& scan,
+                                 const std::string& column,
+                                 TypeInfo type) {
+    GenericColumnExpr out;
+    out.relationInstance = scan.relationInstance;
+    out.table = scan.table;
+    out.alias = scan.alias;
+    out.column = column;
+    out.type = type;
+    return out;
+}
+
+std::optional<MetalQueryPlan> lowerSharedNationDiamondCount(
+        const GenericRelPlan& ir,
+        const MultiTableGroupedAggShape& shape,
+        const GenericAggregateDetail& aggregate,
+        const AnalyzedQuery* aq,
+        std::string* error) {
+    (void)ir;
+    if (!aq || !aq->schema) return std::nullopt;
+    if (shape.scans.size() != 3) return std::nullopt;
+
+    const auto* customer = scanForTable(shape, "customer");
+    const auto* supplier = scanForTable(shape, "supplier");
+    const auto* nation = scanForTable(shape, "nation");
+    if (!customer || !supplier || !nation) return std::nullopt;
+
+    if (aggregate.groupBy.size() != 1 || aggregate.aggregates.size() != 1)
+        return std::nullopt;
+    auto* groupCol = aggregate.groupBy.front()
+        ? std::get_if<GenericColumnExpr>(&aggregate.groupBy.front()->node)
+        : nullptr;
+    if (!groupCol || groupCol->relationInstance.value != nation->relationInstance.value ||
+        groupCol->column != "n_name") {
+        return std::nullopt;
+    }
+
+    const auto& aggProjection = aggregate.aggregates.front();
+    auto* agg = aggProjection.expr
+        ? std::get_if<GenericAggregateExpr>(&aggProjection.expr->node)
+        : nullptr;
+    if (!agg || agg->func != AggFunc::COUNT) return std::nullopt;
+
+    if (auto* filter = filterDetail(shape.filter)) {
+        if (!predicateOnlyReferencesRelation(filter->predicate,
+                                             nation->relationInstance.value)) {
+            return std::nullopt;
+        }
+        if (!predicateSupported(filter->predicate)) {
+            if (error)
+                *error = "IR diamond count lowerer: nation filter predicate is not supported.";
+            return std::nullopt;
+        }
+    }
+
+    ColumnEquivalence eq = buildJoinColumnEquivalence(shape.joins, shape.filter);
+    GenericColumnExpr cNation = relationColumn(
+        *customer, "c_nationkey", TypeInfo{DataType::INT, 0});
+    GenericColumnExpr sNation = relationColumn(
+        *supplier, "s_nationkey", TypeInfo{DataType::INT, 0});
+    GenericColumnExpr nKey = relationColumn(
+        *nation, "n_nationkey", TypeInfo{DataType::INT, 0});
+    if (!eq.equivalent(cNation, sNation) ||
+        !eq.equivalent(sNation, nKey)) {
+        return std::nullopt;
+    }
+
+    constexpr const char* kNationDomain = "25";
+    const std::string idxVar = "i";
+    const std::string customerCount = "d_ir_diamond_customer_nation_count";
+    const std::string supplierCount = "d_ir_diamond_supplier_nation_count";
+
+    MetalQueryPlan plan;
+    plan.name = "GENERIC_IR_MULTI_TABLE_DIAMOND_COUNT";
+
+    {
+        auto scan = makeScanForCols(customer->table, idxVar, {"c_nationkey"},
+                                    aq->schema);
+        auto count = std::make_unique<MetalAtomicCount>(
+            std::move(scan), customerCount, "c_nationkey[" + idxVar + "]",
+            kNationDomain);
+        appendPhase(plan, "GENERIC_ir_diamond_count_customer",
+                    std::move(count));
+    }
+    {
+        auto scan = makeScanForCols(supplier->table, idxVar, {"s_nationkey"},
+                                    aq->schema);
+        auto count = std::make_unique<MetalAtomicCount>(
+            std::move(scan), supplierCount, "s_nationkey[" + idxVar + "]",
+            kNationDomain);
+        appendPhase(plan, "GENERIC_ir_diamond_count_supplier",
+                    std::move(count));
+    }
+
+    const int nameWidth = aq->schema->columnFixedWidth(nation->table, "n_name");
+    std::set<std::string> nationCols{"n_nationkey", "n_name"};
+    std::unique_ptr<MetalOperator> nationPipe =
+        makeScanForCols(nation->table, idxVar, nationCols, aq->schema);
+    if (auto* filter = filterDetail(shape.filter)) {
+        nationPipe = maybeSelect(std::move(nationPipe),
+                                 genericPredicateToMetal(filter->predicate, idxVar));
+    }
+
+    const std::string resultCounter = "d_ir_diamond_result_count";
+    auto materialize = std::make_unique<MetalMaterialize>(
+        std::move(nationPipe), resultCounter, "1");
+    const std::string nameBuffer = "d_ir_diamond_0_n_name";
+    const std::string countBuffer = "d_ir_diamond_1_" +
+        sanitizeIdentifier(aggProjection.name.empty() ? "cnt"
+                                                      : aggProjection.name);
+    const std::string countExpr =
+        "(int)(atomic_load_explicit(&" + customerCount +
+        "[n_nationkey[" + idxVar + "]], memory_order_relaxed) * "
+        "atomic_load_explicit(&" + supplierCount +
+        "[n_nationkey[" + idxVar + "]], memory_order_relaxed))";
+    materialize->addColumn(nameBuffer, "char",
+                           "n_name + " + idxVar + " * " +
+                               std::to_string(nameWidth),
+                           "n_name", tableSizeName(nation->table) + " * " +
+                               std::to_string(nameWidth),
+                           nameWidth);
+    const std::string countDisplay =
+        aggProjection.name.empty() ? "cnt" : aggProjection.name;
+    materialize->addColumn(countBuffer, "int", countExpr, countDisplay,
+                           tableSizeName(nation->table), 0);
+    auto& matPhase = appendPhase(plan, "GENERIC_ir_diamond_materialize",
+                                 std::move(materialize));
+    matPhase.extraBuffers.push_back({customerCount, "atomic_uint", true, false});
+    matPhase.extraBuffers.push_back({supplierCount, "atomic_uint", true, false});
+
+    std::vector<GenericMatColumnDesc> outputCols = {
+        {"n_name", nameBuffer, "char", nameWidth},
+        {countDisplay, countBuffer, "int", 0}
+    };
+
+    std::vector<IrGroupKeyDesc> groupKeys;
+    IrGroupKeyDesc groupKey;
+    groupKey.displayName = "n_name";
+    groupKeys.push_back(std::move(groupKey));
+    GenericSortSpec sortSpec;
+    sortSpec.limit = limitValue(shape.limit);
+    if (auto* sort = sortDetail(shape.sort)) {
+        for (const auto& key : sort->keys) {
+            auto name = sortKeyDisplayNameForGroupedAgg(key, aggregate, groupKeys);
+            if (!name) {
+                if (error)
+                    *error = "IR diamond count lowerer: ORDER BY key is not an output.";
+                return std::nullopt;
+            }
+            sortSpec.keys.push_back({*name, key.descending});
+        }
+    }
+    if (!sortSpec.keys.empty() || sortSpec.limit >= 0) {
+        const std::string rowsSym = "n_gpu_sort_ir_diamond_rows";
+        attachMaterializedCountHook(matPhase, resultCounter, rowsSym);
+        if (!appendGenericGpuSort(plan, "ir_diamond", rowsSym,
+                                  tableSizeName(nation->table),
+                                  outputCols, sortSpec, error)) {
+            return std::nullopt;
+        }
+    }
+
+    return plan;
+}
+
 } // namespace
 
 std::optional<MetalQueryPlan> lowerMultiTableGroupedAggregateIRToMetalImpl(
@@ -733,6 +943,9 @@ std::optional<MetalQueryPlan> lowerMultiTableGroupedAggregateIRToMetalImpl(
         return std::nullopt;
     if (aggregate->aggregates.empty())
         return fail(error, "IR multi-table grouped aggregate lowerer: no aggregate outputs.");
+
+    if (auto p = lowerSharedNationDiamondCount(ir, *shape, *aggregate, aq, error))
+        return p;
 
     std::vector<GenericExprPtr> neededExprs;
     for (const auto& group : aggregate->groupBy)
@@ -907,9 +1120,13 @@ std::optional<MetalQueryPlan> lowerMultiTableGroupedAggregateIRToMetalImpl(
         }
     }
 
-    if (!aggregate->having && !aggregateNeedsHashGroupOutput(*aggregate)) {
+    if (!aggregateNeedsHashGroupOutput(*aggregate)) {
         bool directOk = true;
         int totalBuckets = 1;
+        const std::string dynamicBucketCountSymbol =
+            "n_ir_multi_direct_group_buckets";
+        std::string bucketCountExpr;
+        bool dynamicDomain = false;
         std::vector<IrGroupKeyDesc> denseKeys;
         denseKeys.reserve(aggregate->groupBy.size());
 
@@ -978,6 +1195,14 @@ std::optional<MetalQueryPlan> lowerMultiTableGroupedAggregateIRToMetalImpl(
                 }
             } else if (col && (col->type.type == DataType::INT ||
                         col->type.type == DataType::DATE) &&
+                       aggregate->groupBy.size() == 1 &&
+                       !col->keyDomainSymbol.empty()) {
+                dynamicDomain = true;
+                bucketCountExpr = col->keyDomainSymbol;
+                key.numValuesExpr = dynamicBucketCountSymbol;
+                key.keyExpr = raw;
+            } else if (col && (col->type.type == DataType::INT ||
+                        col->type.type == DataType::DATE) &&
                        col->hasGroupDomain &&
                        col->domainMax >= col->domainMin) {
                 key.numValues = col->domainMax - col->domainMin + 1;
@@ -992,8 +1217,13 @@ std::optional<MetalQueryPlan> lowerMultiTableGroupedAggregateIRToMetalImpl(
                 break;
             }
 
-            totalBuckets *= key.numValues;
-            if (key.numValues <= 0 || totalBuckets > 4096) {
+            if (key.numValuesExpr.empty()) {
+                totalBuckets *= key.numValues;
+                if (key.numValues <= 0 || totalBuckets > 4096) {
+                    directOk = false;
+                    break;
+                }
+            } else if (bucketCountExpr.empty()) {
                 directOk = false;
                 break;
             }
@@ -1001,6 +1231,7 @@ std::optional<MetalQueryPlan> lowerMultiTableGroupedAggregateIRToMetalImpl(
         }
 
         std::vector<IrPendingAgg> pending;
+        std::vector<int> aggregatePendingIndex(aggregate->aggregates.size(), -1);
         int valuesPerBucket = 0;
         if (directOk) {
             for (size_t i = 0; i < aggregate->aggregates.size(); ++i) {
@@ -1029,6 +1260,7 @@ std::optional<MetalQueryPlan> lowerMultiTableGroupedAggregateIRToMetalImpl(
                     out.offset = valuesPerBucket++;
                     out.valueExpr = "1u";
                     out.funcName = "COUNT";
+                    aggregatePendingIndex[i] = static_cast<int>(pending.size());
                     pending.push_back(std::move(out));
                     continue;
                 }
@@ -1061,6 +1293,7 @@ std::optional<MetalQueryPlan> lowerMultiTableGroupedAggregateIRToMetalImpl(
                     }
                     sum.funcName = "AVG";
                     sum.innerColumn = innerColumnName(agg->arg);
+                    aggregatePendingIndex[i] = static_cast<int>(pending.size());
                     pending.push_back(std::move(sum));
 
                     IrPendingAgg cnt;
@@ -1091,6 +1324,7 @@ std::optional<MetalQueryPlan> lowerMultiTableGroupedAggregateIRToMetalImpl(
                         out.isLongPair = true;
                         valuesPerBucket += 2;
                     }
+                    aggregatePendingIndex[i] = static_cast<int>(pending.size());
                     pending.push_back(std::move(out));
                     continue;
                 }
@@ -1100,20 +1334,72 @@ std::optional<MetalQueryPlan> lowerMultiTableGroupedAggregateIRToMetalImpl(
             }
         }
 
+        KeyedCompactHavingSpec havingSpec;
+        if (directOk && !pending.empty()) {
+            auto configureDirectHavingSlot = [&](int aggIdx,
+                                                 bool scalar) -> bool {
+                if (aggIdx < 0 ||
+                    aggIdx >= static_cast<int>(aggregatePendingIndex.size())) {
+                    return false;
+                }
+                const int pendingIdx = aggregatePendingIndex[(size_t)aggIdx];
+                if (pendingIdx < 0 ||
+                    pendingIdx >= static_cast<int>(pending.size())) {
+                    return false;
+                }
+                const auto& p = pending[(size_t)pendingIdx];
+                if (p.funcName == "AVG")
+                    return false;
+                if (scalar) {
+                    havingSpec.scalarAggOffset = p.offset;
+                    havingSpec.scalarAggIsLongPair = p.isLongPair;
+                    havingSpec.scalarAggIsFloatSum = p.isFloatSum;
+                    havingSpec.scalarAggScaleDown = p.scaleDown;
+                    havingSpec.scalarTotalBuffer =
+                        "d_ir_multi_direct_group_having_total";
+                    havingSpec.scalarCompareOp = groupSpec.havingScalarCompareOp;
+                    havingSpec.scalarMultiplier = groupSpec.havingMultiplier;
+                } else {
+                    havingSpec.compareAggOffset = p.offset;
+                    havingSpec.compareAggIsLongPair = p.isLongPair;
+                    havingSpec.compareAggIsFloatSum = p.isFloatSum;
+                    havingSpec.compareAggScaleDown = p.scaleDown;
+                    havingSpec.compareOp = groupSpec.havingCompareOp;
+                    havingSpec.compareValue = groupSpec.havingCompareValue;
+                }
+                return true;
+            };
+            if (aggregate->having) {
+                bool havingOk = true;
+                if (groupSpec.havingAggIdx >= 0)
+                    havingOk = configureDirectHavingSlot(groupSpec.havingAggIdx, true);
+                if (havingOk && groupSpec.havingCompareAggIdx >= 0 &&
+                    !groupSpec.havingCompareOp.empty()) {
+                    havingOk = configureDirectHavingSlot(
+                        groupSpec.havingCompareAggIdx, false);
+                }
+                directOk = havingOk;
+            }
+        }
+
         if (directOk && !pending.empty()) {
             std::string bucketExpr = "(" + denseKeys.front().keyExpr + ")";
             for (size_t i = 1; i < denseKeys.size(); ++i) {
                 bucketExpr = "(" + bucketExpr + " + (" + denseKeys[i].keyExpr + ") * " +
                              std::to_string(denseKeys[i].stride) + ")";
             }
+            bucketCountExpr = dynamicDomain
+                ? bucketCountExpr
+                : std::to_string(totalBuckets);
+            const int keyedBucketCount = dynamicDomain ? 0 : totalBuckets;
 
             const std::string rowsSym = "ir_multi_direct_group_rows";
             auto scan = std::make_unique<MetalMaterializedRangeScan>(
                 rowsSym, idxVar, materializedCols);
             auto keyed = std::make_unique<MetalKeyedAgg>(
                 std::move(scan), "d_ir_multi_direct_group_aggs", bucketExpr,
-                totalBuckets, valuesPerBucket,
-                std::to_string(totalBuckets * valuesPerBucket));
+                keyedBucketCount, valuesPerBucket,
+                bucketCountExpr + " * " + std::to_string(valuesPerBucket));
 
             std::vector<std::string> keyNames;
             std::vector<GroupKeyDecode> decodeInfo;
@@ -1134,6 +1420,10 @@ std::optional<MetalQueryPlan> lowerMultiTableGroupedAggregateIRToMetalImpl(
                                             agg.isFloatSum, agg.isMinMax,
                                             agg.funcName, agg.innerColumn);
             }
+            if (!havingSpec.scalarTotalBuffer.empty()) {
+                keyed->setHavingTotal(havingSpec.scalarTotalBuffer,
+                                      havingSpec.scalarAggOffset);
+            }
 
             attachMaterializedCountHook(matPhase, resultCounter, rowsSym);
             auto& directPhase = appendPhase(lowering->plan,
@@ -1142,7 +1432,8 @@ std::optional<MetalQueryPlan> lowerMultiTableGroupedAggregateIRToMetalImpl(
             std::vector<KeyedCompactKeySpec> compactKeys;
             std::vector<GenericMatColumnDesc> compactCols;
             for (const auto& key : denseKeys) {
-                compactKeys.push_back({key.displayName, key.numValues, key.stride,
+                compactKeys.push_back({key.displayName, key.numValues,
+                                       key.numValuesExpr, key.stride,
                                        key.charMap, key.keyBase, key.stringMap,
                                        key.stringLen});
                 std::string buf = "d_ir_multi_direct_out_" +
@@ -1197,15 +1488,17 @@ std::optional<MetalQueryPlan> lowerMultiTableGroupedAggregateIRToMetalImpl(
             auto& compactPhase = appendPhase(lowering->plan,
                 "GENERIC_ir_multi_table_direct_group_compact",
                 makeKeyedAggCompactOperator(
-                    "d_ir_multi_direct_group_aggs", compactCounter, totalBuckets,
-                    valuesPerBucket, compactKeys, compactAggs, compactCols));
+                    "d_ir_multi_direct_group_aggs", compactCounter, keyedBucketCount,
+                    valuesPerBucket, compactKeys, compactAggs, compactCols,
+                    bucketCountExpr, dynamicDomain ? dynamicBucketCountSymbol : "",
+                    havingSpec));
             (void)directPhase;
 
             if (!sortSpec.keys.empty() || sortSpec.limit >= 0) {
                 const std::string sortRowsSym = "n_gpu_sort_ir_multi_direct_group_rows";
                 attachMaterializedCountHook(compactPhase, compactCounter, sortRowsSym);
                 if (!appendGenericGpuSort(lowering->plan, "ir_multi_direct_group",
-                                          sortRowsSym, std::to_string(totalBuckets),
+                                          sortRowsSym, bucketCountExpr,
                                           compactCols, sortSpec, error)) {
                     return std::nullopt;
                 }

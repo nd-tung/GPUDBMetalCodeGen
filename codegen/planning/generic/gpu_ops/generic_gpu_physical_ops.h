@@ -87,6 +87,7 @@ struct GenericGpuGroupSpec {
 struct KeyedCompactKeySpec {
     std::string displayName;
     int numValues = 0;
+    std::string numValuesExpr;
     int stride = 1;
     std::vector<char> charMap;
     int keyBase = 0;
@@ -109,6 +110,23 @@ struct KeyedCompactAggSpec {
     bool countIsFloat = false;
 };
 
+struct KeyedCompactHavingSpec {
+    int scalarAggOffset = -1;
+    bool scalarAggIsLongPair = false;
+    bool scalarAggIsFloatSum = false;
+    int scalarAggScaleDown = 0;
+    std::string scalarTotalBuffer;
+    std::string scalarCompareOp = ">";
+    double scalarMultiplier = 0.0;
+
+    int compareAggOffset = -1;
+    bool compareAggIsLongPair = false;
+    bool compareAggIsFloatSum = false;
+    int compareAggScaleDown = 0;
+    std::string compareOp;
+    double compareValue = 0.0;
+};
+
 std::vector<GenericMatColumnDesc> genericGpuGroupOutputColumns(
     const GenericGpuGroupSpec& spec);
 
@@ -127,7 +145,10 @@ std::unique_ptr<MetalOperator> makeKeyedAggCompactOperator(
     int valuesPerBucket,
     std::vector<KeyedCompactKeySpec> keys,
     std::vector<KeyedCompactAggSpec> aggs,
-    std::vector<GenericMatColumnDesc> outputs);
+    std::vector<GenericMatColumnDesc> outputs,
+    std::string bucketCountExpr = {},
+    std::string bucketCountSymbol = {},
+    KeyedCompactHavingSpec having = {});
 
 bool appendGenericGpuSort(MetalQueryPlan& plan,
                           const std::string& tag,

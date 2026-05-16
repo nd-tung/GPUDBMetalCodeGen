@@ -926,6 +926,10 @@ void MetalKeyedAgg::setMultiKeyResult(const std::vector<std::string>& displayNam
     multiKeyDecode_ = keys;
 }
 
+void MetalKeyedAgg::setHavingTotal(const std::string& bufferName, int aggregateOffset) {
+    havingTotal_ = HavingTotal{bufferName, aggregateOffset};
+}
+
 void MetalKeyedAgg::addDistinctBitmap(const std::string& outputName,
                                        const std::string& valueExpr,
                                        const std::string& maxValueExpr) {
@@ -939,6 +943,20 @@ void MetalKeyedAgg::produce(MetalCodegen& cg, ConsumerFn consume) {
         ? std::to_string(numBuckets_ * valuesPerBucket_)
         : sizeExpr_;
     cg.addAtomicBufferParam(outputArrayName_, "atomic_uint", sz);
+
+    const Aggregate* havingTotalAgg = nullptr;
+    if (havingTotal_) {
+        for (const auto& agg : aggregates_) {
+            if (agg.offset == havingTotal_->aggregateOffset) {
+                havingTotalAgg = &agg;
+                break;
+            }
+        }
+        if (havingTotalAgg) {
+            cg.addAtomicBufferParam(havingTotal_->bufferName, "atomic_uint",
+                                    havingTotalAgg->isLongPair ? "2" : "1");
+        }
+    }
 
     // Register COUNT(DISTINCT) bitmap buffers.
     for (const auto& db : distinctBitmaps_) {
@@ -958,7 +976,8 @@ void MetalKeyedAgg::produce(MetalCodegen& cg, ConsumerFn consume) {
     // Empirical caps avoid cases where barrier and register pressure beat atomic savings.
     constexpr int kMaxBucketsForTGReduce = 64;
     constexpr int kMinAggsForTGReduce    = 3;
-    if (allAdds && numBuckets_ <= kMaxBucketsForTGReduce &&
+    if (allAdds && !havingTotal_ && numBuckets_ > 0 &&
+        numBuckets_ <= kMaxBucketsForTGReduce &&
         (int)aggregates_.size() >= kMinAggsForTGReduce) {
         // Optimized path: thread-local accumulation plus TG reduction.
         // HAVING needs one TG so the predicate sees global totals.
@@ -1148,6 +1167,21 @@ void MetalKeyedAgg::produce(MetalCodegen& cg, ConsumerFn consume) {
                     } else if (agg.atomicOp == "max") {
                         cg.addLine("atomic_fetch_max_explicit(&" + outputArrayName_ + "[" + idx +
                                    "], (uint)(" + agg.valueExpr + "), memory_order_relaxed);");
+                    }
+                }
+                if (havingTotal_ && havingTotalAgg &&
+                    agg.offset == havingTotal_->aggregateOffset) {
+                    if (agg.isFloatSum) {
+                        cg.addLine("atomic_add_float(&" + havingTotal_->bufferName +
+                                   "[0], (float)(" + agg.valueExpr + "));");
+                    } else if (agg.isLongPair) {
+                        cg.addLine("atomic_add_long_pair(&" + havingTotal_->bufferName +
+                                   "[0], &" + havingTotal_->bufferName +
+                                   "[1], (long)(" + agg.valueExpr + "));");
+                    } else {
+                        cg.addLine("atomic_fetch_add_explicit(&" + havingTotal_->bufferName +
+                                   "[0], (uint)(" + agg.valueExpr +
+                                   "), memory_order_relaxed);");
                     }
                 }
             }
