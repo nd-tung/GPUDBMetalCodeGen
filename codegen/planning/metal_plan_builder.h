@@ -90,7 +90,7 @@ struct MetalQueryPlan {
 };
 
 // Legacy compatibility wrapper. New callers should prefer the explicit APIs in
-// metal_tpch_plan_api.h (predefined TPC-H) or metal_adhoc_plan_api.h
+// api/metal_tpch_plan_api.h (predefined TPC-H) or api/metal_adhoc_plan_api.h
 // (ad-hoc supported SQL patterns).
 std::optional<MetalQueryPlan> buildMetalPlan(const AnalyzedQuery& aq,
                                               const std::string& queryName = "");

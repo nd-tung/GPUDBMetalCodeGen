@@ -1,0 +1,104 @@
+#include "generic/lowering/generic_ir_physical_planner.h"
+#include "generic/lowering/generic_expression_metal.h"
+#include "generic/lowering/generic_plan_shapes.h"
+#include "metal_plan_common.h"
+
+#include <memory>
+#include <optional>
+#include <string>
+
+namespace codegen {
+
+namespace {
+
+std::optional<MetalQueryPlan> fail(std::string* error, const std::string& msg) {
+    if (error) *error = msg;
+    return std::nullopt;
+}
+
+} // namespace
+
+std::optional<MetalQueryPlan> lowerSingleTableScalarAggregateIRToMetal(
+        const GenericRelPlan& ir,
+        std::string* error) {
+    auto shape = parseSingleTableScalarAggShape(ir, error);
+    if (!shape) return std::nullopt;
+
+    auto* scan = scanDetail(shape->scan);
+    auto* aggregate = aggregateDetail(shape->aggregate);
+    if (!scan || !aggregate)
+        return fail(error, "IR scalar aggregate lowerer: malformed scan/aggregate detail.");
+    if (!aggregate->groupBy.empty())
+        return std::nullopt;
+    if (aggregate->aggregates.empty())
+        return fail(error, "IR scalar aggregate lowerer: no aggregate outputs.");
+    if (aggregate->having)
+        return fail(error, "IR scalar aggregate lowerer: HAVING is not supported.");
+
+    const std::string idxVar = "i";
+    std::unique_ptr<MetalOperator> pipe = makeAutoScan(scan->table, idxVar);
+    if (auto* filter = filterDetail(shape->filter)) {
+        if (!predicateSupported(filter->predicate)) {
+            return fail(error, "IR scalar aggregate lowerer: filter predicate is not supported.");
+        }
+        pipe = maybeSelect(std::move(pipe),
+                           genericPredicateToMetal(filter->predicate, idxVar));
+    }
+
+    auto reduce = std::make_unique<MetalTGReduce>(std::move(pipe), "d_ir_scalar");
+    for (size_t i = 0; i < aggregate->aggregates.size(); ++i) {
+        const auto& projection = aggregate->aggregates[i];
+        if (!projection.expr)
+            return fail(error, "IR scalar aggregate lowerer: null aggregate expression.");
+        auto* agg = std::get_if<GenericAggregateExpr>(&projection.expr->node);
+        if (!agg)
+            return fail(error, "IR scalar aggregate lowerer: projection is not an aggregate.");
+
+        const std::string alias = projection.name.empty()
+            ? "agg_" + std::to_string(i)
+            : projection.name;
+        const std::string accName = "a" + std::to_string(i) + "_" +
+                                    sanitizeIdentifier(alias);
+
+        if (agg->func == AggFunc::COUNT) {
+            int accIndex = reduce->addAccumulator(accName, "1", "long");
+            reduce->setAccumulatorResultAlias(alias, accIndex, 0, nullptr);
+            continue;
+        }
+
+        if (!agg->arg)
+            return fail(error, "IR scalar aggregate lowerer: aggregate '" +
+                               aggFuncName(agg->func) + "' requires an argument.");
+        if (!materializeExprSupported(agg->arg))
+            return fail(error, "IR scalar aggregate lowerer: aggregate argument is not supported.");
+
+        std::string valueExpr = genericExprToMetal(agg->arg, idxVar);
+        if (agg->func == AggFunc::AVG) {
+            int sumIndex = reduce->addAccumulator(accName + "_sum", valueExpr, "float");
+            int countIndex = reduce->addAccumulator(accName + "_count", "1.0f", "float");
+            reduce->setAverageResultAlias(alias, sumIndex, countIndex, 0, nullptr);
+            continue;
+        }
+
+        std::string outputType = agg->arg->type.type == DataType::FLOAT ? "float" : "long";
+        MetalTGReduce::ReduceOp op = MetalTGReduce::ReduceOp::SUM;
+        if (agg->func == AggFunc::MIN) op = MetalTGReduce::ReduceOp::MIN;
+        else if (agg->func == AggFunc::MAX) op = MetalTGReduce::ReduceOp::MAX;
+        else if (agg->func != AggFunc::SUM) {
+            return fail(error, "IR scalar aggregate lowerer: unsupported aggregate '" +
+                               aggFuncName(agg->func) + "'.");
+        }
+        if (op != MetalTGReduce::ReduceOp::SUM && agg->arg->type.type != DataType::FLOAT)
+            outputType = "int";
+
+        int accIndex = reduce->addAccumulator(accName, valueExpr, outputType, "", "", op);
+        reduce->setAccumulatorResultAlias(alias, accIndex, 0, nullptr);
+    }
+
+    MetalQueryPlan plan;
+    plan.name = "GENERIC_IR_SINGLE_TABLE_SCALAR";
+    appendPhase(plan, "GENERIC_ir_single_table_scalar", std::move(reduce));
+    return plan;
+}
+
+} // namespace codegen

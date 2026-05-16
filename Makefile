@@ -17,16 +17,14 @@ INCLUDES = -Ithird_party/metal-cpp -Ithird_party/libpg_query \
 FRAMEWORKS = -framework Metal -framework Foundation -framework QuartzCore \
              -L/opt/homebrew/opt/llvm/lib/c++ -Wl,-rpath,/opt/homebrew/opt/llvm/lib/c++
 
-# Codegen subdirectories
-CODEGEN_SUBDIRS = core operators execution planning planning/queries
-
-# Codegen sources — gather from subdirs (main stays at codegen/ root)
-CODEGEN_SUB_SOURCES = $(foreach d,$(CODEGEN_SUBDIRS),$(wildcard $(CODEGEN_DIR)/$(d)/*.cpp))
-CODEGEN_LIB_OBJECTS = $(foreach src,$(CODEGEN_SUB_SOURCES),$(OBJ_DIR)/codegen_$(notdir $(basename $(src))).o)
+# Codegen sources — gather recursively from library subtrees (main stays at codegen/ root)
+CODEGEN_SUBDIRS = core operators execution planning
+CODEGEN_SUB_SOURCES = $(shell find $(addprefix $(CODEGEN_DIR)/,$(CODEGEN_SUBDIRS)) -name '*.cpp' -type f | sort)
+CODEGEN_LIB_OBJECTS = $(patsubst $(CODEGEN_DIR)/%.cpp,$(OBJ_DIR)/codegen_%.o,$(CODEGEN_SUB_SOURCES))
 CODEGEN_MAIN_OBJ    = $(OBJ_DIR)/codegen_codegen_main.o
 
 # Shared infra used by tools without linking the whole codegen binary
-INFRA_OBJ = $(OBJ_DIR)/codegen_infra.o
+INFRA_OBJ = $(OBJ_DIR)/codegen_core/infra.o
 
 # libpg_query
 PG_QUERY_DIR = third_party/libpg_query
@@ -42,10 +40,12 @@ TBL2COLBIN     = $(BIN_DIR)/tbl_to_colbin
 # ---------------------------------------------------------------------------
 # Build
 # ---------------------------------------------------------------------------
-.PHONY: all rebuild clean run tools colbin-sf1 colbin-sf10 colbin-sf20 colbin-sf50 colbin-sf100 clean-colbin
+.PHONY: all rebuild clean run tools strict-generic colbin-sf1 colbin-sf10 colbin-sf20 colbin-sf50 colbin-sf100 clean-colbin
 
 all: $(TARGET)
 tools: $(TBL2COLBIN)
+strict-generic: $(TARGET)
+	@./scripts/run_strict_generic.sh
 
 rebuild: clean all
 
@@ -56,30 +56,17 @@ $(TARGET): $(CODEGEN_MAIN_OBJ) $(CODEGEN_LIB_OBJECTS) | $(BIN_DIR)
 
 $(OBJ_DIR)/codegen_codegen_main.o: $(CODEGEN_DIR)/codegen_main.cpp | $(OBJ_DIR)
 	@echo "Compiling $<..."
+	@mkdir -p $(dir $@)
 	$(CXX) $(CXXFLAGS) $(INCLUDES) -c $< -o $@
 
-$(OBJ_DIR)/codegen_%.o: $(CODEGEN_DIR)/core/%.cpp | $(OBJ_DIR)
+$(OBJ_DIR)/codegen_%.o: $(CODEGEN_DIR)/%.cpp | $(OBJ_DIR)
 	@echo "Compiling $<..."
-	$(CXX) $(CXXFLAGS) $(INCLUDES) -c $< -o $@
-
-$(OBJ_DIR)/codegen_%.o: $(CODEGEN_DIR)/operators/%.cpp | $(OBJ_DIR)
-	@echo "Compiling $<..."
-	$(CXX) $(CXXFLAGS) $(INCLUDES) -c $< -o $@
-
-$(OBJ_DIR)/codegen_%.o: $(CODEGEN_DIR)/execution/%.cpp | $(OBJ_DIR)
-	@echo "Compiling $<..."
-	$(CXX) $(CXXFLAGS) $(INCLUDES) -c $< -o $@
-
-$(OBJ_DIR)/codegen_%.o: $(CODEGEN_DIR)/planning/%.cpp | $(OBJ_DIR)
-	@echo "Compiling $<..."
-	$(CXX) $(CXXFLAGS) $(INCLUDES) -c $< -o $@
-
-$(OBJ_DIR)/codegen_%.o: $(CODEGEN_DIR)/planning/queries/%.cpp | $(OBJ_DIR)
-	@echo "Compiling $<..."
+	@mkdir -p $(dir $@)
 	$(CXX) $(CXXFLAGS) $(INCLUDES) -c $< -o $@
 
 $(TBL2COLBIN_OBJ): $(TBL2COLBIN_SRC) | $(OBJ_DIR)
 	@echo "Compiling $<..."
+	@mkdir -p $(dir $@)
 	$(CXX) $(CXXFLAGS) $(INCLUDES) -c $< -o $@
 
 $(TBL2COLBIN): $(TBL2COLBIN_OBJ) $(INFRA_OBJ) | $(BIN_DIR)
@@ -91,7 +78,7 @@ $(BIN_DIR) $(OBJ_DIR) $(BUILD_DIR):
 	@mkdir -p $@
 
 # Auto-generated header dependencies (-MMD -MP)
--include $(OBJ_DIR)/*.d
+-include $(CODEGEN_MAIN_OBJ:.o=.d) $(CODEGEN_LIB_OBJECTS:.o=.d) $(TBL2COLBIN_OBJ:.o=.d)
 
 clean:
 	@echo "Cleaning build artifacts..."

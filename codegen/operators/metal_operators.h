@@ -743,7 +743,7 @@ private:
 
 class MetalInitSortKeys : public MetalOperator {
 public:
-    // sourceColumn: name of the source buffer to sort (e.g. "d_adhoc_0_expr")
+    // sourceColumn: name of the source buffer to sort (e.g. "d_generic_0_expr")
     // sourceType: "int" or "float" (or "double" for Metal float)
     // sortKeyBuf: name of output uint64_t sort key buffer
     // sortIdxBuf: name of output int row index buffer
