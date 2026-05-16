@@ -1,0 +1,190 @@
+#include "generic/lowering/generic_ir_physical_planner.h"
+#include "generic/lowering/generic_aggregate_helpers.h"
+#include "generic/lowering/generic_expression_metal.h"
+#include "generic/lowering/generic_plan_shapes.h"
+#include "generic/gpu_ops/generic_gpu_physical_ops.h"
+#include "metal_plan_common.h"
+
+#include <memory>
+#include <optional>
+#include <string>
+#include <vector>
+
+namespace codegen {
+
+namespace {
+
+std::optional<MetalQueryPlan> fail(std::string* error, const std::string& msg) {
+    if (error) *error = msg;
+    return std::nullopt;
+}
+
+} // namespace
+
+std::optional<MetalQueryPlan> lowerSingleTableHashGroupedAggregateIRToMetal(
+        const GenericScanDetail& scan,
+        const GenericAggregateDetail& aggregate,
+        const GenericRelNode* filterNode,
+        const GenericRelNode* sortNode,
+        const GenericRelNode* limitNode,
+        std::string* error) {
+    const std::string idxVar = "i";
+    std::unique_ptr<MetalOperator> pipe = makeAutoScan(scan.table, idxVar);
+    if (auto* filter = filterDetail(filterNode)) {
+        if (!predicateSupported(filter->predicate))
+            return fail(error, "IR single-table hash group lowerer: filter predicate unsupported.");
+        pipe = maybeSelect(std::move(pipe),
+                           genericPredicateToMetal(filter->predicate, idxVar));
+    }
+
+    const std::string resultCounter = "d_ir_single_hash_group_input_count";
+    auto materialize = std::make_unique<MetalMaterialize>(
+        std::move(pipe), resultCounter, "1");
+    const std::string outputSize = tableSizeName(scan.table);
+
+    std::vector<GenericMatColumnDesc> materializedCols;
+    GenericGroupSpec groupSpec;
+    std::vector<IrGroupKeyDesc> groupKeys;
+    int matColIdx = 0;
+
+    auto addInputColumn = [&](const std::string& displayName,
+                              const TypeInfo& type,
+                              const GenericExprPtr& expr,
+                              int scaleDown,
+                              const std::string& distinctDomainSymbol) -> bool {
+        if (!materializeExprSupported(expr)) {
+            if (error)
+                *error = "IR single-table hash group lowerer: input expression '" +
+                         displayName + "' is not supported.";
+            return false;
+        }
+        int stringLen = fixedStringLenForExpr(expr);
+        std::string sizeExpr = outputSize;
+        if (stringLen > 0) sizeExpr += " * " + std::to_string(stringLen);
+        std::string bufferName = "d_ir_single_hash_group_" +
+                                 std::to_string(matColIdx++) + "_" +
+                                 sanitizeIdentifier(displayName);
+        std::string metalType = metalTypeForType(type);
+        materialize->addColumn(bufferName, metalType,
+                               materializeExprToMetal(expr, idxVar),
+                               displayName, sizeExpr, stringLen);
+        materializedCols.push_back(GenericMatColumnDesc{
+            displayName, bufferName, metalType, stringLen, scaleDown, false,
+            distinctDomainSymbol});
+        return true;
+    };
+
+    for (size_t i = 0; i < aggregate.groupBy.size(); ++i) {
+        const auto& group = aggregate.groupBy[i];
+        const std::string displayName = groupDisplayNameForAggregate(aggregate, i);
+        groupSpec.keyColumns.push_back(displayName);
+        IrGroupKeyDesc key;
+        key.displayName = displayName;
+        groupKeys.push_back(std::move(key));
+        if (!addInputColumn(displayName,
+                            group ? group->type : TypeInfo{DataType::INT, 0},
+                            group, 0, "")) {
+            return std::nullopt;
+        }
+    }
+
+    for (size_t i = 0; i < aggregate.aggregates.size(); ++i) {
+        const auto& projection = aggregate.aggregates[i];
+        auto* agg = projection.expr
+            ? std::get_if<GenericAggregateExpr>(&projection.expr->node)
+            : nullptr;
+        if (!agg)
+            return fail(error, "IR single-table hash group lowerer: non-aggregate projection.");
+        const std::string displayName = projection.name.empty()
+            ? "agg_" + std::to_string(i)
+            : projection.name;
+
+        GenericExprPtr inputExpr;
+        TypeInfo inputType{DataType::FLOAT, 0};
+        int inputScaleDown = 0;
+        std::string distinctDomainSymbol;
+        std::string funcName = aggregateOutputFuncFor(aggregate, i, agg->func);
+
+        if (agg->func == AggFunc::COUNT) {
+            GenericExpr lit;
+            lit.type = inputType;
+            lit.node = GenericLiteralExpr{1.0, inputType};
+            inputExpr = std::make_shared<GenericExpr>(std::move(lit));
+            funcName = "COUNT";
+        } else {
+            if (!agg->arg)
+                return fail(error, "IR single-table hash group lowerer: aggregate '" +
+                                   aggFuncName(agg->func) + "' requires an argument.");
+            inputExpr = agg->arg;
+            if (agg->func == AggFunc::COUNT_DISTINCT) {
+                distinctDomainSymbol = distinctDomainSymbolForExpr(agg->arg);
+                if (distinctDomainSymbol.empty())
+                    return fail(error, "IR single-table hash group lowerer: COUNT(DISTINCT) has no schema distinct-domain metadata.");
+                inputType = agg->arg->type;
+                funcName = "COUNT_DISTINCT";
+            } else if (agg->func == AggFunc::SUM || agg->func == AggFunc::AVG) {
+                inputScaleDown = numericScaleForExpr(agg->arg);
+            } else if (agg->func != AggFunc::MIN && agg->func != AggFunc::MAX) {
+                return fail(error, "IR single-table hash group lowerer: unsupported aggregate " +
+                                   aggFuncName(agg->func) + ".");
+            }
+        }
+
+        groupSpec.aggColumns.push_back(displayName);
+        groupSpec.aggFuncs.push_back(funcName);
+        if (!addInputColumn(displayName, inputType, inputExpr, inputScaleDown,
+                            distinctDomainSymbol)) {
+            return std::nullopt;
+        }
+    }
+
+    groupSpec.outputColumns = aggregate.outputOrder;
+    if (!configureAggregateHaving(aggregate, groupSpec, nullptr, nullptr, error))
+        return std::nullopt;
+
+    MetalQueryPlan plan;
+    plan.name = "GENERIC_IR_SINGLE_TABLE_HASH_GROUP";
+    auto& matPhase = appendPhase(plan, "GENERIC_ir_single_table_hash_group_materialize",
+                                 std::move(materialize));
+
+    const std::string groupTag = "ir_single_table_hash_group";
+    GenericGpuGroupSpec gbSpec;
+    gbSpec.tag = groupTag;
+    gbSpec.inputCounter = resultCounter;
+    gbSpec.inputRowsSymbol = "n_gpu_gb_" + groupTag + "_input";
+    gbSpec.capacityExpr = "next_pow2(" + outputSize + " * 2)";
+    gbSpec.capacitySymbol = "n_gpu_gb_" + groupTag + "_cap";
+    gbSpec.outputCounter = "d_gpu_gb_" + groupTag + "_count";
+    gbSpec.inputColumns = std::move(materializedCols);
+    gbSpec.groupBy = std::move(groupSpec);
+    attachMaterializedCountHook(matPhase, gbSpec.inputCounter, gbSpec.inputRowsSymbol);
+    appendGenericGpuGroupBy(plan, gbSpec);
+
+    const std::string sortRowsSym = "n_gpu_sort_" + groupTag + "_rows";
+    attachMaterializedCountHook(plan.phases.back(), gbSpec.outputCounter,
+                                sortRowsSym);
+
+    GenericSortSpec sortSpec;
+    sortSpec.limit = limitValue(limitNode);
+    if (auto* sort = sortDetail(sortNode)) {
+        for (const auto& key : sort->keys) {
+            auto name = sortKeyDisplayNameForGroupedAgg(key, aggregate, groupKeys);
+            if (!name)
+                return fail(error, "IR single-table hash group lowerer: ORDER BY key is not an output.");
+            sortSpec.keys.push_back({*name, key.descending});
+        }
+    }
+
+    if (!sortSpec.keys.empty() || sortSpec.limit >= 0) {
+        if (!appendGenericGpuSort(plan, "group_" + groupTag,
+                                  sortRowsSym, gbSpec.capacityExpr,
+                                  genericGpuGroupOutputColumns(gbSpec),
+                                  sortSpec, error)) {
+            return std::nullopt;
+        }
+    }
+
+    return plan;
+}
+
+} // namespace codegen

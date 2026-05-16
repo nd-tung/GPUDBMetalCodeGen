@@ -2,6 +2,6 @@
 
 // Metal plan implementation has been split by responsibility:
 //   - metal_plan_common.cpp: shared plan-builder helpers
-//   - metal_plan_dispatch.cpp: legacy compatibility wrapper
+//   - api/metal_plan_dispatch.cpp: legacy compatibility wrapper
 //   - metal_plan_codegen.cpp: MetalQueryPlan -> MetalCodegen lowering
-//   - queries/tpch_q*.cpp: hand-tuned per-query TPC-H plan builders
+//   - tpch/queries/tpch_q*.cpp: hand-tuned per-query TPC-H plan builders
