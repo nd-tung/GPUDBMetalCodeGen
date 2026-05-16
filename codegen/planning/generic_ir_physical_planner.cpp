@@ -1,5 +1,5 @@
 #include "generic_ir_physical_planner.h"
-#include "metal_generic_adhoc_builder.h"
+#include "generic_scalar_lookup_helpers.h"
 #include "metal_generic_sql_physical_ops.h"
 #include "metal_plan_common.h"
 #include "../core/metal_param_binding.h"

@@ -73,40 +73,6 @@ struct MetalQueryPlan {
     // Default false is the safe choice.
     bool chunkable = false;
 
-    // CPU-side post-processing
-    struct CpuSort {
-        struct SortKey { std::string column; bool descending; };
-        std::vector<SortKey> keys;
-        int limit = -1;
-    };
-    std::optional<CpuSort> cpuSort;
-
-    // Host-side GROUP BY when GPU KeyedAgg cannot handle it.
-    // Columns map by display name to aggregate function: "SUM", "COUNT", "AVG", "MIN", "MAX".
-    struct CpuGroupBy {
-        std::vector<std::string> keyColumns;       // column names in result
-        std::vector<std::string> aggColumns;       // aggregate result columns
-        std::vector<std::string> aggFuncs;         // "SUM", "COUNT", "AVG", "MIN", "MAX", "RATIO"
-        // Pairs of (numIdx, denIdx) into aggColumns for RATIO functions.
-        // After grouping, num/den columns are replaced with their ratio.
-        std::vector<std::pair<int,int>> ratioPairs;
-        // HAVING: if non-empty, the agg column at havingAggIdx is compared
-        // against havingMultiplier * global_sum_of_agg.  If havingMultiplier
-        // is 0, the having literal (from sentinel) is used directly.
-        int havingAggIdx = -1;        // index into aggColumns
-        double havingMultiplier = 0;  // e.g. 0.0001 → filter where agg > global_sum * 0.0001
-        int havingSentinel = 0;       // the sentinel literal value (INT_MIN+idx)
-    };
-    std::optional<CpuGroupBy> cpuGroupBy;
-
-    // CPU scalar aggregation (no GROUP BY).  Used as fallback when
-    // GPU TGReduce cannot handle the probe pipe (e.g., semi-join probes).
-    struct CpuScalarAgg {
-        std::vector<std::string> aggColumns;       // aggregate result columns
-        std::vector<std::string> aggFuncs;         // "SUM", "COUNT", "AVG", "MIN", "MAX", "RATIO"
-    };
-    std::optional<CpuScalarAgg> cpuScalarAgg;
-
     // GPU bitonic sort info.  When set, a GPU sort was attached to the
     // query plan.  The post-processing reads `sortedIndexBuffer` to
     // remap materialized rows into the final ORDER BY sequence.

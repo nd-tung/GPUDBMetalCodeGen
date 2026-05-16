@@ -2,35 +2,17 @@
 #include "generic_ir_builder.h"
 #include "generic_ir_physical_planner.h"
 #include "generic_ir_validator.h"
-#include "metal_generic_adhoc_builder.h"
-
-#include <sstream>
-#include <vector>
 
 namespace codegen {
 
 namespace {
 
-bool validateStrictGenericPlan(const MetalQueryPlan& plan, std::string* error) {
-    std::vector<std::string> fallbacks;
-    if (plan.cpuSort) fallbacks.push_back("cpuSort");
-    if (plan.cpuGroupBy) fallbacks.push_back("cpuGroupBy");
-    if (plan.cpuScalarAgg) fallbacks.push_back("cpuScalarAgg");
-    if (fallbacks.empty()) return true;
-
-    if (error) {
-        std::ostringstream oss;
-        oss << "Strict generic SQL plan contains CPU relational fallback";
-        if (fallbacks.size() > 1) oss << "s";
-        oss << ": ";
-        for (size_t i = 0; i < fallbacks.size(); ++i) {
-            if (i) oss << ", ";
-            oss << fallbacks[i];
-        }
-        oss << ". This SQL shape must be implemented with GPU generic operators or rejected as unsupported.";
-        *error = oss.str();
-    }
-    return false;
+void appendPlannerReason(std::string& out,
+                         const std::string& stage,
+                         const std::string& reason) {
+    if (reason.empty()) return;
+    if (!out.empty()) out += "; ";
+    out += stage + ": " + reason;
 }
 
 std::optional<GenericRelPlan> buildValidatedGenericIr(const AnalyzedQuery& aq,
@@ -75,6 +57,8 @@ std::optional<MetalQueryPlan> buildAdhocSQLPlan(const AnalyzedQuery& aq,
         singleTableIr = buildValidatedSingleTableIr(aq, error);
         if (!singleTableIr) return std::nullopt;
     }
+
+    std::string planningErrors;
     std::optional<GenericRelPlan> multiTableMaterializeIr;
     if (!aq.isSingleTable() && aq.tables.size() >= 2 &&
         !aq.hasAggregation() && !aq.hasGroupBy() &&
@@ -83,6 +67,8 @@ std::optional<MetalQueryPlan> buildAdhocSQLPlan(const AnalyzedQuery& aq,
         aq.inSubAggs.empty()) {
         std::string irError;
         multiTableMaterializeIr = buildValidatedGenericIr(aq, &irError);
+        if (!multiTableMaterializeIr)
+            appendPlannerReason(planningErrors, "multi-table materialize IR", irError);
     }
     std::optional<GenericRelPlan> multiTableAggregateIr;
     if (!aq.isSingleTable() && aq.tables.size() >= 2 &&
@@ -90,21 +76,28 @@ std::optional<MetalQueryPlan> buildAdhocSQLPlan(const AnalyzedQuery& aq,
         aq.fromSubqueryAggs.empty()) {
         std::string irError;
         multiTableAggregateIr = buildValidatedGenericIr(aq, &irError);
+        if (!multiTableAggregateIr)
+            appendPlannerReason(planningErrors, "multi-table aggregate IR", irError);
     }
 
-    std::string singleError, multiError;
+    std::string lowerErrors;
     auto dispatch = [&]() -> std::optional<MetalQueryPlan> {
         if (singleTableIr) {
             std::string irLowerError;
             if (auto p = lowerSingleTableGroupedAggregateIRToMetal(*singleTableIr, &irLowerError)) {
                 return p;
             }
+            appendPlannerReason(lowerErrors, "single-table grouped aggregate lowerer", irLowerError);
+            irLowerError.clear();
             if (auto p = lowerSingleTableScalarAggregateIRToMetal(*singleTableIr, &irLowerError)) {
                 return p;
             }
+            appendPlannerReason(lowerErrors, "single-table scalar aggregate lowerer", irLowerError);
+            irLowerError.clear();
             if (auto p = lowerSingleTableMaterializeIRToMetal(*singleTableIr, &irLowerError)) {
                 return p;
             }
+            appendPlannerReason(lowerErrors, "single-table materialize lowerer", irLowerError);
         }
         if (multiTableMaterializeIr) {
             std::string irLowerError;
@@ -113,6 +106,7 @@ std::optional<MetalQueryPlan> buildAdhocSQLPlan(const AnalyzedQuery& aq,
                                                              &irLowerError)) {
                 return p;
             }
+            appendPlannerReason(lowerErrors, "multi-table materialize lowerer", irLowerError);
         }
         if (multiTableAggregateIr) {
             std::string irLowerError;
@@ -121,40 +115,33 @@ std::optional<MetalQueryPlan> buildAdhocSQLPlan(const AnalyzedQuery& aq,
                                                                   &irLowerError)) {
                 return p;
             }
+            appendPlannerReason(lowerErrors, "multi-table grouped aggregate lowerer", irLowerError);
+            irLowerError.clear();
             if (auto p = lowerMultiTableScalarAggregateIRToMetal(*multiTableAggregateIr,
                                                                  aq,
                                                                  &irLowerError)) {
                 return p;
             }
+            appendPlannerReason(lowerErrors, "multi-table scalar aggregate lowerer", irLowerError);
         }
         if (!aq.fromSubqueryAggs.empty()) {
             std::string irLowerError;
             if (auto p = lowerFromSubqueryAggregateIRToMetal(aq, &irLowerError)) {
                 return p;
             }
-        }
-        if (auto p = buildGenericSingleTableAdhocPlan(aq, &singleError)) {
-            return p;
-        }
-        if (auto p = buildGenericMultiTableAdhocPlan(aq, &multiError)) {
-            return p;
+            appendPlannerReason(lowerErrors, "FROM-subquery aggregate lowerer", irLowerError);
         }
         return std::nullopt;
     };
 
     auto plan = dispatch();
     if (!plan && error) {
-        if (!multiError.empty())
-            *error = multiError;
-        else if (!singleError.empty())
-            *error = singleError;
-        else
-            *error = "Ad-hoc SQL: query does not match any supported pattern.";
+        std::string detail = !lowerErrors.empty() ? lowerErrors : planningErrors;
+        *error = "Strict generic SQL: query is not implemented by Generic IR GPU lowerers";
+        if (!detail.empty()) *error += " (" + detail + ")";
+        *error += ". Legacy ADHOC_* fallback builders are disabled on the ad-hoc SQL route.";
     }
     if (!plan) return plan;
-
-    if (!validateStrictGenericPlan(*plan, error))
-        return std::nullopt;
 
     if (!label.empty()) plan->name = label;
     if (label.rfind("MB", 0) == 0) plan->chunkable = true;

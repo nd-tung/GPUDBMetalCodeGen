@@ -70,36 +70,12 @@ nlohmann::json MetalQueryPlan::toTreeJSON() const {
     nlohmann::json j;
     j["name"] = name;
     j["chunkable"] = chunkable;
-    j["strictGenericGpuOnly"] = !(cpuSort || cpuGroupBy || cpuScalarAgg);
+    j["strictGenericGpuOnly"] = true;
     j["genericOperatorShapes"] = nlohmann::json::array();
     for (const auto& phase : phases) {
         if (phase.root) j["genericOperatorShapes"].push_back(phase.root->describe());
     }
     if (gpuSort) j["genericOperatorShapes"].push_back("GpuSort");
-    if (cpuSort) {
-        nlohmann::json s;
-        s["limit"] = cpuSort->limit;
-        for (auto& k : cpuSort->keys) {
-            nlohmann::json sk;
-            sk["column"] = k.column;
-            sk["descending"] = k.descending;
-            s["keys"].push_back(sk);
-        }
-        j["cpuSort"] = s;
-    }
-    if (cpuGroupBy) {
-        nlohmann::json g;
-        g["keyColumns"] = cpuGroupBy->keyColumns;
-        g["aggColumns"] = cpuGroupBy->aggColumns;
-        g["aggFuncs"] = cpuGroupBy->aggFuncs;
-        j["cpuGroupBy"] = g;
-    }
-    if (cpuScalarAgg) {
-        nlohmann::json s;
-        s["aggColumns"] = cpuScalarAgg->aggColumns;
-        s["aggFuncs"] = cpuScalarAgg->aggFuncs;
-        j["cpuScalarAgg"] = s;
-    }
     if (gpuSort) {
         nlohmann::json gs;
         gs["sortedIndexBuffer"] = gpuSort->sortedIndexBuffer;

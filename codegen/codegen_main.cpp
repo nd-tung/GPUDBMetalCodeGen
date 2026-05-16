@@ -251,58 +251,6 @@ static bool parseRowCountWithSuffix(const std::string& text, size_t& out) {
     return out > 0;
 }
 
-static int compareResultValues(const codegen::GenericResult::Value& left,
-                               const codegen::GenericResult::Value& right) {
-    if (std::holds_alternative<std::string>(left) || std::holds_alternative<std::string>(right)) {
-        std::string l = std::holds_alternative<std::string>(left)
-            ? std::get<std::string>(left) : std::to_string(std::holds_alternative<int64_t>(left)
-                ? static_cast<double>(std::get<int64_t>(left)) : std::get<double>(left));
-        std::string r = std::holds_alternative<std::string>(right)
-            ? std::get<std::string>(right) : std::to_string(std::holds_alternative<int64_t>(right)
-                ? static_cast<double>(std::get<int64_t>(right)) : std::get<double>(right));
-        if (l < r) return -1;
-        if (l > r) return 1;
-        return 0;
-    }
-
-    double l = std::holds_alternative<int64_t>(left)
-        ? static_cast<double>(std::get<int64_t>(left)) : std::get<double>(left);
-    double r = std::holds_alternative<int64_t>(right)
-        ? static_cast<double>(std::get<int64_t>(right)) : std::get<double>(right);
-    if (l < r) return -1;
-    if (l > r) return 1;
-    return 0;
-}
-
-static void applyCpuSortAndLimit(codegen::GenericResult& result,
-                                 const codegen::MetalQueryPlan::CpuSort& cpuSort) {
-    std::vector<std::pair<size_t, bool>> keys;
-    for (const auto& key : cpuSort.keys) {
-        auto it = std::find_if(result.columns.begin(), result.columns.end(), [&](const auto& col) {
-            return col.name == key.column;
-        });
-        if (it == result.columns.end()) {
-            throw std::runtime_error("CPU sort key not present in result: " + key.column);
-        }
-        keys.push_back({static_cast<size_t>(std::distance(result.columns.begin(), it)), key.descending});
-    }
-
-    if (!keys.empty()) {
-        std::stable_sort(result.rows.begin(), result.rows.end(), [&](const auto& left, const auto& right) {
-            for (const auto& [idx, descending] : keys) {
-                int cmp = compareResultValues(left[idx], right[idx]);
-                if (cmp == 0) continue;
-                return descending ? (cmp > 0) : (cmp < 0);
-            }
-            return false;
-        });
-    }
-
-    if (cpuSort.limit >= 0 && result.rows.size() > static_cast<size_t>(cpuSort.limit)) {
-        result.rows.resize(static_cast<size_t>(cpuSort.limit));
-    }
-}
-
 // Apply GPU-sorted index remapping to materialized rows.
 // Reads d_sortIdx from the executor's allocated buffers and reorders
 // result.rows so that rows appear in the sort-order defined by the GPU.
@@ -337,162 +285,6 @@ static void applyGpuSortRemap(codegen::GenericResult& result,
 
     if (gpuSort.limit >= 0 && result.rows.size() > static_cast<size_t>(gpuSort.limit)) {
         result.rows.resize(static_cast<size_t>(gpuSort.limit));
-    }
-}
-
-// Host-side GROUP BY for MaterializeAgg fallback.
-// Groups raw rows by keyColumns and applies aggregate functions.
-static void applyCpuGroupBy(codegen::GenericResult& result,
-                             const codegen::MetalQueryPlan::CpuGroupBy& gb) {
-    if (gb.keyColumns.empty() || gb.aggColumns.empty()) return;
-    if (result.rows.empty()) return;
-
-    // Map column names to indices.
-    std::vector<size_t> keyIdx, aggIdx;
-    std::set<size_t> usedCols;
-    for (const auto& kc : gb.keyColumns) {
-        for (size_t i = 0; i < result.columns.size(); ++i) {
-            if (usedCols.count(i)) continue;
-            if (result.columns[i].name == kc) {
-                keyIdx.push_back(i);
-                usedCols.insert(i);
-                break;
-            }
-        }
-    }
-    for (const auto& ac : gb.aggColumns) {
-        for (size_t i = 0; i < result.columns.size(); ++i) {
-            if (usedCols.count(i)) continue;
-            if (result.columns[i].name == ac) {
-                aggIdx.push_back(i);
-                usedCols.insert(i);
-                break;
-            }
-        }
-    }
-    if (keyIdx.size() != gb.keyColumns.size()) return;
-    if (aggIdx.size() != gb.aggColumns.size()) return;
-
-    auto valToStr = [](const codegen::GenericResult::Value& v) -> std::string {
-        if (auto* s = std::get_if<std::string>(&v)) return *s;
-        if (auto* i = std::get_if<int64_t>(&v)) return std::to_string(*i);
-        if (auto* d = std::get_if<double>(&v)) return std::to_string(*d);
-        return "";
-    };
-
-    auto valToDouble = [](const codegen::GenericResult::Value& v) -> double {
-        if (auto* d = std::get_if<double>(&v)) return *d;
-        if (auto* i = std::get_if<int64_t>(&v)) return static_cast<double>(*i);
-        return 0.0;
-    };
-
-    struct GroupAcc {
-        codegen::GenericResult::Row keyValues;
-        std::vector<double> sums;
-        std::vector<double> counts;
-        std::vector<std::set<double>> distinctSets; // for COUNT(DISTINCT)
-    };
-    std::map<std::string, GroupAcc> groups;
-
-    for (auto& row : result.rows) {
-        std::string key;
-        for (auto ki : keyIdx) key += valToStr(row[ki]) + "\x01";
-
-        auto& ga = groups[key];
-        if (ga.sums.empty()) {
-            ga.sums.resize(aggIdx.size(), 0.0);
-            ga.counts.resize(aggIdx.size(), 0.0);
-            ga.distinctSets.resize(aggIdx.size());
-            for (auto ki : keyIdx) ga.keyValues.push_back(row[ki]);
-        }
-
-        for (size_t a = 0; a < aggIdx.size(); ++a) {
-            double val = valToDouble(row[aggIdx[a]]);
-            const std::string& fn = gb.aggFuncs[a];
-            if (fn == "COUNT" || fn == "SUM" || fn == "RATIO" || fn == "RATIO_DEN") {
-                ga.sums[a] += val;
-                ga.counts[a] += (fn == "COUNT") ? 1.0 : 0.0;
-            } else if (fn == "COUNT_DISTINCT") {
-                ga.distinctSets[a].insert(val);
-            } else if (fn == "AVG") {
-                ga.sums[a] += val;
-                ga.counts[a] += 1.0;
-            } else if (fn == "MIN") {
-                ga.sums[a] = (ga.counts[a] == 0) ? val : std::min(ga.sums[a], val);
-                ga.counts[a] = 1.0;
-            } else if (fn == "MAX") {
-                ga.sums[a] = (ga.counts[a] == 0) ? val : std::max(ga.sums[a], val);
-                ga.counts[a] = 1.0;
-            }
-        }
-    }
-
-    // Build result with aggregates computed.
-    codegen::GenericResult out;
-    out.columns = result.columns;
-    for (auto& [k, ga] : groups) {
-        codegen::GenericResult::Row row(result.columns.size());
-        for (size_t ki = 0; ki < keyIdx.size(); ++ki) {
-            row[keyIdx[ki]] = ga.keyValues[ki];
-        }
-        for (size_t a = 0; a < aggIdx.size(); ++a) {
-            const std::string& fn = gb.aggFuncs[a];
-            if (fn == "AVG" && ga.counts[a] > 0.0)
-                row[aggIdx[a]] = ga.sums[a] / ga.counts[a];
-            else if (fn == "RATIO") {
-                double num = ga.sums[a], den = (a + 1 < aggIdx.size()) ? ga.sums[a + 1] : 0.0;
-                row[aggIdx[a]] = den != 0.0 ? num / den : 0.0;
-            }             else if (fn == "RATIO_DEN") {
-                row[aggIdx[a]] = 0.0; // hide denominator column
-            } else if (fn == "COUNT_DISTINCT") {
-                row[aggIdx[a]] = static_cast<double>(ga.distinctSets[a].size());
-            }
-            else
-                row[aggIdx[a]] = ga.sums[a];
-        }
-        out.rows.push_back(std::move(row));
-    }
-
-    // Apply HAVING filter: if havingMultiplier > 0, compute global sum
-    // of the target agg column and filter rows where agg < globalSum * multiplier.
-    if (gb.havingAggIdx >= 0 && gb.havingAggIdx < (int)aggIdx.size() && !out.rows.empty()) {
-        size_t havingCol = aggIdx[gb.havingAggIdx];
-        if (gb.havingMultiplier > 0.0) {
-            double globalSum = 0.0;
-            for (auto& row : out.rows) {
-                if (auto* d = std::get_if<double>(&row[havingCol]))
-                    globalSum += *d;
-            }
-            double threshold = globalSum * gb.havingMultiplier;
-            std::vector<codegen::GenericResult::Row> filtered;
-            for (auto& row : out.rows) {
-                if (auto* d = std::get_if<double>(&row[havingCol])) {
-                    if (*d > threshold) filtered.push_back(std::move(row));
-                }
-            }
-            out.rows = std::move(filtered);
-        }
-    }
-
-    result = std::move(out);
-
-    // Remove hidden columns (__hidden_ prefix, used for RATIO denominator).
-    {
-        std::vector<size_t> dropIndices;
-        for (size_t c = 0; c < result.columns.size(); ++c) {
-            if (result.columns[c].name.compare(0, 9, "__hidden_") == 0)
-                dropIndices.push_back(c);
-        }
-        if (!dropIndices.empty()) {
-            // Remove from columns (reverse order to preserve indices)
-            for (auto it = dropIndices.rbegin(); it != dropIndices.rend(); ++it)
-                result.columns.erase(result.columns.begin() + *it);
-            // Remove from rows
-            for (auto& row : result.rows) {
-                for (auto it = dropIndices.rbegin(); it != dropIndices.rend(); ++it)
-                    row.erase(row.begin() + *it);
-            }
-        }
     }
 }
 
@@ -654,19 +446,6 @@ static bool runCodegenQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
                        i, ph.name.c_str(), ph.threadgroupSize,
                        ph.singleThread ? "true" : "false",
                        ph.bitmapReads.size(), ph.scalarParams.size(), ph.extraBuffers.size());
-            }
-            if (plan.cpuSort) {
-                printf("  cpuSort.keys      : %zu  limit=%d\n",
-                       plan.cpuSort->keys.size(), plan.cpuSort->limit);
-            }
-            if (plan.cpuGroupBy) {
-                printf("  cpuGroupBy.keys   : %zu  aggs=%zu\n",
-                       plan.cpuGroupBy->keyColumns.size(),
-                       plan.cpuGroupBy->aggColumns.size());
-            }
-            if (plan.cpuScalarAgg) {
-                printf("  cpuScalarAgg.aggs : %zu\n",
-                       plan.cpuScalarAgg->aggColumns.size());
             }
             if (plan.gpuSort) {
                 printf("  gpuSort.index     : %s  limit=%d\n",
@@ -1414,17 +1193,9 @@ static bool runCodegenQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
             result.result.rows.push_back({std::string("SHIP"), shipHigh, shipLow});
         }
 
-        if (plan.cpuGroupBy && !result.result.columns.empty()) {
-            applyCpuGroupBy(result.result, *plan.cpuGroupBy);
-        }
-
         // GPU-sorted materialized output: remap rows using sorted index buffer
         if (plan.gpuSort && !result.result.columns.empty()) {
             applyGpuSortRemap(result.result, *plan.gpuSort, executor);
-        }
-
-        if (plan.cpuSort && !result.result.columns.empty()) {
-            applyCpuSortAndLimit(result.result, *plan.cpuSort);
         }
 
         // 7. Print generic results.
