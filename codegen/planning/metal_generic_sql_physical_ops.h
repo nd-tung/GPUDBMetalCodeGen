@@ -35,6 +35,30 @@ struct GenericMatColumnDesc {
     std::string distinctDomainSymbol;
 };
 
+struct GenericSortSpec {
+    struct SortKey {
+        std::string column;
+        bool descending = false;
+    };
+    std::vector<SortKey> keys;
+    int limit = -1;
+};
+
+struct GenericGroupSpec {
+    std::vector<std::string> keyColumns;
+    std::vector<std::string> aggColumns;
+    std::vector<std::string> aggFuncs;
+    std::vector<std::string> outputColumns;
+    std::vector<std::pair<int,int>> ratioPairs;
+    int havingAggIdx = -1;
+    double havingMultiplier = 0;
+    int havingSentinel = 0;
+    std::string havingScalarCompareOp = ">";
+    int havingCompareAggIdx = -1;
+    std::string havingCompareOp;
+    double havingCompareValue = 0;
+};
+
 struct GenericGpuGroupSpec {
     std::string tag;
     std::string inputCounter;
@@ -43,7 +67,7 @@ struct GenericGpuGroupSpec {
     std::string capacitySymbol;
     std::string outputCounter;
     std::vector<GenericMatColumnDesc> inputColumns;
-    MetalQueryPlan::CpuGroupBy groupBy;
+    GenericGroupSpec groupBy;
 };
 
 struct KeyedCompactKeySpec {
@@ -92,7 +116,7 @@ bool appendGenericGpuSort(MetalQueryPlan& plan,
                           const std::string& nRowsSymbol,
                           const std::string& capacityExpr,
                           const std::vector<GenericMatColumnDesc>& columns,
-                          const MetalQueryPlan::CpuSort& cpuSort,
+                          const GenericSortSpec& sortSpec,
                           std::string* error);
 
 } // namespace codegen

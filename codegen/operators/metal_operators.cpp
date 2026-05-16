@@ -42,7 +42,27 @@ void MetalOperator::appendIUsFromExpr(const std::string& expr,
         i = ce + 1;
     }
 
-    // --- Pass 2: bare column refs in fixed-string helpers ---
+    // --- Pass 2: fixed-string pointer expressions ---
+    // Materialization of CHAR_FIXED/CHAR1 values passes a row pointer, e.g.
+    // "o_orderpriority + i * 15". Register the bare column with the row index.
+    i = 0;
+    while (i < n) {
+        if (!isIdent(expr[i])) { ++i; continue; }
+        size_t cs = i;
+        while (i < n && isIdent(expr[i])) ++i;
+        std::string colName = expr.substr(cs, i - cs);
+        size_t p = i;
+        while (p < n && expr[p] == ' ') ++p;
+        if (p >= n || expr[p] != '+') continue;
+        ++p;
+        while (p < n && expr[p] == ' ') ++p;
+        if (p >= n || !isIdent(expr[p])) continue;
+        size_t is = p;
+        while (p < n && isIdent(expr[p])) ++p;
+        out.emplace_back(colName, expr.substr(is, p - is));
+    }
+
+    // --- Pass 3: bare column refs in fixed-string helpers ---
     // These helpers take the column buffer as first arg (bare identifier
     // without [idx]) and the row index as second arg: (uint)(idxVar).
     // Pattern: fixed_like_one_segment(COL, (uint)(IDX), ...
@@ -420,6 +440,75 @@ void MetalArrayLookup::produce(MetalCodegen& cg, ConsumerFn consume) {
 
 std::string MetalArrayLookup::describe() const {
     return "ArrayLookup(" + resultVar_ + " = " + arrayName_ + "[" + keyExpr_ + "])";
+}
+
+// ===================================================================
+// MetalArraySliceStore
+// ===================================================================
+
+MetalArraySliceStore::MetalArraySliceStore(std::unique_ptr<MetalOperator> child,
+                                           const std::string& arrayName,
+                                           const std::string& keyExpr,
+                                           const std::string& valuePtrExpr,
+                                           int sliceLen,
+                                           const std::string& valueType,
+                                           const std::string& sizeExpr,
+                                           int fillByte,
+                                           std::string sourceColumn,
+                                           std::string sourceIdxVar)
+    : MetalUnaryOperator(std::move(child)),
+      arrayName_(arrayName), keyExpr_(keyExpr), valuePtrExpr_(valuePtrExpr),
+      sliceLen_(sliceLen), valueType_(valueType), sizeExpr_(sizeExpr),
+      fillByte_(fillByte), sourceColumn_(std::move(sourceColumn)),
+      sourceIdxVar_(std::move(sourceIdxVar)) {}
+
+void MetalArraySliceStore::produce(MetalCodegen& cg, ConsumerFn consume) {
+    cg.addBufferParam(arrayName_, valueType_, sizeExpr_, true, fillByte_);
+
+    child_->produce(cg, [&]() {
+        cg.addBlock("for (uint _slice_i = 0; _slice_i < " +
+                    std::to_string(sliceLen_) + "u; ++_slice_i)", [&]() {
+            cg.addLine(arrayName_ + "[(" + keyExpr_ + ") * " +
+                       std::to_string(sliceLen_) + "u + _slice_i] = (" +
+                       valuePtrExpr_ + ")[_slice_i];");
+        });
+        consume();
+    });
+}
+
+std::string MetalArraySliceStore::describe() const {
+    return "ArraySliceStore(" + arrayName_ + "[" + keyExpr_ + ", width=" +
+           std::to_string(sliceLen_) + "] = " + valuePtrExpr_ + ")";
+}
+
+// ===================================================================
+// MetalArraySliceLookup
+// ===================================================================
+
+MetalArraySliceLookup::MetalArraySliceLookup(std::unique_ptr<MetalOperator> child,
+                                             const std::string& arrayName,
+                                             const std::string& keyExpr,
+                                             const std::string& resultVar,
+                                             int sliceLen,
+                                             const std::string& resultType)
+    : MetalUnaryOperator(std::move(child)),
+      arrayName_(arrayName), keyExpr_(keyExpr), resultVar_(resultVar),
+      sliceLen_(sliceLen), resultType_(resultType) {}
+
+void MetalArraySliceLookup::produce(MetalCodegen& cg, ConsumerFn consume) {
+    cg.addBufferParam(arrayName_, resultType_, "", false);
+
+    child_->produce(cg, [&]() {
+        cg.addLine("const device " + resultType_ + "* " + resultVar_ + " = " +
+                   arrayName_ + " + (" + keyExpr_ + ") * " +
+                   std::to_string(sliceLen_) + "u;");
+        consume();
+    });
+}
+
+std::string MetalArraySliceLookup::describe() const {
+    return "ArraySliceLookup(" + resultVar_ + " = " + arrayName_ + "[" +
+           keyExpr_ + ", width=" + std::to_string(sliceLen_) + "])";
 }
 
 // ===================================================================

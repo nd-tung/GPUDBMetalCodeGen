@@ -308,6 +308,63 @@ private:
     int sentinel_;
 };
 
+// Store: map[key * width + byte] = value[byte]
+class MetalArraySliceStore : public MetalUnaryOperator {
+public:
+    MetalArraySliceStore(std::unique_ptr<MetalOperator> child,
+                         const std::string& arrayName,
+                         const std::string& keyExpr,
+                         const std::string& valuePtrExpr,
+                         int sliceLen,
+                         const std::string& valueType = "char",
+                         const std::string& sizeExpr = "",
+                         int fillByte = 0,
+                         std::string sourceColumn = {},
+                         std::string sourceIdxVar = {});
+    void produce(MetalCodegen& cg, ConsumerFn consume) override;
+    std::string describe() const override;
+    void iusUsed(std::vector<IU>& out) const override {
+        appendIUsFromExpr(keyExpr_, out);
+        appendIUsFromExpr(valuePtrExpr_, out);
+        if (!sourceColumn_.empty() && !sourceIdxVar_.empty())
+            out.emplace_back(sourceColumn_, sourceIdxVar_);
+    }
+
+private:
+    std::string arrayName_;
+    std::string keyExpr_;
+    std::string valuePtrExpr_;
+    int sliceLen_ = 0;
+    std::string valueType_;
+    std::string sizeExpr_;
+    int fillByte_;
+    std::string sourceColumn_;
+    std::string sourceIdxVar_;
+};
+
+// Lookup: const device type* var = map + key * width
+class MetalArraySliceLookup : public MetalUnaryOperator {
+public:
+    MetalArraySliceLookup(std::unique_ptr<MetalOperator> child,
+                          const std::string& arrayName,
+                          const std::string& keyExpr,
+                          const std::string& resultVar,
+                          int sliceLen,
+                          const std::string& resultType = "char");
+    void produce(MetalCodegen& cg, ConsumerFn consume) override;
+    std::string describe() const override;
+    void iusUsed(std::vector<IU>& out) const override {
+        appendIUsFromExpr(keyExpr_, out);
+    }
+
+private:
+    std::string arrayName_;
+    std::string keyExpr_;
+    std::string resultVar_;
+    int sliceLen_ = 0;
+    std::string resultType_;
+};
+
 // ===================================================================
 // HASH-MAP OPERATORS  (composite-key, linear-probing)
 // ===================================================================

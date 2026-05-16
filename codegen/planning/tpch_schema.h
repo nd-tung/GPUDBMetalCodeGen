@@ -244,6 +244,7 @@ public:
         if (table == "lineitem" && col == "l_suppkey") return "maxSuppkey";
         if (table == "orders" && col == "o_custkey") return "maxCustkey";
         if (table == "partsupp" && col == "ps_partkey") return "maxPartkey";
+        if (table == "partsupp" && col == "ps_suppkey") return "maxSuppkey";
         if (table == "customer" && col == "c_nationkey") return "25";
         if (table == "supplier" && col == "s_nationkey") return "25";
         if (table == "nation" && col == "n_regionkey") return "5";
@@ -287,7 +288,6 @@ public:
         if (table == "lineitem") return std::make_pair("l_orderkey",  "maxOrderkey");
         if (table == "supplier") return std::make_pair("s_suppkey",   "maxSuppkey");
         if (table == "part")     return std::make_pair("p_partkey",   "maxPartkey");
-        if (table == "partsupp") return std::make_pair("ps_suppkey",  "maxSuppkey");
         if (table == "nation")   return std::make_pair("n_nationkey", "25");
         if (table == "region")   return std::make_pair("r_regionkey", "5");
         return std::nullopt;

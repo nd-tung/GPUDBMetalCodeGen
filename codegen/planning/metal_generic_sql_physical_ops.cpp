@@ -413,7 +413,22 @@ public:
                         cg.addLine("float _threshold = as_type<float>(_tot_raw) * " +
                                    std::to_string(spec_.groupBy.havingMultiplier) + "f;");
                     }
-                    cg.addIf("_hv <= _threshold", [&]() { cg.addLine("continue;"); });
+                    const std::string scalarOp = spec_.groupBy.havingScalarCompareOp.empty()
+                        ? ">"
+                        : spec_.groupBy.havingScalarCompareOp;
+                    cg.addIf("!(_hv " + scalarOp + " _threshold)", [&]() {
+                        cg.addLine("continue;");
+                    });
+                }
+                if (spec_.groupBy.havingCompareAggIdx >= 0 &&
+                    !spec_.groupBy.havingCompareOp.empty()) {
+                    const int h = spec_.groupBy.havingCompareAggIdx;
+                    cg.addLine("float _having_value = " +
+                               aggregateValueExprForComparison((size_t)h, "_slot") + ";");
+                    cg.addIf("!(_having_value " + spec_.groupBy.havingCompareOp + " " +
+                             std::to_string(spec_.groupBy.havingCompareValue) + "f)", [&]() {
+                        cg.addLine("continue;");
+                    });
                 }
                 cg.addLine("uint _pos = atomic_fetch_add_explicit(&" + spec_.outputCounter +
                            "[0], 1u, memory_order_relaxed);");
@@ -546,6 +561,15 @@ private:
         }
         return "as_type<float>(atomic_load_explicit(&" + aggName(ai) +
                "[" + slot + "], memory_order_relaxed))";
+    }
+
+    std::string aggregateValueExprForComparison(size_t ai, const std::string& slot) const {
+        const std::string fn = fnAt(ai);
+        if (fn == "SUM" && aggScale(ai) > 0) {
+            return "(" + longPairAsFloatExpr(aggName(ai), slot) + " / " +
+                   std::to_string(aggScale(ai)) + ".0f)";
+        }
+        return aggregateValueExpr(ai, slot);
     }
 
     void emitDistinctCount(MetalCodegen& cg, size_t ai, const std::string& slot) const {
@@ -935,31 +959,39 @@ std::vector<GenericMatColumnDesc> genericGpuGroupOutputColumns(
             if (spec.groupBy.aggColumns[ai] == display) return (int)ai;
         return -1;
     };
-    for (const auto& col : spec.inputColumns) {
-        const std::string display = col.displayName;
+    auto appendDisplay = [&](const std::string& display) {
+        const auto* col = findMatColumn(spec.inputColumns, display);
+        if (!col) return;
         int ai = aggIndex(display);
         const std::string fn = ai >= 0 && (size_t)ai < spec.groupBy.aggFuncs.size()
             ? spec.groupBy.aggFuncs[(size_t)ai] : "";
-        if (display.rfind("__hidden_", 0) == 0 || fn == "RATIO_DEN") continue;
-        if (seen.count(display)) continue;
+        if (display.rfind("__hidden_", 0) == 0 || fn == "RATIO_DEN") return;
+        if (seen.count(display)) return;
         if (isGroupKey(display)) {
             out.push_back({display, "d_gpu_gb_" + suffix + "_out_" + sanitizeIdentifier(display),
-                           col.metalType, col.stringLen});
+                           col->metalType, col->stringLen});
         } else if (ai >= 0) {
             bool longPair = false;
             int scaleDown = 0;
             std::string outType = "float";
             if (fn == "COUNT_DISTINCT") {
                 outType = "uint";
-            } else if (fn == "SUM" && col.scaleDown > 0) {
+            } else if (fn == "SUM" && col->scaleDown > 0) {
                 outType = "uint";
-                scaleDown = col.scaleDown;
+                scaleDown = col->scaleDown;
                 longPair = true;
             }
             out.push_back({display, "d_gpu_gb_" + suffix + "_out_" + sanitizeIdentifier(display),
                            outType, 0, scaleDown, longPair});
         }
         seen.insert(display);
+    };
+
+    for (const auto& display : spec.groupBy.outputColumns) {
+        appendDisplay(display);
+    }
+    for (const auto& col : spec.inputColumns) {
+        appendDisplay(col.displayName);
     }
     return out;
 }
@@ -1004,10 +1036,10 @@ bool appendGenericGpuSort(MetalQueryPlan& plan,
                           const std::string& nRowsSymbol,
                           const std::string& capacityExpr,
                           const std::vector<GenericMatColumnDesc>& columns,
-                          const MetalQueryPlan::CpuSort& cpuSort,
+                          const GenericSortSpec& sortSpec,
                           std::string* error) {
     std::vector<GenericSortKeySpec> keys;
-    for (const auto& sk : cpuSort.keys) {
+    for (const auto& sk : sortSpec.keys) {
         const auto* col = findMatColumn(columns, sk.column);
         if (!col) {
             if (error) *error = "GPU sort key not present in materialized output: " + sk.column;
@@ -1025,7 +1057,7 @@ bool appendGenericGpuSort(MetalQueryPlan& plan,
             std::make_unique<MetalGenericSortStep>(idxBuf, keys, capacityExpr));
         sortPhase.postDispatchHook = makeGenericSortHook(phaseName, idxBuf, nRowsSymbol, keys);
     }
-    plan.gpuSort = MetalQueryPlan::GpuSort{idxBuf, nRowsSymbol, false, cpuSort.limit};
+    plan.gpuSort = MetalQueryPlan::GpuSort{idxBuf, nRowsSymbol, false, sortSpec.limit};
     return true;
 }
 

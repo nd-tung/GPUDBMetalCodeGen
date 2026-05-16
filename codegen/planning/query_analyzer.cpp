@@ -71,6 +71,22 @@ std::pair<std::string, std::string> resolveColumn(const std::string& colName,
     return {"", colName};
 }
 
+bool isInlinedSubqueryPlaceholder(const PredPtr& pred) {
+    if (!pred) return false;
+    if (std::holds_alternative<ExistsPred>(pred->node)) return true;
+    if (auto* notPred = std::get_if<LogicalNot>(&pred->node)) {
+        if (!notPred->child) return false;
+        if (std::holds_alternative<ExistsPred>(notPred->child->node))
+            return true;
+        if (auto* inList = std::get_if<InList>(&notPred->child->node))
+            return inList->values.empty();
+        return false;
+    }
+    if (auto* inList = std::get_if<InList>(&pred->node))
+        return inList->values.empty();
+    return false;
+}
+
 } // anonymous namespace
 
 // File-scope: scalar subqueries encountered during walkExpr.
@@ -1328,14 +1344,24 @@ AnalyzedQuery analyzeSQL(const std::string& sql, const SchemaProvider* schema) {
                     }
                     // Add join: outer_col = inner_col
                     if (testCol && !innerCol.table.empty()) {
+                        std::string innerJoinName = innerCol.tableAlias;
+                        if (innerJoinName.empty()) {
+                            for (size_t ti = tablesBefore; ti < aq.tables.size() && ti < aq.tableAliases.size(); ++ti) {
+                                if (aq.tables[ti] == innerCol.table) {
+                                    innerJoinName = aq.tableAliases[ti];
+                                    break;
+                                }
+                            }
+                        }
+                        if (innerJoinName.empty()) innerJoinName = innerCol.table;
                         JoinClause jc;
                         jc.leftTable = testCol->table;
                         jc.leftCol = testCol->column;
-                        jc.rightTable = innerCol.table;
+                        jc.rightTable = innerJoinName;
                         jc.rightCol = innerCol.column;
                         jc.anti = negated;
                         jc.semi = true;
-                        jc.innerTable = innerCol.table;
+                        jc.innerTable = innerJoinName;
                         aq.joins.push_back(jc);
                     }
                     // Extract inner WHERE conditions as joins/filters
@@ -1497,28 +1523,22 @@ AnalyzedQuery analyzeSQL(const std::string& sql, const SchemaProvider* schema) {
         // Also remove LogicalNot(InList) wrappers around empty InLists.
         aq.filters.erase(
             std::remove_if(aq.filters.begin(), aq.filters.end(),
-                [](const PredPtr& p) {
-                    if (std::holds_alternative<ExistsPred>(p->node)) return true;
-                    if (auto* ln = std::get_if<LogicalNot>(&p->node)) {
-                        if (ln->child && std::holds_alternative<ExistsPred>(ln->child->node))
-                            return true;
-                        // Also remove LogicalNot wrapping empty InList (from NOT IN subquery)
-                        if (auto* il = ln->child ? std::get_if<InList>(&ln->child->node) : nullptr)
-                            return il->values.empty();
-                    }
-                    if (auto* il = std::get_if<InList>(&p->node)) {
-                        return il->values.empty(); // empty = placeholder from ANY_SUBLINK
-                    }
-                    return false;
-                }),
+                isInlinedSubqueryPlaceholder),
             aq.filters.end());
+        for (auto& [_, filters] : aq.instanceFilters) {
+            filters.erase(
+                std::remove_if(filters.begin(), filters.end(),
+                               isInlinedSubqueryPlaceholder),
+                filters.end());
+        }
     }
 
     // Rebuild alias map after inlineExists may have added new tables
     // with aliases (e.g. Q21's l2, l3 from EXISTS subqueries).
     for (size_t i = 0; i < aq.tables.size() && i < aq.tableAliases.size(); ++i) {
-                            g_aliasMap[aq.tableAliases[i]] = aq.tables[i];
-                        }
+        g_aliasMap[aq.tableAliases[i]] = aq.tables[i];
+    }
+    aq.aliasMap = g_aliasMap;
 
     // 3. Extract SELECT targets
     if (sel.contains("targetList")) {
