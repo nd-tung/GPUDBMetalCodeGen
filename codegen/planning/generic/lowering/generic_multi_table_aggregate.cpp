@@ -2,6 +2,7 @@
 
 #include "generic/gpu_ops/generic_gpu_physical_ops.h"
 #include "generic/lowering/generic_aggregate_helpers.h"
+#include "generic/lowering/generic_cost_model.h"
 #include "generic/lowering/generic_expression_metal.h"
 #include "generic/lowering/generic_join_carry.h"
 #include "generic/lowering/generic_multi_table_checks.h"
@@ -17,6 +18,7 @@
 #include <cctype>
 #include <cstring>
 #include <cstdint>
+#include <functional>
 #include <iterator>
 #include <limits>
 #include <map>
@@ -51,6 +53,12 @@ void prependPlanPhases(MetalQueryPlan& target, MetalQueryPlan& prefix) {
             std::make_move_iterator(prefix.phases.begin()),
             std::make_move_iterator(prefix.phases.end()));
     }
+    if (!prefix.costTraces.empty()) {
+        target.costTraces.insert(
+            target.costTraces.begin(),
+            std::make_move_iterator(prefix.costTraces.begin()),
+            std::make_move_iterator(prefix.costTraces.end()));
+    }
 }
 
 std::string metalCharLiteralLocal(char c) {
@@ -67,9 +75,66 @@ std::string materializedValueAt(const GenericMatColumnDesc& col,
     }
     if (col.stringLen > 0) {
         return col.bufferName + "[" + row + " * " +
-               std::to_string(col.stringLen) + "u]";
+               std::to_string(col.stringLen) + "ul]";
     }
     return col.bufferName + "[" + row + "]";
+}
+
+std::string domainCarryStorageBufferName(
+        const GenericJoinDomainBitmapInfo& storage,
+        const GenericColumnExpr& col) {
+    std::string storageScope =
+        !storage.storageAlias.empty() ? storage.storageAlias
+                                      : storage.storageTable;
+    std::string originScope = !col.alias.empty() ? col.alias : col.table;
+    return "d_ir_carry_" + sanitizeIdentifier(storageScope) + "_" +
+           sanitizeIdentifier(originScope) + "_" +
+           sanitizeIdentifier(col.column);
+}
+
+void appendPostDispatchHook(MetalQueryPlan::Phase& phase,
+                            PostDispatchHook hook) {
+    auto previous = std::move(phase.postDispatchHook);
+    phase.postDispatchHook =
+        [previous = std::move(previous), hook = std::move(hook)](
+                MetalGenericExecutor& executor) mutable {
+            double extraMs = 0.0;
+            if (previous) extraMs += previous(executor);
+            if (hook) extraMs += hook(executor);
+            return extraMs;
+        };
+}
+
+void attachHavingTotalScalarHook(MetalQueryPlan::Phase& phase,
+                                 std::string totalBuffer,
+                                 std::string scalarName,
+                                 bool isLongPair,
+                                 bool isFloatSum) {
+    appendPostDispatchHook(
+        phase,
+        [totalBuffer = std::move(totalBuffer),
+         scalarName = std::move(scalarName),
+         isLongPair,
+         isFloatSum](MetalGenericExecutor& executor) {
+            auto* buffer = executor.getAllocatedBuffer(totalBuffer);
+            if (!buffer) return 0.0;
+            const auto* words =
+                static_cast<const uint32_t*>(buffer->contents());
+            float value = 0.0f;
+            if (isLongPair) {
+                uint64_t raw = (static_cast<uint64_t>(words[1]) << 32) |
+                               static_cast<uint64_t>(words[0]);
+                int64_t signedValue = 0;
+                std::memcpy(&signedValue, &raw, sizeof(signedValue));
+                value = static_cast<float>(signedValue);
+            } else if (isFloatSum) {
+                std::memcpy(&value, words, sizeof(value));
+            } else {
+                value = static_cast<float>(words[0]);
+            }
+            executor.registerScalarFloat(scalarName, value);
+            return 0.0;
+        });
 }
 
 void replaceAllInPlace(std::string& value,
@@ -115,7 +180,7 @@ std::string fixedStringDomainBucketExpr(const std::string& buffer,
                                         const std::vector<std::string>& domain) {
     if (domain.empty() || width <= 0) return "";
     const std::string ptr = buffer + " + " + row + " * " +
-                            std::to_string(width) + "u";
+                            std::to_string(width) + "ul";
     return fixedStringPointerDomainBucketExpr(ptr, width, domain);
 }
 
@@ -769,90 +834,14 @@ std::string groupHashCapacityExpr(const std::string& inputSizeExpr,
     return "next_pow2(" + outputBoundExpr + " * 2 + 4096)";
 }
 
-struct DenseGroupCostChoice {
-    bool useDense = false;
-    double denseCost = 0.0;
-    double hashCost = 0.0;
-    std::string reason;
-};
-
-DenseGroupCostChoice chooseDenseGroupPlan(
-        const std::vector<IrGroupKeyDesc>& keys,
-        const std::vector<IrPendingAgg>& pending,
-        int totalBuckets,
-        bool dynamicDomain,
-        const KeyedCompactHavingSpec& havingSpec) {
-    DenseGroupCostChoice choice;
-    if (keys.empty() || pending.empty() || totalBuckets <= 0) {
-        choice.reason = "invalid dense group shape";
-        return choice;
-    }
-
-    bool allAdds = true;
-    int valueSlots = 0;
-    for (const auto& agg : pending) {
-        if (agg.atomicOp != "add") allAdds = false;
-        valueSlots += agg.isLongPair ? 2 : 1;
-    }
-    valueSlots = std::max(1, valueSlots);
-
-    bool hasDynamicKey = dynamicDomain;
-    bool hasDynamicStringRowRef = false;
-    for (const auto& key : keys) {
-        if (!key.numValuesExpr.empty()) {
-            hasDynamicKey = true;
-            hasDynamicStringRowRef = hasDynamicStringRowRef || key.stringRowRef;
-        }
-    }
-
-    constexpr int kMaxBucketsForLocalReduce = 64;
-    constexpr int kMinAggsForLocalReduce = 3;
-    constexpr int kMaxSingleAggTinyBucketsForLocalReduce = 16;
-    constexpr int kMaxBucketsForTgAtomicReduce = 256;
-    const bool hasHavingTotal = !havingSpec.scalarTotalBuffer.empty();
-    const bool localReduceEligible =
-        allAdds && !hasHavingTotal && !dynamicDomain &&
-        totalBuckets <= kMaxBucketsForLocalReduce &&
-        (static_cast<int>(pending.size()) >= kMinAggsForLocalReduce ||
-         totalBuckets <= kMaxSingleAggTinyBucketsForLocalReduce);
-    const bool tgAtomicReduceEligible =
-        allAdds && !hasHavingTotal && !dynamicDomain &&
-        totalBuckets <= kMaxBucketsForTgAtomicReduce;
-
-    const double keyCost = static_cast<double>(keys.size()) * 8.0;
-    const double aggCost = static_cast<double>(pending.size()) * 12.0;
-    choice.hashCost = 160.0 + keyCost + aggCost;
-    choice.denseCost =
-        static_cast<double>(totalBuckets * valueSlots) * 0.25 + keyCost +
-        (localReduceEligible ? aggCost * 0.25 :
-         tgAtomicReduceEligible ? aggCost * 1.5 : aggCost * 8.0);
-
-    if (hasDynamicKey) {
-        choice.denseCost += hasDynamicStringRowRef ? 24.0 : 0.0;
-        choice.denseCost += hasHavingTotal ? 32.0 : 0.0;
-        choice.useDense = choice.denseCost < choice.hashCost;
-        if (!choice.useDense)
-            choice.reason = "hash group estimated cheaper for dynamic dense key";
-        return choice;
-    }
-
-    if (!localReduceEligible && !tgAtomicReduceEligible) {
-        choice.reason = hasHavingTotal
-            ? "HAVING total prevents local dense reduction"
-            : "dense group cannot reduce atomics locally";
-        return choice;
-    }
-
-    choice.useDense = choice.denseCost < choice.hashCost;
-    if (!choice.useDense)
-        choice.reason = "hash group estimated cheaper";
-    return choice;
-}
-
 struct PrimaryKeyGroupReduction {
     size_t groupIndex = 0;
     std::string outputBoundExpr;
     std::string keyDomainExpr;
+    int relationInstance = -1;
+    std::string table;
+    std::string alias;
+    std::string keyColumn;
 };
 
 std::optional<PrimaryKeyGroupReduction> primaryKeyGroupReduction(
@@ -962,6 +951,10 @@ std::optional<PrimaryKeyGroupReduction> primaryKeyGroupReduction(
                 ? tableSizeName(inst.baseName)
                 : rel->primaryKeyDomainSymbol;
             out.keyDomainExpr = rel->primaryKeyDomainSymbol;
+            out.relationInstance = inst.id.value;
+            out.table = inst.baseName;
+            out.alias = inst.alias;
+            out.keyColumn = rel->primaryKeyColumn;
             return out;
         }
     }
@@ -1020,6 +1013,388 @@ private:
     std::string idxVar_;
     std::vector<GenericMatColumnDesc> columns_;
     std::vector<ExtraBuffer> extraBuffers_;
+};
+
+struct DomainAggReuseColumnSpec {
+    GenericMatColumnDesc output;
+    std::string sourceBuffer;
+    std::string sourceMetalType;
+    bool fromDomainKey = false;
+    bool sourceIsStringRowRef = false;
+    std::string stringSourceTable;
+    std::string stringSourceColumn;
+};
+
+class MetalDomainAggReuseMaterialize : public MetalOperator {
+public:
+    MetalDomainAggReuseMaterialize(std::string bitmapName,
+                                   std::string keyDomain,
+                                   std::string aggBuffer,
+                                   std::string keyListBuffer,
+                                   std::string keyListCountBuffer,
+                                   std::string outputCounter,
+                                   std::vector<DomainAggReuseColumnSpec> columns,
+                                   GenericMatColumnDesc aggregateOutput)
+        : bitmapName_(std::move(bitmapName)),
+          keyDomain_(std::move(keyDomain)),
+          aggBuffer_(std::move(aggBuffer)),
+          keyListBuffer_(std::move(keyListBuffer)),
+          keyListCountBuffer_(std::move(keyListCountBuffer)),
+          outputCounter_(std::move(outputCounter)),
+          columns_(std::move(columns)),
+          aggregateOutput_(std::move(aggregateOutput)) {}
+
+    void produce(MetalCodegen& cg, ConsumerFn consume) override {
+        const std::string domainParam =
+            "n_domain_agg_reuse_" + sanitizeIdentifier(outputCounter_);
+        cg.addResolvedScalarParam(domainParam, "uint", keyDomain_);
+        cg.addBitmapReadParam(bitmapName_, "(" + keyDomain_ + " + 31) / 32");
+        cg.addBufferParam(aggBuffer_, "atomic_uint", keyDomain_, false);
+        const bool useKeyList =
+            !keyListBuffer_.empty() && !keyListCountBuffer_.empty();
+        if (useKeyList) {
+            cg.addBufferParam(keyListBuffer_, "uint", keyDomain_, false);
+            cg.addBufferParam(keyListCountBuffer_, "const atomic_uint", "1",
+                              false);
+        }
+        cg.addAtomicBufferParam(outputCounter_, "atomic_uint", "1");
+
+        for (const auto& col : columns_) {
+            if (!col.fromDomainKey) {
+                cg.addBufferParam(col.sourceBuffer,
+                                  col.sourceIsStringRowRef
+                                      ? "uint"
+                                      : col.sourceMetalType,
+                                  keyDomain_, false);
+            }
+            if (col.sourceIsStringRowRef &&
+                !col.stringSourceTable.empty() &&
+                !col.stringSourceColumn.empty()) {
+                cg.addColumnParam(col.stringSourceColumn, "char",
+                                  col.stringSourceTable);
+            }
+        }
+
+        auto addOutput = [&](const GenericMatColumnDesc& out) {
+            std::string sizeExpr = keyDomain_;
+            if (out.stringLen > 0)
+                sizeExpr += " * " + std::to_string(out.stringLen);
+            if (out.isLongPair)
+                sizeExpr += " * 2";
+            cg.addBufferParam(out.bufferName, out.metalType, sizeExpr, false);
+            cg.registerOutputColumn(out.displayName, out.bufferName,
+                                    out.metalType, out.stringLen,
+                                    out.scaleDown, out.isLongPair);
+        };
+
+        cg.registerMaterializeOutput(outputCounter_);
+        for (const auto& col : columns_)
+            addOutput(col.output);
+        addOutput(aggregateOutput_);
+
+        const std::string scanLimit = useKeyList
+            ? "atomic_load_explicit(&" + keyListCountBuffer_ +
+                  "[0], memory_order_relaxed)"
+            : domainParam;
+        cg.addBlock("for (uint _scan = tid; _scan < " + scanLimit +
+                    "; _scan += tpg)", [&]() {
+            if (useKeyList)
+                cg.addLine("uint _key = " + keyListBuffer_ + "[_scan];");
+            else
+                cg.addLine("uint _key = _scan;");
+            cg.addIf("bitmap_test_atomic(" + bitmapName_ + ", _key)", [&]() {
+                cg.addLine("uint _pos = atomic_fetch_add_explicit(&" +
+                           outputCounter_ +
+                           "[0], 1u, memory_order_relaxed);");
+                for (const auto& col : columns_)
+                    emitColumnWrite(cg, col);
+                cg.addLine(aggregateOutput_.bufferName +
+                           "[_pos] = as_type<float>(atomic_load_explicit(&" +
+                           aggBuffer_ + "[_key], memory_order_relaxed));");
+                consume();
+            });
+        });
+    }
+
+    std::string describe() const override {
+        return "DomainAggReuseMaterialize(" + aggBuffer_ + ")";
+    }
+
+private:
+    std::string bitmapName_;
+    std::string keyDomain_;
+    std::string aggBuffer_;
+    std::string keyListBuffer_;
+    std::string keyListCountBuffer_;
+    std::string outputCounter_;
+    std::vector<DomainAggReuseColumnSpec> columns_;
+    GenericMatColumnDesc aggregateOutput_;
+
+    void emitColumnWrite(MetalCodegen& cg,
+                         const DomainAggReuseColumnSpec& col) const {
+        const auto& out = col.output;
+        if (out.stringLen > 0 && col.sourceIsStringRowRef) {
+            const int width = std::max(1, out.stringLen);
+            cg.addLine("uint _src_row_" + sanitizeIdentifier(out.displayName) +
+                       " = " + col.sourceBuffer + "[_key];");
+            cg.addBlock("for (uint _oc = 0; _oc < " +
+                        std::to_string(width) + "u; ++_oc)", [&]() {
+                cg.addLine(out.bufferName + "[_pos * " +
+                           std::to_string(width) + "u + _oc] = " +
+                           col.stringSourceColumn + "[_src_row_" +
+                           sanitizeIdentifier(out.displayName) + " * " +
+                           std::to_string(width) + "u + _oc];");
+            });
+            return;
+        }
+        if (col.fromDomainKey) {
+            cg.addLine(out.bufferName + "[_pos] = (" + out.metalType +
+                       ")_key;");
+            return;
+        }
+        cg.addLine(out.bufferName + "[_pos] = " + col.sourceBuffer +
+                   "[_key];");
+    }
+};
+
+enum class DomainAggReusePkSourceKind {
+    DomainKey,
+    PkRowColumn,
+    CarryByPkColumn
+};
+
+struct DomainAggReusePkColumnSpec {
+    GenericMatColumnDesc output;
+    DomainAggReusePkSourceKind kind = DomainAggReusePkSourceKind::DomainKey;
+    std::string sourceTable;
+    std::string sourceColumn;
+    std::string sourceMetalType;
+    std::string carryBuffer;
+    std::string carryDomain;
+    std::string carryKeyColumn;
+    std::string carryKeyMetalType;
+    bool sourceIsStringRowRef = false;
+    std::string stringSourceTable;
+    std::string stringSourceColumn;
+};
+
+class MetalDomainAggReusePkLookupMaterialize : public MetalOperator {
+public:
+    MetalDomainAggReusePkLookupMaterialize(
+            std::string pkTable,
+            std::string pkRowLookupBuffer,
+            std::string keyDomain,
+            std::string aggBuffer,
+            std::string keyListBuffer,
+            std::string keyListCountBuffer,
+            std::string outputCounter,
+            std::vector<DomainAggReusePkColumnSpec> columns,
+            GenericMatColumnDesc aggregateOutput)
+        : pkTable_(std::move(pkTable)),
+          pkRowLookupBuffer_(std::move(pkRowLookupBuffer)),
+          keyDomain_(std::move(keyDomain)),
+          aggBuffer_(std::move(aggBuffer)),
+          keyListBuffer_(std::move(keyListBuffer)),
+          keyListCountBuffer_(std::move(keyListCountBuffer)),
+          outputCounter_(std::move(outputCounter)),
+          columns_(std::move(columns)),
+          aggregateOutput_(std::move(aggregateOutput)) {}
+
+    void produce(MetalCodegen& cg, ConsumerFn consume) override {
+        const std::string domainParam =
+            "n_domain_agg_pk_reuse_" + sanitizeIdentifier(outputCounter_);
+        cg.addResolvedScalarParam(domainParam, "uint", keyDomain_);
+        cg.addBufferParam(pkRowLookupBuffer_, "int", keyDomain_, false);
+        cg.addBufferParam(aggBuffer_, "atomic_uint", keyDomain_, false);
+        const bool useKeyList =
+            !keyListBuffer_.empty() && !keyListCountBuffer_.empty();
+        if (useKeyList) {
+            cg.addBufferParam(keyListBuffer_, "uint", keyDomain_, false);
+            cg.addBufferParam(keyListCountBuffer_, "const atomic_uint", "1",
+                              false);
+        }
+        cg.addAtomicBufferParam(outputCounter_, "atomic_uint", "1");
+
+        for (const auto& col : columns_) {
+            if (col.kind == DomainAggReusePkSourceKind::PkRowColumn) {
+                cg.addColumnParam(col.sourceColumn,
+                                  col.output.stringLen > 0 ? "char"
+                                                           : col.sourceMetalType,
+                                  pkTable_);
+            } else if (col.kind ==
+                       DomainAggReusePkSourceKind::CarryByPkColumn) {
+                cg.addColumnParam(col.carryKeyColumn, col.carryKeyMetalType,
+                                  pkTable_);
+                cg.addBufferParam(col.carryBuffer,
+                                  col.sourceIsStringRowRef
+                                      ? "uint"
+                                      : col.sourceMetalType,
+                                  col.carryDomain, false);
+                if (col.sourceIsStringRowRef &&
+                    !col.stringSourceTable.empty() &&
+                    !col.stringSourceColumn.empty()) {
+                    cg.addColumnParam(col.stringSourceColumn, "char",
+                                      col.stringSourceTable);
+                }
+            }
+        }
+
+        auto addOutput = [&](const GenericMatColumnDesc& out) {
+            std::string sizeExpr = keyDomain_;
+            if (out.stringLen > 0)
+                sizeExpr += " * " + std::to_string(out.stringLen);
+            if (out.isLongPair)
+                sizeExpr += " * 2";
+            cg.addBufferParam(out.bufferName, out.metalType, sizeExpr, false);
+            cg.registerOutputColumn(out.displayName, out.bufferName,
+                                    out.metalType, out.stringLen,
+                                    out.scaleDown, out.isLongPair);
+        };
+
+        cg.registerMaterializeOutput(outputCounter_);
+        for (const auto& col : columns_)
+            addOutput(col.output);
+        addOutput(aggregateOutput_);
+
+        const std::string scanLimit = useKeyList
+            ? "atomic_load_explicit(&" + keyListCountBuffer_ +
+                  "[0], memory_order_relaxed)"
+            : domainParam;
+        cg.addBlock("for (uint _scan = tid; _scan < " + scanLimit +
+                    "; _scan += tpg)", [&]() {
+            if (useKeyList)
+                cg.addLine("uint _key = " + keyListBuffer_ + "[_scan];");
+            else
+                cg.addLine("uint _key = _scan;");
+            cg.addLine("int _pk_row_i = " + pkRowLookupBuffer_ + "[_key];");
+            cg.addIf("_pk_row_i >= 0", [&]() {
+                cg.addLine("uint _pk_row = (uint)_pk_row_i;");
+                cg.addLine("bool _row_ok = true;");
+                for (size_t ci = 0; ci < columns_.size(); ++ci)
+                    emitGuard(cg, columns_[ci], ci);
+                cg.addIf("_row_ok", [&]() {
+                    cg.addLine("uint _pos = atomic_fetch_add_explicit(&" +
+                               outputCounter_ +
+                               "[0], 1u, memory_order_relaxed);");
+                    for (size_t ci = 0; ci < columns_.size(); ++ci)
+                        emitColumnWrite(cg, columns_[ci], ci);
+                    cg.addLine(
+                        aggregateOutput_.bufferName +
+                        "[_pos] = as_type<float>(atomic_load_explicit(&" +
+                        aggBuffer_ + "[_key], memory_order_relaxed));");
+                    consume();
+                });
+            });
+        });
+    }
+
+    std::string describe() const override {
+        return "DomainAggReusePkLookupMaterialize(" + aggBuffer_ + ")";
+    }
+
+private:
+    std::string pkTable_;
+    std::string pkRowLookupBuffer_;
+    std::string keyDomain_;
+    std::string aggBuffer_;
+    std::string keyListBuffer_;
+    std::string keyListCountBuffer_;
+    std::string outputCounter_;
+    std::vector<DomainAggReusePkColumnSpec> columns_;
+    GenericMatColumnDesc aggregateOutput_;
+
+    static std::string suffixForColumn(const DomainAggReusePkColumnSpec& col,
+                                       size_t idx) {
+        return std::to_string(idx) + "_" +
+               sanitizeIdentifier(col.output.displayName);
+    }
+
+    static std::string carryKeyExpr(const DomainAggReusePkColumnSpec& col) {
+        return "(uint)(" + col.carryKeyColumn + "[_pk_row])";
+    }
+
+    static bool hasReliableCarrySentinel(
+            const DomainAggReusePkColumnSpec& col) {
+        if (col.sourceIsStringRowRef) return true;
+        return col.sourceMetalType == "int" || col.sourceMetalType == "uint";
+    }
+
+    static std::string sentinelCondition(
+            const DomainAggReusePkColumnSpec& col,
+            const std::string& valueExpr) {
+        if (col.sourceIsStringRowRef || col.sourceMetalType == "uint")
+            return valueExpr + " != 0xFFFFFFFFu";
+        return valueExpr + " != (" + col.sourceMetalType + ")-1";
+    }
+
+    void emitGuard(MetalCodegen& cg,
+                   const DomainAggReusePkColumnSpec& col,
+                   size_t idx) const {
+        if (col.kind != DomainAggReusePkSourceKind::CarryByPkColumn ||
+            !hasReliableCarrySentinel(col)) {
+            return;
+        }
+        const std::string suffix = suffixForColumn(col, idx);
+        const std::string valueType =
+            col.sourceIsStringRowRef ? "uint" : col.sourceMetalType;
+        cg.addLine("uint _carry_key_" + suffix + " = " + carryKeyExpr(col) +
+                   ";");
+        cg.addLine(valueType + " _carry_guard_" + suffix + " = " +
+                   col.carryBuffer + "[_carry_key_" + suffix + "];");
+        cg.addLine("if (!(" +
+                   sentinelCondition(col, "_carry_guard_" + suffix) +
+                   ")) _row_ok = false;");
+    }
+
+    void emitColumnWrite(MetalCodegen& cg,
+                         const DomainAggReusePkColumnSpec& col,
+                         size_t idx) const {
+        const auto& out = col.output;
+        if (col.kind == DomainAggReusePkSourceKind::DomainKey) {
+            cg.addLine(out.bufferName + "[_pos] = (" + out.metalType +
+                       ")_key;");
+            return;
+        }
+
+        if (col.kind == DomainAggReusePkSourceKind::PkRowColumn) {
+            if (out.stringLen > 0) {
+                const int width = std::max(1, out.stringLen);
+                cg.addBlock("for (uint _oc = 0; _oc < " +
+                            std::to_string(width) + "u; ++_oc)", [&]() {
+                    cg.addLine(out.bufferName + "[_pos * " +
+                               std::to_string(width) + "u + _oc] = " +
+                               col.sourceColumn + "[_pk_row * " +
+                               std::to_string(width) + "u + _oc];");
+                });
+            } else {
+                cg.addLine(out.bufferName + "[_pos] = " + col.sourceColumn +
+                           "[_pk_row];");
+            }
+            return;
+        }
+
+        const std::string suffix = suffixForColumn(col, idx);
+        const std::string carryKey = "_carry_key_" + suffix;
+        if (!hasReliableCarrySentinel(col))
+            cg.addLine("uint " + carryKey + " = " + carryKeyExpr(col) + ";");
+        if (out.stringLen > 0 && col.sourceIsStringRowRef) {
+            const int width = std::max(1, out.stringLen);
+            const std::string srcRow = "_src_row_" + suffix;
+            cg.addLine("uint " + srcRow + " = " + col.carryBuffer + "[" +
+                       carryKey + "];");
+            cg.addBlock("for (uint _oc = 0; _oc < " +
+                        std::to_string(width) + "u; ++_oc)", [&]() {
+                cg.addLine(out.bufferName + "[_pos * " +
+                           std::to_string(width) + "u + _oc] = " +
+                           col.stringSourceColumn + "[" + srcRow + " * " +
+                           std::to_string(width) + "u + _oc];");
+            });
+            return;
+        }
+
+        cg.addLine(out.bufferName + "[_pos] = " + col.carryBuffer + "[" +
+                   carryKey + "];");
+    }
 };
 
 class MetalFiniteStringRowRefMapBuild : public MetalOperator {
@@ -1330,11 +1705,11 @@ private:
                              const std::string& offset) const {
         if (col.stringRowRef) {
             return col.stringSourceColumn + "[" + col.bufferName + "[" + rep +
-                   "] * " + std::to_string(col.stringLen) + "u + " +
+                   "] * " + std::to_string(col.stringLen) + "ul + " +
                    offset + "]";
         }
         return col.bufferName + "[" + rep + " * " +
-               std::to_string(col.stringLen) + "u + " + offset + "]";
+               std::to_string(col.stringLen) + "ul + " + offset + "]";
     }
 
     void emitGroupOutput(MetalCodegen& cg,
@@ -1343,10 +1718,10 @@ private:
                          const std::string& rep,
                          const std::string& pos) const {
         if (col.stringLen > 0) {
-            cg.addBlock("for (uint _oc = 0; _oc < " +
+                cg.addBlock("for (uint _oc = 0; _oc < " +
                         std::to_string(col.stringLen) + "u; ++_oc)", [&]() {
-                cg.addLine(out.bufferName + "[" + pos + " * " +
-                           std::to_string(col.stringLen) + "u + _oc] = " +
+                cg.addLine(out.bufferName + "[(ulong)(" + pos + ") * " +
+                           std::to_string(col.stringLen) + "ul + _oc] = " +
                            stringByteAt(col, rep, "_oc") + ";");
             });
         } else {
@@ -1572,11 +1947,11 @@ private:
                              const std::string& offset) const {
         if (col.stringRowRef) {
             return col.stringSourceColumn + "[" + col.bufferName + "[" + rep +
-                   "] * " + std::to_string(col.stringLen) + "u + " +
+                   "] * " + std::to_string(col.stringLen) + "ul + " +
                    offset + "]";
         }
         return col.bufferName + "[" + rep + " * " +
-               std::to_string(col.stringLen) + "u + " + offset + "]";
+               std::to_string(col.stringLen) + "ul + " + offset + "]";
     }
 
     void emitGroupOutput(MetalCodegen& cg,
@@ -1587,8 +1962,8 @@ private:
         if (col.stringLen > 0) {
             cg.addBlock("for (uint _oc = 0; _oc < " +
                         std::to_string(col.stringLen) + "u; ++_oc)", [&]() {
-                cg.addLine(out.bufferName + "[" + pos + " * " +
-                           std::to_string(col.stringLen) + "u + _oc] = " +
+                cg.addLine(out.bufferName + "[(ulong)(" + pos + ") * " +
+                           std::to_string(col.stringLen) + "ul + _oc] = " +
                            stringByteAt(col, rep, "_oc") + ";");
             });
         } else {
@@ -1635,10 +2010,10 @@ std::string materializedStringPtrExpr(const GenericMatColumnDesc& col,
     const int width = std::max(1, col.stringLen);
     if (col.stringRowRef) {
         return "(" + col.stringSourceColumn + " + " + col.bufferName + "[" +
-               row + "] * " + std::to_string(width) + "u)";
+               row + "] * " + std::to_string(width) + "ul)";
     }
     return "(" + col.bufferName + " + " + row + " * " +
-           std::to_string(width) + "u)";
+           std::to_string(width) + "ul)";
 }
 
 void bindMaterializedColumns(MetalCodegen& cg,
@@ -1687,9 +2062,9 @@ public:
         cg.addResolvedScalarParam(capacitySymbol_, "uint", capacityExpr_);
         bindMaterializedColumns(cg, groupKeys_);
         cg.addAtomicBufferParam(stateBuffer_, "atomic_uint", capacityExpr_);
-        cg.addBufferParam(hashBuffer_, "uint", capacityExpr_, false);
-        cg.addBufferParam(slotGroupBuffer_, "uint", capacityExpr_, false);
-        cg.addBufferParam(slotRepRowBuffer_, "uint", capacityExpr_, false);
+        cg.addAtomicBufferParam(hashBuffer_, "atomic_uint", capacityExpr_);
+        cg.addAtomicBufferParam(slotGroupBuffer_, "atomic_uint", capacityExpr_);
+        cg.addAtomicBufferParam(slotRepRowBuffer_, "atomic_uint", capacityExpr_);
         cg.addBufferParam(groupRepRowBuffer_, "uint", capacityExpr_, false);
         cg.addBufferParam(rowGroupBuffer_, "uint", rowGroupSizeExpr_, false);
         cg.addAtomicBufferParam(groupCounter_, "atomic_uint", "1");
@@ -1709,9 +2084,12 @@ public:
                 cg.increaseIndent();
                 cg.addLine("uint _cd_gid = atomic_fetch_add_explicit(&" +
                            groupCounter_ + "[0], 1u, memory_order_relaxed);");
-                cg.addLine(hashBuffer_ + "[_cd_slot] = _cd_hash;");
-                cg.addLine(slotRepRowBuffer_ + "[_cd_slot] = _r;");
-                cg.addLine(slotGroupBuffer_ + "[_cd_slot] = _cd_gid;");
+                cg.addLine("atomic_store_explicit(&" + hashBuffer_ +
+                           "[_cd_slot], _cd_hash, memory_order_relaxed);");
+                cg.addLine("atomic_store_explicit(&" + slotRepRowBuffer_ +
+                           "[_cd_slot], _r, memory_order_relaxed);");
+                cg.addLine("atomic_store_explicit(&" + slotGroupBuffer_ +
+                           "[_cd_slot], _cd_gid, memory_order_relaxed);");
                 cg.addLine(groupRepRowBuffer_ + "[_cd_gid] = _r;");
                 cg.addLine(rowGroupBuffer_ + "[_r] = _cd_gid;");
                 cg.addLine("atomic_store_explicit(&" + stateBuffer_ +
@@ -1722,14 +2100,20 @@ public:
                 cg.decreaseIndent();
                 cg.addLine("} else if (_cd_state == 2u) {");
                 cg.increaseIndent();
-                cg.addLine("bool _cd_same = (" + hashBuffer_ +
-                           "[_cd_slot] == _cd_hash);");
-                emitKeyEquals(cg, "_cd_same", "_r",
-                              slotRepRowBuffer_ + "[_cd_slot]");
+                cg.addLine("bool _cd_same = false;");
+                cg.addBlock("for (uint _cd_retry = 0u; _cd_retry < 32u && !_cd_same; ++_cd_retry)", [&]() {
+                    cg.addLine("uint _cd_slot_hash = atomic_load_explicit(&" +
+                               hashBuffer_ + "[_cd_slot], memory_order_relaxed);");
+                    cg.addLine("uint _cd_rep = atomic_load_explicit(&" +
+                               slotRepRowBuffer_ + "[_cd_slot], memory_order_relaxed);");
+                    cg.addLine("_cd_same = (_cd_slot_hash == _cd_hash);");
+                    emitKeyEquals(cg, "_cd_same", "_r", "_cd_rep");
+                });
                 cg.addLine("if (_cd_same) {");
                 cg.increaseIndent();
-                cg.addLine(rowGroupBuffer_ + "[_r] = " + slotGroupBuffer_ +
-                           "[_cd_slot];");
+                cg.addLine(rowGroupBuffer_ + "[_r] = atomic_load_explicit(&" +
+                           slotGroupBuffer_ +
+                           "[_cd_slot], memory_order_relaxed);");
                 cg.addLine("break;");
                 cg.decreaseIndent();
                 cg.addLine("}");
@@ -1818,6 +2202,8 @@ public:
                                  std::string rowGroupBuffer,
                                  std::string rowGroupSizeExpr,
                                  std::string bitmapBuffer,
+                                 std::string activeWordsBuffer,
+                                 std::string activeCountBuffer,
                                  GenericMatColumnDesc distinctColumn)
         : rowsSymbol_(std::move(rowsSymbol)),
           distinctDomainExpr_(std::move(distinctDomainExpr)),
@@ -1826,6 +2212,8 @@ public:
           rowGroupBuffer_(std::move(rowGroupBuffer)),
           rowGroupSizeExpr_(std::move(rowGroupSizeExpr)),
           bitmapBuffer_(std::move(bitmapBuffer)),
+          activeWordsBuffer_(std::move(activeWordsBuffer)),
+          activeCountBuffer_(std::move(activeCountBuffer)),
           distinctColumn_(std::move(distinctColumn)) {}
 
     void produce(MetalCodegen& cg, ConsumerFn consume) override {
@@ -1840,6 +2228,8 @@ public:
         bindMaterializedColumns(cg, {distinctColumn_});
         cg.addBufferParam(rowGroupBuffer_, "uint", rowGroupSizeExpr_, false);
         cg.addBufferParam(bitmapBuffer_, "atomic_uint", "", false);
+        cg.addBufferParam(activeWordsBuffer_, "uint", "", false);
+        cg.addBufferParam(activeCountBuffer_, "atomic_uint", "", false);
 
         cg.addBlock("for (uint _r = tid; _r < " + nRows + "; _r += tpg)", [&]() {
             cg.addLine("uint _cd_gid = " + rowGroupBuffer_ + "[_r];");
@@ -1849,9 +2239,16 @@ public:
                 cg.addIf("_cd_value < " + distinctDomainSymbol_, [&]() {
                     cg.addLine("uint _cd_word = _cd_gid * " +
                                bitmapStrideSymbol_ + " + (_cd_value >> 5u);");
-                    cg.addLine("atomic_fetch_or_explicit(&" + bitmapBuffer_ +
-                               "[_cd_word], 1u << (_cd_value & 31u), "
+                    cg.addLine("uint _cd_mask = 1u << (_cd_value & 31u);");
+                    cg.addLine("uint _cd_old = atomic_fetch_or_explicit(&" +
+                               bitmapBuffer_ + "[_cd_word], _cd_mask, "
                                "memory_order_relaxed);");
+                    cg.addIf("_cd_old == 0u", [&]() {
+                        cg.addLine("uint _cd_slot = atomic_fetch_add_explicit(&" +
+                                   activeCountBuffer_ +
+                                   "[0], 1u, memory_order_relaxed);");
+                        cg.addLine(activeWordsBuffer_ + "[_cd_slot] = _cd_word;");
+                    });
                 });
             });
         });
@@ -1869,33 +2266,39 @@ private:
     std::string rowGroupBuffer_;
     std::string rowGroupSizeExpr_;
     std::string bitmapBuffer_;
+    std::string activeWordsBuffer_;
+    std::string activeCountBuffer_;
     GenericMatColumnDesc distinctColumn_;
 };
 
 class MetalCountDistinctBitmapPopcount : public MetalOperator {
 public:
-    MetalCountDistinctBitmapPopcount(std::string popWordsSymbol,
+    MetalCountDistinctBitmapPopcount(std::string activeWordsSymbol,
                                      std::string bitmapStrideSymbol,
                                      std::string distinctDomainExpr,
+                                     std::string activeWordsBuffer,
                                      std::string bitmapBuffer,
                                      std::string countBuffer)
-        : popWordsSymbol_(std::move(popWordsSymbol)),
+        : activeWordsSymbol_(std::move(activeWordsSymbol)),
           bitmapStrideSymbol_(std::move(bitmapStrideSymbol)),
           distinctDomainExpr_(std::move(distinctDomainExpr)),
+          activeWordsBuffer_(std::move(activeWordsBuffer)),
           bitmapBuffer_(std::move(bitmapBuffer)),
           countBuffer_(std::move(countBuffer)) {}
 
     void produce(MetalCodegen& cg, ConsumerFn consume) override {
         (void)consume;
-        const std::string nRows = tableSizeName(popWordsSymbol_);
-        cg.setPhaseScannedTable(popWordsSymbol_);
-        cg.addResolvedScalarParam(nRows, "uint", popWordsSymbol_);
+        const std::string nRows = tableSizeName(activeWordsSymbol_);
+        cg.setPhaseScannedTable(activeWordsSymbol_);
+        cg.addResolvedScalarParam(nRows, "uint", activeWordsSymbol_);
         cg.addResolvedScalarParam(bitmapStrideSymbol_, "uint",
                                   "(" + distinctDomainExpr_ + " + 31) / 32");
+        cg.addBufferParam(activeWordsBuffer_, "uint", "", false);
         cg.addBufferParam(bitmapBuffer_, "uint", "", false);
         cg.addBufferParam(countBuffer_, "atomic_uint", "", false);
 
-        cg.addBlock("for (uint _w = tid; _w < " + nRows + "; _w += tpg)", [&]() {
+        cg.addBlock("for (uint _i = tid; _i < " + nRows + "; _i += tpg)", [&]() {
+            cg.addLine("uint _w = " + activeWordsBuffer_ + "[_i];");
             cg.addLine("uint _cd_gid = _w / " + bitmapStrideSymbol_ + ";");
             cg.addLine("uint _cd_count = popcount(" + bitmapBuffer_ + "[_w]);");
             cg.addIf("_cd_count != 0u", [&]() {
@@ -1910,9 +2313,10 @@ public:
     }
 
 private:
-    std::string popWordsSymbol_;
+    std::string activeWordsSymbol_;
     std::string bitmapStrideSymbol_;
     std::string distinctDomainExpr_;
+    std::string activeWordsBuffer_;
     std::string bitmapBuffer_;
     std::string countBuffer_;
 };
@@ -2043,7 +2447,9 @@ void attachCountDistinctBitmapAllocationHook(
         std::string popWordsSymbol,
         std::string bitmapStrideSymbol,
         std::string bitmapBuffer,
-        std::string countBuffer) {
+        std::string countBuffer,
+        std::string activeWordsBuffer,
+        std::string activeCountBuffer) {
     phase.postDispatchHook =
         [groupCounter = std::move(groupCounter),
          distinctDomainExpr = std::move(distinctDomainExpr),
@@ -2051,7 +2457,10 @@ void attachCountDistinctBitmapAllocationHook(
          popWordsSymbol = std::move(popWordsSymbol),
          bitmapStrideSymbol = std::move(bitmapStrideSymbol),
          bitmapBuffer = std::move(bitmapBuffer),
-         countBuffer = std::move(countBuffer)](MetalGenericExecutor& executor) {
+         countBuffer = std::move(countBuffer),
+         activeWordsBuffer = std::move(activeWordsBuffer),
+         activeCountBuffer = std::move(activeCountBuffer)](
+                MetalGenericExecutor& executor) {
             auto* counter = executor.getAllocatedBuffer(groupCounter);
             if (!counter) return 0.0;
             uint32_t groupCount =
@@ -2085,6 +2494,22 @@ void attachCountDistinctBitmapAllocationHook(
                 executor.registerAllocatedBuffer(countBuffer, counts);
             }
 
+            const size_t activeWordsBytes =
+                std::max<size_t>(bitmapWords * sizeof(uint32_t), sizeof(uint32_t));
+            auto* activeWords =
+                device->newBuffer(activeWordsBytes, MTL::ResourceStorageModeShared);
+            if (activeWords) {
+                executor.registerAllocatedBuffer(activeWordsBuffer, activeWords);
+            }
+
+            auto* activeCount =
+                device->newBuffer(sizeof(uint32_t), MTL::ResourceStorageModeShared);
+            if (activeCount) {
+                std::memset(activeCount->contents(), 0, sizeof(uint32_t));
+                activeCount->didModifyRange(NS::Range::Make(0, sizeof(uint32_t)));
+                executor.registerAllocatedBuffer(activeCountBuffer, activeCount);
+            }
+
             executor.registerSymbol(groupRowsSymbol, groupCount);
             executor.registerScalarInt(groupRowsSymbol, static_cast<int>(groupCount));
             executor.registerSymbol(tableSizeName(groupRowsSymbol), groupCount);
@@ -2097,6 +2522,28 @@ void attachCountDistinctBitmapAllocationHook(
                                        static_cast<int>(bitmapWords));
             executor.registerSymbol(bitmapStrideSymbol, stride);
             executor.registerScalarInt(bitmapStrideSymbol, static_cast<int>(stride));
+            return 0.0;
+        };
+}
+
+void attachCountDistinctActiveWordCountHook(
+        MetalQueryPlan::Phase& phase,
+        std::string activeCountBuffer,
+        std::string activeWordsSymbol) {
+    phase.postDispatchHook =
+        [activeCountBuffer = std::move(activeCountBuffer),
+         activeWordsSymbol = std::move(activeWordsSymbol)](
+                MetalGenericExecutor& executor) {
+            auto* counter = executor.getAllocatedBuffer(activeCountBuffer);
+            if (!counter) return 0.0;
+            uint32_t activeWords =
+                *static_cast<const uint32_t*>(counter->contents());
+            executor.registerSymbol(activeWordsSymbol, activeWords);
+            executor.registerScalarInt(activeWordsSymbol,
+                                       static_cast<int>(activeWords));
+            executor.registerSymbol(tableSizeName(activeWordsSymbol), activeWords);
+            executor.registerScalarInt(tableSizeName(activeWordsSymbol),
+                                       static_cast<int>(activeWords));
             return 0.0;
         };
 }
@@ -2166,29 +2613,6 @@ std::vector<GenericMatColumnDesc> fdKeyedGroupOutputColumns(
     return out;
 }
 
-int fdColumnByteWidthEstimate(const GenericMatColumnDesc& col) {
-    if (col.stringLen > 0) return std::max(1, col.stringLen);
-    if (col.isLongPair) return 8;
-    if (col.metalType == "long" || col.metalType == "ulong" ||
-        col.metalType == "double") {
-        return 8;
-    }
-    if (col.metalType == "char" || col.metalType == "uchar") return 1;
-    if (col.metalType == "short" || col.metalType == "ushort") return 2;
-    return 4;
-}
-
-size_t fdRowByteWidthEstimate(const std::vector<GenericMatColumnDesc>& columns,
-                              bool includeHidden = false) {
-    size_t bytes = 0;
-    for (const auto& col : columns) {
-        if (!includeHidden && col.displayName.rfind("__hidden_", 0) == 0)
-            continue;
-        bytes += static_cast<size_t>(fdColumnByteWidthEstimate(col));
-    }
-    return bytes;
-}
-
 std::vector<GenericMatColumnDesc> fdKeyedGroupTopKNarrowColumns(
         const std::string& tag,
         const std::vector<GenericMatColumnDesc>& fullOutputs,
@@ -2215,86 +2639,6 @@ std::vector<GenericMatColumnDesc> fdKeyedGroupTopKNarrowColumns(
                    prefix + std::to_string(out.size()) + "_bucket",
                    "uint", 0});
     return out;
-}
-
-std::optional<double> parsePositiveIntegerBound(const std::string& expr) {
-    size_t first = 0;
-    while (first < expr.size() &&
-           std::isspace(static_cast<unsigned char>(expr[first]))) {
-        ++first;
-    }
-    size_t last = expr.size();
-    while (last > first &&
-           std::isspace(static_cast<unsigned char>(expr[last - 1]))) {
-        --last;
-    }
-    if (first == last) return std::nullopt;
-
-    double value = 0.0;
-    for (size_t i = first; i < last; ++i) {
-        char ch = expr[i];
-        if (!std::isdigit(static_cast<unsigned char>(ch)))
-            return std::nullopt;
-        value = value * 10.0 + static_cast<double>(ch - '0');
-    }
-    return value > 0.0 ? std::optional<double>{value} : std::nullopt;
-}
-
-double fdTopKGroupBoundEstimate(const std::string& outputBoundExpr,
-                                const std::string& keyDomainExpr) {
-    std::optional<double> bound = parsePositiveIntegerBound(outputBoundExpr);
-    if (auto keyDomain = parsePositiveIntegerBound(keyDomainExpr)) {
-        bound = bound ? std::min(*bound, *keyDomain) : keyDomain;
-    }
-    if (bound) return *bound;
-
-    // Symbolic table/cardinality bounds are unknown at lowering time. Use a
-    // generic large-table proxy so the guard still accounts for group count.
-    return 1024.0 * 1024.0;
-}
-
-bool shouldUseFdTopKLateMaterialization(
-        const GenericSortSpec& sortSpec,
-        const std::vector<GenericMatColumnDesc>& fullOutputs,
-        const std::vector<GenericMatColumnDesc>& narrowOutputs,
-        const std::string& outputBoundExpr,
-        const std::string& keyDomainExpr) {
-    if (sortSpec.limit <= 0 || sortSpec.keys.empty()) return false;
-    if (narrowOutputs.empty()) return false;
-    for (const auto& sk : sortSpec.keys) {
-        if (!findMaterializedColumn(narrowOutputs, sk.column))
-            return false;
-    }
-    const size_t fullWidth = fdRowByteWidthEstimate(fullOutputs);
-    const size_t narrowWidth =
-        fdRowByteWidthEstimate(narrowOutputs, /*includeHidden=*/true);
-    if (fullWidth <= narrowWidth) return false;
-
-    const double groupBound =
-        fdTopKGroupBoundEstimate(outputBoundExpr, keyDomainExpr);
-    const double limitRows = std::min<double>(
-        groupBound, static_cast<double>(sortSpec.limit));
-    if (groupBound <= limitRows * 2.0) return false;
-
-    const double fullCompactBytes =
-        static_cast<double>(fullWidth) * groupBound;
-    const double narrowCompactBytes =
-        static_cast<double>(narrowWidth) * groupBound;
-    const double gatherBytes =
-        static_cast<double>(fullWidth + narrowWidth + sizeof(uint32_t) * 2) *
-        limitRows;
-    constexpr double kGatherLaunchBytes = 64.0 * 1024.0;
-    constexpr double kMinSavingsBytes = 64.0 * 1024.0;
-    constexpr double kMinSavingsToGatherCost = 3.0;
-
-    const double lateMaterializeBytes =
-        narrowCompactBytes + gatherBytes + kGatherLaunchBytes;
-    if (fullCompactBytes <= lateMaterializeBytes) return false;
-    const double savedBytes = fullCompactBytes - lateMaterializeBytes;
-    const double requiredSavings =
-        std::max(kMinSavingsBytes,
-                 gatherBytes * kMinSavingsToGatherCost);
-    return savedBytes >= requiredSavings;
 }
 
 bool appendBestGenericGpuOrder(MetalQueryPlan& plan,
@@ -2412,6 +2756,7 @@ bool tryAppendMaterializedCountDistinctGroup(
     const std::string rowsSymbol = tag + "_input_rows";
     const std::string groupRowsSymbol = tag + "_rows";
     const std::string popWordsSymbol = tag + "_pop_words";
+    const std::string activeWordsSymbol = tag + "_active_words";
     const std::string capacityExpr =
         groupHashCapacityExpr(inputUpperBoundExpr, outputCapacityExpr);
     const std::string capacitySymbol = "n_" + tag + "_slots";
@@ -2427,6 +2772,8 @@ bool tryAppendMaterializedCountDistinctGroup(
     const std::string groupCounter = "d_" + tag + "_count";
     const std::string bitmapBuffer = "d_" + tag + "_bitmap";
     const std::string countBuffer = "d_" + tag + "_counts";
+    const std::string activeWordsBuffer = "d_" + tag + "_active_words";
+    const std::string activeCountBuffer = "d_" + tag + "_active_word_count";
     const std::string outputCounter = "d_" + tag + "_result_count";
 
     attachMaterializedCountHook(materializePhase, materializedCounter,
@@ -2440,20 +2787,23 @@ bool tryAppendMaterializedCountDistinctGroup(
     attachCountDistinctBitmapAllocationHook(
         buildPhase, groupCounter, distinctCol->distinctDomainSymbol,
         groupRowsSymbol, popWordsSymbol, bitmapStrideSymbol, bitmapBuffer,
-        countBuffer);
+        countBuffer, activeWordsBuffer, activeCountBuffer);
 
-    appendPhase(
+    auto& fillPhase = appendPhase(
         plan, "GENERIC_ir_multi_table_count_distinct_bitmap_fill",
         std::make_unique<MetalCountDistinctBitmapFill>(
             rowsSymbol, distinctCol->distinctDomainSymbol, distinctDomainSymbol,
             bitmapStrideSymbol, rowGroupBuffer, inputUpperBoundExpr,
-            bitmapBuffer, *distinctCol));
+            bitmapBuffer, activeWordsBuffer, activeCountBuffer, *distinctCol));
+    attachCountDistinctActiveWordCountHook(
+        fillPhase, activeCountBuffer, activeWordsSymbol);
 
     appendPhase(
         plan, "GENERIC_ir_multi_table_count_distinct_popcount",
         std::make_unique<MetalCountDistinctBitmapPopcount>(
-            popWordsSymbol, bitmapStrideSymbol,
-            distinctCol->distinctDomainSymbol, bitmapBuffer, countBuffer));
+            activeWordsSymbol, bitmapStrideSymbol,
+            distinctCol->distinctDomainSymbol, activeWordsBuffer, bitmapBuffer,
+            countBuffer));
 
     auto& compactPhase = appendPhase(
         plan, "GENERIC_ir_multi_table_count_distinct_compact",
@@ -2730,7 +3080,7 @@ std::optional<MetalQueryPlan> lowerSharedDimensionCount(
         materialize->addColumn(
             groupBuffer, "char",
             groupCol->column + " + " + idxVar + " * " +
-                std::to_string(groupStringWidth),
+                std::to_string(groupStringWidth) + "ul",
             groupDisplayName,
             tableSizeName(dimensionScan->table) + " * " +
                 std::to_string(groupStringWidth),
@@ -3005,12 +3355,449 @@ std::optional<MetalQueryPlan> lowerMultiTableGroupedAggregateIRToMetalImpl(
     } else if (auto finiteBound = finiteGroupOutputBound(
             *aggregate, fd ? fd->predicate : GenericPredicatePtr{})) {
         groupOutputBoundExpr = std::to_string(*finiteBound);
-    } else if (auto relationBound = relationBoundedGroupOutputBound(
-            ir, *aggregate, fd ? fd->predicate : GenericPredicatePtr{})) {
-        groupOutputBoundExpr = *relationBound;
-    }
+	    } else if (auto relationBound = relationBoundedGroupOutputBound(
+	            ir, *aggregate, fd ? fd->predicate : GenericPredicatePtr{})) {
+	        groupOutputBoundExpr = *relationBound;
+	    }
 
-    bool hasCountDistinctAgg = false;
+    auto tryInSubAggDomainReuse = [&]() -> std::optional<MetalQueryPlan> {
+        if (aggregate->having || aggregate->aggregates.size() != 1 ||
+            lowering->inSubAggs.empty()) {
+            return std::nullopt;
+        }
+        const auto& projection = aggregate->aggregates.front();
+        auto* agg = projection.expr
+            ? std::get_if<GenericAggregateExpr>(&projection.expr->node)
+            : nullptr;
+        auto* aggCol = agg && agg->arg
+            ? std::get_if<GenericColumnExpr>(&agg->arg->node)
+            : nullptr;
+        if (!agg || !aggCol || agg->func != AggFunc::SUM ||
+            aggCol->type.type != DataType::FLOAT) {
+            return std::nullopt;
+        }
+
+        const GenericInSubAggInfo* reuseAgg = nullptr;
+        for (const auto& info : lowering->inSubAggs) {
+            if (info.aggFunc == "sum" && info.table == aggCol->table &&
+                info.valueColumn == aggCol->column) {
+                reuseAgg = &info;
+                break;
+            }
+        }
+        if (!reuseAgg) return std::nullopt;
+
+        auto pkReduction =
+            primaryKeyGroupReduction(ir, *aggregate, joinEqForPk,
+                                     lowering->carryMap);
+        if (!pkReduction || pkReduction->keyDomainExpr != reuseAgg->keyDomain)
+            return std::nullopt;
+        auto* pkGroupCol = aggregate->groupBy[pkReduction->groupIndex]
+            ? std::get_if<GenericColumnExpr>(
+                  &aggregate->groupBy[pkReduction->groupIndex]->node)
+            : nullptr;
+        if (!pkGroupCol) return std::nullopt;
+
+        const GenericJoinDomainBitmapInfo* domainBitmap = nullptr;
+        for (const auto& bitmap : lowering->domainBitmaps) {
+            if (bitmap.relationInstance == pkReduction->relationInstance &&
+                bitmap.keyColumn == pkReduction->keyColumn &&
+                bitmap.keyDomain == reuseAgg->keyDomain) {
+                domainBitmap = &bitmap;
+                break;
+            }
+        }
+        if (!domainBitmap) return std::nullopt;
+
+        auto scanForRelation = [&](int relationInstance)
+                -> const GenericScanDetail* {
+            for (const auto* scanNode : shape->scans) {
+                auto* scan = scanDetail(scanNode);
+                if (scan && scan->relationInstance.value == relationInstance)
+                    return scan;
+            }
+            return nullptr;
+        };
+
+        auto phaseIndexByName = [&](const std::string& phaseName)
+                -> std::optional<size_t> {
+            if (phaseName.empty()) return std::nullopt;
+            for (size_t i = 0; i < lowering->plan.phases.size(); ++i) {
+                if (lowering->plan.phases[i].name == phaseName)
+                    return i;
+            }
+            return std::nullopt;
+        };
+
+        auto relationInstanceById = [&](int relationInstance)
+                -> const GenericRelationInstance* {
+            GenericRelationInstanceId id;
+            id.value = relationInstance;
+            return ir.findRelationInstance(id);
+        };
+
+        auto makePkColumnExpr = [&]() -> GenericColumnExpr {
+            GenericColumnExpr col;
+            col.relationInstance.value = pkReduction->relationInstance;
+            col.table = pkReduction->table;
+            col.alias = pkReduction->alias;
+            col.column = pkReduction->keyColumn;
+            if (pkGroupCol) col.type = pkGroupCol->type;
+            return col;
+        };
+
+        auto tryPkRowLookupReuse = [&]() -> std::optional<MetalQueryPlan> {
+            const auto* pkScan = scanForRelation(pkReduction->relationInstance);
+            if (!pkScan || pkReduction->keyColumn.empty())
+                return std::nullopt;
+
+            auto phaseIndex = phaseIndexByName(domainBitmap->buildPhaseName);
+            if (!phaseIndex || *phaseIndex + 1 != lowering->plan.phases.size())
+                return std::nullopt;
+
+            const GenericColumnExpr pkColumnExpr = makePkColumnExpr();
+            std::map<std::string, DomainAggReusePkColumnSpec> groupByDisplay;
+            int outIdx = 0;
+            for (size_t gi = 0; gi < aggregate->groupBy.size(); ++gi) {
+                auto* col = aggregate->groupBy[gi]
+                    ? std::get_if<GenericColumnExpr>(
+                          &aggregate->groupBy[gi]->node)
+                    : nullptr;
+                if (!col) return std::nullopt;
+
+                const std::string display =
+                    groupDisplayNameForAggregate(*aggregate, gi);
+                const bool isString = col->type.type == DataType::CHAR_FIXED;
+                DomainAggReusePkColumnSpec spec;
+                spec.output = GenericMatColumnDesc{
+                    display,
+                    "d_ir_multi_reuse_pk_out_" + std::to_string(outIdx++) +
+                        "_" + sanitizeIdentifier(display),
+                    isString ? "char" : metalTypeForType(col->type),
+                    isString ? std::max(1, col->type.fixedWidth) : 0};
+                spec.sourceMetalType = metalTypeForType(col->type);
+
+                if (joinEqForPk.equivalent(*col, pkColumnExpr)) {
+                    spec.kind = DomainAggReusePkSourceKind::DomainKey;
+                } else if (col->relationInstance.value ==
+                           pkReduction->relationInstance) {
+                    spec.kind = DomainAggReusePkSourceKind::PkRowColumn;
+                    spec.sourceTable = pkScan->table;
+                    spec.sourceColumn = col->column;
+                } else {
+                    auto relIt =
+                        lowering->carryMap.find(col->relationInstance.value);
+                    if (relIt == lowering->carryMap.end())
+                        return std::nullopt;
+                    auto colIt = relIt->second.find(col->column);
+                    if (colIt == relIt->second.end())
+                        return std::nullopt;
+                    const auto& carry = colIt->second;
+
+                    const auto* carryInst =
+                        relationInstanceById(carry.column.relationInstance.value);
+                    const auto* carryRel = carryInst
+                        ? ir.findRelation(carryInst->relation)
+                        : nullptr;
+                    if (!carryRel || carryRel->primaryKeyColumn.empty())
+                        return std::nullopt;
+
+                    const GenericJoinDomainBitmapInfo* carryBitmap = nullptr;
+                    for (const auto& bitmap : lowering->domainBitmaps) {
+                        if (bitmap.relationInstance ==
+                                carry.column.relationInstance.value &&
+                            bitmap.keyColumn == carryRel->primaryKeyColumn) {
+                            carryBitmap = &bitmap;
+                            break;
+                        }
+                    }
+                    if (!carryBitmap) return std::nullopt;
+
+                    GenericColumnExpr carriedPk;
+                    carriedPk.relationInstance =
+                        carry.column.relationInstance;
+                    carriedPk.table = carryInst->baseName;
+                    carriedPk.alias = carryInst->alias;
+                    carriedPk.column = carryRel->primaryKeyColumn;
+
+                    std::optional<GenericColumnExpr> pkSideKey;
+                    for (const auto& equivalent :
+                         joinEqForPk.columnsEquivalentTo(carriedPk)) {
+                        if (equivalent.relationInstance.value ==
+                            pkReduction->relationInstance) {
+                            pkSideKey = equivalent;
+                            break;
+                        }
+                    }
+                    if (!pkSideKey) return std::nullopt;
+
+                    const std::string carryMetalType =
+                        metalTypeForType(carry.column.type);
+                    const bool carryIsString =
+                        carry.column.type.type == DataType::CHAR_FIXED;
+                    if (!carryIsString && carryMetalType != "int" &&
+                        carryMetalType != "uint") {
+                        return std::nullopt;
+                    }
+
+                    spec.kind = DomainAggReusePkSourceKind::CarryByPkColumn;
+                    spec.sourceMetalType = carryMetalType;
+                    spec.carryBuffer =
+                        domainCarryStorageBufferName(*carryBitmap,
+                                                     carry.column);
+                    spec.carryDomain = carryBitmap->keyDomain;
+                    spec.carryKeyColumn = pkSideKey->column;
+                    spec.carryKeyMetalType = metalTypeForType(pkSideKey->type);
+                    spec.sourceIsStringRowRef = carryIsString;
+                    if (carryIsString) {
+                        spec.stringSourceTable = carry.column.table;
+                        spec.stringSourceColumn = carry.column.column;
+                    }
+                }
+                groupByDisplay[display] = std::move(spec);
+            }
+
+            const std::string aggregateDisplay = projection.name.empty()
+                ? "agg_0"
+                : projection.name;
+            std::vector<DomainAggReusePkColumnSpec> orderedGroups;
+            if (!aggregate->outputOrder.empty()) {
+                bool seenAggregate = false;
+                for (const auto& name : aggregate->outputOrder) {
+                    if (name == aggregateDisplay) {
+                        seenAggregate = true;
+                        continue;
+                    }
+                    if (seenAggregate) return std::nullopt;
+                    auto it = groupByDisplay.find(name);
+                    if (it == groupByDisplay.end()) return std::nullopt;
+                    orderedGroups.push_back(it->second);
+                }
+            } else {
+                for (size_t gi = 0; gi < aggregate->groupBy.size(); ++gi) {
+                    const std::string display =
+                        groupDisplayNameForAggregate(*aggregate, gi);
+                    auto it = groupByDisplay.find(display);
+                    if (it == groupByDisplay.end()) return std::nullopt;
+                    orderedGroups.push_back(it->second);
+                }
+            }
+
+            GenericMatColumnDesc aggregateOutput{
+                aggregateDisplay,
+                "d_ir_multi_reuse_pk_out_" + std::to_string(outIdx++) + "_" +
+                    sanitizeIdentifier(aggregateDisplay),
+                "float"};
+
+            std::vector<GenericMatColumnDesc> outputCols;
+            outputCols.reserve(orderedGroups.size() + 1);
+            for (const auto& col : orderedGroups)
+                outputCols.push_back(col.output);
+            outputCols.push_back(aggregateOutput);
+
+            lowering->plan.phases.erase(
+                lowering->plan.phases.begin() +
+                static_cast<std::ptrdiff_t>(*phaseIndex));
+
+            const std::string pkTag = sanitizeIdentifier(
+                pkScan->alias.empty() ? pkScan->table : pkScan->alias);
+            const std::string pkRowLookup =
+                "d_ir_multi_reuse_pk_row_" + pkTag;
+            auto rowLookupPipe = std::make_unique<MetalArrayStore>(
+                makeAutoScan(pkScan->table, idxVar), pkRowLookup,
+                pkReduction->keyColumn + "[" + idxVar + "]",
+                "(int)" + idxVar, "int", reuseAgg->keyDomain, 0xFF);
+            appendPhase(lowering->plan,
+                        "GENERIC_ir_multi_table_pk_row_lookup_" + pkTag,
+                        std::move(rowLookupPipe));
+
+            const std::string reuseCounter =
+                "d_ir_multi_reuse_result_count";
+            const std::string reuseRows = "n_ir_multi_reuse_rows";
+            auto& phase = appendPhase(
+                lowering->plan, "GENERIC_ir_multi_table_in_agg_reuse_compact",
+                std::make_unique<MetalDomainAggReusePkLookupMaterialize>(
+                    pkScan->table, pkRowLookup, reuseAgg->keyDomain,
+                    reuseAgg->aggBuffer, reuseAgg->keyListBuffer,
+                    reuseAgg->keyListCountBuffer, reuseCounter,
+                    std::move(orderedGroups), aggregateOutput));
+            attachMaterializedCountHook(phase, reuseCounter, reuseRows);
+
+            if (!sortSpec.keys.empty() || sortSpec.limit >= 0) {
+                std::string sortError;
+                if (sortSpec.limit > 0) {
+                    if (!appendGenericGpuTopK(lowering->plan,
+                                              "ir_multi_in_agg_reuse",
+                                              reuseRows, reuseAgg->keyDomain,
+                                              outputCols, sortSpec,
+                                              &sortError)) {
+                        if (!appendGenericGpuSort(
+                                lowering->plan, "ir_multi_in_agg_reuse",
+                                reuseRows, reuseAgg->keyDomain, outputCols,
+                                sortSpec, &sortError)) {
+                            return std::nullopt;
+                        }
+                    }
+                } else if (!appendGenericGpuSort(
+                               lowering->plan, "ir_multi_in_agg_reuse",
+                               reuseRows, reuseAgg->keyDomain, outputCols,
+                               sortSpec, &sortError)) {
+                    return std::nullopt;
+                }
+            }
+
+            lowering->plan.costTraces.push_back(
+                "cost[ir_multi_in_agg_reuse]: primary-key row lookup " +
+                pkRowLookup + " replaces tail domain build " +
+                domainBitmap->buildPhaseName);
+            return std::move(lowering->plan);
+        };
+
+        if (auto pkLookupPlan = tryPkRowLookupReuse())
+            return pkLookupPlan;
+
+        std::map<std::string, DomainAggReuseColumnSpec> groupByDisplay;
+        int outIdx = 0;
+        for (size_t gi = 0; gi < aggregate->groupBy.size(); ++gi) {
+            auto* col = aggregate->groupBy[gi]
+                ? std::get_if<GenericColumnExpr>(&aggregate->groupBy[gi]->node)
+                : nullptr;
+            if (!col) return std::nullopt;
+
+            const std::string display =
+                groupDisplayNameForAggregate(*aggregate, gi);
+            DomainAggReuseColumnSpec spec;
+            const bool isString = col->type.type == DataType::CHAR_FIXED;
+            spec.output = GenericMatColumnDesc{
+                display,
+                "d_ir_multi_reuse_out_" + std::to_string(outIdx++) + "_" +
+                    sanitizeIdentifier(display),
+                isString ? "char" : metalTypeForType(col->type),
+                isString ? std::max(1, col->type.fixedWidth) : 0};
+            spec.sourceMetalType = metalTypeForType(col->type);
+
+            if (col->relationInstance.value == domainBitmap->relationInstance &&
+                col->column == domainBitmap->keyColumn) {
+                spec.fromDomainKey = true;
+            } else {
+                auto relIt = lowering->carryMap.find(col->relationInstance.value);
+                if (relIt == lowering->carryMap.end()) return std::nullopt;
+                auto colIt = relIt->second.find(col->column);
+                if (colIt == relIt->second.end()) return std::nullopt;
+                const auto& carry = colIt->second;
+                spec.sourceBuffer =
+                    domainCarryStorageBufferName(*domainBitmap,
+                                                 carry.column);
+                if (isString) {
+                    spec.sourceIsStringRowRef = true;
+                    spec.stringSourceTable = carry.column.table;
+                    spec.stringSourceColumn = carry.column.column;
+                }
+            }
+            groupByDisplay[display] = std::move(spec);
+        }
+
+        const std::string aggregateDisplay = projection.name.empty()
+            ? "agg_0"
+            : projection.name;
+        std::vector<DomainAggReuseColumnSpec> orderedGroups;
+        if (!aggregate->outputOrder.empty()) {
+            bool seenAggregate = false;
+            for (const auto& name : aggregate->outputOrder) {
+                if (name == aggregateDisplay) {
+                    seenAggregate = true;
+                    continue;
+                }
+                if (seenAggregate) return std::nullopt;
+                auto it = groupByDisplay.find(name);
+                if (it == groupByDisplay.end()) return std::nullopt;
+                orderedGroups.push_back(it->second);
+            }
+        } else {
+            for (size_t gi = 0; gi < aggregate->groupBy.size(); ++gi) {
+                const std::string display =
+                    groupDisplayNameForAggregate(*aggregate, gi);
+                auto it = groupByDisplay.find(display);
+                if (it == groupByDisplay.end()) return std::nullopt;
+                orderedGroups.push_back(it->second);
+            }
+        }
+
+        GenericMatColumnDesc aggregateOutput{
+            aggregateDisplay,
+            "d_ir_multi_reuse_out_" + std::to_string(outIdx++) + "_" +
+                sanitizeIdentifier(aggregateDisplay),
+            "float"};
+
+        std::vector<GenericMatColumnDesc> outputCols;
+        outputCols.reserve(orderedGroups.size() + 1);
+        for (const auto& col : orderedGroups)
+            outputCols.push_back(col.output);
+        outputCols.push_back(aggregateOutput);
+
+        const std::string reuseCounter = "d_ir_multi_reuse_result_count";
+        const std::string reuseRows = "n_ir_multi_reuse_rows";
+        auto& phase = appendPhase(
+            lowering->plan, "GENERIC_ir_multi_table_in_agg_reuse_compact",
+            std::make_unique<MetalDomainAggReuseMaterialize>(
+                domainBitmap->bitmapName, domainBitmap->keyDomain,
+                reuseAgg->aggBuffer, reuseAgg->keyListBuffer,
+                reuseAgg->keyListCountBuffer, reuseCounter,
+                std::move(orderedGroups),
+                aggregateOutput));
+        attachMaterializedCountHook(phase, reuseCounter, reuseRows);
+
+        if (!sortSpec.keys.empty() || sortSpec.limit >= 0) {
+            std::string sortError;
+            if (sortSpec.limit > 0) {
+                if (!appendGenericGpuTopK(lowering->plan,
+                                          "ir_multi_in_agg_reuse", reuseRows,
+                                          domainBitmap->keyDomain, outputCols,
+                                          sortSpec, &sortError)) {
+                    if (!appendGenericGpuSort(
+                            lowering->plan, "ir_multi_in_agg_reuse",
+                            reuseRows, domainBitmap->keyDomain, outputCols,
+                            sortSpec, &sortError)) {
+                        return std::nullopt;
+                    }
+                }
+            } else if (!appendGenericGpuSort(
+                           lowering->plan, "ir_multi_in_agg_reuse", reuseRows,
+                           domainBitmap->keyDomain, outputCols, sortSpec,
+                           &sortError)) {
+                return std::nullopt;
+            }
+        }
+
+        return std::move(lowering->plan);
+    };
+
+    if (auto reused = tryInSubAggDomainReuse())
+        return reused;
+
+	    auto makeAggregationCostInput =
+	        [&](std::vector<GenericMatColumnDesc> outputColumns) {
+	            GenericAggregationCostInput input;
+	            input.tag = "ir_multi_table_group";
+	            input.inputRowsExpr = lowering->outputSize;
+	            input.outputRowsExpr = groupOutputBoundExpr;
+	            input.materializedInputColumns = materializedCols;
+	            input.outputColumns = std::move(outputColumns);
+	            input.groupKeyCount = aggregate->groupBy.size();
+	            input.aggregateCount = aggregate->aggregates.size();
+	            input.sortLimit = sortSpec.limit;
+	            return input;
+	        };
+	    auto appendAggregationCostChoice =
+	        [&](const GenericAggregationCostInput& input,
+	            const std::string& chosenCandidate) {
+                auto choice = chooseMultiTableAggregationPlan(
+                    input, chosenCandidate);
+	            appendGenericCostDecisionTrace(
+	                lowering->plan, choice.trace);
+	        };
+
+	    bool hasCountDistinctAgg = false;
     for (const auto& projection : aggregate->aggregates) {
         auto* agg = projection.expr
             ? std::get_if<GenericAggregateExpr>(&projection.expr->node)
@@ -3023,15 +3810,36 @@ std::optional<MetalQueryPlan> lowerMultiTableGroupedAggregateIRToMetalImpl(
     if (hasCountDistinctAgg) {
         auto& matPhase = ensureMaterializePhase();
         bool countDistinctGroupApplied = false;
-        if (!tryAppendMaterializedCountDistinctGroup(
-                lowering->plan, matPhase, *aggregate, groupSpec, materializedCols,
-                sortSpec, resultCounter, lowering->outputSize,
-                groupOutputBoundExpr, &countDistinctGroupApplied, error)) {
-            return std::nullopt;
-        }
-        if (countDistinctGroupApplied)
-            return std::move(lowering->plan);
-    }
+	        if (!tryAppendMaterializedCountDistinctGroup(
+	                lowering->plan, matPhase, *aggregate, groupSpec, materializedCols,
+	                sortSpec, resultCounter, lowering->outputSize,
+	                groupOutputBoundExpr, &countDistinctGroupApplied, error)) {
+	            return std::nullopt;
+	        }
+	        if (countDistinctGroupApplied) {
+	            auto costInput = makeAggregationCostInput(materializedCols);
+	            costInput.materializedHashAvailable = false;
+	            costInput.countDistinctAvailable = true;
+	            costInput.aggregateSlots =
+	                static_cast<int>(std::max<size_t>(1, aggregate->aggregates.size()));
+	            appendAggregationCostChoice(costInput,
+	                                        "materialized_count_distinct");
+	            return std::move(lowering->plan);
+	        }
+	    }
+
+    struct FdGroupPlanCandidate {
+        bool available = false;
+        PrimaryKeyGroupReduction reduction;
+        GenericMatColumnDesc keyColumn;
+        std::vector<IrPendingAgg> pending;
+        int valuesPerBucket = 0;
+        std::vector<GenericMatColumnDesc> outputColumns;
+        std::vector<GenericMatColumnDesc> narrowOutputColumns;
+        FdTopKLateMaterializationChoice lateTopKChoice;
+        bool lateTopKMaterialize = false;
+    };
+    FdGroupPlanCandidate fdCandidate;
 
     if (!aggregateNeedsHashGroupOutput(*aggregate) && !aggregate->having) {
         auto pkReduction = primaryKeyGroupReduction(
@@ -3161,86 +3969,149 @@ std::optional<MetalQueryPlan> lowerMultiTableGroupedAggregateIRToMetalImpl(
             }
 
             if (fdDirectOk && fdValuesPerBucket > 0) {
-                const std::string rowsSym = "ir_multi_fd_group_rows";
-                const std::string bucketCountSymbol = "n_ir_multi_fd_group_buckets";
-                const std::string stateBuffer = "d_ir_multi_fd_group_state";
-                const std::string repRowBuffer = "d_ir_multi_fd_group_rep_row";
-                const std::string aggBuffer = "d_ir_multi_fd_group_aggs";
-                const std::string compactCounter = "d_ir_multi_fd_group_count";
-
-                auto& matPhase = ensureMaterializePhase();
-                attachMaterializedCountHook(matPhase, resultCounter, rowsSym);
-                appendPhase(lowering->plan,
-                    "GENERIC_ir_multi_table_fd_group_build",
-                    std::make_unique<MetalFdKeyedGroupBuild>(
-                        rowsSym, pkReduction->keyDomainExpr, bucketCountSymbol,
-                        stateBuffer, repRowBuffer, aggBuffer, *keyCol,
-                        materializedCols, fdPending, fdValuesPerBucket));
-
                 auto narrowFdOutputCols = fdKeyedGroupTopKNarrowColumns(
                     "ir_multi_fd_group_topk", fdOutputCols, sortSpec);
-                const bool lateTopKMaterialize =
-                    shouldUseFdTopKLateMaterialization(
-                        sortSpec, fdOutputCols, narrowFdOutputCols,
-                        pkReduction->outputBoundExpr,
-                        pkReduction->keyDomainExpr);
-                const auto& compactOutputs =
-                    lateTopKMaterialize ? narrowFdOutputCols : fdOutputCols;
-
-                auto& compactPhase = appendPhase(
-                    lowering->plan,
-                    lateTopKMaterialize
-                        ? "GENERIC_ir_multi_table_fd_group_topk_compact"
-                        : "GENERIC_ir_multi_table_fd_group_compact",
-                    std::make_unique<MetalFdKeyedGroupCompact>(
-                        pkReduction->keyDomainExpr, bucketCountSymbol,
-                        pkReduction->outputBoundExpr, stateBuffer, repRowBuffer,
-                        aggBuffer, compactCounter,
-                        materializedCols, groupSpec.keyColumns, fdPending,
-                        compactOutputs, fdValuesPerBucket));
-
-                if (!sortSpec.keys.empty() || sortSpec.limit >= 0) {
-                    const std::string orderTag = lateTopKMaterialize
-                        ? "ir_multi_fd_group_topk"
-                        : "ir_multi_fd_group";
-                    const std::string sortRowsSym =
-                        "n_gpu_sort_" + orderTag + "_rows";
-                    attachMaterializedCountHook(compactPhase, compactCounter,
-                                                sortRowsSym);
-                    if (!appendBestGenericGpuOrder(
-                            lowering->plan, orderTag, sortRowsSym,
-                            pkReduction->outputBoundExpr, compactOutputs, sortSpec,
-                            error)) {
-                        return std::nullopt;
-                    }
-                    if (lateTopKMaterialize) {
-                        const auto* bucketCol = findMaterializedColumn(
-                            compactOutputs, kFdHiddenBucketDisplay);
-                        if (!bucketCol || !lowering->plan.gpuSort) {
-                            return fail(error,
-                                "IR multi-table FD top-k lowerer: missing narrow bucket or GPU order.");
-                        }
-                        const std::string finalCounter =
-                            "d_ir_multi_fd_group_topk_result_count";
-                        appendPhase(lowering->plan,
-                            "GENERIC_ir_multi_table_fd_group_topk_gather",
-                            std::make_unique<MetalFdKeyedGroupTopKGather>(
-                                lowering->plan.gpuSort->sortedIndexBuffer,
-                                sortRowsSym, sortSpec.limit, *bucketCol,
-                                pkReduction->keyDomainExpr, repRowBuffer,
-                                aggBuffer, finalCounter, materializedCols,
-                                groupSpec.keyColumns, fdPending, fdOutputCols,
-                                fdValuesPerBucket),
-                            256);
-                        lowering->plan.gpuSort.reset();
-                    }
-                }
-
-                return std::move(lowering->plan);
+                auto lateTopKChoice = chooseFdTopKLateMaterialization(
+                    sortSpec, fdOutputCols, narrowFdOutputCols,
+                    pkReduction->outputBoundExpr,
+                    pkReduction->keyDomainExpr, "ir_multi_fd_group_topk");
+                fdCandidate.available = true;
+                fdCandidate.reduction = *pkReduction;
+                fdCandidate.keyColumn = *keyCol;
+                fdCandidate.pending = std::move(fdPending);
+                fdCandidate.valuesPerBucket = fdValuesPerBucket;
+                fdCandidate.outputColumns = std::move(fdOutputCols);
+                fdCandidate.narrowOutputColumns = std::move(narrowFdOutputCols);
+                fdCandidate.lateTopKChoice = std::move(lateTopKChoice);
+                fdCandidate.lateTopKMaterialize =
+                    fdCandidate.lateTopKChoice.useLateMaterialization;
             }
         }
     }
 
+    auto fdCandidateName = [&]() {
+        return fdCandidate.lateTopKMaterialize ? std::string("fd_keyed_late_topk")
+                                               : std::string("fd_keyed_group");
+    };
+    auto fdCostCandidate = [&]() {
+        GenericAggregationCandidateCostInput candidate;
+        candidate.name = fdCandidateName();
+        candidate.available = fdCandidate.available;
+        candidate.reason = fdCandidate.available
+            ? ""
+            : "finite-domain keyed group candidate is not applicable";
+        candidate.outputColumns = fdCandidate.outputColumns;
+        candidate.aggregateSlots = fdCandidate.valuesPerBucket;
+        candidate.denseBucketsExpr = fdCandidate.reduction.keyDomainExpr;
+        candidate.fdLateTopK = fdCandidate.lateTopKMaterialize;
+        return candidate;
+    };
+    auto emitFdCandidate = [&]() -> std::optional<MetalQueryPlan> {
+        if (!fdCandidate.available) return std::nullopt;
+        const std::string rowsSym = "ir_multi_fd_group_rows";
+        const std::string bucketCountSymbol = "n_ir_multi_fd_group_buckets";
+        const std::string stateBuffer = "d_ir_multi_fd_group_state";
+        const std::string repRowBuffer = "d_ir_multi_fd_group_rep_row";
+        const std::string aggBuffer = "d_ir_multi_fd_group_aggs";
+        const std::string compactCounter = "d_ir_multi_fd_group_count";
+
+        appendGenericCostDecisionTrace(lowering->plan,
+                                       fdCandidate.lateTopKChoice.trace);
+        auto& matPhase = ensureMaterializePhase();
+        attachMaterializedCountHook(matPhase, resultCounter, rowsSym);
+        appendPhase(lowering->plan,
+            "GENERIC_ir_multi_table_fd_group_build",
+            std::make_unique<MetalFdKeyedGroupBuild>(
+                rowsSym, fdCandidate.reduction.keyDomainExpr, bucketCountSymbol,
+                stateBuffer, repRowBuffer, aggBuffer, fdCandidate.keyColumn,
+                materializedCols, fdCandidate.pending,
+                fdCandidate.valuesPerBucket));
+
+        const auto& compactOutputs = fdCandidate.lateTopKMaterialize
+            ? fdCandidate.narrowOutputColumns
+            : fdCandidate.outputColumns;
+        auto& compactPhase = appendPhase(
+            lowering->plan,
+            fdCandidate.lateTopKMaterialize
+                ? "GENERIC_ir_multi_table_fd_group_topk_compact"
+                : "GENERIC_ir_multi_table_fd_group_compact",
+            std::make_unique<MetalFdKeyedGroupCompact>(
+                fdCandidate.reduction.keyDomainExpr, bucketCountSymbol,
+                fdCandidate.reduction.outputBoundExpr, stateBuffer, repRowBuffer,
+                aggBuffer, compactCounter,
+                materializedCols, groupSpec.keyColumns, fdCandidate.pending,
+                compactOutputs, fdCandidate.valuesPerBucket));
+
+        if (!sortSpec.keys.empty() || sortSpec.limit >= 0) {
+            const std::string orderTag = fdCandidate.lateTopKMaterialize
+                ? "ir_multi_fd_group_topk"
+                : "ir_multi_fd_group";
+            const std::string sortRowsSym =
+                "n_gpu_sort_" + orderTag + "_rows";
+            attachMaterializedCountHook(compactPhase, compactCounter,
+                                        sortRowsSym);
+            if (!appendBestGenericGpuOrder(
+                    lowering->plan, orderTag, sortRowsSym,
+                    fdCandidate.reduction.outputBoundExpr, compactOutputs,
+                    sortSpec, error)) {
+                return std::nullopt;
+            }
+            if (fdCandidate.lateTopKMaterialize) {
+                const auto* bucketCol = findMaterializedColumn(
+                    compactOutputs, kFdHiddenBucketDisplay);
+                if (!bucketCol || !lowering->plan.gpuSort) {
+                    return fail(error,
+                        "IR multi-table FD top-k lowerer: missing narrow bucket or GPU order.");
+                }
+                const std::string finalCounter =
+                    "d_ir_multi_fd_group_topk_result_count";
+                appendPhase(lowering->plan,
+                    "GENERIC_ir_multi_table_fd_group_topk_gather",
+                    std::make_unique<MetalFdKeyedGroupTopKGather>(
+                        lowering->plan.gpuSort->sortedIndexBuffer,
+                        sortRowsSym, sortSpec.limit, *bucketCol,
+                        fdCandidate.reduction.keyDomainExpr, repRowBuffer,
+                        aggBuffer, finalCounter, materializedCols,
+                        groupSpec.keyColumns, fdCandidate.pending,
+                        fdCandidate.outputColumns,
+                        fdCandidate.valuesPerBucket),
+                    256);
+                lowering->plan.gpuSort.reset();
+            }
+        }
+        return std::move(lowering->plan);
+    };
+
+    const std::string groupTag = "ir_multi_table_group";
+    auto makeHashOutputColumns = [&]() {
+        GenericGpuGroupSpec spec;
+        spec.tag = groupTag;
+        spec.inputColumns = materializedCols;
+        spec.groupBy = groupSpec;
+        return genericGpuGroupOutputColumns(spec);
+    };
+    auto hashCostCandidate =
+        [&](const std::vector<GenericMatColumnDesc>& hashOutputColumns) {
+            GenericAggregationCandidateCostInput candidate;
+            candidate.name = "materialized_hash_group";
+            candidate.outputColumns = hashOutputColumns;
+            candidate.aggregateSlots = static_cast<int>(
+                std::max<size_t>(1, aggregate->aggregates.size()));
+            return candidate;
+        };
+    auto chooseAggregationCandidate =
+        [&](std::vector<GenericAggregationCandidateCostInput> candidates) {
+            GenericAggregationCostInput costInput =
+                makeAggregationCostInput(candidates.empty()
+                    ? std::vector<GenericMatColumnDesc>{}
+                    : candidates.front().outputColumns);
+            costInput.candidates = std::move(candidates);
+            auto choice = chooseMultiTableAggregationPlan(costInput);
+            appendGenericCostDecisionTrace(lowering->plan, choice.trace);
+            return choice;
+        };
+
+    bool aggregationChoiceMade = false;
     if (!aggregate->groupBy.empty()) {
         bool directOk = true;
         int totalBuckets = 1;
@@ -3260,13 +4131,30 @@ std::optional<MetalQueryPlan> lowerMultiTableGroupedAggregateIRToMetalImpl(
         std::vector<DirectStringKeyMapSpec> directStringKeyMaps;
         std::vector<MetalMaterializedRangeScan::ExtraBuffer> directExtraBuffers;
         std::map<std::string, std::string> directStringKeyMapBySignature;
-        bool directInputFusionOk = scalarLookups.empty();
+        bool directInputFusionOk = true;
+        int directCarriedStringRowRefRewrites = 0;
         std::vector<std::pair<std::string, std::string>> directInputRewrites;
 
         auto canFuseDirectScalarExpr = [&](const GenericExprPtr& expr) {
             if (!expr || !materializeExprSupported(expr)) return false;
             if (exprNeedsCarriedString(expr, lowering->carryMap)) return false;
             return expr->type.type != DataType::CHAR_FIXED;
+        };
+        auto carriedStringRowRefExpr = [&](const GenericExprPtr& expr)
+                -> std::optional<std::string> {
+            if (!expr) return std::nullopt;
+            const auto* col = std::get_if<GenericColumnExpr>(&expr->node);
+            if (!col || col->type.type != DataType::CHAR_FIXED)
+                return std::nullopt;
+            auto relIt = lowering->carryMap.find(col->relationInstance.value);
+            if (relIt == lowering->carryMap.end())
+                return std::nullopt;
+            auto colIt = relIt->second.find(col->column);
+            if (colIt == relIt->second.end() ||
+                colIt->second.rowVarName.empty()) {
+                return std::nullopt;
+            }
+            return colIt->second.rowVarName;
         };
 
         auto finiteStringKeyMapSignature = [](
@@ -3326,6 +4214,13 @@ std::optional<MetalQueryPlan> lowerMultiTableGroupedAggregateIRToMetalImpl(
                     raw,
                     genericExprToMetalWithCarryMap(
                         group, idxVar, lowering->carryMap)});
+            } else if (directInputFusionOk && matCol->stringRowRef) {
+                if (auto rowRefExpr = carriedStringRowRefExpr(group)) {
+                    directInputRewrites.push_back({raw, *rowRefExpr});
+                    ++directCarriedStringRowRefRewrites;
+                } else {
+                    directInputFusionOk = false;
+                }
             } else {
                 directInputFusionOk = false;
             }
@@ -3637,6 +4532,8 @@ std::optional<MetalQueryPlan> lowerMultiTableGroupedAggregateIRToMetalImpl(
                     havingSpec.scalarAggScaleDown = p.scaleDown;
                     havingSpec.scalarTotalBuffer =
                         "d_ir_multi_direct_group_having_total";
+                    havingSpec.scalarTotalParam =
+                        "s_ir_multi_direct_group_having_total";
                     havingSpec.scalarCompareOp = groupSpec.havingScalarCompareOp;
                     havingSpec.scalarMultiplier = groupSpec.havingMultiplier;
                 } else {
@@ -3662,18 +4559,55 @@ std::optional<MetalQueryPlan> lowerMultiTableGroupedAggregateIRToMetalImpl(
             }
         }
 
+        DenseGroupCostChoice denseChoice;
+        bool haveDenseChoice = false;
         if (directOk && !pending.empty()) {
-            auto denseChoice = chooseDenseGroupPlan(
-                denseKeys, pending, totalBuckets, dynamicDomain, havingSpec);
+            denseChoice = chooseDenseGroupPlan(
+                denseKeys, pending, totalBuckets, dynamicDomain, havingSpec,
+                "ir_multi_table_direct_group");
+            haveDenseChoice = true;
             if (!denseChoice.useDense)
                 directOk = false;
         }
 
         if (directOk && !pending.empty()) {
-            const bool fuseDirectInput =
-                directInputFusionOk &&
-                directStringKeyMaps.empty() &&
-                directExtraBuffers.empty();
+            const bool pipelineInputAvailable = directInputFusionOk;
+            const bool activeBucketCompactionApplicable =
+                !havingSpec.scalarTotalBuffer.empty() ||
+                havingSpec.compareAggOffset >= 0;
+            ActiveBucketCompactionCostChoice activeChoice;
+            bool haveActiveChoice = false;
+            bool useActiveBucketCompaction = false;
+            if (activeBucketCompactionApplicable) {
+                auto activeCostInput = makeAggregationCostInput({});
+                activeCostInput.directDenseAvailable = true;
+                activeCostInput.aggregateSlots = valuesPerBucket;
+                activeCostInput.denseBuckets = dynamicDomain ? 0 : totalBuckets;
+                activeCostInput.denseBucketsExpr =
+                    dynamicDomain ? bucketCountExpr : "";
+                activeCostInput.dynamicDenseDomain = dynamicDomain;
+                activeChoice = chooseActiveBucketCompaction(
+                    activeCostInput, "ir_multi_table_direct_group_active");
+                haveActiveChoice = true;
+                useActiveBucketCompaction = activeChoice.useActiveList;
+            }
+            auto inputModeCost = makeAggregationCostInput({});
+            inputModeCost.directDenseAvailable = true;
+            inputModeCost.directInputFused = pipelineInputAvailable;
+            inputModeCost.directMaterializedAvailable = true;
+            inputModeCost.directPipelineCarriedStringRowRefs =
+                directCarriedStringRowRefRewrites;
+            inputModeCost.directPipelineExtraBuffers =
+                static_cast<int>(directExtraBuffers.size());
+            inputModeCost.activeBucketCompaction = useActiveBucketCompaction;
+            inputModeCost.aggregateSlots = valuesPerBucket;
+            inputModeCost.denseBuckets = dynamicDomain ? 0 : totalBuckets;
+            inputModeCost.denseBucketsExpr =
+                dynamicDomain ? bucketCountExpr : "";
+            inputModeCost.dynamicDenseDomain = dynamicDomain;
+            auto inputModeChoice = chooseDirectDenseInputMode(
+                inputModeCost, "ir_multi_table_direct_group_input");
+            const bool fuseDirectInput = inputModeChoice.usePipeline;
             if (fuseDirectInput) {
                 for (auto& key : denseKeys) {
                     for (const auto& rewrite : directInputRewrites)
@@ -3686,6 +4620,104 @@ std::optional<MetalQueryPlan> lowerMultiTableGroupedAggregateIRToMetalImpl(
                                           rewrite.second);
                 }
             }
+
+            auto directCompactOutputColumns =
+                [&]() -> std::vector<GenericMatColumnDesc> {
+                    std::vector<GenericMatColumnDesc> columns;
+                    for (const auto& key : denseKeys) {
+                        std::string buf = "d_ir_multi_direct_out_" +
+                                          std::to_string(columns.size()) + "_" +
+                                          sanitizeIdentifier(key.displayName);
+                        const bool isStringKey = !key.charMap.empty() ||
+                                                 !key.stringMap.empty() ||
+                                                 key.stringRowRef;
+                        columns.push_back(GenericMatColumnDesc{
+                            key.displayName, buf, isStringKey ? "char" : "int",
+                            isStringKey ? key.stringLen : 0});
+                    }
+
+                    for (size_t pi = 0; pi < pending.size(); ++pi) {
+                        const auto& p = pending[pi];
+                        if (p.funcName == "RATIO_DEN" ||
+                            p.displayName.rfind("__hidden_", 0) == 0) {
+                            continue;
+                        }
+
+                        std::string metalType = "uint";
+                        int outScale = 0;
+                        bool outLongPair = false;
+                        if (p.funcName == "RATIO") {
+                            metalType = "float";
+                            if (pi + 1 < pending.size() &&
+                                pending[pi + 1].funcName == "RATIO_DEN") {
+                                ++pi;
+                            }
+                        } else if (p.scaleDown < 0 && pi + 1 < pending.size()) {
+                            metalType = "float";
+                            ++pi;
+                        } else if (p.isLongPair) {
+                            outScale = p.scaleDown > 0 ? p.scaleDown : 0;
+                            outLongPair = true;
+                        } else if (p.isFloatSum || p.isMinMax) {
+                            metalType = "float";
+                        }
+
+                        std::string buf = "d_ir_multi_direct_out_" +
+                                          std::to_string(columns.size()) + "_" +
+                                          sanitizeIdentifier(p.displayName);
+                        columns.push_back(GenericMatColumnDesc{
+                            p.displayName, buf, metalType, 0, outScale, outLongPair});
+                    }
+                    return columns;
+                };
+
+            const int keyedBucketCount = dynamicDomain ? 0 : totalBuckets;
+            const std::string directCandidateName = fuseDirectInput
+                ? "direct_dense_pipeline"
+                : "direct_dense_materialized";
+            auto hashOutputColumns = makeHashOutputColumns();
+            GenericAggregationCandidateCostInput directCandidate;
+            directCandidate.name = directCandidateName;
+            directCandidate.outputColumns = directCompactOutputColumns();
+            directCandidate.aggregateSlots = valuesPerBucket;
+            directCandidate.denseBuckets = keyedBucketCount;
+            directCandidate.denseBucketsExpr = dynamicDomain ? bucketCountExpr : "";
+            directCandidate.dynamicDenseDomain = dynamicDomain;
+            directCandidate.directInputFused = fuseDirectInput;
+            directCandidate.directPipelineCarriedStringRowRefs =
+                directCarriedStringRowRefRewrites;
+            directCandidate.directPipelineExtraBuffers =
+                static_cast<int>(directExtraBuffers.size());
+            directCandidate.activeBucketCompaction = useActiveBucketCompaction;
+
+            std::vector<GenericAggregationCandidateCostInput> candidates;
+            candidates.push_back(hashCostCandidate(hashOutputColumns));
+            if (fdCandidate.available)
+                candidates.push_back(fdCostCandidate());
+            candidates.push_back(directCandidate);
+            auto globalChoice = chooseAggregationCandidate(std::move(candidates));
+            aggregationChoiceMade = true;
+            if (fdCandidate.available &&
+                globalChoice.chosenCandidate == fdCandidateName()) {
+                return emitFdCandidate();
+            }
+            if (globalChoice.chosenCandidate != directCandidateName) {
+                directOk = false;
+            }
+
+            if (!directOk) {
+                // Fall through to the materialized hash-group path.
+            } else {
+                if (haveDenseChoice) {
+                    appendGenericCostDecisionTrace(lowering->plan,
+                                                   denseChoice.trace);
+                }
+                if (haveActiveChoice) {
+                    appendGenericCostDecisionTrace(lowering->plan,
+                                                   activeChoice.trace);
+                }
+                appendGenericCostDecisionTrace(lowering->plan,
+                                               inputModeChoice.trace);
 
             std::string bucketExpr;
             for (const auto& key : denseKeys) {
@@ -3700,24 +4732,23 @@ std::optional<MetalQueryPlan> lowerMultiTableGroupedAggregateIRToMetalImpl(
             bucketCountExpr = dynamicDomain
                 ? bucketCountExpr
                 : std::to_string(totalBuckets);
-            const int keyedBucketCount = dynamicDomain ? 0 : totalBuckets;
 
             std::unique_ptr<MetalOperator> directInput;
+            for (const auto& spec : directStringKeyMaps) {
+                appendPhase(lowering->plan,
+                    "GENERIC_ir_multi_table_finite_string_keymap_" +
+                        sanitizeIdentifier(spec.mapBuffer),
+                    std::make_unique<MetalFiniteStringRowRefMapBuild>(
+                        spec.sourceTable, spec.sourceColumn, spec.width,
+                        spec.mapBuffer, spec.domain),
+                    256);
+            }
             if (fuseDirectInput) {
                 directInput = std::move(lowering->probePipe);
             } else {
                 auto& matPhase = ensureMaterializePhase();
                 const std::string rowsSym = "ir_multi_direct_group_rows";
                 attachMaterializedCountHook(matPhase, resultCounter, rowsSym);
-                for (const auto& spec : directStringKeyMaps) {
-                    appendPhase(lowering->plan,
-                        "GENERIC_ir_multi_table_finite_string_keymap_" +
-                            sanitizeIdentifier(spec.mapBuffer),
-                        std::make_unique<MetalFiniteStringRowRefMapBuild>(
-                            spec.sourceTable, spec.sourceColumn, spec.width,
-                            spec.mapBuffer, spec.domain),
-                        256);
-                }
                 directInput = std::make_unique<MetalMaterializedRangeScan>(
                     rowsSym, idxVar, materializedCols, directExtraBuffers);
             }
@@ -3725,11 +4756,12 @@ std::optional<MetalQueryPlan> lowerMultiTableGroupedAggregateIRToMetalImpl(
                 std::move(directInput), "d_ir_multi_direct_group_aggs", bucketExpr,
                 keyedBucketCount, valuesPerBucket,
                 bucketCountExpr + " * " + std::to_string(valuesPerBucket));
-            const bool useActiveBucketCompaction =
-                !havingSpec.scalarTotalBuffer.empty() ||
-                havingSpec.compareAggOffset >= 0;
-            const std::string activeFlagBuffer =
-                useActiveBucketCompaction
+            if (fuseDirectInput) {
+                for (const auto& extra : directExtraBuffers)
+                    keyed->addExtraBufferParam(extra.first, extra.second);
+            }
+	            const std::string activeFlagBuffer =
+	                useActiveBucketCompaction
                     ? "d_ir_multi_direct_group_active_flags"
                     : "";
             const std::string activeListBuffer =
@@ -3776,9 +4808,20 @@ std::optional<MetalQueryPlan> lowerMultiTableGroupedAggregateIRToMetalImpl(
 
             auto& directPhase = appendPhase(lowering->plan,
                 "GENERIC_ir_multi_table_direct_group", std::move(keyed));
+            if (fuseDirectInput && !scalarLookups.empty()) {
+                attachGenericScalarLookupBuffers(directPhase, scalarLookups);
+            }
             if (useActiveBucketCompaction) {
                 attachMaterializedCountHook(directPhase, activeCounterBuffer,
                                             activeCountSymbol);
+            }
+            if (!havingSpec.scalarTotalBuffer.empty() &&
+                !havingSpec.scalarTotalParam.empty()) {
+                attachHavingTotalScalarHook(
+                    directPhase, havingSpec.scalarTotalBuffer,
+                    havingSpec.scalarTotalParam,
+                    havingSpec.scalarAggIsLongPair,
+                    havingSpec.scalarAggIsFloatSum);
             }
 
             std::vector<KeyedCompactKeySpec> compactKeys;
@@ -3868,21 +4911,35 @@ std::optional<MetalQueryPlan> lowerMultiTableGroupedAggregateIRToMetalImpl(
                     havingSpec, activeListBuffer, activeCountSymbol));
             (void)directPhase;
 
-            if (!sortSpec.keys.empty() || sortSpec.limit >= 0) {
-                const std::string sortRowsSym = "n_gpu_sort_ir_multi_direct_group_rows";
-                attachMaterializedCountHook(compactPhase, compactCounter, sortRowsSym);
+	            if (!sortSpec.keys.empty() || sortSpec.limit >= 0) {
+	                const std::string sortRowsSym = "n_gpu_sort_ir_multi_direct_group_rows";
+	                attachMaterializedCountHook(compactPhase, compactCounter, sortRowsSym);
                 if (!appendGenericGpuSort(lowering->plan, "ir_multi_direct_group",
                                           sortRowsSym, bucketCountExpr,
                                           compactCols, sortSpec, error)) {
-                    return std::nullopt;
-                }
-            }
+	                    return std::nullopt;
+	                }
+	            }
 
-            return std::move(lowering->plan);
+	            return std::move(lowering->plan);
+            }
+	        }
+    }
+
+    if (!aggregationChoiceMade) {
+        auto hashOutputColumnsForChoice = makeHashOutputColumns();
+        std::vector<GenericAggregationCandidateCostInput> candidates;
+        candidates.push_back(hashCostCandidate(hashOutputColumnsForChoice));
+        if (fdCandidate.available)
+            candidates.push_back(fdCostCandidate());
+        auto globalChoice = chooseAggregationCandidate(std::move(candidates));
+        aggregationChoiceMade = true;
+        if (fdCandidate.available &&
+            globalChoice.chosenCandidate == fdCandidateName()) {
+            return emitFdCandidate();
         }
     }
 
-    const std::string groupTag = "ir_multi_table_group";
     GenericGpuGroupSpec gbSpec;
     gbSpec.tag = groupTag;
     gbSpec.inputCounter = resultCounter;
@@ -3891,22 +4948,23 @@ std::optional<MetalQueryPlan> lowerMultiTableGroupedAggregateIRToMetalImpl(
         lowering->outputSize, groupOutputBoundExpr);
     gbSpec.capacitySymbol = "n_gpu_gb_" + groupTag + "_cap";
     gbSpec.maxOutputRowsExpr = groupOutputBoundExpr;
-    gbSpec.outputCounter = "d_gpu_gb_" + groupTag + "_count";
-    gbSpec.inputColumns = std::move(materializedCols);
-    gbSpec.groupBy = std::move(groupSpec);
-    auto& matPhase = ensureMaterializePhase();
-    attachMaterializedCountHook(matPhase, gbSpec.inputCounter, gbSpec.inputRowsSymbol);
-    appendGenericGpuGroupBy(lowering->plan, gbSpec);
+	    gbSpec.outputCounter = "d_gpu_gb_" + groupTag + "_count";
+	    gbSpec.inputColumns = std::move(materializedCols);
+	    gbSpec.groupBy = std::move(groupSpec);
+	    auto hashOutputColumns = genericGpuGroupOutputColumns(gbSpec);
+	    auto& matPhase = ensureMaterializePhase();
+	    attachMaterializedCountHook(matPhase, gbSpec.inputCounter, gbSpec.inputRowsSymbol);
+	    appendGenericGpuGroupBy(lowering->plan, gbSpec);
 
     const std::string sortRowsSym = "n_gpu_sort_" + groupTag + "_rows";
     attachMaterializedCountHook(lowering->plan.phases.back(), gbSpec.outputCounter,
                                 sortRowsSym);
 
     if (!sortSpec.keys.empty() || sortSpec.limit >= 0) {
-        if (!appendGenericGpuSort(lowering->plan, "group_" + groupTag,
-                                  sortRowsSym, gbSpec.maxOutputRowsExpr,
-                                  genericGpuGroupOutputColumns(gbSpec),
-                                  sortSpec, error)) {
+	        if (!appendGenericGpuSort(lowering->plan, "group_" + groupTag,
+	                                  sortRowsSym, gbSpec.maxOutputRowsExpr,
+	                                  hashOutputColumns,
+	                                  sortSpec, error)) {
             return std::nullopt;
         }
     }
@@ -3917,14 +4975,18 @@ std::optional<MetalQueryPlan> lowerMultiTableGroupedAggregateIRToMetalImpl(
 std::optional<MetalQueryPlan> lowerMultiTableGroupedAggregateIRToMetal(
         const GenericRelPlan& ir,
         std::string* error) {
-    return lowerMultiTableGroupedAggregateIRToMetalImpl(ir, nullptr, error);
+    return attachGenericCostTrace(
+        lowerMultiTableGroupedAggregateIRToMetalImpl(ir, nullptr, error),
+        ir, "multi_table_grouped_aggregate");
 }
 
 std::optional<MetalQueryPlan> lowerMultiTableGroupedAggregateIRToMetal(
         const GenericRelPlan& ir,
         const AnalyzedQuery& aq,
         std::string* error) {
-    return lowerMultiTableGroupedAggregateIRToMetalImpl(ir, &aq, error);
+    return attachGenericCostTrace(
+        lowerMultiTableGroupedAggregateIRToMetalImpl(ir, &aq, error),
+        ir, "multi_table_grouped_aggregate");
 }
 
 std::optional<MetalQueryPlan> lowerMultiTableScalarAggregateIRToMetalImpl(
@@ -4111,14 +5173,18 @@ std::optional<MetalQueryPlan> lowerMultiTableScalarAggregateIRToMetalImpl(
 std::optional<MetalQueryPlan> lowerMultiTableScalarAggregateIRToMetal(
         const GenericRelPlan& ir,
         std::string* error) {
-    return lowerMultiTableScalarAggregateIRToMetalImpl(ir, nullptr, error);
+    return attachGenericCostTrace(
+        lowerMultiTableScalarAggregateIRToMetalImpl(ir, nullptr, error),
+        ir, "multi_table_scalar_aggregate");
 }
 
 std::optional<MetalQueryPlan> lowerMultiTableScalarAggregateIRToMetal(
         const GenericRelPlan& ir,
         const AnalyzedQuery& aq,
         std::string* error) {
-    return lowerMultiTableScalarAggregateIRToMetalImpl(ir, &aq, error);
+    return attachGenericCostTrace(
+        lowerMultiTableScalarAggregateIRToMetalImpl(ir, &aq, error),
+        ir, "multi_table_scalar_aggregate");
 }
 
 } // namespace codegen

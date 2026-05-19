@@ -71,6 +71,13 @@ std::string metalCharLiteral(char ch) {
     return std::string("'") + ch + "'";
 }
 
+std::string fixedStringIndexPrefix(const std::string& dataExpr,
+                                   const std::string& rowExpr,
+                                   int width) {
+    return dataExpr + "[" + rowExpr + " * " +
+           std::to_string(width) + "ul + ";
+}
+
 std::string fixedStringEqMetal(const ColRef& col,
                                 const std::string& literal,
                                 const std::string& idxVar,
@@ -84,7 +91,7 @@ std::string fixedStringEqMetal(const ColRef& col,
 
     std::string aliasPrefix;
     if (!col.tableAlias.empty()) aliasPrefix = "/*" + col.tableAlias + "*/";
-    std::string base = aliasPrefix + col.column + "[" + idxVar + " * " + std::to_string(width) + " + ";
+    std::string base = fixedStringIndexPrefix(aliasPrefix + col.column, idxVar, width);
     std::string cond;
     for (int i = 0; i < cmpLen; ++i) {
         if (!cond.empty()) cond += " && ";
@@ -110,7 +117,7 @@ std::string fixedStringPrefixMetal(const ColRef& col,
 
     std::string aliasPrefix;
     if (!col.tableAlias.empty()) aliasPrefix = "/*" + col.tableAlias + "*/";
-    std::string base = aliasPrefix + col.column + "[" + idxVar + " * " + std::to_string(width) + " + ";
+    std::string base = fixedStringIndexPrefix(aliasPrefix + col.column, idxVar, width);
     std::string cond;
     for (int i = 0; i < cmpLen; ++i) {
         if (!cond.empty()) cond += " && ";
@@ -193,7 +200,7 @@ std::optional<std::string> fixedStringLikeMetal(const Like& like,
     std::ostringstream call;
     if (segments.size() == 1) {
         const auto& segment = segments[0];
-        call << "fixed_like_one_segment(" << col->column << ", (uint)(" << idxVar << "), "
+        call << "fixed_like_one_segment(" << col->column << ", (ulong)(" << idxVar << "), "
              << width << "u, " << packedSegmentWord(segment, 0) << ", "
              << packedSegmentWord(segment, 8) << ", " << segment.size() << "u, "
              << (leadingWildcard ? "true" : "false") << ", "
@@ -201,7 +208,7 @@ std::optional<std::string> fixedStringLikeMetal(const Like& like,
     } else {
         const auto& first = segments[0];
         const auto& second = segments[1];
-        call << "fixed_like_two_segment(" << col->column << ", (uint)(" << idxVar << "), "
+        call << "fixed_like_two_segment(" << col->column << ", (ulong)(" << idxVar << "), "
              << width << "u, " << packedSegmentWord(first, 0) << ", "
              << packedSegmentWord(first, 8) << ", " << first.size() << "u, "
              << packedSegmentWord(second, 0) << ", " << packedSegmentWord(second, 8) << ", "
@@ -291,8 +298,7 @@ std::optional<std::string> fixedStringLikeDataMetal(
         segments[0].size() > 16) {
         const auto& prefix = segments[0];
         int cmpLen = std::min(static_cast<int>(prefix.size()), width);
-        std::string base = dataExpr + "[" + rowIndexExpr + " * " +
-                           std::to_string(width) + "u + ";
+        std::string base = fixedStringIndexPrefix(dataExpr, rowIndexExpr, width);
         std::string cond;
         for (int i = 0; i < cmpLen; ++i) {
             if (!cond.empty()) cond += " && ";
@@ -509,8 +515,9 @@ std::string exprToMetal(const ExprPtr& expr, const std::string& idxVar,
                     int pos = start - 1 + i;
                     int weight = 1;
                     for (int w = 0; w < len - 1 - i; ++w) weight *= 10;
-                    std::string access = colName + "[" + idxVar + " * " + std::to_string(fw) +
-                                        " + " + std::to_string(pos) + "]";
+                    std::string access = colName + "[" + idxVar + " * " +
+                                        std::to_string(fw) + "ul + " +
+                                        std::to_string(pos) + "]";
                     if (weight > 1)
                         result += "(" + access + " - '0') * " + std::to_string(weight);
                     else

@@ -1,6 +1,7 @@
 #include "generic/lowering/generic_ir_physical_planner.h"
 
 #include "generic/gpu_ops/generic_gpu_physical_ops.h"
+#include "generic/lowering/generic_cost_model.h"
 #include "generic/lowering/generic_expression_metal.h"
 #include "generic/lowering/generic_join_carry.h"
 #include "generic/lowering/generic_multi_table_checks.h"
@@ -38,6 +39,12 @@ void prependPlanPhases(MetalQueryPlan& target, MetalQueryPlan& prefix) {
             target.phases.begin(),
             std::make_move_iterator(prefix.phases.begin()),
             std::make_move_iterator(prefix.phases.end()));
+    }
+    if (!prefix.costTraces.empty()) {
+        target.costTraces.insert(
+            target.costTraces.begin(),
+            std::make_move_iterator(prefix.costTraces.begin()),
+            std::make_move_iterator(prefix.costTraces.end()));
     }
 }
 
@@ -144,14 +151,18 @@ std::optional<MetalQueryPlan> lowerMultiTableMaterializeIRToMetalImpl(
 std::optional<MetalQueryPlan> lowerMultiTableMaterializeIRToMetal(
         const GenericRelPlan& ir,
         std::string* error) {
-    return lowerMultiTableMaterializeIRToMetalImpl(ir, nullptr, error);
+    return attachGenericCostTrace(
+        lowerMultiTableMaterializeIRToMetalImpl(ir, nullptr, error),
+        ir, "multi_table_materialize");
 }
 
 std::optional<MetalQueryPlan> lowerMultiTableMaterializeIRToMetal(
         const GenericRelPlan& ir,
         const AnalyzedQuery& aq,
         std::string* error) {
-    return lowerMultiTableMaterializeIRToMetalImpl(ir, &aq, error);
+    return attachGenericCostTrace(
+        lowerMultiTableMaterializeIRToMetalImpl(ir, &aq, error),
+        ir, "multi_table_materialize");
 }
 
 } // namespace codegen

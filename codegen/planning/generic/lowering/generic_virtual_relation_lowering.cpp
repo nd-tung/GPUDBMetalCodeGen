@@ -350,7 +350,7 @@ std::string analyzedMaterializeValueExpr(const ExprPtr& expr,
             if (!col->tableAlias.empty())
                 aliasPrefix = "/*" + col->tableAlias + "*/";
             return aliasPrefix + col->column + " + " + idxVar +
-                   " * " + std::to_string(len);
+                   " * " + std::to_string(len) + "ul";
         }
     }
     return exprToMetal(expr, idxVar, schema);
@@ -657,6 +657,106 @@ private:
     std::string stateScalar_;
     std::string indexExpr_;
     bool useMax_ = true;
+};
+
+class MetalIrCountHistogram : public MetalUnaryOperator {
+public:
+    MetalIrCountHistogram(std::unique_ptr<MetalOperator> child,
+                          std::string countBuffer,
+                          std::string histBuffer,
+                          std::string groupKeyExpr,
+                          int bucketCap,
+                          int localBucketCap)
+        : MetalUnaryOperator(std::move(child)),
+          countBuffer_(std::move(countBuffer)),
+          histBuffer_(std::move(histBuffer)),
+          groupKeyExpr_(std::move(groupKeyExpr)),
+          bucketCap_(bucketCap),
+          localBucketCap_(localBucketCap) {}
+
+    void produce(MetalCodegen& cg, ConsumerFn consume) override {
+        const int bucketCap = std::max(1, bucketCap_);
+        const int localBucketCap =
+            std::max(0, std::min(localBucketCap_, bucketCap));
+        cg.addBufferParam(countBuffer_, "const atomic_uint", "", false, 0);
+        cg.addAtomicBufferParam(histBuffer_, "atomic_uint",
+                                std::to_string(bucketCap));
+
+        const std::string suffix = sanitizeIdentifier(histBuffer_);
+        if (localBucketCap > 0) {
+            const std::string localSize = std::to_string(localBucketCap);
+            cg.setPhaseMaxThreadgroups(1024);
+            cg.addLine("threadgroup uint _tg_hist_" + suffix + "[" +
+                       localSize + "];");
+            cg.addBlock("for (uint _h = lid; _h < " + localSize +
+                        "u; _h += tg_size)", [&]() {
+                cg.addLine("_tg_hist_" + suffix + "[_h] = 0u;");
+            });
+            cg.addLine("threadgroup_barrier(mem_flags::mem_threadgroup);");
+        }
+
+        child_->produce(cg, [&]() {
+            cg.addLine("uint _ir_hist_group_" + suffix + " = (uint)(" +
+                       groupKeyExpr_ + ");");
+            cg.addLine("uint _ir_hist_bucket_" + suffix +
+                       " = atomic_load_explicit(&" + countBuffer_ +
+                       "[_ir_hist_group_" + suffix +
+                       "], memory_order_relaxed);");
+            cg.addIf("_ir_hist_bucket_" + suffix + " >= " +
+                     std::to_string(bucketCap) + "u", [&]() {
+                cg.addLine("_ir_hist_bucket_" + suffix + " = " +
+                           std::to_string(bucketCap - 1) + "u;");
+            });
+            if (localBucketCap > 0) {
+                cg.addIf("_ir_hist_bucket_" + suffix + " < " +
+                         std::to_string(localBucketCap) + "u", [&]() {
+                    cg.addLine(
+                        "atomic_fetch_add_explicit((threadgroup atomic_uint*)&_tg_hist_" +
+                        suffix + "[_ir_hist_bucket_" + suffix +
+                        "], 1u, memory_order_relaxed);");
+                });
+                cg.addIf("_ir_hist_bucket_" + suffix + " >= " +
+                         std::to_string(localBucketCap) + "u", [&]() {
+                    cg.addLine("atomic_fetch_add_explicit(&" + histBuffer_ +
+                               "[_ir_hist_bucket_" + suffix +
+                               "], 1u, memory_order_relaxed);");
+                });
+            } else {
+                cg.addLine("atomic_fetch_add_explicit(&" + histBuffer_ +
+                           "[_ir_hist_bucket_" + suffix +
+                           "], 1u, memory_order_relaxed);");
+            }
+            consume();
+        });
+
+        if (localBucketCap > 0) {
+            cg.addLine("threadgroup_barrier(mem_flags::mem_threadgroup);");
+            cg.addBlock("for (uint _h = lid; _h < " +
+                        std::to_string(localBucketCap) +
+                        "u; _h += tg_size)", [&]() {
+                cg.addIf("_tg_hist_" + suffix + "[_h] > 0u", [&]() {
+                    cg.addLine("atomic_fetch_add_explicit(&" + histBuffer_ +
+                               "[_h], _tg_hist_" + suffix +
+                               "[_h], memory_order_relaxed);");
+                });
+            });
+        }
+    }
+
+    std::string describe() const override {
+        return "IrCountHistogram(" + countBuffer_ + ")";
+    }
+
+    void iusUsed(std::vector<IU>& out) const override {
+        appendIUsFromExpr(groupKeyExpr_, out);
+    }
+
+private:
+    std::string countBuffer_;
+    std::string histBuffer_;
+    std::string groupKeyExpr_;
+    int bucketCap_ = 1;
+    int localBucketCap_ = 0;
 };
 
 std::optional<MetalQueryPlan> lowerFromSubqueryTopScalarIRToMetal(
@@ -1007,26 +1107,19 @@ std::optional<MetalQueryPlan> lowerFromSubqueryHistogramIRToMetal(
         std::set<std::string> scanCols{groupJoinCol};
         auto scan = makeScanForCols(groupBase, idxVar, scanCols, aq.schema);
         const std::string groupKeyExpr = groupJoinCol + "[" + idxVar + "]";
-        const std::string countExpr =
-            "(int)atomic_load_explicit(&" + countBuffer + "[" +
-            groupKeyExpr + "], memory_order_relaxed)";
         const std::string outerCountName =
             analyzedDisplayNameForTarget(*outerCount, outerCountIndex);
         constexpr int kHistogramBucketCap = 65536;
+        constexpr int kLocalHistogramBucketCap = 256;
         const std::string groupTag = "ir_from_subquery_hist_" + tag;
         const std::string histBuffer = "d_ir_from_subquery_" + tag + "_hist";
-        auto hist = std::make_unique<MetalKeyedAgg>(
-            std::move(scan), histBuffer,
-            "min(" + countExpr + ", " +
-                std::to_string(kHistogramBucketCap - 1) + ")",
-            kHistogramBucketCap, 1);
-        hist->setKeyResult(innerAggAlias, 0);
-        hist->addAggregateWithMeta(outerCountName, 0, "1u", "add",
-                                   false, 0, false, false, "COUNT", "");
+        auto hist = std::make_unique<MetalIrCountHistogram>(
+            std::move(scan), countBuffer, histBuffer, groupKeyExpr,
+            kHistogramBucketCap, kLocalHistogramBucketCap);
         auto& histPhase = appendPhase(
             plan, "GENERIC_ir_from_subquery_histogram_" + tag,
             std::move(hist));
-        histPhase.extraBuffers.push_back({countBuffer, "atomic_uint", true, false});
+        (void)histPhase;
 
         const std::string compactCounter =
             "d_ir_from_subquery_" + tag + "_hist_result_count";

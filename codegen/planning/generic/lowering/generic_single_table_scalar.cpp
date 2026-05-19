@@ -1,9 +1,9 @@
 #include "generic/lowering/generic_ir_physical_planner.h"
 #include "generic/lowering/generic_aggregate_helpers.h"
+#include "generic/lowering/generic_cost_model.h"
 #include "generic/lowering/generic_expression_metal.h"
 #include "generic/lowering/generic_plan_shapes.h"
 #include "metal_plan_common.h"
-#include "tpch_schema.h"
 
 #include <algorithm>
 #include <memory>
@@ -21,29 +21,31 @@ std::optional<MetalQueryPlan> fail(std::string* error, const std::string& msg) {
 
 std::optional<std::pair<std::string, TypeInfo>> scanAnchorColumn(
         const GenericRelPlan& ir,
+        const GenericRelNode& scanNode,
         const GenericScanDetail& scan) {
+    auto columnFromScanOutput = [&](const std::string& name)
+            -> std::optional<std::pair<std::string, TypeInfo>> {
+        for (const auto& col : scanNode.output.columns) {
+            if (col.relationInstance.value != scan.relationInstance.value)
+                continue;
+            if (!name.empty() && col.name != name)
+                continue;
+            if (col.name.empty())
+                continue;
+            return std::make_pair(col.name, col.type);
+        }
+        return std::nullopt;
+    };
+
     if (const auto* inst = ir.findRelationInstance(scan.relationInstance)) {
         if (const auto* rel = ir.findRelation(inst->relation)) {
             if (!rel->primaryKeyColumn.empty()) {
-                TypeInfo type{DataType::INT, 0};
-                try {
-                    const auto& col = TPCHSchema::instance()
-                        .table(scan.table)
-                        .col(rel->primaryKeyColumn);
-                    type = TypeInfo{col.type, col.fixedWidth};
-                } catch (...) {}
-                return std::make_pair(rel->primaryKeyColumn, type);
+                if (auto anchor = columnFromScanOutput(rel->primaryKeyColumn))
+                    return anchor;
             }
         }
     }
-    try {
-        const auto& table = TPCHSchema::instance().table(scan.table);
-        if (!table.columns.empty()) {
-            const auto& col = table.columns.front();
-            return std::make_pair(col.name, TypeInfo{col.type, col.fixedWidth});
-        }
-    } catch (...) {}
-    return std::nullopt;
+    return columnFromScanOutput("");
 }
 
 std::optional<double> numericLiteralValueLocal(const GenericExprPtr& expr) {
@@ -100,6 +102,12 @@ int scalarSumFixedPointScale(const GenericExprPtr& expr) {
 std::optional<MetalQueryPlan> lowerSingleTableScalarAggregateIRToMetal(
         const GenericRelPlan& ir,
         std::string* error) {
+    auto finish = [&](MetalQueryPlan&& plan) -> std::optional<MetalQueryPlan> {
+        return attachGenericCostTrace(
+            std::optional<MetalQueryPlan>{std::move(plan)}, ir,
+            "single_table_scalar_aggregate");
+    };
+
     auto shape = parseSingleTableScalarAggShape(ir, error);
     if (!shape) return std::nullopt;
 
@@ -189,7 +197,7 @@ std::optional<MetalQueryPlan> lowerSingleTableScalarAggregateIRToMetal(
     }
 
     if (!hasInputColumnReference) {
-        auto anchor = scanAnchorColumn(ir, *scan);
+        auto anchor = scanAnchorColumn(ir, *shape->scan, *scan);
         if (!anchor) {
             return fail(error, "IR scalar aggregate lowerer: count-only scan has no anchor column.");
         }
@@ -200,7 +208,7 @@ std::optional<MetalQueryPlan> lowerSingleTableScalarAggregateIRToMetal(
     plan.name = "GENERIC_IR_SINGLE_TABLE_SCALAR";
     plan.chunkable = true;
     appendPhase(plan, "GENERIC_ir_single_table_scalar", std::move(reduce));
-    return plan;
+    return finish(std::move(plan));
 }
 
 } // namespace codegen

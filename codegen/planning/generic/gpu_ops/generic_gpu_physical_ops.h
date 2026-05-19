@@ -148,6 +148,7 @@ struct KeyedCompactHavingSpec {
     bool scalarAggIsFloatSum = false;
     int scalarAggScaleDown = 0;
     std::string scalarTotalBuffer;
+    std::string scalarTotalParam;
     std::string scalarCompareOp = ">";
     double scalarMultiplier = 0.0;
 

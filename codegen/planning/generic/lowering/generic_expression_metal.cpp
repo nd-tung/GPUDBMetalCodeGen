@@ -95,6 +95,13 @@ std::string genericMetalCharLiteral(char ch) {
     return std::string("'") + ch + "'";
 }
 
+std::string genericFixedStringIndexPrefix(const std::string& dataExpr,
+                                          const std::string& rowExpr,
+                                          int width) {
+    return dataExpr + "[" + rowExpr + " * " +
+           std::to_string(width) + "ul + ";
+}
+
 std::string fixedStringEqMetalFromPointer(const std::string& basePtr,
                                           int width,
                                           const std::string& literal) {
@@ -120,8 +127,7 @@ std::string fixedStringEqMetalImpl(const GenericColumnExpr& col,
                                    const std::string& idxVar) {
     int width = col.type.fixedWidth > 0 ? col.type.fixedWidth : 1;
     int cmpLen = std::min(static_cast<int>(literal.size()), width);
-    std::string base = col.column + "[" + idxVar + " * " +
-                       std::to_string(width) + " + ";
+    std::string base = genericFixedStringIndexPrefix(col.column, idxVar, width);
     std::string cond;
     for (int i = 0; i < cmpLen; ++i) {
         if (!cond.empty()) cond += " && ";
@@ -228,7 +234,7 @@ std::string functionExprToMetalImpl(const GenericFunctionExpr& fn,
             int weight = 1;
             for (int w = 0; w < len - 1 - i; ++w) weight *= 10;
             std::string access = col->column + "[" + idxVar + " * " +
-                                 std::to_string(width) + " + " +
+                                 std::to_string(width) + "ul + " +
                                  std::to_string(pos) + "]";
             if (weight > 1)
                 result += "(" + access + " - '0') * " + std::to_string(weight);
@@ -314,7 +320,7 @@ std::optional<std::string> fixedStringLikeMetal(
         return like.negated ? "!(" + exact + ")" : exact;
     }
 
-    return fixedStringLikeDataMetal(col->column, "(uint)(" + idxVar + ")",
+    return fixedStringLikeDataMetal(col->column, "(ulong)(" + idxVar + ")",
                                     width, like.pattern, like.negated);
 }
 
@@ -331,7 +337,8 @@ std::string materializeExprToMetal(const GenericExprPtr& expr,
             return col->column + " + " + idxVar;
         if (col->type.type == DataType::CHAR_FIXED) {
             int len = col->type.fixedWidth > 0 ? col->type.fixedWidth : 1;
-            return col->column + " + " + idxVar + " * " + std::to_string(len);
+            return col->column + " + " + idxVar + " * " +
+                   std::to_string(len) + "ul";
         }
     }
     return genericExprToMetalImpl(expr, idxVar);

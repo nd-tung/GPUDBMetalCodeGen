@@ -215,18 +215,21 @@ public:
 
     void produce(MetalCodegen& cg, ConsumerFn consume) override {
         cg.addAtomicBufferParam(map_ + "_states", "atomic_uint", capacity_, 0);
-        cg.addBufferParam(map_ + "_keys", "ulong", capacity_, false);
+        cg.addAtomicBufferParam(map_ + "_keys1", "atomic_uint", capacity_, 0);
+        cg.addAtomicBufferParam(map_ + "_keys2", "atomic_uint", capacity_, 0);
         cg.addAtomicBufferParam(map_ + "_values", "atomic_uint", capacity_, 0);
         cg.addResolvedScalarParam("n_" + map_, "uint", capacity_);
         child_->produce(cg, [&]() {
             if (valueIsFloat_) {
                 cg.addLine("scalar_hash_insert_add_float_64(" + map_ + "_states, " +
-                           map_ + "_keys, " + map_ + "_values, n_" + map_ +
+                           map_ + "_keys1, " + map_ + "_keys2, " +
+                           map_ + "_values, n_" + map_ +
                            ", (uint)(" + key1_ + "), (uint)(" + key2_ +
                            "), (float)(" + value_ + "));");
             } else {
                 cg.addLine("scalar_hash_insert_add_u32_64(" + map_ + "_states, " +
-                           map_ + "_keys, " + map_ + "_values, n_" + map_ +
+                           map_ + "_keys1, " + map_ + "_keys2, " +
+                           map_ + "_values, n_" + map_ +
                            ", (uint)(" + key1_ + "), (uint)(" + key2_ +
                            "), (uint)(" + value_ + "));");
             }
@@ -269,7 +272,8 @@ const std::string& scalarCompositeHashHelpers() {
 	}
 
 	static void scalar_hash_insert_add_u32_64(device atomic_uint* states,
-	                                          device ulong* keys,
+	                                          device atomic_uint* keys1,
+	                                          device atomic_uint* keys2,
 	                                          device atomic_uint* vals,
 	                                          uint cap, uint k1, uint k2, uint value) {
 	    ulong key = scalar_hash_pack2(k1, k2);
@@ -281,7 +285,8 @@ const std::string& scalarCompositeHashHelpers() {
 	            uint expected = 0u;
 	            if (atomic_compare_exchange_weak_explicit(&states[slot], &expected, 1u,
 	                    memory_order_relaxed, memory_order_relaxed)) {
-	                keys[slot] = key;
+	                atomic_store_explicit(&keys1[slot], k1, memory_order_relaxed);
+	                atomic_store_explicit(&keys2[slot], k2, memory_order_relaxed);
 	                atomic_store_explicit(&vals[slot], 0u, memory_order_relaxed);
 	                atomic_store_explicit(&states[slot], 2u, memory_order_relaxed);
 	                atomic_fetch_add_explicit(&vals[slot], value, memory_order_relaxed);
@@ -292,16 +297,23 @@ const std::string& scalarCompositeHashHelpers() {
 	        while (state == 1u) {
 	            state = atomic_load_explicit(&states[slot], memory_order_relaxed);
 	        }
-	        if (state == 2u && keys[slot] == key) {
-	            atomic_fetch_add_explicit(&vals[slot], value, memory_order_relaxed);
-	            return;
+	        if (state == 2u) {
+	            for (uint retry = 0u; retry < 32u; ++retry) {
+	                uint slot_k1 = atomic_load_explicit(&keys1[slot], memory_order_relaxed);
+	                uint slot_k2 = atomic_load_explicit(&keys2[slot], memory_order_relaxed);
+	                if (slot_k1 == k1 && slot_k2 == k2) {
+	                    atomic_fetch_add_explicit(&vals[slot], value, memory_order_relaxed);
+	                    return;
+	                }
+	            }
 	        }
 	        slot = (slot + 1u) & mask;
 	    }
 	}
 
 	static void scalar_hash_insert_add_float_64(device atomic_uint* states,
-	                                            device ulong* keys,
+	                                            device atomic_uint* keys1,
+	                                            device atomic_uint* keys2,
 	                                            device atomic_uint* vals,
 	                                            uint cap, uint k1, uint k2, float value) {
 	    ulong key = scalar_hash_pack2(k1, k2);
@@ -313,7 +325,8 @@ const std::string& scalarCompositeHashHelpers() {
 	            uint expected = 0u;
 	            if (atomic_compare_exchange_weak_explicit(&states[slot], &expected, 1u,
 	                    memory_order_relaxed, memory_order_relaxed)) {
-	                keys[slot] = key;
+	                atomic_store_explicit(&keys1[slot], k1, memory_order_relaxed);
+	                atomic_store_explicit(&keys2[slot], k2, memory_order_relaxed);
 	                atomic_store_explicit(&vals[slot], 0u, memory_order_relaxed);
 	                atomic_store_explicit(&states[slot], 2u, memory_order_relaxed);
 	                atomic_add_float(&vals[slot], value);
@@ -324,16 +337,23 @@ const std::string& scalarCompositeHashHelpers() {
 	        while (state == 1u) {
 	            state = atomic_load_explicit(&states[slot], memory_order_relaxed);
 	        }
-	        if (state == 2u && keys[slot] == key) {
-	            atomic_add_float(&vals[slot], value);
-	            return;
+	        if (state == 2u) {
+	            for (uint retry = 0u; retry < 32u; ++retry) {
+	                uint slot_k1 = atomic_load_explicit(&keys1[slot], memory_order_relaxed);
+	                uint slot_k2 = atomic_load_explicit(&keys2[slot], memory_order_relaxed);
+	                if (slot_k1 == k1 && slot_k2 == k2) {
+	                    atomic_add_float(&vals[slot], value);
+	                    return;
+	                }
+	            }
 	        }
 	        slot = (slot + 1u) & mask;
 	    }
 	}
 
 	static uint scalar_hash_lookup_raw64(const device uint* states,
-	                                     const device ulong* keys,
+	                                     const device uint* keys1,
+	                                     const device uint* keys2,
 	                                     const device uint* vals,
 	                                     uint cap, uint k1, uint k2) {
 	    ulong key = scalar_hash_pack2(k1, k2);
@@ -342,14 +362,15 @@ const std::string& scalarCompositeHashHelpers() {
 	    for (uint probe = 0u; probe < cap; ++probe) {
 	        uint state = states[slot];
 	        if (state == 0u) return 0u;
-	        if (state == 2u && keys[slot] == key) return vals[slot];
+	        if (state == 2u && keys1[slot] == k1 && keys2[slot] == k2) return vals[slot];
 	        slot = (slot + 1u) & mask;
 	    }
 	    return 0u;
 	}
 
 	static float scalar_hash_lookup_float_or_nan64(const device uint* states,
-	                                               const device ulong* keys,
+	                                               const device uint* keys1,
+	                                               const device uint* keys2,
 	                                               const device uint* vals,
 	                                               uint cap, uint k1, uint k2) {
 	    ulong key = scalar_hash_pack2(k1, k2);
@@ -358,7 +379,7 @@ const std::string& scalarCompositeHashHelpers() {
 	    for (uint probe = 0u; probe < cap; ++probe) {
 	        uint state = states[slot];
 	        if (state == 0u) return as_type<float>(0x7fc00000u);
-	        if (state == 2u && keys[slot] == key) return as_type<float>(vals[slot]);
+	        if (state == 2u && keys1[slot] == k1 && keys2[slot] == k2) return as_type<float>(vals[slot]);
 	        slot = (slot + 1u) & mask;
 	    }
 	    return as_type<float>(0x7fc00000u);

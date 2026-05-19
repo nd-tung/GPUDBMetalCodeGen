@@ -237,7 +237,10 @@ private:
     }
 
     std::string valueAt(const GenericMatColumnDesc& col, const std::string& row) const {
-        if (col.stringLen > 0) return col.bufferName + " + " + row + " * " + std::to_string(col.stringLen);
+        if (col.stringLen > 0) {
+            return col.bufferName + " + " + row + " * " +
+                   std::to_string(col.stringLen) + "ul";
+        }
         return col.bufferName + "[" + row + "]";
     }
 
@@ -245,10 +248,10 @@ private:
                             const std::string& row) const {
         if (col.stringRowRef) {
             return col.stringSourceColumn + " + " + col.bufferName + "[" + row +
-                   "] * " + std::to_string(col.stringLen);
+                   "] * " + std::to_string(col.stringLen) + "ul";
         }
         return col.bufferName + " + " + row + " * " +
-               std::to_string(col.stringLen);
+               std::to_string(col.stringLen) + "ul";
     }
 
     std::string stringByteAt(const GenericMatColumnDesc& col,
@@ -256,10 +259,10 @@ private:
                              const std::string& offset) const {
         if (col.stringRowRef) {
             return col.stringSourceColumn + "[" + col.bufferName + "[" + row +
-                   "] * " + std::to_string(col.stringLen) + "u + " + offset + "]";
+                   "] * " + std::to_string(col.stringLen) + "ul + " + offset + "]";
         }
         return col.bufferName + "[" + row + " * " +
-               std::to_string(col.stringLen) + "u + " + offset + "]";
+               std::to_string(col.stringLen) + "ul + " + offset + "]";
     }
 
     void emitHashMix(MetalCodegen& cg, const std::string& hashVar, const std::string& valueExpr) const {
@@ -634,10 +637,10 @@ private:
                              const std::string& offset) const {
         if (col.stringRowRef) {
             return col.stringSourceColumn + "[" + col.bufferName + "[" + row +
-                   "] * " + std::to_string(col.stringLen) + "u + " + offset + "]";
+                   "] * " + std::to_string(col.stringLen) + "ul + " + offset + "]";
         }
         return col.bufferName + "[" + row + " * " +
-               std::to_string(col.stringLen) + "u + " + offset + "]";
+               std::to_string(col.stringLen) + "ul + " + offset + "]";
     }
 
     void emitCopyKey(MetalCodegen& cg, const GenericMatColumnDesc& out,
@@ -647,8 +650,9 @@ private:
         if (keyCol.stringLen > 0) {
             const std::string row = repRowName() + "[" + slot + "]";
             cg.addBlock("for (uint _oc = 0; _oc < " + std::to_string(keyCol.stringLen) + "u; ++_oc)", [&]() {
-                cg.addLine(out.bufferName + "[" + pos + " * " + std::to_string(keyCol.stringLen) +
-                           "u + _oc] = " + stringByteAt(keyCol, row, "_oc") + ";");
+                cg.addLine(out.bufferName + "[(ulong)(" + pos + ") * " +
+                           std::to_string(keyCol.stringLen) +
+                           "ul + _oc] = " + stringByteAt(keyCol, row, "_oc") + ";");
             });
         } else {
             cg.addLine(out.bufferName + "[" + pos + "] = " + src + "[" + slot + "];");
@@ -794,10 +798,13 @@ public:
             cg.addScalarParam(activeCountSymbol_, "uint");
         }
         cg.addAtomicBufferParam(outputCounter_, "atomic_uint", "1");
-        if (!having_.scalarTotalBuffer.empty()) {
+        if (!having_.scalarTotalBuffer.empty() &&
+            having_.scalarTotalParam.empty()) {
             cg.addBufferParam(having_.scalarTotalBuffer, "atomic_uint",
                               having_.scalarAggIsLongPair ? "2" : "1", false);
         }
+        if (!having_.scalarTotalParam.empty())
+            cg.addScalarParam(having_.scalarTotalParam, "float");
         for (const auto& key : keys_) {
             if (key.stringRowRef && !key.stringSourceColumn.empty())
                 cg.addColumnParam(key.stringSourceColumn, "char",
@@ -830,14 +837,22 @@ public:
             } else {
                 cg.addLine("uint _bucket = _scan;");
             }
-            cg.addLine("bool _has_data = false;");
-            cg.addBlock("for (uint _v = 0; _v < " + std::to_string(valuesPerBucket_) + "u; ++_v)", [&]() {
-                cg.addIf("atomic_load_explicit(&" + inputBuffer_ + "[_bucket * " +
-                         std::to_string(valuesPerBucket_) + "u + _v], memory_order_relaxed) != 0u", [&]() {
-                    cg.addLine("_has_data = true;");
-                    cg.addLine("break;");
+            if (useActiveList) {
+                cg.addLine("bool _has_data = true;");
+            } else {
+                cg.addLine("bool _has_data = false;");
+                cg.addBlock("for (uint _v = 0; _v < " +
+                            std::to_string(valuesPerBucket_) +
+                            "u; ++_v)", [&]() {
+                    cg.addIf("atomic_load_explicit(&" + inputBuffer_ +
+                             "[_bucket * " +
+                             std::to_string(valuesPerBucket_) +
+                             "u + _v], memory_order_relaxed) != 0u", [&]() {
+                        cg.addLine("_has_data = true;");
+                        cg.addLine("break;");
+                    });
                 });
-            });
+            }
             cg.addIf("!_has_data", [&]() { cg.addLine("continue;"); });
             emitHavingFilter(cg);
             cg.addLine("uint _pos = atomic_fetch_add_explicit(&" + outputCounter_ +
@@ -883,11 +898,11 @@ private:
             const int width = std::max(1, key.stringLen);
             cg.addBlock("for (uint _oc = 0; _oc < " +
                         std::to_string(width) + "u; ++_oc)", [&]() {
-                cg.addLine(out.bufferName + "[_pos * " +
-                           std::to_string(width) + "u + _oc] = " +
-                           key.stringSourceColumn + "[_encoded_" +
+                cg.addLine(out.bufferName + "[(ulong)_pos * " +
+                           std::to_string(width) + "ul + _oc] = " +
+                           key.stringSourceColumn + "[(ulong)_encoded_" +
                            std::to_string(outIdx) + " * " +
-                           std::to_string(width) + "u + _oc];");
+                           std::to_string(width) + "ul + _oc];");
             });
         } else if (!key.stringMap.empty()) {
             const int width = std::max(1, key.stringLen);
@@ -903,8 +918,9 @@ private:
                            std::to_string(i) + "u ? " + charAt(key.stringMap[(size_t)i]) +
                            " : " + expr + ")";
                 }
-                cg.addLine(out.bufferName + "[_pos * " + std::to_string(width) +
-                           "u + " + std::to_string(ci) + "u] = " + expr + ";");
+                cg.addLine(out.bufferName + "[(ulong)_pos * " +
+                           std::to_string(width) + "ul + " +
+                           std::to_string(ci) + "u] = " + expr + ";");
             }
         } else if (!key.charMap.empty()) {
             std::string expr = metalCharLiteral(key.charMap.back());
@@ -947,6 +963,8 @@ private:
     }
 
     std::string totalHavingValueExpr() const {
+        if (!having_.scalarTotalParam.empty())
+            return having_.scalarTotalParam;
         if (having_.scalarAggIsLongPair) {
             return "((float)atomic_load_explicit(&" + having_.scalarTotalBuffer +
                    "[1], memory_order_relaxed) * 4294967296.0f + "
@@ -962,7 +980,10 @@ private:
     }
 
     void emitHavingFilter(MetalCodegen& cg) const {
-        if (having_.scalarAggOffset >= 0 && !having_.scalarTotalBuffer.empty() &&
+        const bool hasScalarTotal =
+            !having_.scalarTotalBuffer.empty() ||
+            !having_.scalarTotalParam.empty();
+        if (having_.scalarAggOffset >= 0 && hasScalarTotal &&
             having_.scalarMultiplier >= 0.0) {
             cg.addLine("float _having_value = " +
                        havingValueExpr(having_.scalarAggOffset,
@@ -1129,10 +1150,10 @@ private:
         cg.addIf("_cmp == 0", [&]() {
             if (c.stringLen > 0) {
                 cg.addBlock("for (uint _sc = 0; _sc < " + std::to_string(c.stringLen) + "u; ++_sc)", [&]() {
-                    cg.addLine("char _ca = " + c.bufferName + "[(uint)_a * " +
-                               std::to_string(c.stringLen) + "u + _sc];");
-                    cg.addLine("char _cb = " + c.bufferName + "[(uint)_b * " +
-                               std::to_string(c.stringLen) + "u + _sc];");
+                    cg.addLine("char _ca = " + c.bufferName + "[(ulong)_a * " +
+                               std::to_string(c.stringLen) + "ul + _sc];");
+                    cg.addLine("char _cb = " + c.bufferName + "[(ulong)_b * " +
+                               std::to_string(c.stringLen) + "ul + _sc];");
                     cg.addIf("_ca < _cb", [&]() {
                         cg.addLine("_cmp = " + std::string(key.descending ? "1" : "-1") + ";");
                         cg.addLine("break;");
@@ -1257,10 +1278,10 @@ private:
         cg.addIf("_cmp == 0", [&]() {
             if (c.stringLen > 0) {
                 cg.addBlock("for (uint _sc = 0; _sc < " + std::to_string(c.stringLen) + "u; ++_sc)", [&]() {
-                    cg.addLine("char _ca = " + c.bufferName + "[(uint)_a * " +
-                               std::to_string(c.stringLen) + "u + _sc];");
-                    cg.addLine("char _cb = " + c.bufferName + "[(uint)_b * " +
-                               std::to_string(c.stringLen) + "u + _sc];");
+                    cg.addLine("char _ca = " + c.bufferName + "[(ulong)_a * " +
+                               std::to_string(c.stringLen) + "ul + _sc];");
+                    cg.addLine("char _cb = " + c.bufferName + "[(ulong)_b * " +
+                               std::to_string(c.stringLen) + "ul + _sc];");
                     cg.addIf("_ca < _cb", [&]() {
                         cg.addLine("_cmp = " + std::string(key.descending ? "1" : "-1") + ";");
                         cg.addLine("break;");
@@ -1433,15 +1454,15 @@ private:
                         const std::string& bExpr,
                         const std::string& cmpVar) const {
         const auto& c = key.column;
-        const std::string aIdx = "(uint)(" + aExpr + ")";
-        const std::string bIdx = "(uint)(" + bExpr + ")";
+        const std::string aIdx = "(ulong)(" + aExpr + ")";
+        const std::string bIdx = "(ulong)(" + bExpr + ")";
         cg.addIf(cmpVar + " == 0", [&]() {
             if (c.stringLen > 0) {
                 cg.addBlock("for (uint _sc = 0; _sc < " + std::to_string(c.stringLen) + "u; ++_sc)", [&]() {
                     cg.addLine("char _ca = " + c.bufferName + "[" + aIdx + " * " +
-                               std::to_string(c.stringLen) + "u + _sc];");
+                               std::to_string(c.stringLen) + "ul + _sc];");
                     cg.addLine("char _cb = " + c.bufferName + "[" + bIdx + " * " +
-                               std::to_string(c.stringLen) + "u + _sc];");
+                               std::to_string(c.stringLen) + "ul + _sc];");
                     cg.addIf("_ca < _cb", [&]() {
                         cg.addLine(cmpVar + " = " +
                                    std::string(key.descending ? "1" : "-1") + ";");
