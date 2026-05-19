@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cstdlib>
 #include <functional>
 #include <map>
 #include <set>
@@ -35,6 +36,11 @@ bool isSimpleIdentifier(const std::string& value) {
         if (!std::isalnum(uch) && ch != '_') return false;
     }
     return true;
+}
+
+bool domainKeyListExistsEnabled() {
+    const char* value = std::getenv("GPUDB_DOMAIN_KEYLIST_EXISTS");
+    return value && value[0] != '\0' && value[0] != '0';
 }
 
 CmpOp reverseCmpOp(CmpOp op) {
@@ -97,6 +103,14 @@ struct IrExistsDistinctInfo {
 struct IrSiblingBitmapFilter {
     std::string bitmapName;
     std::string keyColumn;
+    int sourceRelationInstance = -1;
+};
+
+struct IrDomainKeyDrive {
+    int sourceRelationInstance = -1;
+    std::string keyListBuffer;
+    std::string keyListCountBuffer;
+    std::string dispatchTable;
 };
 
 bool typeCanUseArrayCarry(DataType type) {
@@ -153,6 +167,23 @@ std::string existsDistinctBufferPrefix(const GenericScanDetail& scan,
     std::string scope = !scan.alias.empty() ? scan.alias : scan.table;
     return "d_ir_exists_" + sanitizeIdentifier(scope) + "_" +
            sanitizeIdentifier(valueCol.column);
+}
+
+std::string rowRangeFirstBufferName(const std::string& table,
+                                    const std::string& keyColumn) {
+    return "d_ir_row_first_" + sanitizeIdentifier(table) + "_" +
+           sanitizeIdentifier(keyColumn);
+}
+
+std::string rowRangeLastBufferName(const std::string& table,
+                                   const std::string& keyColumn) {
+    return "d_ir_row_last_" + sanitizeIdentifier(table) + "_" +
+           sanitizeIdentifier(keyColumn);
+}
+
+std::string rowRangeIndexKey(const std::string& table,
+                             const std::string& keyColumn) {
+    return table + ":" + keyColumn;
 }
 
 bool typeCanUseExistsDistinct(DataType type) {
@@ -236,6 +267,8 @@ struct IrBuildSide {
     std::string keyDomain;
     std::string bitmapName;
     std::optional<IrExistsDistinctInfo> existsDistinct;
+    bool emitKeyList = false;
+    std::optional<IrDomainKeyDrive> domainKeyDrive;
 };
 
 struct IrScanSide {
@@ -243,6 +276,20 @@ struct IrScanSide {
     const GenericScanDetail* scan = nullptr;
     const GenericRelation* relation = nullptr;
 };
+
+std::string buildScopeName(const IrBuildSide& build) {
+    return sanitizeIdentifier(build.scan && !build.scan->alias.empty()
+        ? build.scan->alias
+        : (build.scan ? build.scan->table : std::string("rel")));
+}
+
+std::string keyListBufferName(const IrBuildSide& build) {
+    return "d_ir_keylist_" + buildScopeName(build);
+}
+
+std::string keyListCountBufferName(const IrBuildSide& build) {
+    return keyListBufferName(build) + "_count";
+}
 
 class MetalIrExistsDistinctBuild : public MetalUnaryOperator {
 public:
@@ -314,6 +361,406 @@ private:
     std::string keyExpr_;
     std::string valueExpr_;
     std::string sizeExpr_;
+};
+
+class MetalIrExistsDistinctMultiBuild : public MetalUnaryOperator {
+public:
+    struct Target {
+        std::string firstBuffer;
+        std::string stateBuffer;
+        std::string multiBitmap;
+        std::string valueExpr;
+        std::string predicate;
+    };
+
+    MetalIrExistsDistinctMultiBuild(std::unique_ptr<MetalOperator> child,
+                                    std::string keyExpr,
+                                    std::string keyDomain,
+                                    std::vector<Target> targets)
+        : MetalUnaryOperator(std::move(child)),
+          keyExpr_(std::move(keyExpr)),
+          keyDomain_(std::move(keyDomain)),
+          targets_(std::move(targets)) {}
+
+    void produce(MetalCodegen& cg, ConsumerFn consume) override {
+        const std::string keySuffix = sanitizeIdentifier(keyExpr_);
+        for (const auto& target : targets_) {
+            cg.addAtomicBufferParam(target.firstBuffer, "atomic_uint",
+                                    keyDomain_);
+            cg.addAtomicBufferParam(target.stateBuffer, "atomic_uint",
+                                    keyDomain_);
+            cg.addBitmapWriteParam(target.multiBitmap,
+                                   "(" + keyDomain_ + " + 31) / 32");
+        }
+
+        child_->produce(cg, [&]() {
+            cg.addLine("uint _ir_exists_key_" + keySuffix +
+                       " = (uint)(" + keyExpr_ + ");");
+            for (const auto& target : targets_) {
+                auto emitUpdate = [&]() {
+                    const std::string targetSuffix =
+                        sanitizeIdentifier(target.firstBuffer);
+                    cg.addLine("uint _ir_exists_val_" + targetSuffix +
+                               " = (uint)(" + target.valueExpr + ");");
+                    cg.addLine("while (true) {");
+                    cg.addLine("    uint _ir_exists_state_" + targetSuffix +
+                               " = atomic_load_explicit(&" +
+                               target.stateBuffer + "[_ir_exists_key_" +
+                               keySuffix + "], memory_order_relaxed);");
+                    cg.addLine("    if (_ir_exists_state_" + targetSuffix +
+                               " == 0u) {");
+                    cg.addLine("        uint _ir_exists_expected_" +
+                               targetSuffix + " = 0u;");
+                    cg.addLine("        if (atomic_compare_exchange_weak_explicit(&" +
+                               target.stateBuffer + "[_ir_exists_key_" +
+                               keySuffix + "], &_ir_exists_expected_" +
+                               targetSuffix +
+                               ", 1u, memory_order_relaxed, memory_order_relaxed)) {");
+                    cg.addLine("            atomic_store_explicit(&" +
+                               target.firstBuffer + "[_ir_exists_key_" +
+                               keySuffix + "], _ir_exists_val_" +
+                               targetSuffix + ", memory_order_relaxed);");
+                    cg.addLine("            atomic_store_explicit(&" +
+                               target.stateBuffer + "[_ir_exists_key_" +
+                               keySuffix + "], 2u, memory_order_relaxed);");
+                    cg.addLine("            break;");
+                    cg.addLine("        }");
+                    cg.addLine("    } else if (_ir_exists_state_" +
+                               targetSuffix + " == 2u) {");
+                    cg.addLine("        uint _ir_exists_first_" +
+                               targetSuffix +
+                               " = atomic_load_explicit(&" +
+                               target.firstBuffer + "[_ir_exists_key_" +
+                               keySuffix + "], memory_order_relaxed);");
+                    cg.addLine("        if (_ir_exists_first_" + targetSuffix +
+                               " != _ir_exists_val_" + targetSuffix +
+                               ") bitmap_set(" + target.multiBitmap +
+                               ", _ir_exists_key_" + keySuffix + ");");
+                    cg.addLine("        break;");
+                    cg.addLine("    }");
+                    cg.addLine("}");
+                };
+                if (target.predicate.empty() || target.predicate == "true") {
+                    emitUpdate();
+                } else {
+                    cg.addIf(target.predicate, emitUpdate);
+                }
+            }
+            consume();
+        });
+    }
+
+    std::string describe() const override {
+        return "IrExistsDistinctMultiBuild(" +
+               std::to_string(targets_.size()) + ")";
+    }
+
+    void iusUsed(std::vector<IU>& out) const override {
+        appendIUsFromExpr(keyExpr_, out);
+        for (const auto& target : targets_) {
+            appendIUsFromExpr(target.valueExpr, out);
+            appendIUsFromExpr(target.predicate, out);
+        }
+    }
+
+private:
+    std::string keyExpr_;
+    std::string keyDomain_;
+    std::vector<Target> targets_;
+};
+
+class MetalBitmapBuildWithKeyList : public MetalUnaryOperator {
+public:
+    MetalBitmapBuildWithKeyList(std::unique_ptr<MetalOperator> child,
+                                std::string bitmapName,
+                                std::string keyExpr,
+                                std::string bitmapSizeExpr,
+                                std::string keyListBuffer,
+                                std::string keyListCountBuffer,
+                                std::string keyListCapacityExpr)
+        : MetalUnaryOperator(std::move(child)),
+          bitmapName_(std::move(bitmapName)),
+          keyExpr_(std::move(keyExpr)),
+          bitmapSizeExpr_(std::move(bitmapSizeExpr)),
+          keyListBuffer_(std::move(keyListBuffer)),
+          keyListCountBuffer_(std::move(keyListCountBuffer)),
+          keyListCapacityExpr_(std::move(keyListCapacityExpr)) {}
+
+    void produce(MetalCodegen& cg, ConsumerFn consume) override {
+        cg.addBitmapWriteParam(bitmapName_, bitmapSizeExpr_);
+        cg.addBufferParam(keyListBuffer_, "uint", keyListCapacityExpr_, false);
+        cg.addAtomicBufferParam(keyListCountBuffer_, "atomic_uint", "1");
+
+        const std::string suffix = sanitizeIdentifier(keyListBuffer_);
+        child_->produce(cg, [&]() {
+            cg.addLine("uint _ir_keylist_key_" + suffix + " = (uint)(" +
+                       keyExpr_ + ");");
+            cg.addLine("bitmap_set(" + bitmapName_ + ", _ir_keylist_key_" +
+                       suffix + ");");
+            cg.addLine("uint _ir_keylist_slot_" + suffix +
+                       " = atomic_fetch_add_explicit(&" + keyListCountBuffer_ +
+                       "[0], 1u, memory_order_relaxed);");
+            cg.addIf("_ir_keylist_slot_" + suffix + " < (uint)(" +
+                     keyListCapacityExpr_ + ")", [&]() {
+                cg.addLine(keyListBuffer_ + "[_ir_keylist_slot_" + suffix +
+                           "] = _ir_keylist_key_" + suffix + ";");
+            });
+            consume();
+        });
+    }
+
+    std::string describe() const override {
+        return "BitmapBuildWithKeyList(" + bitmapName_ + ")";
+    }
+
+    void iusUsed(std::vector<IU>& out) const override {
+        appendIUsFromExpr(keyExpr_, out);
+    }
+
+private:
+    std::string bitmapName_;
+    std::string keyExpr_;
+    std::string bitmapSizeExpr_;
+    std::string keyListBuffer_;
+    std::string keyListCountBuffer_;
+    std::string keyListCapacityExpr_;
+};
+
+class MetalRowRangeIndexBuild : public MetalUnaryOperator {
+public:
+    MetalRowRangeIndexBuild(std::unique_ptr<MetalOperator> child,
+                            std::string table,
+                            std::string keyColumn,
+                            std::string firstRowBuffer,
+                            std::string lastRowBuffer,
+                            std::string keyExpr,
+                            std::string keyDomain)
+        : MetalUnaryOperator(std::move(child)),
+          table_(std::move(table)),
+          keyColumn_(std::move(keyColumn)),
+          firstRowBuffer_(std::move(firstRowBuffer)),
+          lastRowBuffer_(std::move(lastRowBuffer)),
+          keyExpr_(std::move(keyExpr)),
+          keyDomain_(std::move(keyDomain)) {}
+
+    void produce(MetalCodegen& cg, ConsumerFn consume) override {
+        const std::string suffix = sanitizeIdentifier(firstRowBuffer_);
+        const std::string domainParam =
+            "n_row_range_" + suffix + "_domain";
+        cg.addResolvedScalarParam(domainParam, "uint", keyDomain_);
+        cg.addAtomicBufferParam(firstRowBuffer_, "atomic_uint", keyDomain_,
+                                0xFF);
+        cg.addAtomicBufferParam(lastRowBuffer_, "atomic_uint", keyDomain_);
+
+        child_->produce(cg, [&]() {
+            cg.addLine("uint _ir_row_key_" + suffix + " = (uint)(" +
+                       keyExpr_ + ");");
+            cg.addIf("_ir_row_key_" + suffix + " < " + domainParam, [&]() {
+                cg.addLine("bool _ir_row_start_" + suffix +
+                           " = (i == 0u) || ((uint)(" + keyColumn_ +
+                           "[i - 1u]) != _ir_row_key_" + suffix + ");");
+                cg.addLine("bool _ir_row_end_" + suffix +
+                           " = (i + 1u >= " + tableSizeName(table_) +
+                           ") || ((uint)(" + keyColumn_ +
+                           "[i + 1u]) != _ir_row_key_" + suffix + ");");
+                cg.addIf("_ir_row_start_" + suffix, [&]() {
+                    cg.addLine("atomic_fetch_min_explicit(&" + firstRowBuffer_ +
+                               "[_ir_row_key_" + suffix + "], (uint)i, "
+                               "memory_order_relaxed);");
+                });
+                cg.addIf("_ir_row_end_" + suffix, [&]() {
+                    cg.addLine("atomic_fetch_max_explicit(&" + lastRowBuffer_ +
+                               "[_ir_row_key_" + suffix + "], (uint)i, "
+                               "memory_order_relaxed);");
+                });
+            });
+            consume();
+        });
+    }
+
+    std::string describe() const override {
+        return "RowRangeIndexBuild(" + firstRowBuffer_ + ")";
+    }
+
+    void iusUsed(std::vector<IU>& out) const override {
+        appendIUsFromExpr(keyExpr_, out);
+    }
+
+private:
+    std::string table_;
+    std::string keyColumn_;
+    std::string firstRowBuffer_;
+    std::string lastRowBuffer_;
+    std::string keyExpr_;
+    std::string keyDomain_;
+};
+
+class MetalIrExistsDistinctKeyListBuild : public MetalOperator {
+public:
+    struct Target {
+        std::string firstBuffer;
+        std::string stateBuffer;
+        std::string multiBitmap;
+        std::string valueExpr;
+        std::string predicate;
+    };
+
+    MetalIrExistsDistinctKeyListBuild(std::string dispatchTable,
+                                      std::string table,
+                                      std::string keyColumn,
+                                      std::string keyDomain,
+                                      std::string keyListBuffer,
+                                      std::string keyListCountBuffer,
+                                      std::string firstRowBuffer,
+                                      std::string lastRowBuffer,
+                                      std::vector<GenericColumnExpr> columns,
+                                      std::vector<Target> targets)
+        : dispatchTable_(std::move(dispatchTable)),
+          table_(std::move(table)),
+          keyColumn_(std::move(keyColumn)),
+          keyDomain_(std::move(keyDomain)),
+          keyListBuffer_(std::move(keyListBuffer)),
+          keyListCountBuffer_(std::move(keyListCountBuffer)),
+          firstRowBuffer_(std::move(firstRowBuffer)),
+          lastRowBuffer_(std::move(lastRowBuffer)),
+          columns_(std::move(columns)),
+          targets_(std::move(targets)) {}
+
+    void produce(MetalCodegen& cg, ConsumerFn consume) override {
+        (void)consume;
+        const std::string suffix = sanitizeIdentifier(keyListBuffer_);
+        const std::string domainParam =
+            "n_exists_keylist_" + suffix + "_domain";
+        cg.setPhaseScannedTable(dispatchTable_);
+        cg.addResolvedScalarParam(domainParam, "uint", keyDomain_);
+        cg.addBufferParam(keyListBuffer_, "const uint", "", false);
+        cg.addBufferParam(keyListCountBuffer_, "const atomic_uint", "", false);
+        cg.addBufferParam(firstRowBuffer_, "const atomic_uint", "", false);
+        cg.addBufferParam(lastRowBuffer_, "const atomic_uint", "", false);
+
+        std::set<std::string> seenColumns;
+        for (const auto& col : columns_) {
+            if (!seenColumns.insert(col.column).second) continue;
+            cg.addColumnParam(col.column, metalTypeForType(col.type), table_);
+        }
+
+        for (const auto& target : targets_) {
+            cg.addAtomicBufferParam(target.firstBuffer, "atomic_uint",
+                                    keyDomain_);
+            cg.addAtomicBufferParam(target.stateBuffer, "atomic_uint",
+                                    keyDomain_);
+            cg.addBitmapWriteParam(target.multiBitmap,
+                                   "(" + keyDomain_ + " + 31) / 32");
+        }
+
+        cg.addLine("uint _ir_keylist_count_" + suffix +
+                   " = atomic_load_explicit(&" + keyListCountBuffer_ +
+                   "[0], memory_order_relaxed);");
+        cg.addBlock("for (uint i = tid; i < _ir_keylist_count_" + suffix +
+                    "; i += tpg)", [&]() {
+            cg.addLine("uint _ir_range_key_" + suffix + " = " +
+                       keyListBuffer_ + "[i];");
+            cg.addIf("_ir_range_key_" + suffix + " < " + domainParam, [&]() {
+                cg.addLine("uint _ir_range_first_" + suffix +
+                           " = atomic_load_explicit(&" + firstRowBuffer_ +
+                           "[_ir_range_key_" + suffix + "], "
+                           "memory_order_relaxed);");
+                cg.addLine("uint _ir_range_last_" + suffix +
+                           " = atomic_load_explicit(&" + lastRowBuffer_ +
+                           "[_ir_range_key_" + suffix + "], "
+                           "memory_order_relaxed);");
+                cg.addIf("_ir_range_first_" + suffix +
+                         " != 0xFFFFFFFFu && _ir_range_first_" + suffix +
+                         " <= _ir_range_last_" + suffix, [&]() {
+                    cg.addBlock("for (uint j = _ir_range_first_" + suffix +
+                                "; j <= _ir_range_last_" + suffix + "; ++j)",
+                                [&]() {
+                        cg.addIf("(uint)(" + keyColumn_ + "[j]) == " +
+                                 "_ir_range_key_" + suffix, [&]() {
+                            for (const auto& target : targets_) {
+                                auto emitUpdate = [&]() {
+                                    const std::string targetSuffix =
+                                        sanitizeIdentifier(target.firstBuffer);
+                                    cg.addLine("uint _ir_exists_val_" +
+                                               targetSuffix + " = (uint)(" +
+                                               target.valueExpr + ");");
+                                    cg.addLine("while (true) {");
+                                    cg.addLine("    uint _ir_exists_state_" +
+                                               targetSuffix +
+                                               " = atomic_load_explicit(&" +
+                                               target.stateBuffer +
+                                               "[_ir_range_key_" + suffix +
+                                               "], memory_order_relaxed);");
+                                    cg.addLine("    if (_ir_exists_state_" +
+                                               targetSuffix + " == 0u) {");
+                                    cg.addLine("        uint _ir_exists_expected_" +
+                                               targetSuffix + " = 0u;");
+                                    cg.addLine("        if (atomic_compare_exchange_weak_explicit(&" +
+                                               target.stateBuffer +
+                                               "[_ir_range_key_" + suffix +
+                                               "], &_ir_exists_expected_" +
+                                               targetSuffix +
+                                               ", 1u, memory_order_relaxed, memory_order_relaxed)) {");
+                                    cg.addLine("            atomic_store_explicit(&" +
+                                               target.firstBuffer +
+                                               "[_ir_range_key_" + suffix +
+                                               "], _ir_exists_val_" +
+                                               targetSuffix +
+                                               ", memory_order_relaxed);");
+                                    cg.addLine("            atomic_store_explicit(&" +
+                                               target.stateBuffer +
+                                               "[_ir_range_key_" + suffix +
+                                               "], 2u, memory_order_relaxed);");
+                                    cg.addLine("            break;");
+                                    cg.addLine("        }");
+                                    cg.addLine("    } else if (_ir_exists_state_" +
+                                               targetSuffix + " == 2u) {");
+                                    cg.addLine("        uint _ir_exists_first_" +
+                                               targetSuffix +
+                                               " = atomic_load_explicit(&" +
+                                               target.firstBuffer +
+                                               "[_ir_range_key_" + suffix +
+                                               "], memory_order_relaxed);");
+                                    cg.addLine("        if (_ir_exists_first_" +
+                                               targetSuffix +
+                                               " != _ir_exists_val_" +
+                                               targetSuffix + ") bitmap_set(" +
+                                               target.multiBitmap +
+                                               ", _ir_range_key_" + suffix +
+                                               ");");
+                                    cg.addLine("        break;");
+                                    cg.addLine("    }");
+                                    cg.addLine("}");
+                                };
+                                if (target.predicate.empty() ||
+                                    target.predicate == "true") {
+                                    emitUpdate();
+                                } else {
+                                    cg.addIf(target.predicate, emitUpdate);
+                                }
+                            }
+                        });
+                    });
+                });
+            });
+        });
+    }
+
+    std::string describe() const override {
+        return "IrExistsDistinctKeyListBuild(" + keyListBuffer_ + ")";
+    }
+
+private:
+    std::string dispatchTable_;
+    std::string table_;
+    std::string keyColumn_;
+    std::string keyDomain_;
+    std::string keyListBuffer_;
+    std::string keyListCountBuffer_;
+    std::string firstRowBuffer_;
+    std::string lastRowBuffer_;
+    std::vector<GenericColumnExpr> columns_;
+    std::vector<Target> targets_;
 };
 
 class MetalIrExistsDistinctProbe : public MetalUnaryOperator {
@@ -772,9 +1219,12 @@ std::vector<int> orderedJoinChildren(
     std::vector<int> ordered = children;
     auto rank = [&](int rel) {
         const auto& build = buildByRel.at(rel);
-        if (build.useHashJoin) return 3;
-        if (!build.subtreeCarries.empty()) return 1;
-        return 0;
+        if (build.useHashJoin) return 5;
+        if (build.antiJoinFilter) return 4;
+        if (build.semiJoinFilter || build.existsDistinct) return 3;
+        if (!build.filters.empty()) return 0;
+        if (!build.subtreeCarries.empty()) return 2;
+        return 1;
     };
     std::stable_sort(ordered.begin(), ordered.end(), [&](int a, int b) {
         return rank(a) < rank(b);
@@ -782,49 +1232,85 @@ std::vector<int> orderedJoinChildren(
     return ordered;
 }
 
-void addSiblingBitmapFilters(std::map<int, IrBuildSide>& buildByRel,
-                             int probeRel) {
-    auto parentIt = buildByRel.find(probeRel);
-    if (parentIt == buildByRel.end()) return;
-    const auto children = parentIt->second.children;
-    for (int hashRel : children) {
-        auto hashIt = buildByRel.find(hashRel);
-        if (hashIt == buildByRel.end() || !hashIt->second.useHashJoin)
-            continue;
-        auto& hashBuild = hashIt->second;
-        for (int filterRel : children) {
-            if (filterRel == hashRel) continue;
-            auto filterIt = buildByRel.find(filterRel);
-            if (filterIt == buildByRel.end()) continue;
-            const auto& filterBuild = filterIt->second;
-            if (filterBuild.useHashJoin || filterBuild.antiJoinFilter ||
-                filterBuild.existsDistinct || filterBuild.bitmapName.empty()) {
-                continue;
-            }
+std::optional<std::string> siblingBitmapProbeColumn(
+        const IrBuildSide& targetBuild,
+        const IrBuildSide& sourceBuild) {
+    if (sourceBuild.useHashJoin || sourceBuild.antiJoinFilter ||
+        sourceBuild.existsDistinct || sourceBuild.bitmapName.empty()) {
+        return std::nullopt;
+    }
+    if (sourceBuild.filters.empty() && sourceBuild.children.empty())
+        return std::nullopt;
+    if (targetBuild.parentCol.column == sourceBuild.parentCol.column)
+        return targetBuild.joinCol.column;
+    if (targetBuild.useHashJoin && !targetBuild.parentCol2.column.empty() &&
+        targetBuild.parentCol2.column == sourceBuild.parentCol.column) {
+        return targetBuild.joinCol2.column;
+    }
+    return std::nullopt;
+}
 
-            std::string keyColumn;
-            if (hashBuild.parentCol.column == filterBuild.parentCol.column) {
-                keyColumn = hashBuild.joinCol.column;
-            } else if (!hashBuild.parentCol2.column.empty() &&
-                       hashBuild.parentCol2.column ==
-                           filterBuild.parentCol.column) {
-                keyColumn = hashBuild.joinCol2.column;
-            }
-            if (keyColumn.empty()) continue;
+void addSiblingBitmapFilter(IrBuildSide& targetBuild,
+                            const IrBuildSide& sourceBuild,
+                            const std::string& keyColumn) {
+    for (const auto& existing : targetBuild.siblingBitmapFilters) {
+        if (existing.bitmapName == sourceBuild.bitmapName &&
+            existing.keyColumn == keyColumn &&
+            existing.sourceRelationInstance == sourceBuild.relationInstance) {
+            return;
+        }
+    }
+    targetBuild.siblingBitmapFilters.push_back(
+        {sourceBuild.bitmapName, keyColumn, sourceBuild.relationInstance});
+}
 
-            bool duplicate = false;
-            for (const auto& existing : hashBuild.siblingBitmapFilters) {
-                if (existing.bitmapName == filterBuild.bitmapName &&
-                    existing.keyColumn == keyColumn) {
-                    duplicate = true;
-                    break;
-                }
-            }
-            if (!duplicate) {
-                hashBuild.siblingBitmapFilters.push_back(
-                    {filterBuild.bitmapName, keyColumn});
+void addSiblingBitmapFilters(std::map<int, IrBuildSide>& buildByRel) {
+    for (auto& [parentRel, parentBuild] : buildByRel) {
+        (void)parentRel;
+        const auto children = orderedJoinChildren(parentBuild.children, buildByRel);
+        for (size_t targetIdx = 0; targetIdx < children.size(); ++targetIdx) {
+            auto targetIt = buildByRel.find(children[targetIdx]);
+            if (targetIt == buildByRel.end()) continue;
+            auto& targetBuild = targetIt->second;
+            for (size_t sourceIdx = 0; sourceIdx < targetIdx; ++sourceIdx) {
+                auto sourceIt = buildByRel.find(children[sourceIdx]);
+                if (sourceIt == buildByRel.end()) continue;
+                const auto& sourceBuild = sourceIt->second;
+                auto keyColumn = siblingBitmapProbeColumn(targetBuild, sourceBuild);
+                if (!keyColumn) continue;
+                addSiblingBitmapFilter(targetBuild, sourceBuild, *keyColumn);
             }
         }
+    }
+}
+
+void configureDomainKeyListDrives(std::map<int, IrBuildSide>& buildByRel) {
+    if (!domainKeyListExistsEnabled()) return;
+    for (auto& [targetRel, targetBuild] : buildByRel) {
+        (void)targetRel;
+        if (!targetBuild.existsDistinct ||
+            targetBuild.siblingBitmapFilters.size() != 1 ||
+            targetBuild.useHashJoin || !targetBuild.children.empty()) {
+            continue;
+        }
+        if (!targetBuild.relation ||
+            targetBuild.relation->primaryKeyColumn != targetBuild.joinCol.column) {
+            continue;
+        }
+
+        const auto& sibling = targetBuild.siblingBitmapFilters.front();
+        auto sourceIt = buildByRel.find(sibling.sourceRelationInstance);
+        if (sourceIt == buildByRel.end() || !sourceIt->second.scan)
+            continue;
+
+        auto& sourceBuild = sourceIt->second;
+        sourceBuild.emitKeyList = true;
+        targetBuild.domainKeyDrive = IrDomainKeyDrive{
+            sourceBuild.relationInstance,
+            keyListBufferName(sourceBuild),
+            keyListCountBufferName(sourceBuild),
+            sourceBuild.scan->table,
+        };
     }
 }
 
@@ -1236,7 +1722,8 @@ std::optional<MultiTableJoinLowering> buildMultiTableJoinLowering(
             return out;
     };
     computeSubtreeCarries(probeRel);
-    addSiblingBitmapFilters(buildByRel, probeRel);
+    addSiblingBitmapFilters(buildByRel);
+    configureDomainKeyListDrives(buildByRel);
 
     for (const auto& [rel, build] : buildByRel) {
         if (rel == probeRel || !build.useHashJoin) continue;
@@ -1319,31 +1806,256 @@ std::optional<MultiTableJoinLowering> buildMultiTableJoinLowering(
         return pipe;
     };
 
+    struct BuildFilterSplit {
+        std::vector<GenericPredicatePtr> immediate;
+        std::vector<GenericPredicatePtr> deferred;
+    };
+
+    auto splitBuildFilters = [&](const IrBuildSide& build) {
+        BuildFilterSplit split;
+        for (const auto& pred : build.filters) {
+            if (predicateHasScalarLookup(pred, build.scan->table)) {
+                split.deferred.push_back(pred);
+                continue;
+            }
+            split.immediate.push_back(pred);
+        }
+        return split;
+    };
+
+    auto buildPredicateForRow = [&](const BuildFilterSplit& split,
+                                    const std::string& rowIdxVar) {
+        std::string predicate = "true";
+        for (const auto& pred : split.immediate) {
+            std::string part = genericPredicateToMetal(pred, rowIdxVar);
+            predicate = predicate == "true" ? part
+                                            : "(" + predicate + ") && (" +
+                                                  part + ")";
+        }
+        return predicate;
+    };
+
+    auto isDomainDrivenExistsCandidate = [&](const IrBuildSide& build,
+                                             const BuildFilterSplit& split) {
+        return build.existsDistinct &&
+               build.domainKeyDrive &&
+               !build.useHashJoin &&
+               build.children.empty() &&
+               split.deferred.empty() &&
+               build.siblingBitmapFilters.size() == 1 &&
+               build.relation &&
+               build.relation->primaryKeyColumn == build.joinCol.column;
+    };
+
+    auto sameDomainDrivenGroup = [&](const IrBuildSide& base,
+                                     const IrBuildSide& other,
+                                     const BuildFilterSplit& otherSplit) {
+        if (!isDomainDrivenExistsCandidate(other, otherSplit))
+            return false;
+        return base.domainKeyDrive &&
+               other.domainKeyDrive &&
+               base.domainKeyDrive->sourceRelationInstance ==
+                   other.domainKeyDrive->sourceRelationInstance &&
+               base.scan && other.scan &&
+               base.scan->table == other.scan->table &&
+               base.joinCol.column == other.joinCol.column &&
+               base.keyDomain == other.keyDomain;
+    };
+
+    auto sameSiblingBitmapFilters = [](const IrBuildSide& a,
+                                       const IrBuildSide& b) {
+        if (a.siblingBitmapFilters.size() != b.siblingBitmapFilters.size())
+            return false;
+        for (size_t i = 0; i < a.siblingBitmapFilters.size(); ++i) {
+            const auto& af = a.siblingBitmapFilters[i];
+            const auto& bf = b.siblingBitmapFilters[i];
+            if (af.bitmapName != bf.bitmapName ||
+                af.keyColumn != bf.keyColumn ||
+                af.sourceRelationInstance != bf.sourceRelationInstance) {
+                return false;
+            }
+        }
+        return true;
+    };
+
+    auto isFusedExistsCandidate = [&](const IrBuildSide& build,
+                                      const BuildFilterSplit& split) {
+        return build.existsDistinct &&
+               !build.useHashJoin &&
+               build.children.empty() &&
+               split.deferred.empty() &&
+               !build.siblingBitmapFilters.empty();
+    };
+
+    auto sameFusedExistsGroup = [&](const IrBuildSide& base,
+                                    const IrBuildSide& other,
+                                    const BuildFilterSplit& otherSplit) {
+        if (!isFusedExistsCandidate(other, otherSplit))
+            return false;
+        return base.scan && other.scan &&
+               base.scan->table == other.scan->table &&
+               base.joinCol.column == other.joinCol.column &&
+               base.keyDomain == other.keyDomain &&
+               sameSiblingBitmapFilters(base, other);
+    };
+
+    std::set<std::string> emittedRowRangeIndexes;
+    std::set<int> emittedDomainDrivenExists;
+    std::set<int> emittedFusedExists;
+
     for (int rel : postorder) {
+        if (emittedDomainDrivenExists.count(rel) ||
+            emittedFusedExists.count(rel)) {
+            continue;
+        }
         const auto& build = buildByRel.at(rel);
         const std::string buildKeyExpr = build.joinCol.column + "[" + idxVar + "]";
         const std::string buildTag = sanitizeIdentifier(build.scan->alias.empty()
             ? build.scan->table : build.scan->alias);
+        const BuildFilterSplit buildFilterSplit = splitBuildFilters(build);
+
+        if (isDomainDrivenExistsCandidate(build, buildFilterSplit)) {
+            std::vector<int> groupRels;
+            groupRels.push_back(rel);
+            for (int otherRel : postorder) {
+                if (otherRel == rel ||
+                    emittedDomainDrivenExists.count(otherRel)) {
+                    continue;
+                }
+                const auto& otherBuild = buildByRel.at(otherRel);
+                BuildFilterSplit otherSplit = splitBuildFilters(otherBuild);
+                if (sameDomainDrivenGroup(build, otherBuild, otherSplit))
+                    groupRels.push_back(otherRel);
+            }
+
+            const std::string rangeKey =
+                rowRangeIndexKey(build.scan->table, build.joinCol.column);
+            const std::string firstRowBuffer =
+                rowRangeFirstBufferName(build.scan->table, build.joinCol.column);
+            const std::string lastRowBuffer =
+                rowRangeLastBufferName(build.scan->table, build.joinCol.column);
+            if (!emittedRowRangeIndexes.count(rangeKey)) {
+                auto rangeIndexScan = makeAutoScan(build.scan->table, idxVar);
+                auto rangeIndex = std::make_unique<MetalRowRangeIndexBuild>(
+                    std::move(rangeIndexScan), build.scan->table,
+                    build.joinCol.column, firstRowBuffer, lastRowBuffer,
+                    buildKeyExpr, build.keyDomain);
+                appendPhase(lowering.plan,
+                            "GENERIC_ir_multi_table_row_range_" + buildTag,
+                            std::move(rangeIndex));
+                emittedRowRangeIndexes.insert(rangeKey);
+            }
+
+            std::map<std::string, GenericColumnExpr> neededColumns;
+            neededColumns[build.joinCol.column] = build.joinCol;
+            std::vector<MetalIrExistsDistinctKeyListBuild::Target> targets;
+            for (int groupRel : groupRels) {
+                const auto& groupBuild = buildByRel.at(groupRel);
+                const auto& info = *groupBuild.existsDistinct;
+                BuildFilterSplit groupSplit = splitBuildFilters(groupBuild);
+                neededColumns[groupBuild.joinCol.column] = groupBuild.joinCol;
+                neededColumns[info.childValueCol.column] = info.childValueCol;
+                for (const auto& pred : groupSplit.immediate) {
+                    collectPredicateColumnsForRelation(
+                        pred, groupBuild.scan->relationInstance,
+                        neededColumns);
+                }
+                targets.push_back({
+                    info.firstBuffer,
+                    info.stateBuffer,
+                    info.multiBitmap,
+                    info.childValueCol.column + "[j]",
+                    buildPredicateForRow(groupSplit, "j"),
+                });
+                emittedDomainDrivenExists.insert(groupRel);
+            }
+
+            std::vector<GenericColumnExpr> columnList;
+            for (const auto& [_, col] : neededColumns)
+                columnList.push_back(col);
+
+            const auto& drive = *build.domainKeyDrive;
+            auto domainBuild =
+                std::make_unique<MetalIrExistsDistinctKeyListBuild>(
+                    drive.dispatchTable,
+                    build.scan->table,
+                    build.joinCol.column,
+                    build.keyDomain,
+                    drive.keyListBuffer,
+                    drive.keyListCountBuffer,
+                    firstRowBuffer,
+                    lastRowBuffer,
+                    std::move(columnList),
+                    std::move(targets));
+            appendPhase(lowering.plan,
+                        "GENERIC_ir_multi_table_exists_keylist_" + buildTag,
+                        std::move(domainBuild));
+            continue;
+        }
+
+        if (isFusedExistsCandidate(build, buildFilterSplit)) {
+            std::vector<int> groupRels;
+            groupRels.push_back(rel);
+            for (int otherRel : postorder) {
+                if (otherRel == rel ||
+                    emittedDomainDrivenExists.count(otherRel) ||
+                    emittedFusedExists.count(otherRel)) {
+                    continue;
+                }
+                const auto& otherBuild = buildByRel.at(otherRel);
+                BuildFilterSplit otherSplit = splitBuildFilters(otherBuild);
+                if (sameFusedExistsGroup(build, otherBuild, otherSplit))
+                    groupRels.push_back(otherRel);
+            }
+
+            if (groupRels.size() > 1) {
+                std::unique_ptr<MetalOperator> fusedPipe =
+                    makeAutoScan(build.scan->table, idxVar);
+                for (const auto& siblingFilter : build.siblingBitmapFilters) {
+                    fusedPipe = std::make_unique<MetalBitmapProbe>(
+                        std::move(fusedPipe), siblingFilter.bitmapName,
+                        siblingFilter.keyColumn + "[" + idxVar + "]");
+                }
+
+                std::vector<MetalIrExistsDistinctMultiBuild::Target> targets;
+                for (int groupRel : groupRels) {
+                    const auto& groupBuild = buildByRel.at(groupRel);
+                    const auto& info = *groupBuild.existsDistinct;
+                    BuildFilterSplit groupSplit = splitBuildFilters(groupBuild);
+                    targets.push_back({
+                        info.firstBuffer,
+                        info.stateBuffer,
+                        info.multiBitmap,
+                        info.childValueCol.column + "[" + idxVar + "]",
+                        buildPredicateForRow(groupSplit, idxVar),
+                    });
+                    emittedFusedExists.insert(groupRel);
+                }
+
+                fusedPipe = std::make_unique<MetalIrExistsDistinctMultiBuild>(
+                    std::move(fusedPipe), buildKeyExpr, build.keyDomain,
+                    std::move(targets));
+                appendPhase(lowering.plan,
+                            "GENERIC_ir_multi_table_exists_multi_" + buildTag,
+                            std::move(fusedPipe));
+                continue;
+            }
+        }
+
         std::unique_ptr<MetalOperator> buildPipe =
             makeAutoScan(build.scan->table, idxVar);
         bool buildScalarLookupsLoaded = false;
         bool buildUsesScalarLookupBuffer = false;
-        std::vector<GenericPredicatePtr> deferredBuildFilters;
-        for (const auto& pred : build.filters) {
-            if (predicateHasScalarLookup(pred, build.scan->table)) {
-                deferredBuildFilters.push_back(pred);
-                continue;
-            }
-            buildPipe = applyPredicateFilters(
-                std::move(buildPipe), {pred}, build.scan->table,
-                buildScalarLookupsLoaded, buildUsesScalarLookupBuffer);
-        }
 
         for (const auto& siblingFilter : build.siblingBitmapFilters) {
             buildPipe = std::make_unique<MetalBitmapProbe>(
                 std::move(buildPipe), siblingFilter.bitmapName,
                 siblingFilter.keyColumn + "[" + idxVar + "]");
         }
+
+        buildPipe = applyPredicateFilters(
+            std::move(buildPipe), buildFilterSplit.immediate, build.scan->table,
+            buildScalarLookupsLoaded, buildUsesScalarLookupBuffer);
 
         if (build.useHashJoin) {
             const std::string mapName = "hm_ir_join_" + buildTag;
@@ -1358,7 +2070,7 @@ std::optional<MultiTableJoinLowering> buildMultiTableJoinLowering(
                     carry.column, carry.column.column + "[" + idxVar + "]");
             }
             buildPipe = applyPredicateFilters(
-                std::move(buildPipe), deferredBuildFilters, build.scan->table,
+                std::move(buildPipe), buildFilterSplit.deferred, build.scan->table,
                 buildScalarLookupsLoaded, buildUsesScalarLookupBuffer);
             buildPipe = std::make_unique<MetalHashMapBuild>(
                 std::move(buildPipe), mapName, buildKeyExpr, buildKeyExpr2,
@@ -1371,7 +2083,7 @@ std::optional<MultiTableJoinLowering> buildMultiTableJoinLowering(
             continue;
         }
 
-        for (int childRel : build.children) {
+        for (int childRel : orderedJoinChildren(build.children, buildByRel)) {
             const auto& child = buildByRel.at(childRel);
             const std::string childProbeKeyExpr = child.parentCol.column + "[" + idxVar + "]";
             if (child.antiJoinFilter) {
@@ -1388,7 +2100,7 @@ std::optional<MultiTableJoinLowering> buildMultiTableJoinLowering(
         }
 
         buildPipe = applyPredicateFilters(
-            std::move(buildPipe), deferredBuildFilters, build.scan->table,
+            std::move(buildPipe), buildFilterSplit.deferred, build.scan->table,
             buildScalarLookupsLoaded, buildUsesScalarLookupBuffer);
 
         if (build.existsDistinct) {
@@ -1470,9 +2182,18 @@ std::optional<MultiTableJoinLowering> buildMultiTableJoinLowering(
             continue;
         }
 
-        buildPipe = std::make_unique<MetalBitmapBuild>(
-            std::move(buildPipe), build.bitmapName, buildKeyExpr,
-            "(" + build.keyDomain + " + 31) / 32");
+        if (build.emitKeyList) {
+            buildPipe = std::make_unique<MetalBitmapBuildWithKeyList>(
+                std::move(buildPipe), build.bitmapName, buildKeyExpr,
+                "(" + build.keyDomain + " + 31) / 32",
+                keyListBufferName(build),
+                keyListCountBufferName(build),
+                tableSizeName(build.scan->table));
+        } else {
+            buildPipe = std::make_unique<MetalBitmapBuild>(
+                std::move(buildPipe), build.bitmapName, buildKeyExpr,
+                "(" + build.keyDomain + " + 31) / 32");
+        }
         for (const auto& carry : build.subtreeCarries) {
             buildPipe = appendCarryStore(std::move(buildPipe), *build.scan,
                                          carry, buildKeyExpr, rel, idxVar,

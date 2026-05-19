@@ -324,6 +324,61 @@ static std::string autoDetectStreamTable(
     return best;
 }
 
+static uint64_t saturatingAdd(uint64_t a, uint64_t b) {
+    if (a > std::numeric_limits<uint64_t>::max() - b)
+        return std::numeric_limits<uint64_t>::max();
+    return a + b;
+}
+
+static uint64_t saturatingMul(uint64_t a, uint64_t b) {
+    if (a != 0 && b > std::numeric_limits<uint64_t>::max() / a)
+        return std::numeric_limits<uint64_t>::max();
+    return a * b;
+}
+
+struct DeviceBufferEstimate {
+    uint64_t totalBytes = 0;
+    uint64_t largestBytes = 0;
+    std::string largestName;
+    size_t resolvedBuffers = 0;
+    size_t unresolvedBuffers = 0;
+};
+
+static DeviceBufferEstimate estimateDeviceBufferBytes(
+        const codegen::MetalCodegen& cg,
+        const std::map<std::string, uint64_t>& tableRows) {
+    codegen::MetalSizeResolver resolver;
+    for (const auto& [table, rows] : tableRows) {
+        resolver.registerSymbol(codegen::tableSizeName(table), (size_t)rows);
+        resolver.registerSymbol("num" + table, (size_t)rows);
+    }
+
+    DeviceBufferEstimate out;
+    for (const auto& b : cg.getAllBindings()) {
+        if (b.kind != codegen::MetalParamKind::DeviceBuffer ||
+            b.readOnly || b.sizeExpr.empty()) {
+            continue;
+        }
+        size_t count = 0;
+        try {
+            count = resolver.resolve(b.sizeExpr);
+        } catch (...) {
+            out.unresolvedBuffers++;
+            continue;
+        }
+        uint64_t bytes = saturatingMul((uint64_t)count,
+                                       (uint64_t)b.elemSizeBytes());
+        if (bytes == 0) bytes = (uint64_t)b.elemSizeBytes();
+        out.totalBytes = saturatingAdd(out.totalBytes, bytes);
+        out.resolvedBuffers++;
+        if (bytes > out.largestBytes) {
+            out.largestBytes = bytes;
+            out.largestName = b.name;
+        }
+    }
+    return out;
+}
+
 static bool runCodegenQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
                             const std::string& sql, const std::string& queryName,
                             QueryApiKind apiKind) {
@@ -546,10 +601,13 @@ static bool runCodegenQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
 
                 // Full file size is diagnostic; projected size drives chunking.
                 uint64_t totalDataBytes = 0;
+                std::map<std::string, uint64_t> fullTableRows;
                 for (const auto& [tName, _cols] : tableCols) {
                     uint64_t nr = 0, fsz = 0;
-                    if (peekColbinHeader(g_dataset_path + tName + ".colbin", nr, fsz))
+                    if (peekColbinHeader(g_dataset_path + tName + ".colbin", nr, fsz)) {
                         totalDataBytes += fsz;
+                        fullTableRows[tName] = nr;
+                    }
                 }
 
                 uint64_t residentBytes = 0;
@@ -571,8 +629,21 @@ static bool runCodegenQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
                                                       tableCols.at(autoStreamTable));
                     }
                 }
-                // Resident buffers plus projected stream buffers.
-                uint64_t projectedWorkingSet = residentBytes + streamProjectedBytes;
+                auto estimateForStreamRows = [&](uint64_t streamRows) {
+                    auto rows = fullTableRows;
+                    rows[autoStreamTable] = streamRows;
+                    return estimateDeviceBufferBytes(cg, rows);
+                };
+
+                DeviceBufferEstimate fullDeviceBuffers =
+                    estimateDeviceBufferBytes(cg, fullTableRows);
+
+                // Resident buffers plus projected stream buffers plus
+                // generated operator buffers. The latter catches hash/group/sort
+                // allocations that can dwarf table input size.
+                uint64_t projectedWorkingSet = saturatingAdd(
+                    saturatingAdd(residentBytes, streamProjectedBytes),
+                    fullDeviceBuffers.totalBytes);
 
                 constexpr double kThreshold    = 0.75;
                 constexpr double kBudgetFraction = 0.50; // headroom for hash maps, output, kernels
@@ -610,43 +681,69 @@ static bool runCodegenQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
                         if (streamBytesPerRow == 0) streamBytesPerRow = 1;
                         const int slots = g_chunkDoubleBuffer ? 2 : 1;
 
-                        // Keep a floor for stream buffers even with large residents.
-                        int64_t streamBudget =
-                            (int64_t)((double)totalBudget * kBudgetFraction)
-                            - (int64_t)residentBytes;
-                        int64_t minStreamBudget =
-                            (int64_t)(totalBudget / 8);
-                        if (streamBudget < minStreamBudget)
-                            streamBudget = minStreamBudget;
-                        if (streamBudget < (int64_t)(64ull << 20))  // 64 MiB floor
-                            streamBudget = (int64_t)(64ull << 20);
+                        const uint64_t chunkBudget =
+                            (uint64_t)((double)totalBudget * kBudgetFraction);
+                        auto workingSetForChunkRows = [&](uint64_t rows) {
+                            const uint64_t streamInputBytes = saturatingMul(
+                                saturatingMul(rows, streamBytesPerRow),
+                                (uint64_t)slots);
+                            DeviceBufferEstimate deviceBuffers =
+                                estimateForStreamRows(rows);
+                            return saturatingAdd(
+                                saturatingAdd(residentBytes, streamInputBytes),
+                                deviceBuffers.totalBytes);
+                        };
 
-                        size_t autoChunkRows = (size_t)
-                            ((uint64_t)streamBudget /
-                             (streamBytesPerRow * (uint64_t)slots));
-                        // Clamp to useful chunk sizes.
-                        autoChunkRows = std::max<size_t>(autoChunkRows, 256u * 1024);
-                        if (autoChunkRows > streamRows)
-                            autoChunkRows = (size_t)streamRows;
+                        uint64_t lo = 1, hi = streamRows, best = 0;
+                        while (lo <= hi) {
+                            uint64_t mid = lo + (hi - lo) / 2;
+                            if (workingSetForChunkRows(mid) <= chunkBudget) {
+                                best = mid;
+                                lo = mid + 1;
+                            } else {
+                                if (mid == 0) break;
+                                hi = mid - 1;
+                            }
+                        }
+                        size_t autoChunkRows = best > 0 ? (size_t)best : 1;
                         g_chunkRows = autoChunkRows;
                         if (!g_csv) {
+                            DeviceBufferEstimate chunkDeviceBuffers =
+                                estimateForStreamRows(g_chunkRows);
                             printf("[auto-chunk] %s: disk=%.1f GiB working-set=%.1f GiB"
-                                   " (resident=%.1f + stream=%.1f)"
+                                   " (resident=%.1f + stream=%.1f + device=%.1f)"
                                    " budget=%.1f GiB (avail=%.1f phys=%.1f GPU=%.1f)"
                                    " stream=%s bytes/row=%llu slots=%d"
-                                   " — chunk=%zu rows (%.0f MiB/slot)\n",
+                                   " — chunk=%zu rows (%.0f MiB/slot,"
+                                   " chunk-working-set=%.1f GiB,"
+                                   " chunk-device=%.1f GiB",
                                    plan.name.c_str(),
                                    totalDataBytes / 1e9,
                                    projectedWorkingSet / 1e9,
                                    residentBytes / 1e9,
                                    streamProjectedBytes / 1e9,
+                                   fullDeviceBuffers.totalBytes / 1e9,
                                    totalBudget * kBudgetFraction / 1e9,
                                    availMemBytes / 1e9, physMemBytes / 1e9,
                                    gpuBudgetBytes / 1e9,
                                    autoStreamTable.c_str(),
                                    (unsigned long long)streamBytesPerRow,
                                    slots, g_chunkRows,
-                                   (double)(g_chunkRows * streamBytesPerRow) / (1ull << 20));
+                                   (double)(g_chunkRows * streamBytesPerRow) / (1ull << 20),
+                                   workingSetForChunkRows(g_chunkRows) / 1e9,
+                                   chunkDeviceBuffers.totalBytes / 1e9);
+                            if (!fullDeviceBuffers.largestName.empty()) {
+                                printf(", largest-device=%s %.1f GiB",
+                                       fullDeviceBuffers.largestName.c_str(),
+                                       fullDeviceBuffers.largestBytes / 1e9);
+                            }
+                            if (fullDeviceBuffers.unresolvedBuffers > 0 ||
+                                chunkDeviceBuffers.unresolvedBuffers > 0) {
+                                printf(", unresolved-device-buffers=%zu",
+                                       std::max(fullDeviceBuffers.unresolvedBuffers,
+                                                chunkDeviceBuffers.unresolvedBuffers));
+                            }
+                            printf(")\n");
                         }
                     }
                 }

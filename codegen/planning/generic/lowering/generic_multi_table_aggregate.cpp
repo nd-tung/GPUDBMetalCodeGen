@@ -7,6 +7,7 @@
 #include "generic/lowering/generic_multi_table_checks.h"
 #include "generic/lowering/generic_multi_table_join_lowering.h"
 #include "generic/lowering/generic_plan_shapes.h"
+#include "generic/lowering/generic_relation_analysis.h"
 #include "generic/lowering/generic_scalar_lookup.h"
 #include "generic/lowering/generic_scalar_preagg_lowering.h"
 #include "execution/metal_generic_executor.h"
@@ -318,6 +319,18 @@ public:
         return false;
     }
 
+    std::vector<GenericColumnExpr> columnsEquivalentTo(
+            const GenericColumnExpr& target) {
+        add(target);
+        std::vector<GenericColumnExpr> out;
+        const size_t n = columns_.size();
+        for (size_t i = 0; i < n; ++i) {
+            const auto& col = columns_[i];
+            if (equivalent(target, col)) out.push_back(col);
+        }
+        return out;
+    }
+
 private:
     std::string find(const std::string& key) {
         auto it = parent_.find(key);
@@ -514,6 +527,19 @@ std::optional<int64_t> datePartDomainSizeForPredicate(
     auto bounds = dateBoundsForPredicate(pred, dateExpr);
     if (!bounds || !bounds->minValue || !bounds->maxValue ||
         *bounds->minValue > *bounds->maxValue) {
+        if (auto* col = dateExpr
+                ? std::get_if<GenericColumnExpr>(&dateExpr->node)
+                : nullptr) {
+            if (col->hasGroupDomain && col->domainMax >= col->domainMin) {
+                if (unit == "year") {
+                    int64_t minYear = col->domainMin / 10000;
+                    int64_t maxYear = col->domainMax / 10000;
+                    if (maxYear >= minYear) return maxYear - minYear + 1;
+                }
+                if (unit == "month") return 12;
+                if (unit == "day") return 31;
+            }
+        }
         return std::nullopt;
     }
     if (unit == "year") {
@@ -539,16 +565,34 @@ std::optional<std::pair<int64_t, int64_t>> datePartBoundsForPredicate(
         if (auto* s = std::get_if<std::string>(&lit->value))
             unit = lowerAsciiLocal(*s);
     }
-    if (unit != "year") return std::nullopt;
+    if (unit != "year" && unit != "month" && unit != "day")
+        return std::nullopt;
     auto bounds = dateBoundsForPredicate(pred, fn->args[1]);
     if (!bounds || !bounds->minValue || !bounds->maxValue ||
         *bounds->minValue > *bounds->maxValue) {
+        if (auto* col = std::get_if<GenericColumnExpr>(&fn->args[1]->node)) {
+            if (col->hasGroupDomain && col->domainMax >= col->domainMin) {
+                if (unit == "year") {
+                    int64_t minYear = col->domainMin / 10000;
+                    int64_t maxYear = col->domainMax / 10000;
+                    if (maxYear >= minYear)
+                        return std::make_pair(minYear, maxYear);
+                }
+                if (unit == "month") return std::make_pair<int64_t, int64_t>(1, 12);
+                if (unit == "day") return std::make_pair<int64_t, int64_t>(1, 31);
+            }
+        }
         return std::nullopt;
     }
-    int64_t minYear = *bounds->minValue / 10000;
-    int64_t maxYear = *bounds->maxValue / 10000;
-    if (maxYear < minYear) return std::nullopt;
-    return std::make_pair(minYear, maxYear);
+    if (unit == "year") {
+        int64_t minYear = *bounds->minValue / 10000;
+        int64_t maxYear = *bounds->maxValue / 10000;
+        if (maxYear < minYear) return std::nullopt;
+        return std::make_pair(minYear, maxYear);
+    }
+    if (unit == "month") return std::make_pair<int64_t, int64_t>(1, 12);
+    if (unit == "day") return std::make_pair<int64_t, int64_t>(1, 31);
+    return std::nullopt;
 }
 
 std::optional<int64_t> finiteGroupExprCardinality(
@@ -1923,51 +1967,61 @@ bool predicateOnlyReferencesRelation(const GenericPredicatePtr& pred,
     return true;
 }
 
-const GenericScanDetail* scanForTable(const MultiTableGroupedAggShape& shape,
-                                      const std::string& table) {
+const GenericScanDetail* scanForRelation(const MultiTableGroupedAggShape& shape,
+                                         int relationInstance) {
     for (const auto* scanNode : shape.scans) {
         auto* scan = scanDetail(scanNode);
-        if (scan && scan->table == table) return scan;
+        if (scan && scan->relationInstance.value == relationInstance)
+            return scan;
     }
     return nullptr;
 }
 
 GenericColumnExpr relationColumn(const GenericScanDetail& scan,
                                  const std::string& column,
-                                 TypeInfo type) {
+                                 const SchemaProvider& schema) {
     GenericColumnExpr out;
     out.relationInstance = scan.relationInstance;
     out.table = scan.table;
     out.alias = scan.alias;
     out.column = column;
-    out.type = type;
+    if (schema.hasColumn(scan.table, column)) {
+        out.type = TypeInfo{schema.columnType(scan.table, column),
+                            schema.columnFixedWidth(scan.table, column)};
+        if (auto domain = schema.groupDomain(scan.table, column)) {
+            out.hasGroupDomain = true;
+            out.domainMin = domain->minValue;
+            out.domainMax = domain->maxValue;
+        }
+        out.charDomain = schema.charDomain(scan.table, column);
+        out.numericScale = schema.numericScale(scan.table, column);
+        out.keyDomainSymbol = schema.keyDomainSymbol(scan.table, column);
+        out.distinctDomainSymbol =
+            schema.distinctDomainSymbol(scan.table, column);
+    }
     return out;
 }
 
-std::optional<MetalQueryPlan> lowerSharedNationDiamondCount(
+std::string scanScopeName(const GenericScanDetail& scan) {
+    return sanitizeIdentifier(scan.alias.empty() ? scan.table : scan.alias);
+}
+
+std::optional<MetalQueryPlan> lowerSharedDimensionCount(
         const GenericRelPlan& ir,
         const MultiTableGroupedAggShape& shape,
         const GenericAggregateDetail& aggregate,
         const AnalyzedQuery* aq,
         std::string* error) {
-    (void)ir;
     if (!aq || !aq->schema) return std::nullopt;
     if (shape.scans.size() != 3) return std::nullopt;
-
-    const auto* customer = scanForTable(shape, "customer");
-    const auto* supplier = scanForTable(shape, "supplier");
-    const auto* nation = scanForTable(shape, "nation");
-    if (!customer || !supplier || !nation) return std::nullopt;
 
     if (aggregate.groupBy.size() != 1 || aggregate.aggregates.size() != 1)
         return std::nullopt;
     auto* groupCol = aggregate.groupBy.front()
         ? std::get_if<GenericColumnExpr>(&aggregate.groupBy.front()->node)
         : nullptr;
-    if (!groupCol || groupCol->relationInstance.value != nation->relationInstance.value ||
-        groupCol->column != "n_name") {
+    if (!groupCol)
         return std::nullopt;
-    }
 
     const auto& aggProjection = aggregate.aggregates.front();
     auto* agg = aggProjection.expr
@@ -1975,101 +2029,169 @@ std::optional<MetalQueryPlan> lowerSharedNationDiamondCount(
         : nullptr;
     if (!agg || agg->func != AggFunc::COUNT) return std::nullopt;
 
+    const auto* dimensionScan =
+        scanForRelation(shape, groupCol->relationInstance.value);
+    if (!dimensionScan) return std::nullopt;
+    const GenericRelNode* dimensionScanNode = nullptr;
+    for (const auto* scanNode : shape.scans) {
+        auto* scan = scanDetail(scanNode);
+        if (scan &&
+            scan->relationInstance.value ==
+                dimensionScan->relationInstance.value) {
+            dimensionScanNode = scanNode;
+            break;
+        }
+    }
+    const auto* dimensionRel = relationForScan(ir, dimensionScanNode);
+    if (!dimensionRel || dimensionRel->primaryKeyColumn.empty() ||
+        dimensionRel->primaryKeyDomainSymbol.empty()) {
+        return std::nullopt;
+    }
+
     if (auto* filter = filterDetail(shape.filter)) {
         if (!predicateOnlyReferencesRelation(filter->predicate,
-                                             nation->relationInstance.value)) {
+                                             dimensionScan->relationInstance.value)) {
             return std::nullopt;
         }
         if (!predicateSupported(filter->predicate)) {
             if (error)
-                *error = "IR diamond count lowerer: nation filter predicate is not supported.";
+                *error = "IR shared-dimension count lowerer: dimension filter predicate is not supported.";
             return std::nullopt;
         }
     }
 
     ColumnEquivalence eq = buildJoinColumnEquivalence(shape.joins, shape.filter);
-    GenericColumnExpr cNation = relationColumn(
-        *customer, "c_nationkey", TypeInfo{DataType::INT, 0});
-    GenericColumnExpr sNation = relationColumn(
-        *supplier, "s_nationkey", TypeInfo{DataType::INT, 0});
-    GenericColumnExpr nKey = relationColumn(
-        *nation, "n_nationkey", TypeInfo{DataType::INT, 0});
-    if (!eq.equivalent(cNation, sNation) ||
-        !eq.equivalent(sNation, nKey)) {
-        return std::nullopt;
-    }
+    GenericColumnExpr dimensionPk =
+        relationColumn(*dimensionScan, dimensionRel->primaryKeyColumn,
+                       *aq->schema);
+    auto equivalentCols = eq.columnsEquivalentTo(dimensionPk);
 
-    constexpr const char* kNationDomain = "25";
+    struct CountInput {
+        const GenericScanDetail* scan = nullptr;
+        GenericColumnExpr keyCol;
+        std::string countBuffer;
+    };
+    std::vector<CountInput> countInputs;
+    for (const auto* scanNode : shape.scans) {
+        auto* scan = scanDetail(scanNode);
+        if (!scan ||
+            scan->relationInstance.value ==
+                dimensionScan->relationInstance.value) {
+            continue;
+        }
+
+        auto it = std::find_if(
+            equivalentCols.begin(), equivalentCols.end(),
+            [&](const GenericColumnExpr& col) {
+                return col.relationInstance.value == scan->relationInstance.value;
+            });
+        if (it == equivalentCols.end())
+            return std::nullopt;
+
+        CountInput input;
+        input.scan = scan;
+        input.keyCol = *it;
+        input.countBuffer = "d_ir_shared_dim_count_" +
+                            scanScopeName(*scan) + "_" +
+                            sanitizeIdentifier(it->column);
+        countInputs.push_back(std::move(input));
+    }
+    if (countInputs.size() != 2) return std::nullopt;
+
     const std::string idxVar = "i";
-    const std::string customerCount = "d_ir_diamond_customer_nation_count";
-    const std::string supplierCount = "d_ir_diamond_supplier_nation_count";
 
     MetalQueryPlan plan;
-    plan.name = "GENERIC_IR_MULTI_TABLE_DIAMOND_COUNT";
+    plan.name = "GENERIC_IR_SHARED_DIMENSION_COUNT";
 
-    {
-        auto scan = makeScanForCols(customer->table, idxVar, {"c_nationkey"},
+    for (const auto& input : countInputs) {
+        auto scan = makeScanForCols(input.scan->table, idxVar,
+                                    {input.keyCol.column},
                                     aq->schema);
         auto count = std::make_unique<MetalAtomicCount>(
-            std::move(scan), customerCount, "c_nationkey[" + idxVar + "]",
-            kNationDomain);
-        appendPhase(plan, "GENERIC_ir_diamond_count_customer",
-                    std::move(count));
-    }
-    {
-        auto scan = makeScanForCols(supplier->table, idxVar, {"s_nationkey"},
-                                    aq->schema);
-        auto count = std::make_unique<MetalAtomicCount>(
-            std::move(scan), supplierCount, "s_nationkey[" + idxVar + "]",
-            kNationDomain);
-        appendPhase(plan, "GENERIC_ir_diamond_count_supplier",
+            std::move(scan), input.countBuffer,
+            input.keyCol.column + "[" + idxVar + "]",
+            dimensionRel->primaryKeyDomainSymbol);
+        appendPhase(plan, "GENERIC_ir_shared_dimension_count_" +
+                          scanScopeName(*input.scan),
                     std::move(count));
     }
 
-    const int nameWidth = aq->schema->columnFixedWidth(nation->table, "n_name");
-    std::set<std::string> nationCols{"n_nationkey", "n_name"};
-    std::unique_ptr<MetalOperator> nationPipe =
-        makeScanForCols(nation->table, idxVar, nationCols, aq->schema);
+    int groupStringWidth = 0;
+    if (groupCol->type.type == DataType::CHAR_FIXED) {
+        groupStringWidth = groupCol->type.fixedWidth > 0
+            ? groupCol->type.fixedWidth
+            : aq->schema->columnFixedWidth(dimensionScan->table,
+                                           groupCol->column);
+        if (groupStringWidth <= 0) return std::nullopt;
+    }
+
+    std::set<std::string> dimensionCols{
+        dimensionRel->primaryKeyColumn, groupCol->column};
+    std::unique_ptr<MetalOperator> dimensionPipe =
+        makeScanForCols(dimensionScan->table, idxVar, dimensionCols,
+                        aq->schema);
     if (auto* filter = filterDetail(shape.filter)) {
-        nationPipe = maybeSelect(std::move(nationPipe),
-                                 genericPredicateToMetal(filter->predicate, idxVar));
+        dimensionPipe = maybeSelect(
+            std::move(dimensionPipe),
+            genericPredicateToMetal(filter->predicate, idxVar));
     }
 
-    const std::string resultCounter = "d_ir_diamond_result_count";
+    const std::string resultCounter = "d_ir_shared_dim_result_count";
     auto materialize = std::make_unique<MetalMaterialize>(
-        std::move(nationPipe), resultCounter, "1");
-    const std::string nameBuffer = "d_ir_diamond_0_n_name";
-    const std::string countBuffer = "d_ir_diamond_1_" +
+        std::move(dimensionPipe), resultCounter, "1");
+    const std::string groupDisplayName =
+        groupDisplayNameForAggregate(aggregate, 0);
+    const std::string groupBuffer = "d_ir_shared_dim_0_" +
+        sanitizeIdentifier(groupDisplayName);
+    const std::string countBuffer = "d_ir_shared_dim_1_" +
         sanitizeIdentifier(aggProjection.name.empty() ? "cnt"
                                                       : aggProjection.name);
-    const std::string countExpr =
-        "(int)(atomic_load_explicit(&" + customerCount +
-        "[n_nationkey[" + idxVar + "]], memory_order_relaxed) * "
-        "atomic_load_explicit(&" + supplierCount +
-        "[n_nationkey[" + idxVar + "]], memory_order_relaxed))";
-    materialize->addColumn(nameBuffer, "char",
-                           "n_name + " + idxVar + " * " +
-                               std::to_string(nameWidth),
-                           "n_name", tableSizeName(nation->table) + " * " +
-                               std::to_string(nameWidth),
-                           nameWidth);
+    std::string countExpr = "(int)(";
+    for (size_t i = 0; i < countInputs.size(); ++i) {
+        if (i > 0) countExpr += " * ";
+        countExpr += "atomic_load_explicit(&" + countInputs[i].countBuffer +
+                     "[" + dimensionRel->primaryKeyColumn + "[" + idxVar +
+                     "]], memory_order_relaxed)";
+    }
+    countExpr += ")";
+
+    std::vector<GenericMatColumnDesc> outputCols;
+    if (groupCol->type.type == DataType::CHAR_FIXED) {
+        materialize->addColumn(
+            groupBuffer, "char",
+            groupCol->column + " + " + idxVar + " * " +
+                std::to_string(groupStringWidth),
+            groupDisplayName,
+            tableSizeName(dimensionScan->table) + " * " +
+                std::to_string(groupStringWidth),
+            groupStringWidth);
+        outputCols.push_back(
+            {groupDisplayName, groupBuffer, "char", groupStringWidth});
+    } else {
+        materialize->addColumn(
+            groupBuffer, metalTypeForType(groupCol->type),
+            groupCol->column + "[" + idxVar + "]",
+            groupDisplayName, tableSizeName(dimensionScan->table), 0);
+        outputCols.push_back(
+            {groupDisplayName, groupBuffer, metalTypeForType(groupCol->type), 0});
+    }
+
     const std::string countDisplay =
         aggProjection.name.empty() ? "cnt" : aggProjection.name;
     materialize->addColumn(countBuffer, "int", countExpr, countDisplay,
-                           tableSizeName(nation->table), 0);
-    auto& matPhase = appendPhase(plan, "GENERIC_ir_diamond_materialize",
+                           tableSizeName(dimensionScan->table), 0);
+    auto& matPhase = appendPhase(plan, "GENERIC_ir_shared_dimension_materialize",
                                  std::move(materialize));
-    matPhase.extraBuffers.push_back({customerCount, "atomic_uint", true, false});
-    matPhase.extraBuffers.push_back({supplierCount, "atomic_uint", true, false});
+    for (const auto& input : countInputs) {
+        matPhase.extraBuffers.push_back(
+            {input.countBuffer, "atomic_uint", true, false});
+    }
 
-    std::vector<GenericMatColumnDesc> outputCols = {
-        {"n_name", nameBuffer, "char", nameWidth},
-        {countDisplay, countBuffer, "int", 0}
-    };
+    outputCols.push_back({countDisplay, countBuffer, "int", 0});
 
     std::vector<IrGroupKeyDesc> groupKeys;
     IrGroupKeyDesc groupKey;
-    groupKey.displayName = "n_name";
+    groupKey.displayName = groupDisplayName;
     groupKeys.push_back(std::move(groupKey));
     GenericSortSpec sortSpec;
     sortSpec.limit = limitValue(shape.limit);
@@ -2078,17 +2200,17 @@ std::optional<MetalQueryPlan> lowerSharedNationDiamondCount(
             auto name = sortKeyDisplayNameForGroupedAgg(key, aggregate, groupKeys);
             if (!name) {
                 if (error)
-                    *error = "IR diamond count lowerer: ORDER BY key is not an output.";
+                    *error = "IR shared-dimension count lowerer: ORDER BY key is not an output.";
                 return std::nullopt;
             }
             sortSpec.keys.push_back({*name, key.descending});
         }
     }
     if (!sortSpec.keys.empty() || sortSpec.limit >= 0) {
-        const std::string rowsSym = "n_gpu_sort_ir_diamond_rows";
+        const std::string rowsSym = "n_gpu_sort_ir_shared_dim_rows";
         attachMaterializedCountHook(matPhase, resultCounter, rowsSym);
-        if (!appendGenericGpuSort(plan, "ir_diamond", rowsSym,
-                                  tableSizeName(nation->table),
+        if (!appendGenericGpuSort(plan, "ir_shared_dim", rowsSym,
+                                  tableSizeName(dimensionScan->table),
                                   outputCols, sortSpec, error)) {
             return std::nullopt;
         }
@@ -2114,7 +2236,7 @@ std::optional<MetalQueryPlan> lowerMultiTableGroupedAggregateIRToMetalImpl(
     if (aggregate->aggregates.empty())
         return fail(error, "IR multi-table grouped aggregate lowerer: no aggregate outputs.");
 
-    if (auto p = lowerSharedNationDiamondCount(ir, *shape, *aggregate, aq, error))
+    if (auto p = lowerSharedDimensionCount(ir, *shape, *aggregate, aq, error))
         return p;
 
     std::vector<GenericExprPtr> neededExprs;
@@ -2507,7 +2629,7 @@ std::optional<MetalQueryPlan> lowerMultiTableGroupedAggregateIRToMetalImpl(
 
             IrGroupKeyDesc key;
             key.displayName = displayName;
-            key.stride = totalBuckets;
+            key.stride = 1;
             const std::string raw = materializedValueAt(*matCol, idxVar);
             const auto* fd = shape->filter ? filterDetail(shape->filter) : nullptr;
             auto finiteIntDomain = finiteIntDomainForPredicate(
@@ -2537,7 +2659,6 @@ std::optional<MetalQueryPlan> lowerMultiTableGroupedAggregateIRToMetalImpl(
                            fd ? fd->predicate : GenericPredicatePtr{}, group);
                        (group->type.type == DataType::INT ||
                         group->type.type == DataType::DATE) &&
-                       aggregateNeedsHashGroupOutput(*aggregate) &&
                        datePartBounds) {
                 int64_t minValue = datePartBounds->first;
                 int64_t maxValue = datePartBounds->second;
@@ -2566,13 +2687,11 @@ std::optional<MetalQueryPlan> lowerMultiTableGroupedAggregateIRToMetalImpl(
             } else if (col && col->type.type == DataType::CHAR_FIXED) {
                 auto domain = finiteStringDomainForPredicate(
                     fd ? fd->predicate : GenericPredicatePtr{}, group);
-                if (matCol->stringRowRef && aggregate->groupBy.size() == 1 &&
+                if (matCol->stringRowRef &&
                     matCol->stringLen > 0 && matCol->metalType == "uint" &&
                     !matCol->stringSourceTable.empty() &&
                     !matCol->stringSourceColumn.empty()) {
-                    dynamicDomain = true;
-                    bucketCountExpr = tableSizeName(matCol->stringSourceTable);
-                    key.numValuesExpr = dynamicBucketCountSymbol;
+                    key.numValuesExpr = tableSizeName(matCol->stringSourceTable);
                     key.keyExpr = raw;
                     key.stringRowRef = true;
                     key.stringLen = matCol->stringLen;
@@ -2594,14 +2713,6 @@ std::optional<MetalQueryPlan> lowerMultiTableGroupedAggregateIRToMetalImpl(
                 }
             } else if (col && (col->type.type == DataType::INT ||
                         col->type.type == DataType::DATE) &&
-                       aggregate->groupBy.size() == 1 &&
-                       !col->keyDomainSymbol.empty()) {
-                dynamicDomain = true;
-                bucketCountExpr = col->keyDomainSymbol;
-                key.numValuesExpr = dynamicBucketCountSymbol;
-                key.keyExpr = raw;
-            } else if (col && (col->type.type == DataType::INT ||
-                        col->type.type == DataType::DATE) &&
                        col->hasGroupDomain &&
                        col->domainMax >= col->domainMin) {
                 key.numValues = col->domainMax - col->domainMin + 1;
@@ -2611,23 +2722,65 @@ std::optional<MetalQueryPlan> lowerMultiTableGroupedAggregateIRToMetalImpl(
                     : raw;
                 key.keyExpr = "clamp(" + key.keyExpr + ", 0, " +
                               std::to_string(key.numValues - 1) + ")";
+            } else if (col && (col->type.type == DataType::INT ||
+                        col->type.type == DataType::DATE) &&
+                       aggregate->groupBy.size() == 1 &&
+                       !col->keyDomainSymbol.empty()) {
+                key.numValuesExpr = col->keyDomainSymbol;
+                key.keyExpr = raw;
             } else {
                 directOk = false;
                 break;
             }
 
             if (key.numValuesExpr.empty()) {
-                totalBuckets *= key.numValues;
-                if (key.numValues <= 0 || totalBuckets > 4096) {
+                if (key.numValues <= 0) {
                     directOk = false;
                     break;
                 }
-            } else if (bucketCountExpr.empty()) {
-                directOk = false;
-                break;
             }
             denseKeys.push_back(std::move(key));
         }
+
+        auto assignDenseKeyStrides = [&]() -> bool {
+            int staticProduct = 1;
+            int dynamicIndex = -1;
+            for (size_t i = 0; i < denseKeys.size(); ++i) {
+                auto& key = denseKeys[i];
+                if (!key.numValuesExpr.empty()) {
+                    if (dynamicIndex >= 0) return false;
+                    dynamicIndex = static_cast<int>(i);
+                    continue;
+                }
+                if (key.numValues <= 0) return false;
+                if (staticProduct > 4096 / key.numValues) return false;
+                key.stride = staticProduct;
+                staticProduct *= key.numValues;
+            }
+
+            if (dynamicIndex >= 0) {
+                auto& dynamicKey = denseKeys[(size_t)dynamicIndex];
+                if (staticProduct <= 0) return false;
+                dynamicDomain = true;
+                dynamicKey.stride = staticProduct;
+                bucketCountExpr = "(" + dynamicKey.numValuesExpr + ")";
+                if (staticProduct != 1)
+                    bucketCountExpr += " * " + std::to_string(staticProduct);
+                dynamicKey.numValuesExpr = staticProduct == 1
+                    ? dynamicBucketCountSymbol
+                    : "(" + dynamicBucketCountSymbol + " / " +
+                          std::to_string(staticProduct) + "u)";
+                totalBuckets = staticProduct;
+            } else {
+                dynamicDomain = false;
+                totalBuckets = staticProduct;
+                bucketCountExpr = std::to_string(totalBuckets);
+            }
+            return totalBuckets > 0;
+        };
+
+        if (directOk)
+            directOk = assignDenseKeyStrides();
 
         std::vector<IrPendingAgg> pending;
         std::vector<int> aggregatePendingIndex(aggregate->aggregates.size(), -1);
@@ -2784,10 +2937,15 @@ std::optional<MetalQueryPlan> lowerMultiTableGroupedAggregateIRToMetalImpl(
         }
 
         if (directOk && !pending.empty()) {
-            std::string bucketExpr = "(" + denseKeys.front().keyExpr + ")";
-            for (size_t i = 1; i < denseKeys.size(); ++i) {
-                bucketExpr = "(" + bucketExpr + " + (" + denseKeys[i].keyExpr + ") * " +
-                             std::to_string(denseKeys[i].stride) + ")";
+            std::string bucketExpr;
+            for (const auto& key : denseKeys) {
+                std::string term = "(" + key.keyExpr + ")";
+                if (key.stride != 1)
+                    term = "(" + term + " * " +
+                           std::to_string(key.stride) + ")";
+                bucketExpr = bucketExpr.empty()
+                    ? term
+                    : "(" + bucketExpr + " + " + term + ")";
             }
             bucketCountExpr = dynamicDomain
                 ? bucketCountExpr
