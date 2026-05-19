@@ -22,6 +22,9 @@ struct IrGroupKeyDesc {
     int keyBase = 0;
     std::vector<std::string> stringMap;
     int stringLen = 0;
+    bool stringRowRef = false;
+    std::string stringSourceTable;
+    std::string stringSourceColumn;
 };
 
 struct IrPendingAgg {

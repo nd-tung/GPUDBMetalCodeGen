@@ -73,6 +73,17 @@ bool MetalGenericExecutor::tryGetSymbol(const std::string& name, size_t& out) co
     out = sizeResolver_.getSymbol(name);
     return true;
 }
+
+bool MetalGenericExecutor::tryResolveSizeExpression(const std::string& expr,
+                                                    size_t& out) const {
+    try {
+        out = sizeResolver_.resolve(expr);
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
 void MetalGenericExecutor::registerScalarInt(const std::string& name, int value) {
     scalarInts_[name] = value;
 }

@@ -28,6 +28,15 @@ std::string lowerAscii(std::string value) {
     return value;
 }
 
+bool isSimpleIdentifier(const std::string& value) {
+    if (value.empty()) return false;
+    for (char ch : value) {
+        unsigned char uch = static_cast<unsigned char>(ch);
+        if (!std::isalnum(uch) && ch != '_') return false;
+    }
+    return true;
+}
+
 CmpOp reverseCmpOp(CmpOp op) {
     switch (op) {
         case CmpOp::LT: return CmpOp::GT;
@@ -83,6 +92,11 @@ struct IrExistsDistinctInfo {
     std::string stateBuffer;
     std::string multiBitmap;
     bool anti = false;
+};
+
+struct IrSiblingBitmapFilter {
+    std::string bitmapName;
+    std::string keyColumn;
 };
 
 bool typeCanUseArrayCarry(DataType type) {
@@ -218,6 +232,7 @@ struct IrBuildSide {
     std::vector<GenericPredicatePtr> filters;
     std::map<std::string, IrCarryColumn> localCarries;
     std::vector<IrCarryColumn> subtreeCarries;
+    std::vector<IrSiblingBitmapFilter> siblingBitmapFilters;
     std::string keyDomain;
     std::string bitmapName;
     std::optional<IrExistsDistinctInfo> existsDistinct;
@@ -363,6 +378,74 @@ private:
     std::string keyExpr_;
     std::string valueExpr_;
     bool anti_;
+};
+
+class MetalRunSegmentedInSubAgg : public MetalOperator {
+public:
+    MetalRunSegmentedInSubAgg(std::string table,
+                              std::string keyColumn,
+                              std::string valueColumn,
+                              std::string outputBuffer,
+                              std::string keyDomain,
+                              bool countOnly)
+        : table_(std::move(table)),
+          keyColumn_(std::move(keyColumn)),
+          valueColumn_(std::move(valueColumn)),
+          outputBuffer_(std::move(outputBuffer)),
+          keyDomain_(std::move(keyDomain)),
+          countOnly_(countOnly) {}
+
+    void produce(MetalCodegen& cg, ConsumerFn consume) override {
+        (void)consume;
+        const std::string nRows = tableSizeName(table_);
+        const std::string domainParam =
+            "n_segmented_in_" + sanitizeIdentifier(outputBuffer_) + "_domain";
+        cg.setPhaseScannedTable(table_);
+        cg.addScalarParam(nRows, "uint");
+        cg.addResolvedScalarParam(domainParam, "uint", keyDomain_);
+        cg.addColumnParam(keyColumn_, "int", table_);
+        if (!countOnly_)
+            cg.addColumnParam(valueColumn_, "float", table_);
+        cg.addAtomicBufferParam(outputBuffer_, "atomic_uint", keyDomain_);
+
+        cg.addBlock("for (uint i = tid; i < " + nRows + "; i += tpg)", [&]() {
+            cg.addLine("const uint _seg_rows = 1024u;");
+            cg.addLine("uint _seg_begin = (i / _seg_rows) * _seg_rows;");
+            cg.addLine("uint _seg_end = min(_seg_begin + _seg_rows, " + nRows + ");");
+            cg.addLine("int _seg_key = " + keyColumn_ + "[i];");
+            cg.addIf("_seg_key >= 0 && (uint)_seg_key < " + domainParam, [&]() {
+                cg.addLine("bool _seg_start = (i == _seg_begin) || (" +
+                           keyColumn_ + "[i - 1u] != _seg_key);");
+                cg.addIf("_seg_start", [&]() {
+                    cg.addLine("float _seg_sum = 0.0f;");
+                    cg.addLine("uint _seg_j = i;");
+                    cg.addBlock("while (_seg_j < _seg_end && " +
+                                keyColumn_ + "[_seg_j] == _seg_key)", [&]() {
+                        if (countOnly_)
+                            cg.addLine("_seg_sum += 1.0f;");
+                        else
+                            cg.addLine("_seg_sum += " + valueColumn_ +
+                                       "[_seg_j];");
+                        cg.addLine("_seg_j++;");
+                    });
+                    cg.addLine("atomic_add_float(&" + outputBuffer_ +
+                               "[(uint)_seg_key], _seg_sum);");
+                });
+            });
+        });
+    }
+
+    std::string describe() const override {
+        return "RunSegmentedInSubAgg(" + table_ + "." + keyColumn_ + ")";
+    }
+
+private:
+    std::string table_;
+    std::string keyColumn_;
+    std::string valueColumn_;
+    std::string outputBuffer_;
+    std::string keyDomain_;
+    bool countOnly_ = false;
 };
 
 class MetalIrScalarAtomicLookup : public MetalUnaryOperator {
@@ -602,6 +685,149 @@ std::optional<std::string> inSubAggHavingCondition(
     return aggRef + " " + cmpOpToMetal(op) + " " + *rhs;
 }
 
+GenericPredicatePtr makeLogicalPredicate(
+        GenericLogicalPred::Op op,
+        std::vector<GenericPredicatePtr> children) {
+    std::vector<GenericPredicatePtr> flat;
+    for (const auto& child : children) {
+        if (!child) continue;
+        if (auto* logical = std::get_if<GenericLogicalPred>(&child->node)) {
+            if (logical->op == op && op != GenericLogicalPred::Op::Not) {
+                flat.insert(flat.end(), logical->children.begin(),
+                            logical->children.end());
+                continue;
+            }
+        }
+        flat.push_back(child);
+    }
+    if (flat.empty()) return {};
+    if (flat.size() == 1) return flat.front();
+
+    auto out = std::make_shared<GenericPredicate>();
+    out->node = GenericLogicalPred{op, std::move(flat)};
+    return out;
+}
+
+std::optional<GenericPredicatePtr> relationLocalNecessaryPredicate(
+        const GenericPredicatePtr& pred,
+        int relationInstance) {
+    if (!pred) return std::nullopt;
+
+    if (auto* logical = std::get_if<GenericLogicalPred>(&pred->node)) {
+        if (logical->op == GenericLogicalPred::Op::And) {
+            std::vector<GenericPredicatePtr> localParts;
+            for (const auto& child : logical->children) {
+                if (auto local =
+                        relationLocalNecessaryPredicate(child, relationInstance)) {
+                    localParts.push_back(*local);
+                }
+            }
+            auto out = makeLogicalPredicate(GenericLogicalPred::Op::And,
+                                            std::move(localParts));
+            if (!out) return std::nullopt;
+            return out;
+        }
+
+        if (logical->op == GenericLogicalPred::Op::Or) {
+            std::vector<GenericPredicatePtr> localBranches;
+            for (const auto& child : logical->children) {
+                auto local =
+                    relationLocalNecessaryPredicate(child, relationInstance);
+                if (!local) return std::nullopt;
+                localBranches.push_back(*local);
+            }
+            auto out = makeLogicalPredicate(GenericLogicalPred::Op::Or,
+                                            std::move(localBranches));
+            if (!out) return std::nullopt;
+            return out;
+        }
+    }
+
+    std::set<int> rels;
+    collectPredicateRelations(pred, rels);
+    if (rels.size() == 1 && rels.count(relationInstance))
+        return pred;
+    return std::nullopt;
+}
+
+void addRelationLocalFilter(
+        const GenericPredicatePtr& pred,
+        int relationInstance,
+        int probeRel,
+        std::map<int, IrBuildSide>& buildByRel,
+        std::vector<GenericPredicatePtr>& probeFilters) {
+    if (!pred) return;
+    if (relationInstance == probeRel) {
+        probeFilters.push_back(pred);
+        return;
+    }
+    auto it = buildByRel.find(relationInstance);
+    if (it != buildByRel.end())
+        it->second.filters.push_back(pred);
+}
+
+std::vector<int> orderedJoinChildren(
+        const std::vector<int>& children,
+        const std::map<int, IrBuildSide>& buildByRel) {
+    std::vector<int> ordered = children;
+    auto rank = [&](int rel) {
+        const auto& build = buildByRel.at(rel);
+        if (build.useHashJoin) return 3;
+        if (!build.subtreeCarries.empty()) return 1;
+        return 0;
+    };
+    std::stable_sort(ordered.begin(), ordered.end(), [&](int a, int b) {
+        return rank(a) < rank(b);
+    });
+    return ordered;
+}
+
+void addSiblingBitmapFilters(std::map<int, IrBuildSide>& buildByRel,
+                             int probeRel) {
+    auto parentIt = buildByRel.find(probeRel);
+    if (parentIt == buildByRel.end()) return;
+    const auto children = parentIt->second.children;
+    for (int hashRel : children) {
+        auto hashIt = buildByRel.find(hashRel);
+        if (hashIt == buildByRel.end() || !hashIt->second.useHashJoin)
+            continue;
+        auto& hashBuild = hashIt->second;
+        for (int filterRel : children) {
+            if (filterRel == hashRel) continue;
+            auto filterIt = buildByRel.find(filterRel);
+            if (filterIt == buildByRel.end()) continue;
+            const auto& filterBuild = filterIt->second;
+            if (filterBuild.useHashJoin || filterBuild.antiJoinFilter ||
+                filterBuild.existsDistinct || filterBuild.bitmapName.empty()) {
+                continue;
+            }
+
+            std::string keyColumn;
+            if (hashBuild.parentCol.column == filterBuild.parentCol.column) {
+                keyColumn = hashBuild.joinCol.column;
+            } else if (!hashBuild.parentCol2.column.empty() &&
+                       hashBuild.parentCol2.column ==
+                           filterBuild.parentCol.column) {
+                keyColumn = hashBuild.joinCol2.column;
+            }
+            if (keyColumn.empty()) continue;
+
+            bool duplicate = false;
+            for (const auto& existing : hashBuild.siblingBitmapFilters) {
+                if (existing.bitmapName == filterBuild.bitmapName &&
+                    existing.keyColumn == keyColumn) {
+                    duplicate = true;
+                    break;
+                }
+            }
+            if (!duplicate) {
+                hashBuild.siblingBitmapFilters.push_back(
+                    {filterBuild.bitmapName, keyColumn});
+            }
+        }
+    }
+}
+
 bool orientJoinTreeEdge(const IrJoinEdgeCandidate& candidate,
                         int parentRel,
                         const std::map<int, IrScanSide>& sideByRel,
@@ -705,6 +931,12 @@ void classifyPredicateForJoinLowering(
         else
             crossFilters.push_back(pred);
     } else {
+        for (int rel : rels) {
+            if (auto local = relationLocalNecessaryPredicate(pred, rel)) {
+                addRelationLocalFilter(*local, rel, probeRel, buildByRel,
+                                       probeFilters);
+            }
+        }
         crossFilters.push_back(pred);
     }
 }
@@ -1002,8 +1234,9 @@ std::optional<MultiTableJoinLowering> buildMultiTableJoinLowering(
             if (bit != buildByRel.end() && rel != probeRel)
                 bit->second.subtreeCarries = out;
             return out;
-        };
+    };
     computeSubtreeCarries(probeRel);
+    addSiblingBitmapFilters(buildByRel, probeRel);
 
     for (const auto& [rel, build] : buildByRel) {
         if (rel == probeRel || !build.useHashJoin) continue;
@@ -1037,7 +1270,7 @@ std::optional<MultiTableJoinLowering> buildMultiTableJoinLowering(
     std::function<void(int)> appendPostorder = [&](int rel) {
         auto it = buildByRel.find(rel);
         if (it == buildByRel.end()) return;
-        for (int childRel : it->second.children)
+        for (int childRel : orderedJoinChildren(it->second.children, buildByRel))
             appendPostorder(childRel);
         if (rel != probeRel) postorder.push_back(rel);
     };
@@ -1049,6 +1282,43 @@ std::optional<MultiTableJoinLowering> buildMultiTableJoinLowering(
     lowering.probeScan = probe->scan;
     lowering.outputSize = tableSizeName(probe->scan->table);
 
+    auto predicateHasScalarLookup = [&](const GenericPredicatePtr& pred,
+                                        const std::string& table) {
+        if (!scalarLookups) return false;
+        std::string cond = genericPredicateToMetal(pred, idxVar);
+        if (referencesGenericScalarSentinel(cond, *scalarLookups)) return true;
+        cond = rewriteScalarLookupsInCondition(
+            std::move(cond), scalarLookups, idxVar, table,
+            aq ? aq->schema : nullptr);
+        return referencesGenericScalarLookupBuffer(cond, *scalarLookups);
+    };
+
+    auto applyPredicateFilters = [&](std::unique_ptr<MetalOperator> pipe,
+                                     const std::vector<GenericPredicatePtr>& filters,
+                                     const std::string& table,
+                                     bool& scalarLookupsLoaded,
+                                     bool& usesScalarLookupBuffer) {
+        for (const auto& pred : filters) {
+            std::string cond = genericPredicateToMetal(pred, idxVar);
+            if (scalarLookups && referencesGenericScalarSentinel(cond, *scalarLookups) &&
+                !scalarLookupsLoaded) {
+                pipe = appendScalarLookupLoads(
+                    std::move(pipe), scalarLookups, idxVar, table,
+                    aq ? aq->schema : nullptr);
+                scalarLookupsLoaded = true;
+            }
+            cond = rewriteScalarLookupsInCondition(
+                std::move(cond), scalarLookups, idxVar, table,
+                aq ? aq->schema : nullptr);
+            usesScalarLookupBuffer =
+                usesScalarLookupBuffer ||
+                (scalarLookups &&
+                 referencesGenericScalarLookupBuffer(cond, *scalarLookups));
+            pipe = maybeSelect(std::move(pipe), cond);
+        }
+        return pipe;
+    };
+
     for (int rel : postorder) {
         const auto& build = buildByRel.at(rel);
         const std::string buildKeyExpr = build.joinCol.column + "[" + idxVar + "]";
@@ -1058,23 +1328,21 @@ std::optional<MultiTableJoinLowering> buildMultiTableJoinLowering(
             makeAutoScan(build.scan->table, idxVar);
         bool buildScalarLookupsLoaded = false;
         bool buildUsesScalarLookupBuffer = false;
+        std::vector<GenericPredicatePtr> deferredBuildFilters;
         for (const auto& pred : build.filters) {
-            std::string cond = genericPredicateToMetal(pred, idxVar);
-            if (scalarLookups && referencesGenericScalarSentinel(cond, *scalarLookups) &&
-                !buildScalarLookupsLoaded) {
-                buildPipe = appendScalarLookupLoads(
-                    std::move(buildPipe), scalarLookups, idxVar,
-                    build.scan->table, aq ? aq->schema : nullptr);
-                buildScalarLookupsLoaded = true;
+            if (predicateHasScalarLookup(pred, build.scan->table)) {
+                deferredBuildFilters.push_back(pred);
+                continue;
             }
-            cond = rewriteScalarLookupsInCondition(
-                std::move(cond), scalarLookups, idxVar, build.scan->table,
-                aq ? aq->schema : nullptr);
-            buildUsesScalarLookupBuffer =
-                buildUsesScalarLookupBuffer ||
-                (scalarLookups &&
-                 referencesGenericScalarLookupBuffer(cond, *scalarLookups));
-            buildPipe = maybeSelect(std::move(buildPipe), cond);
+            buildPipe = applyPredicateFilters(
+                std::move(buildPipe), {pred}, build.scan->table,
+                buildScalarLookupsLoaded, buildUsesScalarLookupBuffer);
+        }
+
+        for (const auto& siblingFilter : build.siblingBitmapFilters) {
+            buildPipe = std::make_unique<MetalBitmapProbe>(
+                std::move(buildPipe), siblingFilter.bitmapName,
+                siblingFilter.keyColumn + "[" + idxVar + "]");
         }
 
         if (build.useHashJoin) {
@@ -1089,6 +1357,9 @@ std::optional<MultiTableJoinLowering> buildMultiTableJoinLowering(
                 valueExpr = encodeHashCarryValue(
                     carry.column, carry.column.column + "[" + idxVar + "]");
             }
+            buildPipe = applyPredicateFilters(
+                std::move(buildPipe), deferredBuildFilters, build.scan->table,
+                buildScalarLookupsLoaded, buildUsesScalarLookupBuffer);
             buildPipe = std::make_unique<MetalHashMapBuild>(
                 std::move(buildPipe), mapName, buildKeyExpr, buildKeyExpr2,
                 valueExpr, capExpr);
@@ -1115,6 +1386,10 @@ std::optional<MultiTableJoinLowering> buildMultiTableJoinLowering(
                                                carry, childProbeKeyExpr);
             }
         }
+
+        buildPipe = applyPredicateFilters(
+            std::move(buildPipe), deferredBuildFilters, build.scan->table,
+            buildScalarLookupsLoaded, buildUsesScalarLookupBuffer);
 
         if (build.existsDistinct) {
             const auto& info = *build.existsDistinct;
@@ -1150,14 +1425,27 @@ std::optional<MultiTableJoinLowering> buildMultiTableJoinLowering(
             const std::string valueExpr = aggFunc == "count"
                 ? "1.0f"
                 : subAgg->aggExpr + "[" + idxVar + "]";
-            auto aggPipe = std::make_unique<MetalAtomicAgg>(
-                std::move(buildPipe), aggArrayName, bucketExpr, valueExpr,
-                build.keyDomain, "atomic_uint", "float");
-            auto& aggPhase = appendPhase(
-                lowering.plan, "GENERIC_ir_multi_table_agg_" + buildTag,
-                std::move(aggPipe));
-            if (buildUsesScalarLookupBuffer && scalarLookups)
-                attachGenericScalarLookupBuffers(aggPhase, *scalarLookups);
+            const bool canSegmentRuns =
+                build.scan && build.filters.empty() && build.children.empty() &&
+                !buildUsesScalarLookupBuffer &&
+                (aggFunc == "count" || isSimpleIdentifier(subAgg->aggExpr));
+            if (canSegmentRuns) {
+                appendPhase(
+                    lowering.plan, "GENERIC_ir_multi_table_agg_" + buildTag,
+                    std::make_unique<MetalRunSegmentedInSubAgg>(
+                        build.scan->table, subAgg->groupCol,
+                        aggFunc == "count" ? std::string{} : subAgg->aggExpr,
+                        aggArrayName, build.keyDomain, aggFunc == "count"));
+            } else {
+                auto aggPipe = std::make_unique<MetalAtomicAgg>(
+                    std::move(buildPipe), aggArrayName, bucketExpr, valueExpr,
+                    build.keyDomain, "atomic_uint", "float");
+                auto& aggPhase = appendPhase(
+                    lowering.plan, "GENERIC_ir_multi_table_agg_" + buildTag,
+                    std::move(aggPipe));
+                if (buildUsesScalarLookupBuffer && scalarLookups)
+                    attachGenericScalarLookupBuffers(aggPhase, *scalarLookups);
+            }
 
             auto rangeScan = std::make_unique<MetalRangeScan>(build.keyDomain, idxVar);
             const std::string aggBits =
@@ -1199,22 +1487,20 @@ std::optional<MultiTableJoinLowering> buildMultiTableJoinLowering(
 
     lowering.probePipe = makeAutoScan(probe->scan->table, idxVar);
     bool probeScalarLookupsLoaded = false;
+    bool probeUsesScalarLookupBuffer = false;
+    std::vector<GenericPredicatePtr> deferredProbeFilters;
     for (const auto& pred : probeFilters) {
-        std::string cond = genericPredicateToMetal(pred, idxVar);
-        if (scalarLookups && referencesGenericScalarSentinel(cond, *scalarLookups) &&
-            !probeScalarLookupsLoaded) {
-            lowering.probePipe = appendScalarLookupLoads(
-                std::move(lowering.probePipe), scalarLookups, idxVar,
-                probe->scan->table, aq ? aq->schema : nullptr);
-            probeScalarLookupsLoaded = true;
+        if (predicateHasScalarLookup(pred, probe->scan->table)) {
+            deferredProbeFilters.push_back(pred);
+            continue;
         }
-        cond = rewriteScalarLookupsInCondition(
-            std::move(cond), scalarLookups, idxVar, probe->scan->table,
-            aq ? aq->schema : nullptr);
-        lowering.probePipe = maybeSelect(std::move(lowering.probePipe), cond);
+        lowering.probePipe = applyPredicateFilters(
+            std::move(lowering.probePipe), {pred}, probe->scan->table,
+            probeScalarLookupsLoaded, probeUsesScalarLookupBuffer);
     }
 
-    for (int childRel : buildByRel[probeRel].children) {
+    for (int childRel : orderedJoinChildren(buildByRel[probeRel].children,
+                                            buildByRel)) {
         const auto& build = buildByRel.at(childRel);
         const std::string probeKeyExpr = build.parentCol.column + "[" + idxVar + "]";
         if (build.useHashJoin) {
@@ -1267,6 +1553,11 @@ std::optional<MultiTableJoinLowering> buildMultiTableJoinLowering(
             lowering.carryMap[carry.column.relationInstance.value][carry.column.column] = carry;
         }
     }
+
+    lowering.probePipe = applyPredicateFilters(
+        std::move(lowering.probePipe), deferredProbeFilters,
+        probe->scan->table, probeScalarLookupsLoaded,
+        probeUsesScalarLookupBuffer);
 
     for (const auto& pred : crossFilters) {
         std::string cond = genericPredicateToMetalWithCarryMap(pred, idxVar,

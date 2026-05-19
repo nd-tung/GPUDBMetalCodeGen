@@ -70,7 +70,7 @@ nlohmann::json MetalQueryPlan::toTreeJSON() const {
     nlohmann::json j;
     j["name"] = name;
     j["chunkable"] = chunkable;
-    j["strictGenericGpuOnly"] = true;
+    j["genericGpuOnly"] = true;
     j["genericOperatorShapes"] = nlohmann::json::array();
     for (const auto& phase : phases) {
         if (phase.root) j["genericOperatorShapes"].push_back(phase.root->describe());

@@ -59,6 +59,9 @@ public:
     // Look up a registered symbolic size; returns false if absent.
     bool tryGetSymbol(const std::string& name, size_t& out) const;
 
+    // Resolve a full size expression against the current symbol table.
+    bool tryResolveSizeExpression(const std::string& expr, size_t& out) const;
+
     // Register scalar constants used by setBytes bindings.
     void registerScalarInt(const std::string& name, int value);
     void registerScalarFloat(const std::string& name, float value);

@@ -7,12 +7,12 @@ cd "$ROOT"
 BIN="${BIN:-build/bin/GPUDBCodegen}"
 SF="${SF:-sf1}"
 CHECK_DIR="${CHECK_DIR:-tmp/duckdb_generic_sql}"
-OUT="${OUT:-tmp/strict_generic_$(date +%Y%m%d_%H%M%S)}"
+OUT="${OUT:-tmp/generic_only_$(date +%Y%m%d_%H%M%S)}"
 MARKERS="${MARKERS:-ADHOC_|cpuSort|cpuGroupBy|cpuScalarAgg|buildQ[0-9]|predefined|Predefined}"
 
 if [ ! -x "$BIN" ]; then
-    echo "strict-generic: binary not found or not executable: $BIN" >&2
-    echo "strict-generic: run 'make' first or set BIN=/path/to/GPUDBCodegen" >&2
+    echo "generic-only: binary not found or not executable: $BIN" >&2
+    echo "generic-only: run 'make' first or set BIN=/path/to/GPUDBCodegen" >&2
     exit 2
 fi
 
@@ -51,21 +51,21 @@ fi
 
 cat "$OUT/summary.tsv"
 echo
-echo "strict-generic logs: $OUT"
+echo "generic-only logs: $OUT"
 
 if [ "$failed" -ne 0 ]; then
-    echo "strict-generic: one or more queries failed" >&2
+    echo "generic-only: one or more queries failed" >&2
     exit 1
 fi
 if [ "$marker_failed" -ne 0 ]; then
-    echo "strict-generic: forbidden runtime markers found" >&2
+    echo "generic-only: forbidden runtime markers found" >&2
     cat "$OUT/marker_scan.txt" >&2
     exit 1
 fi
 if [ "$source_failed" -ne 0 ]; then
-    echo "strict-generic: forbidden source markers found" >&2
+    echo "generic-only: forbidden source markers found" >&2
     cat "$OUT/source_marker_scan.txt" >&2
     exit 1
 fi
 
-echo "strict-generic: PASS"
+echo "generic-only: PASS"
