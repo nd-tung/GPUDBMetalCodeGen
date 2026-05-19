@@ -8,6 +8,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace codegen {
@@ -25,6 +26,13 @@ namespace {
 std::optional<MetalQueryPlan> fail(std::string* error, const std::string& msg) {
     if (error) *error = msg;
     return std::nullopt;
+}
+
+std::string keyedAggSlotKey(const IrPendingAgg& agg) {
+    return agg.atomicOp + "|" + agg.valueExpr +
+           "|lp=" + std::to_string(agg.isLongPair ? 1 : 0) +
+           "|fs=" + std::to_string(agg.isFloatSum ? 1 : 0) +
+           "|mm=" + std::to_string(agg.isMinMax ? 1 : 0);
 }
 
 } // namespace
@@ -97,7 +105,33 @@ std::optional<MetalQueryPlan> lowerSingleTableGroupedAggregateIRToMetal(
     }
 
     std::vector<IrPendingAgg> pending;
+    std::vector<IrPendingAgg> physicalAggs;
+    std::unordered_map<std::string, IrPendingAgg> physicalSlots;
     int valuesPerBucket = 0;
+    auto registerPhysicalSlot = [&](const std::string& key,
+                                    IrPendingAgg slot,
+                                    int width) {
+        auto it = physicalSlots.find(key);
+        if (it != physicalSlots.end()) {
+            return it->second;
+        }
+        slot.offset = valuesPerBucket;
+        valuesPerBucket += width;
+        physicalSlots.emplace(key, slot);
+        physicalAggs.push_back(slot);
+        return slot;
+    };
+    auto countSlot = [&](const std::string& displayName, bool forAvg) {
+        IrPendingAgg out;
+        out.displayName = displayName;
+        out.valueExpr = "1u";
+        out.funcName = forAvg ? "AVG" : "COUNT";
+        IrPendingAgg slot = registerPhysicalSlot("COUNT|*", out, 1);
+        slot.displayName = displayName;
+        slot.funcName = forAvg ? "AVG" : "COUNT";
+        if (slot.valueExpr != "1u") slot.valueExpr = "1u";
+        return slot;
+    };
     for (size_t i = 0; i < aggregate->aggregates.size(); ++i) {
         const auto& projection = aggregate->aggregates[i];
         auto* agg = projection.expr ? std::get_if<GenericAggregateExpr>(&projection.expr->node) : nullptr;
@@ -108,12 +142,7 @@ std::optional<MetalQueryPlan> lowerSingleTableGroupedAggregateIRToMetal(
             ? "agg_" + std::to_string(i)
             : projection.name;
         if (agg->func == AggFunc::COUNT) {
-            IrPendingAgg out;
-            out.displayName = displayName;
-            out.offset = valuesPerBucket++;
-            out.valueExpr = "1u";
-            out.funcName = "COUNT";
-            pending.push_back(std::move(out));
+            pending.push_back(countSlot(displayName, false));
             continue;
         }
         if (!agg->arg)
@@ -126,49 +155,50 @@ std::optional<MetalQueryPlan> lowerSingleTableGroupedAggregateIRToMetal(
             const int fixedScale = isFloat ? numericScaleForExpr(agg->arg) : 0;
             IrPendingAgg sum;
             sum.displayName = displayName;
-            sum.offset = valuesPerBucket;
             std::string valueExpr = genericExprToMetal(agg->arg, idxVar);
             if (isFloat && fixedScale > 0) {
                 sum.valueExpr = scaledLongExpr(valueExpr, fixedScale);
                 sum.isLongPair = true;
                 sum.scaleDown = -fixedScale;
-                valuesPerBucket += 2;
             } else if (isFloat) {
                 sum.valueExpr = valueExpr;
                 sum.isFloatSum = true;
                 sum.scaleDown = -1;
-                valuesPerBucket += 1;
             } else {
                 sum.valueExpr = valueExpr;
                 sum.isLongPair = true;
                 sum.scaleDown = -1;
-                valuesPerBucket += 2;
             }
             sum.funcName = "AVG";
             sum.innerColumn = innerColumnName(agg->arg);
-            pending.push_back(std::move(sum));
+            IrPendingAgg sumSlot = sum;
+            if (sumSlot.isLongPair && fixedScale > 0)
+                sumSlot.scaleDown = fixedScale;
+            else if (sumSlot.scaleDown < 0)
+                sumSlot.scaleDown = 0;
+            const int sumWidth = sumSlot.isLongPair ? 2 : 1;
+            IrPendingAgg sumView = registerPhysicalSlot(keyedAggSlotKey(sumSlot),
+                                                        sumSlot, sumWidth);
+            sumView.displayName = displayName;
+            sumView.funcName = "AVG";
+            sumView.scaleDown = sum.scaleDown;
+            pending.push_back(std::move(sumView));
 
-            IrPendingAgg cnt;
-            cnt.displayName = displayName + "_cnt";
-            cnt.offset = valuesPerBucket++;
-            cnt.valueExpr = "1u";
-            cnt.funcName = "AVG";
-            pending.push_back(std::move(cnt));
+            pending.push_back(countSlot(displayName + "_cnt", true));
             continue;
         }
 
         IrPendingAgg out;
         out.displayName = displayName;
-        out.offset = valuesPerBucket;
         out.valueExpr = genericExprToMetal(agg->arg, idxVar);
         out.funcName = aggFuncName(agg->func);
         out.innerColumn = innerColumnName(agg->arg);
+        int width = 1;
         if (agg->func == AggFunc::MIN || agg->func == AggFunc::MAX) {
             out.atomicOp = agg->func == AggFunc::MIN ? "min" : "max";
             out.isMinMax = true;
             if (agg->arg->type.type == DataType::FLOAT)
                 out.isFloatSum = true;
-            valuesPerBucket += 1;
         } else if (agg->func == AggFunc::SUM) {
             if (agg->arg->type.type == DataType::FLOAT) {
                 const int fixedScale = numericScaleForExpr(agg->arg);
@@ -176,20 +206,23 @@ std::optional<MetalQueryPlan> lowerSingleTableGroupedAggregateIRToMetal(
                     out.valueExpr = scaledLongExpr(out.valueExpr, fixedScale);
                     out.isLongPair = true;
                     out.scaleDown = fixedScale;
-                    valuesPerBucket += 2;
+                    width = 2;
                 } else {
                     out.isFloatSum = true;
-                    valuesPerBucket += 1;
                 }
             } else {
                 out.isLongPair = true;
-                valuesPerBucket += 2;
+                width = 2;
             }
         } else {
             return fail(error, "IR grouped aggregate lowerer: unsupported aggregate " +
                                aggFuncName(agg->func) + ".");
         }
-        pending.push_back(std::move(out));
+        IrPendingAgg view = registerPhysicalSlot(keyedAggSlotKey(out), out, width);
+        view.displayName = displayName;
+        view.funcName = aggFuncName(agg->func);
+        view.scaleDown = out.scaleDown;
+        pending.push_back(std::move(view));
     }
     if (pending.empty())
         return fail(error, "IR grouped aggregate lowerer: no aggregate slots.");
@@ -225,7 +258,7 @@ std::optional<MetalQueryPlan> lowerSingleTableGroupedAggregateIRToMetal(
     }
     keyed->setMultiKeyResult(keyNames, decodeInfo, totalBuckets);
 
-    for (const auto& agg : pending) {
+    for (const auto& agg : physicalAggs) {
         keyed->addAggregateWithMeta(agg.displayName, agg.offset, agg.valueExpr,
                                     agg.atomicOp, agg.isLongPair, agg.scaleDown,
                                     agg.isFloatSum, agg.isMinMax,

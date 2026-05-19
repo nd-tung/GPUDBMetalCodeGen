@@ -133,6 +133,27 @@ static bool scalarAtomicMode() {
     return e && e[0] && e[0] != '0';
 }
 
+enum class KeyedAggBackend {
+    PrivateThreadReduce,
+    ThreadgroupAtomicHistogram,
+    GlobalAtomic
+};
+
+static KeyedAggBackend keyedAggBackendOverride(KeyedAggBackend fallback,
+                                               bool canPrivateReduce,
+                                               bool canTgAtomicHistogram) {
+    const char* e = std::getenv("GPUDB_KEYED_AGG_BACKEND");
+    if (!e || !e[0]) return fallback;
+    if (std::strcmp(e, "private") == 0 && canPrivateReduce)
+        return KeyedAggBackend::PrivateThreadReduce;
+    if ((std::strcmp(e, "tg_atomic") == 0 ||
+         std::strcmp(e, "histogram") == 0) && canTgAtomicHistogram)
+        return KeyedAggBackend::ThreadgroupAtomicHistogram;
+    if (std::strcmp(e, "global") == 0)
+        return KeyedAggBackend::GlobalAtomic;
+    return fallback;
+}
+
 // --- MetalGridStrideScan ---
 
 MetalGridStrideScan::MetalGridStrideScan(const std::string& table,
@@ -930,6 +951,19 @@ void MetalKeyedAgg::setHavingTotal(const std::string& bufferName, int aggregateO
     havingTotal_ = HavingTotal{bufferName, aggregateOffset};
 }
 
+void MetalKeyedAgg::setActiveBucketTracking(const std::string& flagBuffer,
+                                            const std::string& listBuffer,
+                                            const std::string& counterBuffer,
+                                            const std::string& bucketCountExpr) {
+    if (flagBuffer.empty() || listBuffer.empty() || counterBuffer.empty() ||
+        bucketCountExpr.empty()) {
+        activeBucketTracking_.reset();
+        return;
+    }
+    activeBucketTracking_ = ActiveBucketTracking{
+        flagBuffer, listBuffer, counterBuffer, bucketCountExpr};
+}
+
 void MetalKeyedAgg::addDistinctBitmap(const std::string& outputName,
                                        const std::string& valueExpr,
                                        const std::string& maxValueExpr) {
@@ -943,6 +977,15 @@ void MetalKeyedAgg::produce(MetalCodegen& cg, ConsumerFn consume) {
         ? std::to_string(numBuckets_ * valuesPerBucket_)
         : sizeExpr_;
     cg.addAtomicBufferParam(outputArrayName_, "atomic_uint", sz);
+    if (activeBucketTracking_) {
+        cg.addAtomicBufferParam(activeBucketTracking_->flagBuffer,
+                                "atomic_uint",
+                                activeBucketTracking_->bucketCountExpr);
+        cg.addBufferParam(activeBucketTracking_->listBuffer, "uint",
+                          activeBucketTracking_->bucketCountExpr, false);
+        cg.addAtomicBufferParam(activeBucketTracking_->counterBuffer,
+                                "atomic_uint", "1");
+    }
 
     const Aggregate* havingTotalAgg = nullptr;
     if (havingTotal_) {
@@ -973,12 +1016,67 @@ void MetalKeyedAgg::produce(MetalCodegen& cg, ConsumerFn consume) {
         if (agg.atomicOp != "add") { allAdds = false; break; }
     }
 
+    auto emitActiveBucketTrack = [&]() {
+        if (!activeBucketTracking_) return;
+        cg.addLine("uint _active_bucket = (uint)_bucket;");
+        cg.addIf("atomic_exchange_explicit(&" +
+                 activeBucketTracking_->flagBuffer +
+                 "[_active_bucket], 1u, memory_order_relaxed) == 0u", [&]() {
+            cg.addLine("uint _active_pos = atomic_fetch_add_explicit(&" +
+                       activeBucketTracking_->counterBuffer +
+                       "[0], 1u, memory_order_relaxed);");
+            cg.addLine(activeBucketTracking_->listBuffer +
+                       "[_active_pos] = _active_bucket;");
+        });
+    };
+
     // Empirical caps avoid cases where barrier and register pressure beat atomic savings.
     constexpr int kMaxBucketsForTGReduce = 64;
     constexpr int kMinAggsForTGReduce    = 3;
-    if (allAdds && !havingTotal_ && numBuckets_ > 0 &&
+    constexpr int kMaxSingleAggTinyBucketsForTGReduce = 16;
+    constexpr int kMaxBucketsForTGAtomicReduce = 256;
+    const int aggregateCount = (int)aggregates_.size();
+    int aggregateSlots = 0;
+    int floatAggs = 0;
+    int longPairAggs = 0;
+    for (const auto& agg : aggregates_) {
+        aggregateSlots += agg.isLongPair ? 2 : 1;
+        if (agg.isFloatSum) ++floatAggs;
+        if (agg.isLongPair) ++longPairAggs;
+    }
+    const bool tgReduceEligibleByShape =
+        (int)aggregates_.size() >= kMinAggsForTGReduce ||
+        (numBuckets_ <= kMaxSingleAggTinyBucketsForTGReduce &&
+         !aggregates_.empty());
+    const bool canPrivateReduce =
+        allAdds && !havingTotal_ && numBuckets_ > 0 &&
         numBuckets_ <= kMaxBucketsForTGReduce &&
-        (int)aggregates_.size() >= kMinAggsForTGReduce) {
+        tgReduceEligibleByShape;
+    const bool canTgAtomicHistogram =
+        allAdds && !havingTotal_ && !havingPredicate_ &&
+        distinctBitmaps_.empty() && numBuckets_ > 0 &&
+        numBuckets_ <= kMaxBucketsForTGAtomicReduce;
+
+    const int privateAccumulatorFootprint = numBuckets_ * aggregateCount;
+    const int tgAtomicFootprint = numBuckets_ * aggregateSlots;
+    KeyedAggBackend backend = KeyedAggBackend::GlobalAtomic;
+    if (canPrivateReduce || canTgAtomicHistogram) {
+        const bool privateFootprintSmall =
+            privateAccumulatorFootprint <= 96 &&
+            longPairAggs <= 12;
+        if (canPrivateReduce && (privateFootprintSmall || floatAggs > 0)) {
+            backend = KeyedAggBackend::PrivateThreadReduce;
+        } else if (canTgAtomicHistogram && floatAggs == 0 && tgAtomicFootprint <= 4096) {
+            backend = KeyedAggBackend::ThreadgroupAtomicHistogram;
+        } else if (canPrivateReduce) {
+            backend = KeyedAggBackend::PrivateThreadReduce;
+        } else if (canTgAtomicHistogram) {
+            backend = KeyedAggBackend::ThreadgroupAtomicHistogram;
+        }
+    }
+    backend = keyedAggBackendOverride(backend, canPrivateReduce, canTgAtomicHistogram);
+
+    if (backend == KeyedAggBackend::PrivateThreadReduce) {
         // Optimized path: thread-local accumulation plus TG reduction.
         // HAVING needs one TG so the predicate sees global totals.
         if (havingPredicate_)
@@ -1008,6 +1106,7 @@ void MetalKeyedAgg::produce(MetalCodegen& cg, ConsumerFn consume) {
         // Child produces rows; each row updates local bucket slots.
         child_->produce(cg, [&]() {
             cg.addLine("int _bucket = " + bucketExpr_ + ";");
+            emitActiveBucketTrack();
             for (const auto& agg : aggregates_) {
                 if (agg.isFloatSum) {
                     cg.addLine("_local_" + agg.name + "[_bucket] += (float)(" + agg.valueExpr + ");");
@@ -1140,10 +1239,106 @@ void MetalKeyedAgg::produce(MetalCodegen& cg, ConsumerFn consume) {
                 }
             }
         }
+    } else if (backend == KeyedAggBackend::ThreadgroupAtomicHistogram) {
+        cg.setPhaseMaxThreadgroups(1024);
+
+        for (const auto& agg : aggregates_) {
+            const int slots = agg.isLongPair ? 2 : 1;
+            cg.addLine("threadgroup atomic_uint _tg_hist_" + agg.name + "[" +
+                       std::to_string(numBuckets_ * slots) + "];");
+        }
+
+        cg.addBlock("for (uint _b = lid; _b < " +
+                    std::to_string(numBuckets_) + "u; _b += tg_size)", [&]() {
+            for (const auto& agg : aggregates_) {
+                if (agg.isLongPair) {
+                    cg.addLine("atomic_store_explicit(&_tg_hist_" + agg.name +
+                               "[_b * 2u], 0u, memory_order_relaxed);");
+                    cg.addLine("atomic_store_explicit(&_tg_hist_" + agg.name +
+                               "[_b * 2u + 1u], 0u, memory_order_relaxed);");
+                } else {
+                    cg.addLine("atomic_store_explicit(&_tg_hist_" + agg.name +
+                               "[_b], 0u, memory_order_relaxed);");
+                }
+            }
+        });
+        cg.addLine("threadgroup_barrier(mem_flags::mem_threadgroup);");
+
+        child_->produce(cg, [&]() {
+            cg.addLine("int _bucket = " + bucketExpr_ + ";");
+            emitActiveBucketTrack();
+            for (const auto& agg : aggregates_) {
+                if (agg.isFloatSum) {
+                    cg.addLine("atomic_add_float_tg(&_tg_hist_" + agg.name +
+                               "[_bucket], (float)(" + agg.valueExpr + "));");
+                } else if (agg.isLongPair) {
+                    cg.addLine("atomic_add_long_pair_tg(&_tg_hist_" + agg.name +
+                               "[_bucket * 2], &_tg_hist_" + agg.name +
+                               "[_bucket * 2 + 1], (long)(" + agg.valueExpr + "));");
+                } else {
+                    cg.addLine("atomic_fetch_add_explicit(&_tg_hist_" + agg.name +
+                               "[_bucket], (uint)(" + agg.valueExpr +
+                               "), memory_order_relaxed);");
+                }
+            }
+            consume();
+        });
+
+        cg.addLine("threadgroup_barrier(mem_flags::mem_threadgroup);");
+        cg.addBlock("for (uint _b = lid; _b < " +
+                    std::to_string(numBuckets_) + "u; _b += tg_size)", [&]() {
+            for (const auto& agg : aggregates_) {
+                const std::string base =
+                    "_b * " + std::to_string(valuesPerBucket_) + "u";
+                if (agg.isFloatSum) {
+                    const std::string bits = "_tg_bits_" + agg.name;
+                    const std::string val = "_tg_val_" + agg.name;
+                    cg.addLine("uint " + bits + " = atomic_load_explicit(&_tg_hist_" +
+                               agg.name + "[_b], memory_order_relaxed);");
+                    cg.addLine("float " + val + " = as_type<float>(" + bits + ");");
+                    cg.addIf(val + " != 0.0f", [&]() {
+                        std::string idx = base + " + " + std::to_string(agg.offset) + "u";
+                        cg.addLine("atomic_add_float(&" + outputArrayName_ + "[" +
+                                   idx + "], " + val + ");");
+                    });
+                } else if (agg.isLongPair) {
+                    const std::string lo = "_tg_lo_" + agg.name;
+                    const std::string hi = "_tg_hi_" + agg.name;
+                    const std::string val = "_tg_val_" + agg.name;
+                    cg.addLine("uint " + lo + " = atomic_load_explicit(&_tg_hist_" +
+                               agg.name + "[_b * 2u], memory_order_relaxed);");
+                    cg.addLine("uint " + hi + " = atomic_load_explicit(&_tg_hist_" +
+                               agg.name + "[_b * 2u + 1u], memory_order_relaxed);");
+                    cg.addIf(lo + " != 0u || " + hi + " != 0u", [&]() {
+                        cg.addLine("long " + val + " = as_type<long>(((ulong)" +
+                                   hi + " << 32) | (ulong)" + lo + ");");
+                        std::string loIdx = base + " + " +
+                                            std::to_string(agg.offset) + "u";
+                        std::string hiIdx = base + " + " +
+                                            std::to_string(agg.offset + 1) + "u";
+                        cg.addLine("atomic_add_long_pair(&" + outputArrayName_ +
+                                   "[" + loIdx + "], &" + outputArrayName_ +
+                                   "[" + hiIdx + "], " + val + ");");
+                    });
+                } else {
+                    const std::string val = "_tg_val_" + agg.name;
+                    cg.addLine("uint " + val + " = atomic_load_explicit(&_tg_hist_" +
+                               agg.name + "[_b], memory_order_relaxed);");
+                    cg.addIf(val + " != 0u", [&]() {
+                        std::string idx = base + " + " +
+                                          std::to_string(agg.offset) + "u";
+                        cg.addLine("atomic_fetch_add_explicit(&" + outputArrayName_ +
+                                   "[" + idx + "], " + val +
+                                   ", memory_order_relaxed);");
+                    });
+                }
+            }
+        });
     } else {
         // Per-row global atomics handle min/max and high cardinality.
         child_->produce(cg, [&]() {
             cg.addLine("int _bucket = " + bucketExpr_ + ";");
+            emitActiveBucketTrack();
             for (const auto& agg : aggregates_) {
                 std::string base = "_bucket * " + std::to_string(valuesPerBucket_);
                 if (agg.isFloatSum && agg.atomicOp == "add") {

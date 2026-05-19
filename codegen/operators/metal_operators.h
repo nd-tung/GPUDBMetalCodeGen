@@ -555,6 +555,10 @@ public:
                            int totalBuckets);
     void setHaving(const PredPtr& havingPredicate) { havingPredicate_ = havingPredicate; }
     void setHavingTotal(const std::string& bufferName, int aggregateOffset);
+    void setActiveBucketTracking(const std::string& flagBuffer,
+                                 const std::string& listBuffer,
+                                 const std::string& counterBuffer,
+                                 const std::string& bucketCountExpr);
     void produce(MetalCodegen& cg, ConsumerFn consume) override;
     std::string describe() const override;
     void iusUsed(std::vector<IU>& out) const override {
@@ -584,6 +588,14 @@ private:
         int aggregateOffset = -1;
     };
     std::optional<HavingTotal> havingTotal_;
+
+    struct ActiveBucketTracking {
+        std::string flagBuffer;
+        std::string listBuffer;
+        std::string counterBuffer;
+        std::string bucketCountExpr;
+    };
+    std::optional<ActiveBucketTracking> activeBucketTracking_;
 
     struct DistinctBitmap {
         std::string outputName;     // buffer name for popcount output

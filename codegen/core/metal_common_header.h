@@ -286,12 +286,36 @@ inline void atomic_add_long_pair(device atomic_uint* lo,
         atomic_fetch_add_explicit(hi, add_hi + carry, memory_order_relaxed);
 }
 
+inline void atomic_add_long_pair_tg(threadgroup atomic_uint* lo,
+                                    threadgroup atomic_uint* hi,
+                                    long val) {
+    ulong uval = as_type<ulong>(val);
+    uint add_lo = (uint)(uval);
+    uint add_hi = (uint)(uval >> 32);
+    uint old_lo = atomic_fetch_add_explicit(lo, add_lo, memory_order_relaxed);
+    uint new_lo = old_lo + add_lo;
+    uint carry = (new_lo < old_lo) ? 1u : 0u;
+    if (add_hi != 0 || carry != 0)
+        atomic_fetch_add_explicit(hi, add_hi + carry, memory_order_relaxed);
+}
+
 inline long load_long_pair(const device uint* lo, const device uint* hi) {
     ulong v = ((ulong)(*hi) << 32) | (ulong)(*lo);
     return as_type<long>(v);
 }
 
 inline void atomic_add_float(device atomic_uint* addr, float val) {
+    uint old_val = atomic_load_explicit(addr, memory_order_relaxed);
+    while (true) {
+        float new_f = as_type<float>(old_val) + val;
+        uint new_val = as_type<uint>(new_f);
+        if (atomic_compare_exchange_weak_explicit(addr, &old_val, new_val,
+                                                   memory_order_relaxed,
+                                                   memory_order_relaxed)) break;
+    }
+}
+
+inline void atomic_add_float_tg(threadgroup atomic_uint* addr, float val) {
     uint old_val = atomic_load_explicit(addr, memory_order_relaxed);
     while (true) {
         float new_f = as_type<float>(old_val) + val;

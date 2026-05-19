@@ -10,7 +10,9 @@
 #include <cctype>
 #include <cstdlib>
 #include <functional>
+#include <limits>
 #include <map>
+#include <optional>
 #include <set>
 #include <type_traits>
 #include <utility>
@@ -106,6 +108,11 @@ struct IrSiblingBitmapFilter {
     int sourceRelationInstance = -1;
 };
 
+struct IrPropagatedBitmapFilter {
+    std::string bitmapName;
+    std::string keyColumn;
+};
+
 struct IrDomainKeyDrive {
     int sourceRelationInstance = -1;
     std::string keyListBuffer;
@@ -186,6 +193,52 @@ std::string rowRangeIndexKey(const std::string& table,
     return table + ":" + keyColumn;
 }
 
+std::optional<int64_t> positiveIntegerLiteral(const std::string& expr) {
+    if (expr.empty()) return std::nullopt;
+    int64_t value = 0;
+    for (char ch : expr) {
+        if (!std::isdigit(static_cast<unsigned char>(ch)))
+            return std::nullopt;
+        int digit = ch - '0';
+        if (value > (std::numeric_limits<int64_t>::max() - digit) / 10)
+            return std::nullopt;
+        value = value * 10 + digit;
+    }
+    if (value <= 0) return std::nullopt;
+    return value;
+}
+
+std::string keyDomainExprForColumn(const GenericColumnExpr& col,
+                                   const SchemaProvider* schema) {
+    if (!col.keyDomainSymbol.empty()) return col.keyDomainSymbol;
+    if (schema) {
+        auto keySym = schema->keyDomainSymbol(col.table, col.column);
+        if (!keySym.empty()) return keySym;
+        if (auto gd = schema->groupDomain(col.table, col.column))
+            return std::to_string(gd->maxValue + 1);
+        auto pk = schema->pkInfo(col.table);
+        if (pk && pk->first == col.column) return pk->second;
+    }
+    if (col.hasGroupDomain && col.domainMax >= col.domainMin)
+        return std::to_string(col.domainMax + 1);
+    return "";
+}
+
+bool columnHasSmallFiniteKeyDomain(const GenericColumnExpr& col,
+                                   const SchemaProvider* schema) {
+    if (col.type.type != DataType::INT && col.type.type != DataType::DATE)
+        return false;
+    auto bound = positiveIntegerLiteral(keyDomainExprForColumn(col, schema));
+    return bound && *bound <= 4096;
+}
+
+std::string keysetBitmapName(const GenericColumnExpr& col,
+                             const std::string& suffix) {
+    std::string scope = !col.alias.empty() ? col.alias : col.table;
+    return "d_ir_keyset_" + sanitizeIdentifier(scope) + "_" +
+           sanitizeIdentifier(col.column) + "_" + suffix;
+}
+
 bool typeCanUseExistsDistinct(DataType type) {
     return type == DataType::INT || type == DataType::DATE ||
            type == DataType::CHAR1;
@@ -264,6 +317,7 @@ struct IrBuildSide {
     std::map<std::string, IrCarryColumn> localCarries;
     std::vector<IrCarryColumn> subtreeCarries;
     std::vector<IrSiblingBitmapFilter> siblingBitmapFilters;
+    std::vector<IrPropagatedBitmapFilter> propagatedBitmapFilters;
     std::string keyDomain;
     std::string bitmapName;
     std::optional<IrExistsDistinctInfo> existsDistinct;
@@ -1903,6 +1957,280 @@ std::optional<MultiTableJoinLowering> buildMultiTableJoinLowering(
     std::set<int> emittedDomainDrivenExists;
     std::set<int> emittedFusedExists;
 
+    struct SelectiveKeysetState {
+        GenericColumnExpr column;
+        std::string bitmapName;
+        bool externalToRelation = false;
+        int specIndex = -1;
+    };
+
+    struct SelectiveKeysetBuildSpec {
+        int phaseId = -1;
+        int scanRelation = -1;
+        GenericColumnExpr outputColumn;
+        std::string bitmapName;
+        std::string reason;
+        int sourceSpecIndex = -1;
+        std::string sourceBitmapName;
+        std::string sourceProbeColumn;
+    };
+
+    std::map<int, std::map<std::string, GenericColumnExpr>> keysetColumnsByRel;
+    std::vector<IrJoinColumns> keysetEdges;
+    auto addKeysetColumn = [&](const GenericColumnExpr& col) {
+        if (!col.relationInstance.valid()) return;
+        keysetColumnsByRel[col.relationInstance.value][col.column] = col;
+    };
+    for (const auto& candidate : candidates) {
+        for (const auto& cols : candidate.columns) {
+            keysetEdges.push_back(cols);
+            addKeysetColumn(cols.left);
+            addKeysetColumn(cols.right);
+        }
+    }
+
+    std::vector<IrPropagatedBitmapFilter> probePropagatedBitmapFilters;
+    std::map<std::pair<int, std::string>, SelectiveKeysetState> keysetStates;
+    std::vector<SelectiveKeysetBuildSpec> keysetSpecs;
+    auto hasKeysetState = [&](const GenericColumnExpr& col) {
+        return keysetStates.count({col.relationInstance.value, col.column}) != 0;
+    };
+    auto addKeysetState = [&](const GenericColumnExpr& col,
+                              std::string bitmapName,
+                              bool externalToRelation,
+                              int specIndex) {
+        std::pair<int, std::string> key{col.relationInstance.value, col.column};
+        if (keysetStates.count(key)) return false;
+        keysetStates[key] = SelectiveKeysetState{
+            col, std::move(bitmapName), externalToRelation, specIndex};
+        return true;
+    };
+    auto relationImmediateFilters = [&](int rel) {
+        std::vector<GenericPredicatePtr> out;
+        if (rel == probeRel) {
+            for (const auto& pred : probeFilters) {
+                if (!predicateHasScalarLookup(pred, probe->scan->table))
+                    out.push_back(pred);
+            }
+            return out;
+        }
+        auto buildIt = buildByRel.find(rel);
+        if (buildIt == buildByRel.end()) return out;
+        BuildFilterSplit split = splitBuildFilters(buildIt->second);
+        out = std::move(split.immediate);
+        return out;
+    };
+    auto makeRelationKeysetScan =
+        [&](int rel,
+            const std::vector<GenericPredicatePtr>& filters) -> std::unique_ptr<MetalOperator> {
+        auto sideIt = sideByRel.find(rel);
+        if (sideIt == sideByRel.end() || !sideIt->second.scan)
+            return nullptr;
+        const std::string& table = sideIt->second.scan->table;
+        std::unique_ptr<MetalOperator> pipe = makeAutoScan(table, idxVar);
+        for (const auto& pred : filters) {
+            if (predicateHasScalarLookup(pred, table))
+                return nullptr;
+            pipe = maybeSelect(std::move(pipe),
+                               genericPredicateToMetal(pred, idxVar));
+        }
+        return pipe;
+    };
+    auto appendKeysetBitmapBuild =
+        [&](const SelectiveKeysetBuildSpec& spec) {
+        auto filters = relationImmediateFilters(spec.scanRelation);
+        auto pipe = makeRelationKeysetScan(spec.scanRelation, filters);
+        if (!pipe) return;
+        if (spec.sourceSpecIndex >= 0) {
+            pipe = std::make_unique<MetalBitmapProbe>(
+                std::move(pipe), spec.sourceBitmapName,
+                spec.sourceProbeColumn + "[" + idxVar + "]");
+        }
+        const std::string domainExpr =
+            keyDomainExprForColumn(spec.outputColumn, aq ? aq->schema : nullptr);
+        auto build = std::make_unique<MetalBitmapBuild>(
+            std::move(pipe), spec.bitmapName,
+            spec.outputColumn.column + "[" + idxVar + "]",
+            "(" + domainExpr + " + 31) / 32");
+        std::string scope = !spec.outputColumn.alias.empty()
+            ? spec.outputColumn.alias
+            : spec.outputColumn.table;
+        appendPhase(lowering.plan,
+                    "GENERIC_ir_multi_table_keyset_" +
+                        std::to_string(spec.phaseId) + "_" +
+                        sanitizeIdentifier(scope + "_" +
+                                           spec.outputColumn.column + "_" +
+                                           spec.reason),
+                    std::move(build));
+    };
+
+    int keysetPhaseId = 0;
+    const bool selectiveKeysetAllowed =
+        !scalarLookups || scalarLookups->empty();
+    if (selectiveKeysetAllowed) {
+        for (const auto& [rel, columns] : keysetColumnsByRel) {
+            auto filters = relationImmediateFilters(rel);
+            if (filters.empty()) continue;
+            for (const auto& [_, col] : columns) {
+                if (!columnHasSmallFiniteKeyDomain(col, aq ? aq->schema : nullptr))
+                    continue;
+                auto pipe = makeRelationKeysetScan(rel, filters);
+                if (!pipe) continue;
+                const std::string bitmapName = keysetBitmapName(
+                    col, "seed_" + std::to_string(keysetPhaseId));
+                SelectiveKeysetBuildSpec spec;
+                spec.phaseId = keysetPhaseId++;
+                spec.scanRelation = rel;
+                spec.outputColumn = col;
+                spec.bitmapName = bitmapName;
+                spec.reason = "seed";
+                const int specIndex = static_cast<int>(keysetSpecs.size());
+                keysetSpecs.push_back(std::move(spec));
+                addKeysetState(col, bitmapName, false, specIndex);
+            }
+        }
+    }
+
+    bool keysetChanged = true;
+    int keysetGuard = 0;
+    while (selectiveKeysetAllowed && keysetChanged && keysetGuard++ < 64) {
+        keysetChanged = false;
+        std::vector<SelectiveKeysetState> snapshot;
+        for (const auto& [_, state] : keysetStates)
+            snapshot.push_back(state);
+
+        for (const auto& state : snapshot) {
+            const int rel = state.column.relationInstance.value;
+            auto colsIt = keysetColumnsByRel.find(rel);
+            if (colsIt != keysetColumnsByRel.end()) {
+                for (const auto& [_, outCol] : colsIt->second) {
+                    if (outCol.column == state.column.column ||
+                        hasKeysetState(outCol) ||
+                        !columnHasSmallFiniteKeyDomain(
+                            outCol, aq ? aq->schema : nullptr)) {
+                        continue;
+                    }
+                    auto filters = relationImmediateFilters(rel);
+                    auto pipe = makeRelationKeysetScan(rel, filters);
+                    if (!pipe) continue;
+                    const std::string bitmapName = keysetBitmapName(
+                        outCol, "xfer_" + std::to_string(keysetPhaseId));
+                    SelectiveKeysetBuildSpec spec;
+                    spec.phaseId = keysetPhaseId++;
+                    spec.scanRelation = rel;
+                    spec.outputColumn = outCol;
+                    spec.bitmapName = bitmapName;
+                    spec.reason = "xfer";
+                    spec.sourceSpecIndex = state.specIndex;
+                    spec.sourceBitmapName = state.bitmapName;
+                    spec.sourceProbeColumn = state.column.column;
+                    const int specIndex = static_cast<int>(keysetSpecs.size());
+                    keysetSpecs.push_back(std::move(spec));
+                    keysetChanged =
+                        addKeysetState(outCol, bitmapName,
+                                       state.externalToRelation, specIndex) ||
+                        keysetChanged;
+                }
+            }
+
+            for (const auto& edge : keysetEdges) {
+                const GenericColumnExpr* dst = nullptr;
+                if (edge.left.relationInstance.value ==
+                        state.column.relationInstance.value &&
+                    edge.left.column == state.column.column) {
+                    dst = &edge.right;
+                } else if (edge.right.relationInstance.value ==
+                               state.column.relationInstance.value &&
+                           edge.right.column == state.column.column) {
+                    dst = &edge.left;
+                }
+                if (!dst || hasKeysetState(*dst) ||
+                    !columnHasSmallFiniteKeyDomain(
+                        *dst, aq ? aq->schema : nullptr)) {
+                    continue;
+                }
+
+                const int dstRel = dst->relationInstance.value;
+                auto filters = relationImmediateFilters(dstRel);
+                auto pipe = makeRelationKeysetScan(dstRel, filters);
+                if (!pipe) continue;
+                const std::string bitmapName = keysetBitmapName(
+                    *dst, "join_" + std::to_string(keysetPhaseId));
+                SelectiveKeysetBuildSpec spec;
+                spec.phaseId = keysetPhaseId++;
+                spec.scanRelation = dstRel;
+                spec.outputColumn = *dst;
+                spec.bitmapName = bitmapName;
+                spec.reason = "join";
+                spec.sourceSpecIndex = state.specIndex;
+                spec.sourceBitmapName = state.bitmapName;
+                spec.sourceProbeColumn = dst->column;
+                const int specIndex = static_cast<int>(keysetSpecs.size());
+                keysetSpecs.push_back(std::move(spec));
+                keysetChanged =
+                    addKeysetState(*dst, bitmapName, true, specIndex) ||
+                    keysetChanged;
+            }
+        }
+    }
+
+    auto addPropagatedFilter =
+        [](std::vector<IrPropagatedBitmapFilter>& filters,
+           const std::string& bitmapName,
+           const std::string& keyColumn) {
+        for (const auto& existing : filters) {
+            if (existing.bitmapName == bitmapName &&
+                existing.keyColumn == keyColumn) {
+                return;
+            }
+        }
+        filters.push_back({bitmapName, keyColumn});
+    };
+    auto buildAlreadyFiltersColumn = [&](const IrBuildSide& build,
+                                         const std::string& column) {
+        if (build.joinCol.column == column || build.joinCol2.column == column)
+            return true;
+        for (int childRel : build.children) {
+            auto childIt = buildByRel.find(childRel);
+            if (childIt == buildByRel.end()) continue;
+            if (childIt->second.parentCol.column == column ||
+                childIt->second.parentCol2.column == column)
+                return true;
+        }
+        return false;
+    };
+    std::set<int> requiredKeysetSpecs;
+    std::function<void(int)> markRequiredKeysetSpec = [&](int specIndex) {
+        if (specIndex < 0 ||
+            specIndex >= static_cast<int>(keysetSpecs.size()) ||
+            !requiredKeysetSpecs.insert(specIndex).second) {
+            return;
+        }
+        markRequiredKeysetSpec(keysetSpecs[(size_t)specIndex].sourceSpecIndex);
+    };
+    for (const auto& [_, state] : keysetStates) {
+        if (!state.externalToRelation) continue;
+        const int rel = state.column.relationInstance.value;
+        if (rel == probeRel) {
+            addPropagatedFilter(probePropagatedBitmapFilters,
+                                state.bitmapName, state.column.column);
+            markRequiredKeysetSpec(state.specIndex);
+            continue;
+        }
+        auto buildIt = buildByRel.find(rel);
+        if (buildIt == buildByRel.end()) continue;
+        if (buildAlreadyFiltersColumn(buildIt->second, state.column.column))
+            continue;
+        addPropagatedFilter(buildIt->second.propagatedBitmapFilters,
+                            state.bitmapName, state.column.column);
+        markRequiredKeysetSpec(state.specIndex);
+    }
+
+    for (size_t i = 0; i < keysetSpecs.size(); ++i) {
+        if (!requiredKeysetSpecs.count(static_cast<int>(i))) continue;
+        appendKeysetBitmapBuild(keysetSpecs[i]);
+    }
+
     for (int rel : postorder) {
         if (emittedDomainDrivenExists.count(rel) ||
             emittedFusedExists.count(rel)) {
@@ -2011,6 +2339,12 @@ std::optional<MultiTableJoinLowering> buildMultiTableJoinLowering(
             if (groupRels.size() > 1) {
                 std::unique_ptr<MetalOperator> fusedPipe =
                     makeAutoScan(build.scan->table, idxVar);
+                for (const auto& propagatedFilter :
+                         build.propagatedBitmapFilters) {
+                    fusedPipe = std::make_unique<MetalBitmapProbe>(
+                        std::move(fusedPipe), propagatedFilter.bitmapName,
+                        propagatedFilter.keyColumn + "[" + idxVar + "]");
+                }
                 for (const auto& siblingFilter : build.siblingBitmapFilters) {
                     fusedPipe = std::make_unique<MetalBitmapProbe>(
                         std::move(fusedPipe), siblingFilter.bitmapName,
@@ -2046,6 +2380,12 @@ std::optional<MultiTableJoinLowering> buildMultiTableJoinLowering(
             makeAutoScan(build.scan->table, idxVar);
         bool buildScalarLookupsLoaded = false;
         bool buildUsesScalarLookupBuffer = false;
+
+        for (const auto& propagatedFilter : build.propagatedBitmapFilters) {
+            buildPipe = std::make_unique<MetalBitmapProbe>(
+                std::move(buildPipe), propagatedFilter.bitmapName,
+                propagatedFilter.keyColumn + "[" + idxVar + "]");
+        }
 
         for (const auto& siblingFilter : build.siblingBitmapFilters) {
             buildPipe = std::make_unique<MetalBitmapProbe>(
@@ -2209,6 +2549,11 @@ std::optional<MultiTableJoinLowering> buildMultiTableJoinLowering(
     lowering.probePipe = makeAutoScan(probe->scan->table, idxVar);
     bool probeScalarLookupsLoaded = false;
     bool probeUsesScalarLookupBuffer = false;
+    for (const auto& propagatedFilter : probePropagatedBitmapFilters) {
+        lowering.probePipe = std::make_unique<MetalBitmapProbe>(
+            std::move(lowering.probePipe), propagatedFilter.bitmapName,
+            propagatedFilter.keyColumn + "[" + idxVar + "]");
+    }
     std::vector<GenericPredicatePtr> deferredProbeFilters;
     for (const auto& pred : probeFilters) {
         if (predicateHasScalarLookup(pred, probe->scan->table)) {
