@@ -1,9 +1,11 @@
 #include "generic/lowering/generic_ir_physical_planner.h"
+#include "generic/lowering/generic_aggregate_helpers.h"
 #include "generic/lowering/generic_expression_metal.h"
 #include "generic/lowering/generic_plan_shapes.h"
 #include "metal_plan_common.h"
 #include "tpch_schema.h"
 
+#include <algorithm>
 #include <memory>
 #include <optional>
 #include <string>
@@ -42,6 +44,55 @@ std::optional<std::pair<std::string, TypeInfo>> scanAnchorColumn(
         }
     } catch (...) {}
     return std::nullopt;
+}
+
+std::optional<double> numericLiteralValueLocal(const GenericExprPtr& expr) {
+    if (!expr) return std::nullopt;
+    auto* lit = std::get_if<GenericLiteralExpr>(&expr->node);
+    if (!lit) return std::nullopt;
+    return std::visit([](const auto& value) -> std::optional<double> {
+        using V = std::decay_t<decltype(value)>;
+        if constexpr (std::is_same_v<V, int64_t>)
+            return static_cast<double>(value);
+        else if constexpr (std::is_same_v<V, double>)
+            return value;
+        else
+            return std::nullopt;
+    }, lit->value);
+}
+
+bool scaleNeutralFactor(const GenericExprPtr& expr) {
+    if (!expr) return false;
+    if (numericLiteralValueLocal(expr)) return true;
+    return expr->type.type == DataType::INT;
+}
+
+int scalarSumFixedPointScale(const GenericExprPtr& expr) {
+    const int directScale = numericScaleForExpr(expr);
+    if (directScale > 0) return directScale;
+    if (!expr) return 0;
+    auto* bin = std::get_if<GenericBinaryExpr>(&expr->node);
+    if (!bin) return 0;
+
+    const int leftScale = scalarSumFixedPointScale(bin->left);
+    const int rightScale = scalarSumFixedPointScale(bin->right);
+    switch (bin->op) {
+        case ExprOp::ADD:
+        case ExprOp::SUB:
+            if (leftScale > 0 && leftScale == rightScale) return leftScale;
+            if (leftScale > 0 && numericLiteralValueLocal(bin->right)) return leftScale;
+            if (rightScale > 0 && numericLiteralValueLocal(bin->left)) return rightScale;
+            return 0;
+        case ExprOp::MUL:
+            if (leftScale > 0 && rightScale > 0)
+                return std::max(leftScale, rightScale);
+            if (leftScale > 0 && scaleNeutralFactor(bin->right)) return leftScale;
+            if (rightScale > 0 && scaleNeutralFactor(bin->left)) return rightScale;
+            return 0;
+        case ExprOp::DIV:
+            return 0;
+    }
+    return 0;
 }
 
 } // namespace
@@ -112,6 +163,7 @@ std::optional<MetalQueryPlan> lowerSingleTableScalarAggregateIRToMetal(
             continue;
         }
 
+        int outputScale = 0;
         std::string outputType = agg->arg->type.type == DataType::FLOAT ? "float" : "long";
         MetalTGReduce::ReduceOp op = MetalTGReduce::ReduceOp::SUM;
         if (agg->func == AggFunc::MIN) op = MetalTGReduce::ReduceOp::MIN;
@@ -120,11 +172,20 @@ std::optional<MetalQueryPlan> lowerSingleTableScalarAggregateIRToMetal(
             return fail(error, "IR scalar aggregate lowerer: unsupported aggregate '" +
                                aggFuncName(agg->func) + "'.");
         }
-        if (op != MetalTGReduce::ReduceOp::SUM && agg->arg->type.type != DataType::FLOAT)
+        if (op == MetalTGReduce::ReduceOp::SUM &&
+            agg->arg->type.type == DataType::FLOAT) {
+            outputScale = scalarSumFixedPointScale(agg->arg);
+            if (outputScale > 0) {
+                valueExpr = scaledLongExpr(valueExpr, outputScale);
+                outputType = "long";
+            }
+        } else if (op != MetalTGReduce::ReduceOp::SUM &&
+                   agg->arg->type.type != DataType::FLOAT) {
             outputType = "int";
+        }
 
         int accIndex = reduce->addAccumulator(accName, valueExpr, outputType, "", "", op);
-        reduce->setAccumulatorResultAlias(alias, accIndex, 0, nullptr);
+        reduce->setAccumulatorResultAlias(alias, accIndex, outputScale, nullptr);
     }
 
     if (!hasInputColumnReference) {

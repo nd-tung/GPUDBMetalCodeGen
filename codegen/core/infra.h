@@ -762,31 +762,29 @@ inline bool writeColbin(const std::string& tblPath,
 
 // --- Zero-Copy Column Buffers ---
 // Requires .colbin v2 with page-aligned payloads.
-// The loader mmaps .colbin once and wraps each payload directly as an
-// MTL::Buffer. On Apple Silicon, the GPU can read the shared pages without
-// host->buffer staging.
+// The loader mmaps only the projected column payloads and wraps each payload
+// directly as an MTL::Buffer. On Apple Silicon, the GPU can read the shared
+// pages without host->buffer staging.
 struct MappedColumns {
     std::unordered_map<int, MTL::Buffer*> buffers;
     size_t nRows = 0;
-    void*  mapBase = nullptr;
-    size_t mapSize = 0;
+    std::vector<std::pair<void*, size_t>> mappings;
 
     MappedColumns() = default;
     MappedColumns(const MappedColumns&) = delete;
     MappedColumns& operator=(const MappedColumns&) = delete;
     MappedColumns(MappedColumns&& o) noexcept
       : buffers(std::move(o.buffers)), nRows(o.nRows),
-        mapBase(o.mapBase), mapSize(o.mapSize) {
-        o.mapBase = nullptr; o.mapSize = 0;
+        mappings(std::move(o.mappings)) {
+        o.nRows = 0;
     }
     MappedColumns& operator=(MappedColumns&& o) noexcept {
         if (this != &o) {
             reset();
             buffers  = std::move(o.buffers);
             nRows    = o.nRows;
-            mapBase  = o.mapBase;
-            mapSize  = o.mapSize;
-            o.mapBase = nullptr; o.mapSize = 0;
+            mappings = std::move(o.mappings);
+            o.nRows = 0;
         }
         return *this;
     }
@@ -796,13 +794,16 @@ struct MappedColumns {
         auto it = buffers.find(col);
         return it == buffers.end() ? nullptr : it->second;
     }
-    bool valid() const { return mapBase != nullptr && !buffers.empty(); }
+    bool valid() const { return !mappings.empty() && !buffers.empty(); }
 
     void reset() {
         for (auto& [k, b] : buffers) if (b) b->release();
         buffers.clear();
-        if (mapBase && mapSize) ::munmap(mapBase, mapSize);
-        mapBase = nullptr; mapSize = 0;
+        for (auto& [base, size] : mappings) {
+            if (base && size) ::munmap(base, size);
+        }
+        mappings.clear();
+        nRows = 0;
     }
 };
 
@@ -827,56 +828,129 @@ inline MappedColumns loadColumnsAsBuffers(MTL::Device* device,
     size_t fileSize = (size_t)st.st_size;
     if (fileSize < sizeof(FileHeader)) { ::close(fd); return out; }
 
-    void* base = ::mmap(nullptr, fileSize, PROT_READ, MAP_PRIVATE, fd, 0);
-    ::close(fd);
-    if (base == MAP_FAILED) return out;
+    constexpr size_t kWholeFileMmapMinColumns = 6;
+    if (specs.size() >= kWholeFileMmapMinColumns) {
+        void* base = ::mmap(nullptr, fileSize, PROT_READ, MAP_PRIVATE, fd, 0);
+        ::close(fd);
+        if (base == MAP_FAILED) return out;
 
-    FileHeader hdr;
-    memcpy(&hdr, base, sizeof(hdr));
+        FileHeader hdr{};
+        memcpy(&hdr, base, sizeof(hdr));
+        if (memcmp(hdr.magic, MAGIC, 8) != 0 ||
+            hdr.version != VERSION ||
+            (tblPresent && (hdr.source_size != tblSize ||
+                            hdr.source_mtime_ns != tblMtime))) {
+            ::munmap(base, fileSize);
+            return out;
+        }
+        if (sizeof(FileHeader) + hdr.n_cols * sizeof(ColDesc) > fileSize) {
+            ::munmap(base, fileSize);
+            return out;
+        }
+
+        const ColDesc* descs =
+            (const ColDesc*)((const char*)base + sizeof(FileHeader));
+        std::unordered_map<int, const ColDesc*> byIdx;
+        byIdx.reserve(hdr.n_cols);
+        for (uint32_t i = 0; i < hdr.n_cols; i++) {
+            byIdx[descs[i].columnIndex] = &descs[i];
+        }
+
+        for (const auto& s : specs) {
+            auto it = byIdx.find(s.columnIndex);
+            if (it == byIdx.end())                 { ::munmap(base, fileSize); return MappedColumns{}; }
+            const ColDesc* d = it->second;
+            if (decodeType(d->dtype) != s.type)    { ::munmap(base, fileSize); return MappedColumns{}; }
+            if (s.type == ColType::CHAR_FIXED && d->fixedWidth != s.fixedWidth) {
+                ::munmap(base, fileSize); return MappedColumns{};
+            }
+            if (d->offset % ALIGN != 0) {
+                ::munmap(base, fileSize); return MappedColumns{};
+            }
+            if (d->offset + d->size_bytes > fileSize) {
+                ::munmap(base, fileSize); return MappedColumns{};
+            }
+            void* colPtr = (char*)base + d->offset;
+            MTL::Buffer* buf = device->newBuffer(colPtr, d->size_bytes,
+                                                  MTL::ResourceStorageModeShared,
+                                                  nullptr);
+            if (!buf) {
+                ::munmap(base, fileSize);
+                return MappedColumns{};
+            }
+            out.buffers[s.columnIndex] = buf;
+        }
+        out.nRows = hdr.n_rows;
+        out.mappings.emplace_back(base, fileSize);
+        return out;
+    }
+
+    FileHeader hdr{};
+    if (::pread(fd, &hdr, sizeof(hdr), 0) != (ssize_t)sizeof(hdr)) {
+        ::close(fd);
+        return out;
+    }
     if (memcmp(hdr.magic, MAGIC, 8) != 0 ||
         hdr.version != VERSION ||
         (tblPresent && (hdr.source_size != tblSize ||
                         hdr.source_mtime_ns != tblMtime))) {
-        ::munmap(base, fileSize);
+        ::close(fd);
         return out;
     }
     if (sizeof(FileHeader) + hdr.n_cols * sizeof(ColDesc) > fileSize) {
-        ::munmap(base, fileSize);
+        ::close(fd);
         return out;
     }
 
-    const ColDesc* descs = (const ColDesc*)((const char*)base + sizeof(FileHeader));
+    std::vector<ColDesc> descs(hdr.n_cols);
+    const size_t descBytes = descs.size() * sizeof(ColDesc);
+    if (::pread(fd, descs.data(), descBytes, sizeof(FileHeader)) !=
+        (ssize_t)descBytes) {
+        ::close(fd);
+        return out;
+    }
     std::unordered_map<int, const ColDesc*> byIdx;
     byIdx.reserve(hdr.n_cols);
     for (uint32_t i = 0; i < hdr.n_cols; i++) byIdx[descs[i].columnIndex] = &descs[i];
 
     for (const auto& s : specs) {
         auto it = byIdx.find(s.columnIndex);
-        if (it == byIdx.end())                 { ::munmap(base, fileSize); return MappedColumns{}; }
+        if (it == byIdx.end())                 { ::close(fd); return MappedColumns{}; }
         const ColDesc* d = it->second;
-        if (decodeType(d->dtype) != s.type)    { ::munmap(base, fileSize); return MappedColumns{}; }
+        if (decodeType(d->dtype) != s.type)    { ::close(fd); return MappedColumns{}; }
         if (s.type == ColType::CHAR_FIXED && d->fixedWidth != s.fixedWidth) {
-            ::munmap(base, fileSize); return MappedColumns{};
+            ::close(fd); return MappedColumns{};
         }
         if (d->offset % ALIGN != 0) {
-            ::munmap(base, fileSize); return MappedColumns{};
+            ::close(fd); return MappedColumns{};
         }
         if (d->offset + d->size_bytes > fileSize) {
-            ::munmap(base, fileSize); return MappedColumns{};
+            ::close(fd); return MappedColumns{};
         }
-        void* colPtr = (char*)base + d->offset;
-        MTL::Buffer* buf = device->newBuffer(colPtr, d->size_bytes,
-                                              MTL::ResourceStorageModeShared,
-                                              nullptr /* no deallocator: we own the mmap */);
-        if (!buf) {
-            ::munmap(base, fileSize);
+        if (d->size_bytes == 0) {
+            ::close(fd); return MappedColumns{};
+        }
+        void* colPtr = ::mmap(nullptr, d->size_bytes, PROT_READ, MAP_PRIVATE,
+                              fd, (off_t)d->offset);
+        if (colPtr == MAP_FAILED) {
+            out.reset();
+            ::close(fd);
             return MappedColumns{};
         }
+        MTL::Buffer* buf = device->newBuffer(colPtr, d->size_bytes,
+                                              MTL::ResourceStorageModeShared,
+                                              nullptr /* no deallocator: mappings own the mmap */);
+        if (!buf) {
+            ::munmap(colPtr, d->size_bytes);
+            out.reset();
+            ::close(fd);
+            return MappedColumns{};
+        }
+        out.mappings.emplace_back(colPtr, d->size_bytes);
         out.buffers[s.columnIndex] = buf;
     }
     out.nRows   = hdr.n_rows;
-    out.mapBase = base;
-    out.mapSize = fileSize;
+    ::close(fd);
     return out;
 }
 

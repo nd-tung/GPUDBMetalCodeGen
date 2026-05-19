@@ -754,7 +754,9 @@ public:
                          std::vector<GenericMatColumnDesc> outputs,
                          std::string bucketCountExpr,
                          std::string bucketCountSymbol,
-                         KeyedCompactHavingSpec having)
+                         KeyedCompactHavingSpec having,
+                         std::string activeListBuffer,
+                         std::string activeCountSymbol)
         : inputBuffer_(std::move(inputBuffer)),
           outputCounter_(std::move(outputCounter)),
           numBuckets_(numBuckets),
@@ -764,7 +766,9 @@ public:
           outputs_(std::move(outputs)),
           bucketCountExpr_(std::move(bucketCountExpr)),
           bucketCountSymbol_(std::move(bucketCountSymbol)),
-          having_(std::move(having)) {}
+          having_(std::move(having)),
+          activeListBuffer_(std::move(activeListBuffer)),
+          activeCountSymbol_(std::move(activeCountSymbol)) {}
 
     void produce(MetalCodegen& cg, ConsumerFn consume) override {
         const std::string bucketCountExpr = bucketCountExpr_.empty()
@@ -785,6 +789,10 @@ public:
         cg.addBufferParam(inputBuffer_, "atomic_uint",
                           bucketCountExpr + " * " +
                           std::to_string(valuesPerBucket_), false);
+        if (!activeListBuffer_.empty() && !activeCountSymbol_.empty()) {
+            cg.addBufferParam(activeListBuffer_, "uint", bucketCountExpr, false);
+            cg.addScalarParam(activeCountSymbol_, "uint");
+        }
         cg.addAtomicBufferParam(outputCounter_, "atomic_uint", "1");
         if (!having_.scalarTotalBuffer.empty()) {
             cg.addBufferParam(having_.scalarTotalBuffer, "atomic_uint",
@@ -811,7 +819,17 @@ public:
                                     out.isLongPair);
         }
 
-        cg.addBlock("for (uint _bucket = tid; _bucket < " + bucketCountLimit + "; _bucket += tpg)", [&]() {
+        const bool useActiveList =
+            !activeListBuffer_.empty() && !activeCountSymbol_.empty();
+        const std::string scanLimit = useActiveList
+            ? activeCountSymbol_
+            : bucketCountLimit;
+        cg.addBlock("for (uint _scan = tid; _scan < " + scanLimit + "; _scan += tpg)", [&]() {
+            if (useActiveList) {
+                cg.addLine("uint _bucket = " + activeListBuffer_ + "[_scan];");
+            } else {
+                cg.addLine("uint _bucket = _scan;");
+            }
             cg.addLine("bool _has_data = false;");
             cg.addBlock("for (uint _v = 0; _v < " + std::to_string(valuesPerBucket_) + "u; ++_v)", [&]() {
                 cg.addIf("atomic_load_explicit(&" + inputBuffer_ + "[_bucket * " +
@@ -847,6 +865,8 @@ private:
     std::string bucketCountExpr_;
     std::string bucketCountSymbol_;
     KeyedCompactHavingSpec having_;
+    std::string activeListBuffer_;
+    std::string activeCountSymbol_;
 
     std::string valueBase() const {
         return "_bucket * " + std::to_string(valuesPerBucket_) + "u";
@@ -1715,11 +1735,14 @@ std::unique_ptr<MetalOperator> makeKeyedAggCompactOperator(
     std::vector<GenericMatColumnDesc> outputs,
     std::string bucketCountExpr,
     std::string bucketCountSymbol,
-    KeyedCompactHavingSpec having) {
+    KeyedCompactHavingSpec having,
+    std::string activeListBuffer,
+    std::string activeCountSymbol) {
     return std::make_unique<MetalKeyedAggCompact>(
         std::move(inputBuffer), std::move(outputCounter), numBuckets, valuesPerBucket,
         std::move(keys), std::move(aggs), std::move(outputs),
-        std::move(bucketCountExpr), std::move(bucketCountSymbol), std::move(having));
+        std::move(bucketCountExpr), std::move(bucketCountSymbol), std::move(having),
+        std::move(activeListBuffer), std::move(activeCountSymbol));
 }
 
 bool appendGenericGpuSort(MetalQueryPlan& plan,

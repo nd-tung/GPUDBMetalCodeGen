@@ -180,7 +180,9 @@ std::unique_ptr<MetalOperator> makeKeyedAggCompactOperator(
     std::vector<GenericMatColumnDesc> outputs,
     std::string bucketCountExpr = {},
     std::string bucketCountSymbol = {},
-    KeyedCompactHavingSpec having = {});
+    KeyedCompactHavingSpec having = {},
+    std::string activeListBuffer = {},
+    std::string activeCountSymbol = {});
 
 bool appendGenericGpuSort(MetalQueryPlan& plan,
                           const std::string& tag,
