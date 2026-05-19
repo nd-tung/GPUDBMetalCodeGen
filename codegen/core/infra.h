@@ -1294,14 +1294,14 @@ inline void printDetailedTimingSummary(const DetailedTiming& t, bool quiet = fal
     double loadMibps = (ioMs > 0.0 && t.loadBytes > 0)
         ? ((double)t.loadBytes / (1024.0*1024.0)) / (ioMs / 1000.0)
         : 0.0;
-    const double cpuTotalLegacy = compileOverheadMs + t.dataLoadMs +
+    const double cpuTotalForCsv = compileOverheadMs + t.dataLoadMs +
                                   t.bufferAllocMs + cpuComputeMs;
     // CSV trailer fields: io_ms, preprocess_ms, query_execution_ms.
     printf("TIMING_CSV,%s,%s,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%s,%zu,%.3f,%.3f,%.3f,%d,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f\n",
            t.scaleFactor.c_str(), t.queryName.c_str(),
            t.analyzeMs, t.planMs, t.codegenMs, t.compileMs, t.psoMs,
            t.dataLoadMs, t.bufferAllocMs, gpuComputeMs, cpuComputeMs,
-           compileOverheadMs, cpuTotalLegacy, end2end,
+           compileOverheadMs, cpuTotalForCsv, end2end,
            t.loadSource.empty() ? "none" : t.loadSource.c_str(),
            t.loadBytes, loadMibps, t.ingestMs, queryComputeMs,
            // C1: per-trial GPU-time distribution (zeros if --repeat 1)

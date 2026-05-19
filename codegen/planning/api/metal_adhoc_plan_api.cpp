@@ -137,9 +137,9 @@ std::optional<MetalQueryPlan> buildAdhocSQLPlan(const AnalyzedQuery& aq,
     auto plan = dispatch();
     if (!plan && error) {
         std::string detail = !lowerErrors.empty() ? lowerErrors : planningErrors;
-        *error = "Strict generic SQL: query is not implemented by Generic IR GPU lowerers";
+        *error = "Generic SQL route: query is not implemented by Generic IR GPU lowerers";
         if (!detail.empty()) *error += " (" + detail + ")";
-        *error += ". Legacy generic fallback builders are disabled on the ad-hoc SQL route.";
+        *error += ". The ad-hoc SQL route does not use fallback query builders.";
     }
     if (!plan) return plan;
 

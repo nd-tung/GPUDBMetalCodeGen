@@ -85,6 +85,30 @@ struct GenericGpuGroupSpec {
 };
 
 struct KeyedCompactKeySpec {
+    KeyedCompactKeySpec() = default;
+    KeyedCompactKeySpec(std::string displayName,
+                        int numValues = 0,
+                        std::string numValuesExpr = {},
+                        int stride = 1,
+                        std::vector<char> charMap = {},
+                        int keyBase = 0,
+                        std::vector<std::string> stringMap = {},
+                        int stringLen = 0,
+                        bool stringRowRef = false,
+                        std::string stringSourceTable = {},
+                        std::string stringSourceColumn = {})
+        : displayName(std::move(displayName)),
+          numValues(numValues),
+          numValuesExpr(std::move(numValuesExpr)),
+          stride(stride),
+          charMap(std::move(charMap)),
+          keyBase(keyBase),
+          stringMap(std::move(stringMap)),
+          stringLen(stringLen),
+          stringRowRef(stringRowRef),
+          stringSourceTable(std::move(stringSourceTable)),
+          stringSourceColumn(std::move(stringSourceColumn)) {}
+
     std::string displayName;
     int numValues = 0;
     std::string numValuesExpr;
@@ -93,6 +117,9 @@ struct KeyedCompactKeySpec {
     int keyBase = 0;
     std::vector<std::string> stringMap;
     int stringLen = 0;
+    bool stringRowRef = false;
+    std::string stringSourceTable;
+    std::string stringSourceColumn;
 };
 
 struct KeyedCompactAggSpec {
@@ -108,6 +135,11 @@ struct KeyedCompactAggSpec {
     bool avgSumIsLongPair = false;
     int countOffset = -1;
     bool countIsFloat = false;
+    bool isRatio = false;
+    int ratioDenOffset = -1;
+    bool ratioDenIsLongPair = false;
+    bool ratioDenIsFloatSum = false;
+    int ratioDenScaleDown = 0;
 };
 
 struct KeyedCompactHavingSpec {

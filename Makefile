@@ -40,12 +40,12 @@ TBL2COLBIN     = $(BIN_DIR)/tbl_to_colbin
 # ---------------------------------------------------------------------------
 # Build
 # ---------------------------------------------------------------------------
-.PHONY: all rebuild clean run tools strict-generic colbin-sf1 colbin-sf10 colbin-sf20 colbin-sf50 colbin-sf100 clean-colbin
+.PHONY: all rebuild clean run tools generic-only colbin-sf1 colbin-sf10 colbin-sf20 colbin-sf50 colbin-sf100 clean-colbin
 
 all: $(TARGET)
 tools: $(TBL2COLBIN)
-strict-generic: $(TARGET)
-	@./scripts/run_strict_generic.sh
+generic-only: $(TARGET)
+	@./scripts/run_generic_only.sh
 
 rebuild: clean all
 

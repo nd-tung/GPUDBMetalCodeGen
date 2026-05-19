@@ -790,6 +790,11 @@ public:
             cg.addBufferParam(having_.scalarTotalBuffer, "atomic_uint",
                               having_.scalarAggIsLongPair ? "2" : "1", false);
         }
+        for (const auto& key : keys_) {
+            if (key.stringRowRef && !key.stringSourceColumn.empty())
+                cg.addColumnParam(key.stringSourceColumn, "char",
+                                  key.stringSourceTable);
+        }
         for (const auto& out : outputs_) {
             std::string sizeExpr = bucketCountExpr;
             if (out.stringLen > 0)
@@ -854,7 +859,17 @@ private:
             : key.numValuesExpr;
         cg.addLine("uint _encoded_" + std::to_string(outIdx) + " = (_bucket / " +
                    std::to_string(key.stride) + "u) % " + numValues + ";");
-        if (!key.stringMap.empty()) {
+        if (key.stringRowRef && !key.stringSourceColumn.empty()) {
+            const int width = std::max(1, key.stringLen);
+            cg.addBlock("for (uint _oc = 0; _oc < " +
+                        std::to_string(width) + "u; ++_oc)", [&]() {
+                cg.addLine(out.bufferName + "[_pos * " +
+                           std::to_string(width) + "u + _oc] = " +
+                           key.stringSourceColumn + "[_encoded_" +
+                           std::to_string(outIdx) + " * " +
+                           std::to_string(width) + "u + _oc];");
+            });
+        } else if (!key.stringMap.empty()) {
             const int width = std::max(1, key.stringLen);
             for (int ci = 0; ci < width; ++ci) {
                 auto charAt = [&](const std::string& value) {
@@ -958,6 +973,17 @@ private:
 
     void emitAggWrite(MetalCodegen& cg, const KeyedCompactAggSpec& agg, size_t outIdx) const {
         const auto& out = outputs_[outIdx];
+        if (agg.isRatio) {
+            std::string num = havingValueExpr(agg.offset, agg.isLongPair,
+                                              agg.isFloatSum, agg.scaleDown, true);
+            std::string den = havingValueExpr(agg.ratioDenOffset,
+                                              agg.ratioDenIsLongPair,
+                                              agg.ratioDenIsFloatSum,
+                                              agg.ratioDenScaleDown, true);
+            cg.addLine(out.bufferName + "[_pos] = ((" + den +
+                       ") != 0.0f ? (" + num + ") / (" + den + ") : 0.0f);");
+            return;
+        }
         if (agg.isAvg) {
             if (agg.avgSumIsLongPair) {
                 cg.addLine("float _avg_sum_" + std::to_string(outIdx) +

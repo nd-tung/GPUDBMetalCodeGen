@@ -9,6 +9,7 @@
 #include <map>
 #include <optional>
 #include <set>
+#include <utility>
 #include <vector>
 
 
@@ -63,6 +64,18 @@ struct OuterFilterBinding {
     std::string alias;
 };
 
+struct OuterKeysetState {
+    std::string node;
+    std::string table;
+    std::string column;
+    std::string bitmap;
+};
+
+struct ValueExternalProbe {
+    std::string bitmap;
+    std::string keyColumn;
+};
+
 static std::optional<OuterFilterBinding> resolveOuterFilterBinding(
         const DecorrCol& outer,
         const AnalyzedQuery& aq) {
@@ -112,6 +125,68 @@ static bool predicateOnlyReferencesTable(const PredPtr& pred,
     return true;
 }
 
+static bool exprHasScalarSentinel(const ExprPtr& expr, int sqIdx);
+
+static bool predHasScalarSentinel(const PredPtr& pred, int sqIdx) {
+    if (!pred) return false;
+    return std::visit([&](const auto& node) -> bool {
+        using T = std::decay_t<decltype(node)>;
+        if constexpr (std::is_same_v<T, Comparison>) {
+            return exprHasScalarSentinel(node.left, sqIdx) ||
+                   exprHasScalarSentinel(node.right, sqIdx);
+        } else if constexpr (std::is_same_v<T, Between>) {
+            return exprHasScalarSentinel(node.expr, sqIdx) ||
+                   exprHasScalarSentinel(node.low, sqIdx) ||
+                   exprHasScalarSentinel(node.high, sqIdx);
+        } else if constexpr (std::is_same_v<T, InList>) {
+            if (exprHasScalarSentinel(node.expr, sqIdx)) return true;
+            for (const auto& value : node.values)
+                if (exprHasScalarSentinel(value, sqIdx)) return true;
+            return false;
+        } else if constexpr (std::is_same_v<T, Like>) {
+            return exprHasScalarSentinel(node.expr, sqIdx);
+        } else if constexpr (std::is_same_v<T, LogicalAnd> ||
+                             std::is_same_v<T, LogicalOr>) {
+            for (const auto& child : node.children)
+                if (predHasScalarSentinel(child, sqIdx)) return true;
+            return false;
+        } else if constexpr (std::is_same_v<T, LogicalNot>) {
+            return predHasScalarSentinel(node.child, sqIdx);
+        } else {
+            return false;
+        }
+    }, pred->node);
+}
+
+static bool exprHasScalarSentinel(const ExprPtr& expr, int sqIdx) {
+    if (!expr) return false;
+    return std::visit([&](const auto& node) -> bool {
+        using T = std::decay_t<decltype(node)>;
+        if constexpr (std::is_same_v<T, Literal>) {
+            if (auto value = std::get_if<int>(&node.value))
+                return *value == INT_MIN + sqIdx;
+            return false;
+        } else if constexpr (std::is_same_v<T, BinaryExpr>) {
+            return exprHasScalarSentinel(node.left, sqIdx) ||
+                   exprHasScalarSentinel(node.right, sqIdx);
+        } else if constexpr (std::is_same_v<T, FuncCall>) {
+            for (const auto& arg : node.args)
+                if (exprHasScalarSentinel(arg, sqIdx)) return true;
+            return false;
+        } else if constexpr (std::is_same_v<T, CaseWhen>) {
+            for (const auto& branch : node.branches) {
+                if (predHasScalarSentinel(branch.condition, sqIdx) ||
+                    exprHasScalarSentinel(branch.result, sqIdx)) {
+                    return true;
+                }
+            }
+            return exprHasScalarSentinel(node.elseResult, sqIdx);
+        } else {
+            return false;
+        }
+    }, expr->node);
+}
+
 static std::optional<ScalarLookupInfo> buildDecorrelatedScalarPreAgg(
         const DecorrelatedScalarSubquery& dsq,
         const AnalyzedQuery& aq,
@@ -128,6 +203,7 @@ static std::optional<ScalarLookupInfo> buildDecorrelatedScalarPreAgg(
     std::map<std::string, std::vector<PredPtr>> filtersByTable =
         dsq.filtersByTable;
     std::vector<ResolvedCorrelation> resolvedCorrelations;
+    std::vector<std::pair<OuterFilterBinding, DecorrCol>> outerBindingCols;
     std::set<const Predicate*> copiedOuterFilters;
     // Bitmap state is one path per column; keep outer-filter seeding to
     // correlation-only subqueries so inner join constraints stay intact.
@@ -137,10 +213,12 @@ static std::optional<ScalarLookupInfo> buildDecorrelatedScalarPreAgg(
         if (auto binding = resolveOuterFilterBinding(c.outer, aq)) {
             outer.table = binding->table;
             relevantCols[outer.table].insert(outer.column);
+            outerBindingCols.push_back({*binding, outer});
 
             if (canSeedOuterFilters) {
                 for (const auto& pred : aq.filters) {
                     if (!pred || copiedOuterFilters.count(pred.get())) continue;
+                    if (predHasScalarSentinel(pred, dsq.sqIdx)) continue;
                     if (!predicateOnlyReferencesTable(pred, binding->table)) continue;
                     filtersByTable[binding->table].push_back(pred);
                     copiedOuterFilters.insert(pred.get());
@@ -150,6 +228,7 @@ static std::optional<ScalarLookupInfo> buildDecorrelatedScalarPreAgg(
                     if (instIt != aq.instanceFilters.end()) {
                         for (const auto& pred : instIt->second) {
                             if (!pred || copiedOuterFilters.count(pred.get())) continue;
+                            if (predHasScalarSentinel(pred, dsq.sqIdx)) continue;
                             filtersByTable[binding->table].push_back(pred);
                             copiedOuterFilters.insert(pred.get());
                         }
@@ -185,10 +264,208 @@ static std::optional<ScalarLookupInfo> buildDecorrelatedScalarPreAgg(
                sanitizeIdentifier(table + "_" + col + "_" + suffix) + "_bmp";
     };
 
+    std::map<std::string, std::string> outerNodeTable;
+    std::map<std::string, int> outerBaseCounts;
+    std::map<std::string, std::string> uniqueOuterNodeForBase;
+    for (size_t i = 0; i < aq.tables.size(); ++i) {
+        const std::string& table = aq.tables[i];
+        std::string node = table;
+        if (i < aq.tableAliases.size() && !aq.tableAliases[i].empty())
+            node = aq.tableAliases[i];
+        outerNodeTable[node] = table;
+        outerBaseCounts[table]++;
+    }
+    for (const auto& [node, table] : outerNodeTable) {
+        if (outerBaseCounts[table] == 1)
+            uniqueOuterNodeForBase[table] = node;
+    }
+    auto resolveOuterNode = [&](const std::string& name) -> std::string {
+        if (outerNodeTable.count(name)) return name;
+        auto aliasIt = aq.aliasMap.find(name);
+        if (aliasIt != aq.aliasMap.end()) {
+            auto uniqueIt = uniqueOuterNodeForBase.find(aliasIt->second);
+            if (uniqueIt != uniqueOuterNodeForBase.end()) return uniqueIt->second;
+        }
+        auto uniqueIt = uniqueOuterNodeForBase.find(name);
+        if (uniqueIt != uniqueOuterNodeForBase.end()) return uniqueIt->second;
+        return {};
+    };
+
+    struct OuterJoinEdge {
+        std::string leftNode;
+        std::string leftTable;
+        std::string leftCol;
+        std::string rightNode;
+        std::string rightTable;
+        std::string rightCol;
+    };
+    std::vector<OuterJoinEdge> outerJoinEdges;
+    std::map<std::string, std::set<std::string>> outerRelevantCols;
+    for (const auto& join : aq.joins) {
+        if (join.anti || join.leftOuter) continue;
+        std::string leftNode = resolveOuterNode(join.leftTable);
+        std::string rightNode = resolveOuterNode(join.rightTable);
+        if (leftNode.empty() || rightNode.empty()) continue;
+        const std::string& leftTable = outerNodeTable[leftNode];
+        const std::string& rightTable = outerNodeTable[rightNode];
+        if (outerBaseCounts[leftTable] != 1 || outerBaseCounts[rightTable] != 1)
+            continue;
+        outerJoinEdges.push_back({leftNode, leftTable, join.leftCol,
+                                  rightNode, rightTable, join.rightCol});
+        outerRelevantCols[leftNode].insert(join.leftCol);
+        outerRelevantCols[rightNode].insert(join.rightCol);
+    }
+
+    std::set<std::string> outerCorrelationNodes;
+    for (const auto& [binding, outerCol] : outerBindingCols) {
+        std::string node = !binding.alias.empty()
+            ? resolveOuterNode(binding.alias)
+            : resolveOuterNode(binding.table);
+        if (node.empty()) continue;
+        outerCorrelationNodes.insert(node);
+        outerRelevantCols[node].insert(outerCol.column);
+    }
+
+    std::map<std::string, std::vector<PredPtr>> outerFiltersByNode;
+    for (const auto& pred : aq.filters) {
+        if (!pred) continue;
+        if (predHasScalarSentinel(pred, dsq.sqIdx)) continue;
+        std::map<std::string, std::string> colToTable;
+        collectColumnTables(pred, colToTable);
+        if (colToTable.empty()) continue;
+        std::set<std::string> tables;
+        for (const auto& [_, table] : colToTable) tables.insert(table);
+        if (tables.size() != 1) continue;
+        const std::string& table = *tables.begin();
+        if (outerBaseCounts[table] != 1) continue;
+        auto nodeIt = uniqueOuterNodeForBase.find(table);
+        if (nodeIt != uniqueOuterNodeForBase.end())
+            outerFiltersByNode[nodeIt->second].push_back(pred);
+    }
+    for (const auto& [alias, filters] : aq.instanceFilters) {
+        std::string node = resolveOuterNode(alias);
+        if (node.empty()) continue;
+        const std::string& table = outerNodeTable[node];
+        if (outerBaseCounts[table] != 1) continue;
+        for (const auto& pred : filters) {
+            if (predHasScalarSentinel(pred, dsq.sqIdx)) continue;
+            if (pred) outerFiltersByNode[node].push_back(pred);
+        }
+    }
+
+    auto outerFilterCondFor = [&](const std::string& node) {
+        auto it = outerFiltersByNode.find(node);
+        if (it == outerFiltersByNode.end()) return std::string("true");
+        return combineFilters(it->second, idxVar, aq.schema);
+    };
+    auto makeOuterFilteredScan = [&](const std::string& node) -> std::unique_ptr<MetalOperator> {
+        auto tableIt = outerNodeTable.find(node);
+        if (tableIt == outerNodeTable.end()) return nullptr;
+        std::unique_ptr<MetalOperator> pipe = makeAutoScan(tableIt->second, idxVar);
+        return maybeSelect(std::move(pipe), outerFilterCondFor(node));
+    };
+    std::map<std::pair<std::string, std::string>, OuterKeysetState> outerStates;
+    auto hasOuterState = [&](const std::string& node, const std::string& col) {
+        return outerStates.count({node, col}) != 0;
+    };
+    auto addOuterState = [&](std::string node,
+                             std::string table,
+                             std::string col,
+                             std::string bitmap) {
+        std::pair<std::string, std::string> key{node, col};
+        if (outerStates.count(key)) return false;
+        outerStates[key] = {node, table, col, bitmap};
+        auto relevantIt = relevantCols.find(table);
+        if (relevantIt != relevantCols.end() && relevantIt->second.count(col) &&
+            !hasState(table, col)) {
+            addState(table, col, {table, col, bitmap, true});
+        }
+        return true;
+    };
+
+    for (const auto& [node, filters] : outerFiltersByNode) {
+        if (outerCorrelationNodes.count(node)) continue;
+        auto colsIt = outerRelevantCols.find(node);
+        if (colsIt == outerRelevantCols.end()) continue;
+        const std::string& table = outerNodeTable[node];
+        for (const auto& col : colsIt->second) {
+            std::string bitmap = stateName(table, col, "outer_seed");
+            auto pipe = makeOuterFilteredScan(node);
+            if (!pipe) continue;
+            auto build = std::make_unique<MetalBitmapBuild>(
+                std::move(pipe), bitmap, col + "[" + idxVar + "]",
+                maxKeySymbolForColumn(table, col, aq.schema));
+            appendPhase(plan, "GENERIC_scalar_outer_keyset_" +
+                              std::to_string(dsq.sqIdx) + "_" +
+                              sanitizeIdentifier(node + "_" + col + "_seed"),
+                        std::move(build));
+            addOuterState(node, table, col, bitmap);
+        }
+    }
+
+    bool outerChanged = true;
+    int outerGuard = 0;
+    while (outerChanged && outerGuard++ < 64) {
+        outerChanged = false;
+        std::vector<OuterKeysetState> snapshot;
+        for (const auto& [_, state] : outerStates) snapshot.push_back(state);
+        for (const auto& st : snapshot) {
+            auto colsIt = outerRelevantCols.find(st.node);
+            if (colsIt != outerRelevantCols.end()) {
+                for (const auto& outCol : colsIt->second) {
+                    if (outCol == st.column || hasOuterState(st.node, outCol)) continue;
+                    std::string bitmap = stateName(st.table, outCol, "outer_xfer");
+                    auto pipe = makeOuterFilteredScan(st.node);
+                    if (!pipe) continue;
+                    pipe = std::make_unique<MetalBitmapProbe>(
+                        std::move(pipe), st.bitmap, st.column + "[" + idxVar + "]");
+                    auto build = std::make_unique<MetalBitmapBuild>(
+                        std::move(pipe), bitmap, outCol + "[" + idxVar + "]",
+                        maxKeySymbolForColumn(st.table, outCol, aq.schema));
+                    appendPhase(plan, "GENERIC_scalar_outer_keyset_" +
+                                      std::to_string(dsq.sqIdx) + "_" +
+                                      sanitizeIdentifier(st.node + "_" + outCol + "_xfer"),
+                                std::move(build));
+                    outerChanged =
+                        addOuterState(st.node, st.table, outCol, bitmap) ||
+                        outerChanged;
+                }
+            }
+
+            for (const auto& edge : outerJoinEdges) {
+                const bool fromLeft =
+                    edge.leftNode == st.node && edge.leftCol == st.column;
+                const bool fromRight =
+                    edge.rightNode == st.node && edge.rightCol == st.column;
+                if (!fromLeft && !fromRight) continue;
+                const std::string& dstNode = fromLeft ? edge.rightNode : edge.leftNode;
+                const std::string& dstTable = fromLeft ? edge.rightTable : edge.leftTable;
+                const std::string& dstCol = fromLeft ? edge.rightCol : edge.leftCol;
+                if (hasOuterState(dstNode, dstCol)) continue;
+                std::string bitmap = stateName(dstTable, dstCol, "outer_join");
+                auto pipe = makeOuterFilteredScan(dstNode);
+                if (!pipe) continue;
+                pipe = std::make_unique<MetalBitmapProbe>(
+                    std::move(pipe), st.bitmap, dstCol + "[" + idxVar + "]");
+                auto build = std::make_unique<MetalBitmapBuild>(
+                    std::move(pipe), bitmap, dstCol + "[" + idxVar + "]",
+                    maxKeySymbolForColumn(dstTable, dstCol, aq.schema));
+                appendPhase(plan, "GENERIC_scalar_outer_keyset_" +
+                                  std::to_string(dsq.sqIdx) + "_" +
+                                  sanitizeIdentifier(dstNode + "_" + dstCol + "_join"),
+                            std::move(build));
+                outerChanged =
+                    addOuterState(dstNode, dstTable, dstCol, bitmap) ||
+                    outerChanged;
+            }
+        }
+    }
+
     for (const auto& [table, filters] : filtersByTable) {
         auto colsIt = relevantCols.find(table);
         if (colsIt == relevantCols.end()) continue;
         for (const auto& col : colsIt->second) {
+            if (hasState(table, col)) continue;
             std::string bitmap = stateName(table, col, "seed");
             auto pipe = makeFilteredScan(table);
             auto build = std::make_unique<MetalBitmapBuild>(
@@ -278,9 +555,31 @@ static std::optional<ScalarLookupInfo> buildDecorrelatedScalarPreAgg(
         }
     }
 
+    std::vector<ValueExternalProbe> valueExternalProbes;
+    std::set<std::pair<std::string, std::string>> valueExternalProbeKeys;
+    auto addValueExternalProbe = [&](const std::string& bitmap,
+                                     const std::string& keyColumn) {
+        std::pair<std::string, std::string> key{bitmap, keyColumn};
+        if (valueExternalProbeKeys.insert(key).second)
+            valueExternalProbes.push_back({bitmap, keyColumn});
+    };
+    for (const auto& [_, st] : states) {
+        if (!st.externalToTable) continue;
+        for (const auto& c : resolvedCorrelations) {
+            if (c.outer.table == st.table && c.outer.column == st.column &&
+                c.inner.table == dsq.valueTable) {
+                addValueExternalProbe(st.bitmap, c.inner.column);
+            }
+        }
+    }
+
     auto makeAggInput = [&]() -> std::unique_ptr<MetalOperator> {
         std::unique_ptr<MetalOperator> pipe = makeAutoScan(dsq.valueTable, idxVar);
         pipe = maybeSelect(std::move(pipe), filterCondFor(dsq.valueTable));
+        for (const auto& probe : valueExternalProbes) {
+            pipe = std::make_unique<MetalBitmapProbe>(
+                std::move(pipe), probe.bitmap, probe.keyColumn + "[" + idxVar + "]");
+        }
         for (const auto& [_, st] : states) {
             if (st.table == dsq.valueTable && st.externalToTable) {
                 pipe = std::make_unique<MetalBitmapProbe>(
