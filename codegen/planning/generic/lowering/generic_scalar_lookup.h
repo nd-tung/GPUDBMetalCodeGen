@@ -39,6 +39,7 @@ struct GenericScalarLookupInfo {
     std::string htVals;
     std::string cntVar;
     std::string sumVar;
+    std::string scalarName;
 };
 
 std::string genericScalarLookupKeyExpr(

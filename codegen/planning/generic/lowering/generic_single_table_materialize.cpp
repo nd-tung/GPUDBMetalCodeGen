@@ -1,4 +1,5 @@
 #include "generic/lowering/generic_ir_physical_planner.h"
+#include "generic/lowering/generic_cost_model.h"
 #include "generic/lowering/generic_expression_metal.h"
 #include "generic/lowering/generic_plan_shapes.h"
 #include "generic/gpu_ops/generic_gpu_physical_ops.h"
@@ -23,6 +24,12 @@ std::optional<MetalQueryPlan> fail(std::string* error, const std::string& msg) {
 std::optional<MetalQueryPlan> lowerSingleTableMaterializeIRToMetal(
         const GenericRelPlan& ir,
         std::string* error) {
+    auto finish = [&](MetalQueryPlan&& plan) -> std::optional<MetalQueryPlan> {
+        return attachGenericCostTrace(
+            std::optional<MetalQueryPlan>{std::move(plan)}, ir,
+            "single_table_materialize");
+    };
+
     auto shape = parseSingleTableMaterializeShape(ir, error);
     if (!shape) return std::nullopt;
 
@@ -95,7 +102,7 @@ std::optional<MetalQueryPlan> lowerSingleTableMaterializeIRToMetal(
         }
     }
 
-    return plan;
+    return finish(std::move(plan));
 }
 
 } // namespace codegen

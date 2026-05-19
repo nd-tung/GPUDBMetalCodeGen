@@ -43,14 +43,17 @@ std::string scalarLookupKeyExpr(const ScalarLookupInfo& info,
 std::string scalarHashLookupRaw(const std::string& mapName,
                                 const std::string& key1,
                                 const std::string& key2) {
-    return "scalar_hash_lookup_raw64(" + mapName + "_states, " + mapName + "_keys, " +
-           mapName + "_values, n_" + mapName + ", " + key1 + ", " + key2 + ")";
+    return "scalar_hash_lookup_raw64(" + mapName + "_states, " +
+           mapName + "_keys1, " + mapName + "_keys2, " +
+           mapName + "_values, n_" + mapName + ", " + key1 + ", " +
+           key2 + ")";
 }
 
 std::string scalarLookupReplacement(const ScalarLookupInfo& info,
                                     const std::string& idxVar,
                                     const std::string& probeTable,
                                     const SchemaProvider* schema) {
+    if (!info.scalarName.empty()) return info.scalarName;
     const std::string key0 = scalarLookupKeyExpr(info, 0, idxVar, probeTable, schema);
     const std::string key1 = scalarLookupKeyExpr(info, 1, idxVar, probeTable, schema);
     switch (info.kind) {
@@ -88,8 +91,9 @@ std::string scalarLookupReplacement(const ScalarLookupInfo& info,
                    info.countBuffer + "[" + key0 + "])";
         case ScalarLookupInfo::SumByCompositeHash: {
             std::string val = "scalar_hash_lookup_float_or_nan64(" + info.hashMap + "_states, " +
-                              info.hashMap + "_keys, " + info.hashMap + "_values, n_" +
-                              info.hashMap + ", (uint)(" + key0 + "), (uint)(" + key1 + "))";
+                              info.hashMap + "_keys1, " + info.hashMap + "_keys2, " +
+                              info.hashMap + "_values, n_" + info.hashMap + ", (uint)(" +
+                              key0 + "), (uint)(" + key1 + "))";
             return "(" + scalarFloatLiteral(info.multiplier) + " * " + val + ")";
         }
         case ScalarLookupInfo::CountByCompositeHash: {
@@ -199,7 +203,8 @@ bool referencesGenericScalarLookupBuffer(
         }
         if (!info.hashMap.empty()) {
             if (hasName(info.hashMap + "_states") ||
-                hasName(info.hashMap + "_keys") ||
+                hasName(info.hashMap + "_keys1") ||
+                hasName(info.hashMap + "_keys2") ||
                 hasName(info.hashMap + "_values") ||
                 hasName("n_" + info.hashMap)) {
                 return true;
@@ -207,7 +212,8 @@ bool referencesGenericScalarLookupBuffer(
         }
         if (!info.countHashMap.empty()) {
             if (hasName(info.countHashMap + "_states") ||
-                hasName(info.countHashMap + "_keys") ||
+                hasName(info.countHashMap + "_keys1") ||
+                hasName(info.countHashMap + "_keys2") ||
                 hasName(info.countHashMap + "_values") ||
                 hasName("n_" + info.countHashMap)) {
                 return true;
@@ -229,6 +235,13 @@ void attachGenericScalarLookupBuffers(
         }
         phase.resolvedScalarParams.push_back({name, type, sizeExpr});
     };
+    auto addScalar = [&](const std::string& name, const std::string& type) {
+        if (name.empty()) return;
+        for (const auto& existing : phase.scalarParams) {
+            if (existing.first == name) return;
+        }
+        phase.scalarParams.push_back({name, type});
+    };
 
     for (const auto& info : lookups) {
         bool global = info.kind == ScalarLookupInfo::GlobalSum ||
@@ -237,6 +250,10 @@ void attachGenericScalarLookupBuffers(
                       info.kind == ScalarLookupInfo::GlobalMax ||
                       info.kind == ScalarLookupInfo::GlobalCount;
         if (global) {
+            if (!info.scalarName.empty()) {
+                addScalar(info.scalarName, "float");
+                continue;
+            }
             if (!info.sumBuffer.empty())
                 phase.extraBuffers.push_back({
                     info.sumBuffer,
@@ -267,13 +284,15 @@ void attachGenericScalarLookupBuffers(
             phase.extraBuffers.push_back({info.stateBuffer, "uint", true, false});
         if (!info.hashMap.empty()) {
             phase.extraBuffers.push_back({info.hashMap + "_states", "uint", true, false});
-            phase.extraBuffers.push_back({info.hashMap + "_keys", "ulong", true, false});
+            phase.extraBuffers.push_back({info.hashMap + "_keys1", "uint", true, false});
+            phase.extraBuffers.push_back({info.hashMap + "_keys2", "uint", true, false});
             phase.extraBuffers.push_back({info.hashMap + "_values", "uint", true, false});
             addResolvedScalar("n_" + info.hashMap, "uint", info.hashCapacityExpr);
         }
         if (!info.countHashMap.empty()) {
             phase.extraBuffers.push_back({info.countHashMap + "_states", "uint", true, false});
-            phase.extraBuffers.push_back({info.countHashMap + "_keys", "ulong", true, false});
+            phase.extraBuffers.push_back({info.countHashMap + "_keys1", "uint", true, false});
+            phase.extraBuffers.push_back({info.countHashMap + "_keys2", "uint", true, false});
             phase.extraBuffers.push_back({info.countHashMap + "_values", "uint", true, false});
             addResolvedScalar("n_" + info.countHashMap, "uint", info.hashCapacityExpr);
         }

@@ -1,5 +1,6 @@
 #include "generic/lowering/generic_ir_physical_planner.h"
 #include "generic/lowering/generic_aggregate_helpers.h"
+#include "generic/lowering/generic_cost_model.h"
 #include "generic/lowering/generic_expression_metal.h"
 #include "generic/lowering/generic_plan_shapes.h"
 #include "generic/gpu_ops/generic_gpu_physical_ops.h"
@@ -40,6 +41,12 @@ std::string keyedAggSlotKey(const IrPendingAgg& agg) {
 std::optional<MetalQueryPlan> lowerSingleTableGroupedAggregateIRToMetal(
         const GenericRelPlan& ir,
         std::string* error) {
+    auto finish = [&](MetalQueryPlan&& plan) -> std::optional<MetalQueryPlan> {
+        return attachGenericCostTrace(
+            std::optional<MetalQueryPlan>{std::move(plan)}, ir,
+            "single_table_grouped_aggregate");
+    };
+
     auto shape = parseSingleTableGroupedAggShape(ir, error);
     if (!shape) return std::nullopt;
 
@@ -56,8 +63,11 @@ std::optional<MetalQueryPlan> lowerSingleTableGroupedAggregateIRToMetal(
 
     if (aggregateNeedsHashGroupOutput(*aggregate) ||
         !canUseKeyedSingleTableGroup(*aggregate)) {
-        return lowerSingleTableHashGroupedAggregateIRToMetal(
-            *scan, *aggregate, shape->filter, shape->sort, shape->limit, error);
+        return attachGenericCostTrace(
+            lowerSingleTableHashGroupedAggregateIRToMetal(
+                *scan, *aggregate, shape->filter, shape->sort, shape->limit,
+                error),
+            ir, "single_table_hash_grouped_aggregate");
     }
 
     const std::string idxVar = "i";
@@ -345,7 +355,7 @@ std::optional<MetalQueryPlan> lowerSingleTableGroupedAggregateIRToMetal(
         }
     }
 
-    return plan;
+    return finish(std::move(plan));
 }
 
 } // namespace codegen

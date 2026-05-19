@@ -1,11 +1,17 @@
 #include "generic/lowering/generic_scalar_preagg_lowering.h"
+#include "generic/lowering/generic_cost_model.h"
 #include "generic/lowering/generic_scalar_preagg_ops.h"
 #include "generic/lowering/generic_scalar_subquery_analysis.h"
 #include "generic/gpu_ops/generic_gpu_physical_ops.h"
+#include "execution/metal_generic_executor.h"
 #include "metal_plan_common.h"
 
+#include <algorithm>
 #include <cctype>
 #include <climits>
+#include <cstdint>
+#include <cstring>
+#include <limits>
 #include <map>
 #include <optional>
 #include <set>
@@ -31,6 +37,64 @@ std::string sanitizeIdentifier(std::string name) {
 
 using ScalarLookupInfo = GenericScalarLookupInfo;
 
+static float scalarFloatFromBits(uint32_t bits) {
+    float value = 0.0f;
+    std::memcpy(&value, &bits, sizeof(float));
+    return value;
+}
+
+static void attachGlobalScalarValueHook(MetalQueryPlan::Phase& phase,
+                                        ScalarLookupInfo info) {
+    phase.postDispatchHook = [info = std::move(info)](
+            MetalGenericExecutor& executor) {
+        float value = std::numeric_limits<float>::quiet_NaN();
+        auto readFloat = [&](const std::string& bufferName) -> std::optional<float> {
+            auto* buffer = executor.getAllocatedBuffer(bufferName);
+            if (!buffer) return std::nullopt;
+            return *static_cast<const float*>(buffer->contents());
+        };
+        auto readUint = [&](const std::string& bufferName) -> std::optional<uint32_t> {
+            auto* buffer = executor.getAllocatedBuffer(bufferName);
+            if (!buffer) return std::nullopt;
+            return *static_cast<const uint32_t*>(buffer->contents());
+        };
+
+        switch (info.kind) {
+            case ScalarLookupInfo::GlobalCount:
+                if (auto count = readUint(info.countBuffer))
+                    value = info.multiplier * static_cast<float>(*count);
+                break;
+            case ScalarLookupInfo::GlobalSum:
+                if (auto sum = readFloat(info.sumBuffer))
+                    value = info.multiplier * *sum;
+                break;
+            case ScalarLookupInfo::GlobalAvg: {
+                auto sum = readFloat(info.sumBuffer);
+                auto count = readUint(info.countBuffer);
+                if (sum && count && *count > 0)
+                    value = info.multiplier * *sum / static_cast<float>(*count);
+                break;
+            }
+            case ScalarLookupInfo::GlobalMin:
+                if (auto seen = readUint(info.stateBuffer); seen && *seen != 0u) {
+                    if (auto bits = readUint(info.minBuffer))
+                        value = info.multiplier * scalarFloatFromBits(*bits);
+                }
+                break;
+            case ScalarLookupInfo::GlobalMax:
+                if (auto seen = readUint(info.stateBuffer); seen && *seen != 0u) {
+                    if (auto bits = readUint(info.maxBuffer))
+                        value = info.multiplier * scalarFloatFromBits(*bits);
+                }
+                break;
+            default:
+                break;
+        }
+        executor.registerScalarFloat(info.scalarName, value);
+        return 0.0;
+    };
+}
+
 static std::string maxKeySymbolForColumn(const std::string& table,
                                          const std::string& col,
                                          const SchemaProvider* schema) {
@@ -45,6 +109,24 @@ static std::string maxKeySymbolForColumn(const std::string& table,
         if (!tableSym.empty()) return tableSym;
     }
     return "";
+}
+
+static size_t scalarCostColumnWidth(const std::string& table,
+                                    const std::string& col,
+                                    const SchemaProvider* schema) {
+    if (!schema || !schema->hasColumn(table, col)) return 4;
+    TypeInfo type{schema->columnType(table, col),
+                  schema->columnFixedWidth(table, col)};
+    return genericCostTypeByteWidth(type);
+}
+
+static std::string scalarCostTableRowsExpr(const std::string& table,
+                                           const SchemaProvider* schema) {
+    if (schema) {
+        size_t rows = schema->tableRowCount(table);
+        if (rows > 0) return std::to_string(rows);
+    }
+    return tableSizeName(table);
 }
 
 struct DecorrelatedBitmapState {
@@ -69,6 +151,8 @@ struct OuterKeysetState {
     std::string table;
     std::string column;
     std::string bitmap;
+    double estimatedActiveKeyFraction = 0.5;
+    int propagationDepth = 0;
 };
 
 struct ValueExternalProbe {
@@ -205,6 +289,7 @@ static std::optional<ScalarLookupInfo> buildDecorrelatedScalarPreAgg(
     std::vector<ResolvedCorrelation> resolvedCorrelations;
     std::vector<std::pair<OuterFilterBinding, DecorrCol>> outerBindingCols;
     std::set<const Predicate*> copiedOuterFilters;
+    std::set<std::pair<std::string, std::string>> outerFilterSeedCols;
     // Bitmap state is one path per column; keep outer-filter seeding to
     // correlation-only subqueries so inner join constraints stay intact.
     const bool canSeedOuterFilters = dsq.joins.empty();
@@ -216,24 +301,33 @@ static std::optional<ScalarLookupInfo> buildDecorrelatedScalarPreAgg(
             outerBindingCols.push_back({*binding, outer});
 
             if (canSeedOuterFilters) {
+                bool hasOuterFilterForBinding = false;
                 for (const auto& pred : aq.filters) {
-                    if (!pred || copiedOuterFilters.count(pred.get())) continue;
+                    if (!pred) continue;
                     if (predHasScalarSentinel(pred, dsq.sqIdx)) continue;
                     if (!predicateOnlyReferencesTable(pred, binding->table)) continue;
-                    filtersByTable[binding->table].push_back(pred);
-                    copiedOuterFilters.insert(pred.get());
+                    hasOuterFilterForBinding = true;
+                    if (!copiedOuterFilters.count(pred.get())) {
+                        filtersByTable[binding->table].push_back(pred);
+                        copiedOuterFilters.insert(pred.get());
+                    }
                 }
                 if (!binding->alias.empty()) {
                     auto instIt = aq.instanceFilters.find(binding->alias);
                     if (instIt != aq.instanceFilters.end()) {
                         for (const auto& pred : instIt->second) {
-                            if (!pred || copiedOuterFilters.count(pred.get())) continue;
+                            if (!pred) continue;
                             if (predHasScalarSentinel(pred, dsq.sqIdx)) continue;
-                            filtersByTable[binding->table].push_back(pred);
-                            copiedOuterFilters.insert(pred.get());
+                            hasOuterFilterForBinding = true;
+                            if (!copiedOuterFilters.count(pred.get())) {
+                                filtersByTable[binding->table].push_back(pred);
+                                copiedOuterFilters.insert(pred.get());
+                            }
                         }
                     }
                 }
+                if (hasOuterFilterForBinding)
+                    outerFilterSeedCols.insert({outer.table, outer.column});
             }
         }
         if (!outer.table.empty())
@@ -262,6 +356,36 @@ static std::optional<ScalarLookupInfo> buildDecorrelatedScalarPreAgg(
                          const std::string& suffix) {
         return "d_scalar_" + std::to_string(dsq.sqIdx) + "_" +
                sanitizeIdentifier(table + "_" + col + "_" + suffix) + "_bmp";
+    };
+    auto stateFeedsInnerJoin = [&](const std::string& table,
+                                   const std::string& col) {
+        for (const auto& j : dsq.joins) {
+            if ((j.left.table == table && j.left.column == col) ||
+                (j.right.table == table && j.right.column == col)) {
+                return true;
+            }
+        }
+        return false;
+    };
+    auto keyDomainsMatch = [&](const std::string& leftTable,
+                               const std::string& leftCol,
+                               const std::string& rightTable,
+                               const std::string& rightCol) {
+        std::string leftDomain = maxKeySymbolForColumn(leftTable, leftCol, aq.schema);
+        std::string rightDomain = maxKeySymbolForColumn(rightTable, rightCol, aq.schema);
+        return !leftDomain.empty() && leftDomain == rightDomain;
+    };
+    auto canDirectProbeValueTableFromOuterSeed =
+            [&](const std::string& table, const std::string& col) {
+        for (const auto& c : resolvedCorrelations) {
+            if (c.outer.table == table && c.outer.column == col &&
+                c.inner.table == dsq.valueTable &&
+                !stateFeedsInnerJoin(c.inner.table, c.inner.column) &&
+                keyDomainsMatch(table, col, c.inner.table, c.inner.column)) {
+                return true;
+            }
+        }
+        return false;
     };
 
     std::map<std::string, std::string> outerNodeTable;
@@ -371,16 +495,58 @@ static std::optional<ScalarLookupInfo> buildDecorrelatedScalarPreAgg(
     auto addOuterState = [&](std::string node,
                              std::string table,
                              std::string col,
-                             std::string bitmap) {
+                             std::string bitmap,
+                             double estimatedActiveKeyFraction,
+                             int propagationDepth) {
         std::pair<std::string, std::string> key{node, col};
         if (outerStates.count(key)) return false;
-        outerStates[key] = {node, table, col, bitmap};
+        outerStates[key] = {node, table, col, bitmap,
+                            estimatedActiveKeyFraction, propagationDepth};
         auto relevantIt = relevantCols.find(table);
         if (relevantIt != relevantCols.end() && relevantIt->second.count(col) &&
             !hasState(table, col)) {
             addState(table, col, {table, col, bitmap, true});
         }
         return true;
+    };
+
+    auto outerKeysetTargetWidth = [&](const std::string& node,
+                                      const std::string& keyCol) {
+        auto tableIt = outerNodeTable.find(node);
+        if (tableIt == outerNodeTable.end()) return size_t{64};
+        const std::string& table = tableIt->second;
+        size_t width = scalarCostColumnWidth(table, keyCol, aq.schema);
+        auto colsIt = outerRelevantCols.find(node);
+        if (colsIt != outerRelevantCols.end()) {
+            for (const auto& col : colsIt->second)
+                width += scalarCostColumnWidth(table, col, aq.schema);
+        }
+        return std::max<size_t>(width, 64);
+    };
+    auto chooseOuterKeyset = [&](const std::string& tag,
+                                 const OuterKeysetState& source,
+                                 const std::string& targetNode,
+                                 const std::string& targetTable,
+                                 const std::string& targetCol,
+                                 double activeFraction,
+                                 int propagationDepth) {
+        KeysetPropagationCostInput input;
+        input.tag = tag;
+        input.buildRowsExpr = scalarCostTableRowsExpr(targetTable, aq.schema);
+        input.targetRowsExpr = input.buildRowsExpr;
+        input.keyDomainExpr = maxKeySymbolForColumn(targetTable, targetCol,
+                                                    aq.schema);
+        input.keyByteWidth =
+            scalarCostColumnWidth(targetTable, targetCol, aq.schema);
+        input.targetRowByteWidth =
+            outerKeysetTargetWidth(targetNode, targetCol);
+        input.estimatedActiveKeyFraction = activeFraction;
+        input.propagationDepth = propagationDepth;
+        input.hasSourceBitmap = true;
+        auto choice = chooseKeysetPropagation(input);
+        appendGenericCostDecisionTrace(plan, choice.trace);
+        (void)source;
+        return choice;
     };
 
     for (const auto& [node, filters] : outerFiltersByNode) {
@@ -399,7 +565,7 @@ static std::optional<ScalarLookupInfo> buildDecorrelatedScalarPreAgg(
                               std::to_string(dsq.sqIdx) + "_" +
                               sanitizeIdentifier(node + "_" + col + "_seed"),
                         std::move(build));
-            addOuterState(node, table, col, bitmap);
+            addOuterState(node, table, col, bitmap, 0.25, 0);
         }
     }
 
@@ -417,6 +583,16 @@ static std::optional<ScalarLookupInfo> buildDecorrelatedScalarPreAgg(
                     std::string bitmap = stateName(st.table, outCol, "outer_xfer");
                     auto pipe = makeOuterFilteredScan(st.node);
                     if (!pipe) continue;
+                    const double activeFraction =
+                        std::min(0.95, std::max(0.05,
+                            st.estimatedActiveKeyFraction));
+                    const int propagationDepth = st.propagationDepth + 1;
+                    auto choice = chooseOuterKeyset(
+                        "scalar_outer_xfer_" +
+                            sanitizeIdentifier(st.node + "_" + outCol),
+                        st, st.node, st.table, outCol, activeFraction,
+                        propagationDepth);
+                    if (!choice.useKeyset) continue;
                     pipe = std::make_unique<MetalBitmapProbe>(
                         std::move(pipe), st.bitmap, st.column + "[" + idxVar + "]");
                     auto build = std::make_unique<MetalBitmapBuild>(
@@ -427,7 +603,8 @@ static std::optional<ScalarLookupInfo> buildDecorrelatedScalarPreAgg(
                                       sanitizeIdentifier(st.node + "_" + outCol + "_xfer"),
                                 std::move(build));
                     outerChanged =
-                        addOuterState(st.node, st.table, outCol, bitmap) ||
+                        addOuterState(st.node, st.table, outCol, bitmap,
+                                      activeFraction, propagationDepth) ||
                         outerChanged;
                 }
             }
@@ -445,6 +622,16 @@ static std::optional<ScalarLookupInfo> buildDecorrelatedScalarPreAgg(
                 std::string bitmap = stateName(dstTable, dstCol, "outer_join");
                 auto pipe = makeOuterFilteredScan(dstNode);
                 if (!pipe) continue;
+                const double activeFraction =
+                    std::min(0.95, std::max(0.05,
+                        st.estimatedActiveKeyFraction));
+                const int propagationDepth = st.propagationDepth + 1;
+                auto choice = chooseOuterKeyset(
+                    "scalar_outer_join_" +
+                        sanitizeIdentifier(dstNode + "_" + dstCol),
+                    st, dstNode, dstTable, dstCol, activeFraction,
+                    propagationDepth);
+                if (!choice.useKeyset) continue;
                 pipe = std::make_unique<MetalBitmapProbe>(
                     std::move(pipe), st.bitmap, dstCol + "[" + idxVar + "]");
                 auto build = std::make_unique<MetalBitmapBuild>(
@@ -455,7 +642,8 @@ static std::optional<ScalarLookupInfo> buildDecorrelatedScalarPreAgg(
                                   sanitizeIdentifier(dstNode + "_" + dstCol + "_join"),
                             std::move(build));
                 outerChanged =
-                    addOuterState(dstNode, dstTable, dstCol, bitmap) ||
+                    addOuterState(dstNode, dstTable, dstCol, bitmap,
+                                  activeFraction, propagationDepth) ||
                     outerChanged;
             }
         }
@@ -466,6 +654,8 @@ static std::optional<ScalarLookupInfo> buildDecorrelatedScalarPreAgg(
         if (colsIt == relevantCols.end()) continue;
         for (const auto& col : colsIt->second) {
             if (hasState(table, col)) continue;
+            if (table == dsq.valueTable && !stateFeedsInnerJoin(table, col))
+                continue;
             std::string bitmap = stateName(table, col, "seed");
             auto pipe = makeFilteredScan(table);
             auto build = std::make_unique<MetalBitmapBuild>(
@@ -474,7 +664,10 @@ static std::optional<ScalarLookupInfo> buildDecorrelatedScalarPreAgg(
             appendPhase(plan, "GENERIC_scalar_decorrelate_" + std::to_string(dsq.sqIdx) +
                               "_" + sanitizeIdentifier(table + "_" + col + "_seed"),
                         std::move(build));
-            addState(table, col, {table, col, bitmap, false});
+            const bool externalSeed =
+                outerFilterSeedCols.count({table, col}) != 0 &&
+                canDirectProbeValueTableFromOuterSeed(table, col);
+            addState(table, col, {table, col, bitmap, externalSeed});
         }
     }
 
@@ -538,6 +731,15 @@ static std::optional<ScalarLookupInfo> buildDecorrelatedScalarPreAgg(
                     dst = &c.inner;
                 }
                 if (!dst || dst->table.empty() || hasState(dst->table, dst->column)) continue;
+                const bool directValueProbeAvailable =
+                    st.externalToTable &&
+                    c.outer.table == st.table &&
+                    c.outer.column == st.column &&
+                    c.inner.table == dsq.valueTable &&
+                    !stateFeedsInnerJoin(c.inner.table, c.inner.column) &&
+                    keyDomainsMatch(st.table, st.column,
+                                    c.inner.table, c.inner.column);
+                if (directValueProbeAvailable) continue;
                 std::string bitmap = stateName(dst->table, dst->column, "corr");
                 std::unique_ptr<MetalOperator> pipe = makeAutoScan(dst->table, idxVar);
                 pipe = std::make_unique<MetalBitmapProbe>(
@@ -606,14 +808,17 @@ static std::optional<ScalarLookupInfo> buildDecorrelatedScalarPreAgg(
                                                 (info.keyCol2.empty() ? "" : "_" + info.keyCol2) +
                                                 "_" + (dsq.valueCol.empty() ? "star" : dsq.valueCol));
     if (info.keyCols.empty()) {
+        info.scalarName = "s_scalar_global_" + std::to_string(dsq.sqIdx);
         const std::string valueExpr = dsq.countStar ? "1.0f" : dsq.valueCol + "[" + idxVar + "]";
         if (dsq.func == AggFunc::COUNT) {
             info.kind = ScalarLookupInfo::GlobalCount;
             info.countBuffer = base + "_cnt";
             auto count = std::make_unique<MetalAtomicCount>(
                 makeAggInput(), info.countBuffer, "0u", "1");
-            appendPhase(plan, "GENERIC_scalar_global_" + std::to_string(dsq.sqIdx) + "_count",
-                        std::move(count), 256);
+            auto& phase = appendPhase(
+                plan, "GENERIC_scalar_global_" + std::to_string(dsq.sqIdx) + "_count",
+                std::move(count), 256);
+            attachGlobalScalarValueHook(phase, info);
             return info;
         }
         if (dsq.func == AggFunc::AVG) {
@@ -626,8 +831,10 @@ static std::optional<ScalarLookupInfo> buildDecorrelatedScalarPreAgg(
                         std::move(count), 256);
             auto sum = makeScalarGlobalFloatAgg(
                 makeAggInput(), "sum", info.sumBuffer, "", valueExpr);
-            appendPhase(plan, "GENERIC_scalar_global_" + std::to_string(dsq.sqIdx) + "_avg_sum",
-                        std::move(sum), 256);
+            auto& phase = appendPhase(
+                plan, "GENERIC_scalar_global_" + std::to_string(dsq.sqIdx) + "_avg_sum",
+                std::move(sum), 256);
+            attachGlobalScalarValueHook(phase, info);
             return info;
         }
         if (dsq.func == AggFunc::SUM) {
@@ -635,8 +842,10 @@ static std::optional<ScalarLookupInfo> buildDecorrelatedScalarPreAgg(
             info.sumBuffer = base + "_sum";
             auto sum = makeScalarGlobalFloatAgg(
                 makeAggInput(), "sum", info.sumBuffer, "", valueExpr);
-            appendPhase(plan, "GENERIC_scalar_global_" + std::to_string(dsq.sqIdx) + "_sum",
-                        std::move(sum), 256);
+            auto& phase = appendPhase(
+                plan, "GENERIC_scalar_global_" + std::to_string(dsq.sqIdx) + "_sum",
+                std::move(sum), 256);
+            attachGlobalScalarValueHook(phase, info);
             return info;
         }
         if (dsq.func == AggFunc::MIN || dsq.func == AggFunc::MAX) {
@@ -649,9 +858,12 @@ static std::optional<ScalarLookupInfo> buildDecorrelatedScalarPreAgg(
                 makeAggInput(), isMin ? "min" : "max",
                 isMin ? info.minBuffer : info.maxBuffer,
                 info.stateBuffer, valueExpr);
-            appendPhase(plan, "GENERIC_scalar_global_" + std::to_string(dsq.sqIdx) +
-                              (isMin ? "_min" : "_max"),
-                        std::move(minmax), 256);
+            auto& phase = appendPhase(
+                plan,
+                "GENERIC_scalar_global_" + std::to_string(dsq.sqIdx) +
+                    (isMin ? "_min" : "_max"),
+                std::move(minmax), 256);
+            attachGlobalScalarValueHook(phase, info);
             return info;
         }
         return std::nullopt;

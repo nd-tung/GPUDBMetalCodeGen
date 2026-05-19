@@ -1,5 +1,6 @@
 #include "generic/lowering/generic_multi_table_join_lowering.h"
 
+#include "generic/lowering/generic_cost_model.h"
 #include "generic/lowering/generic_expression_metal.h"
 #include "generic/lowering/generic_plan_shapes.h"
 #include "generic/lowering/generic_relation_analysis.h"
@@ -323,6 +324,7 @@ struct IrBuildSide {
     std::optional<IrExistsDistinctInfo> existsDistinct;
     bool emitKeyList = false;
     std::optional<IrDomainKeyDrive> domainKeyDrive;
+    bool elideBitmapWithCarrySentinel = false;
 };
 
 struct IrScanSide {
@@ -542,10 +544,12 @@ public:
 
     void produce(MetalCodegen& cg, ConsumerFn consume) override {
         cg.addBitmapWriteParam(bitmapName_, bitmapSizeExpr_);
+        const std::string suffix = sanitizeIdentifier(keyListBuffer_);
+        const std::string capacityParam = "n_keylist_capacity_" + suffix;
+        cg.addResolvedScalarParam(capacityParam, "uint", keyListCapacityExpr_);
         cg.addBufferParam(keyListBuffer_, "uint", keyListCapacityExpr_, false);
         cg.addAtomicBufferParam(keyListCountBuffer_, "atomic_uint", "1");
 
-        const std::string suffix = sanitizeIdentifier(keyListBuffer_);
         child_->produce(cg, [&]() {
             cg.addLine("uint _ir_keylist_key_" + suffix + " = (uint)(" +
                        keyExpr_ + ");");
@@ -554,8 +558,8 @@ public:
             cg.addLine("uint _ir_keylist_slot_" + suffix +
                        " = atomic_fetch_add_explicit(&" + keyListCountBuffer_ +
                        "[0], 1u, memory_order_relaxed);");
-            cg.addIf("_ir_keylist_slot_" + suffix + " < (uint)(" +
-                     keyListCapacityExpr_ + ")", [&]() {
+            cg.addIf("_ir_keylist_slot_" + suffix + " < " +
+                     capacityParam, [&]() {
                 cg.addLine(keyListBuffer_ + "[_ir_keylist_slot_" + suffix +
                            "] = _ir_keylist_key_" + suffix + ";");
             });
@@ -1077,7 +1081,8 @@ std::string carryValueExpr(const IrCarryColumn& carry,
         return carry.varName;
     if (carry.column.type.type == DataType::CHAR_FIXED) {
         int width = carry.column.type.fixedWidth > 0 ? carry.column.type.fixedWidth : 1;
-        return carry.column.column + " + " + idxVar + " * " + std::to_string(width);
+        return carry.column.column + " + " + idxVar + " * " +
+               std::to_string(width) + "ul";
     }
     return carry.column.column + "[" + idxVar + "]";
 }
@@ -1336,6 +1341,36 @@ void addSiblingBitmapFilters(std::map<int, IrBuildSide>& buildByRel) {
             }
         }
     }
+}
+
+bool carryLookupHasReliableSentinel(const IrCarryColumn& carry) {
+    switch (carry.column.type.type) {
+        case DataType::INT:
+        case DataType::DATE:
+        case DataType::CHAR_FIXED:
+            return true;
+        default:
+            return false;
+    }
+}
+
+bool canElideBitmapWithCarrySentinel(const IrBuildSide& build,
+                                     const AnalyzedQuery* aq) {
+    if (build.useHashJoin || build.semiJoinFilter || build.antiJoinFilter ||
+        build.existsDistinct || build.emitKeyList ||
+        build.subtreeCarries.empty() || !build.scan || !aq || !aq->schema) {
+        return false;
+    }
+    if (!aq->inSubAggs.empty())
+        return false;
+    auto pk = aq->schema->pkInfo(build.scan->table);
+    if (!pk || pk->first != build.joinCol.column)
+        return false;
+    for (const auto& carry : build.subtreeCarries) {
+        if (!carryLookupHasReliableSentinel(carry))
+            return false;
+    }
+    return true;
 }
 
 void configureDomainKeyListDrives(std::map<int, IrBuildSide>& buildByRel) {
@@ -1778,6 +1813,19 @@ std::optional<MultiTableJoinLowering> buildMultiTableJoinLowering(
     computeSubtreeCarries(probeRel);
     addSiblingBitmapFilters(buildByRel);
     configureDomainKeyListDrives(buildByRel);
+    std::set<std::string> siblingBitmapReads;
+    for (const auto& [_, build] : buildByRel) {
+        for (const auto& filter : build.siblingBitmapFilters)
+            siblingBitmapReads.insert(filter.bitmapName);
+    }
+    for (auto& [rel, build] : buildByRel) {
+        if (rel == probeRel || build.bitmapName.empty() ||
+            siblingBitmapReads.count(build.bitmapName) != 0) {
+            continue;
+        }
+        build.elideBitmapWithCarrySentinel =
+            canElideBitmapWithCarrySentinel(build, aq);
+    }
 
     for (const auto& [rel, build] : buildByRel) {
         if (rel == probeRel || !build.useHashJoin) continue;
@@ -1962,6 +2010,8 @@ std::optional<MultiTableJoinLowering> buildMultiTableJoinLowering(
         std::string bitmapName;
         bool externalToRelation = false;
         int specIndex = -1;
+        double estimatedActiveKeyFraction = 0.5;
+        int propagationDepth = 0;
     };
 
     struct SelectiveKeysetBuildSpec {
@@ -1973,6 +2023,8 @@ std::optional<MultiTableJoinLowering> buildMultiTableJoinLowering(
         int sourceSpecIndex = -1;
         std::string sourceBitmapName;
         std::string sourceProbeColumn;
+        double estimatedActiveKeyFraction = 0.5;
+        int propagationDepth = 0;
     };
 
     std::map<int, std::map<std::string, GenericColumnExpr>> keysetColumnsByRel;
@@ -1998,11 +2050,14 @@ std::optional<MultiTableJoinLowering> buildMultiTableJoinLowering(
     auto addKeysetState = [&](const GenericColumnExpr& col,
                               std::string bitmapName,
                               bool externalToRelation,
-                              int specIndex) {
+                              int specIndex,
+                              double estimatedActiveKeyFraction,
+                              int propagationDepth) {
         std::pair<int, std::string> key{col.relationInstance.value, col.column};
         if (keysetStates.count(key)) return false;
         keysetStates[key] = SelectiveKeysetState{
-            col, std::move(bitmapName), externalToRelation, specIndex};
+            col, std::move(bitmapName), externalToRelation, specIndex,
+            estimatedActiveKeyFraction, propagationDepth};
         return true;
     };
     auto relationImmediateFilters = [&](int rel) {
@@ -2084,9 +2139,10 @@ std::optional<MultiTableJoinLowering> buildMultiTableJoinLowering(
                 spec.outputColumn = col;
                 spec.bitmapName = bitmapName;
                 spec.reason = "seed";
+                spec.estimatedActiveKeyFraction = 0.25;
                 const int specIndex = static_cast<int>(keysetSpecs.size());
                 keysetSpecs.push_back(std::move(spec));
-                addKeysetState(col, bitmapName, false, specIndex);
+                addKeysetState(col, bitmapName, false, specIndex, 0.25, 0);
             }
         }
     }
@@ -2124,11 +2180,18 @@ std::optional<MultiTableJoinLowering> buildMultiTableJoinLowering(
                     spec.sourceSpecIndex = state.specIndex;
                     spec.sourceBitmapName = state.bitmapName;
                     spec.sourceProbeColumn = state.column.column;
+                    const double activeFraction =
+                        std::min(0.95, std::max(0.05,
+                            state.estimatedActiveKeyFraction * 1.5));
+                    const int propagationDepth = state.propagationDepth + 1;
+                    spec.estimatedActiveKeyFraction = activeFraction;
+                    spec.propagationDepth = propagationDepth;
                     const int specIndex = static_cast<int>(keysetSpecs.size());
                     keysetSpecs.push_back(std::move(spec));
                     keysetChanged =
                         addKeysetState(outCol, bitmapName,
-                                       state.externalToRelation, specIndex) ||
+                                       state.externalToRelation, specIndex,
+                                       activeFraction, propagationDepth) ||
                         keysetChanged;
                 }
             }
@@ -2165,10 +2228,17 @@ std::optional<MultiTableJoinLowering> buildMultiTableJoinLowering(
                 spec.sourceSpecIndex = state.specIndex;
                 spec.sourceBitmapName = state.bitmapName;
                 spec.sourceProbeColumn = dst->column;
+                const double activeFraction =
+                    std::min(0.95, std::max(0.05,
+                        state.estimatedActiveKeyFraction * 1.25));
+                const int propagationDepth = state.propagationDepth + 1;
+                spec.estimatedActiveKeyFraction = activeFraction;
+                spec.propagationDepth = propagationDepth;
                 const int specIndex = static_cast<int>(keysetSpecs.size());
                 keysetSpecs.push_back(std::move(spec));
                 keysetChanged =
-                    addKeysetState(*dst, bitmapName, true, specIndex) ||
+                    addKeysetState(*dst, bitmapName, true, specIndex,
+                                   activeFraction, propagationDepth) ||
                     keysetChanged;
             }
         }
@@ -2199,6 +2269,57 @@ std::optional<MultiTableJoinLowering> buildMultiTableJoinLowering(
         }
         return false;
     };
+    auto relationRowsExpr = [&](int rel) {
+        auto sideIt = sideByRel.find(rel);
+        if (sideIt == sideByRel.end() || !sideIt->second.scan)
+            return std::string{};
+        return tableSizeName(sideIt->second.scan->table);
+    };
+    auto relationFilterWidth = [&](int rel, const GenericColumnExpr& keyCol) {
+        size_t width = genericCostTypeByteWidth(keyCol.type);
+        auto buildIt = buildByRel.find(rel);
+        if (buildIt != buildByRel.end()) {
+            width += genericCostTypeByteWidth(buildIt->second.joinCol.type);
+            if (!buildIt->second.joinCol2.column.empty())
+                width += genericCostTypeByteWidth(buildIt->second.joinCol2.type);
+            width += buildIt->second.subtreeCarries.size() * 4;
+        } else if (rel == probeRel) {
+            for (const auto& childRel :
+                 orderedJoinChildren(buildByRel[probeRel].children, buildByRel)) {
+                const auto& child = buildByRel.at(childRel);
+                width += genericCostTypeByteWidth(child.parentCol.type);
+            }
+        }
+        return std::max<size_t>(width, 64);
+    };
+    auto choosePropagatedKeyset = [&](const SelectiveKeysetState& state,
+                                      int targetRel) {
+        KeysetPropagationCostInput input;
+        input.tag = "ir_multi_table_keyset_" +
+            std::to_string(state.column.relationInstance.value) + "_" +
+            sanitizeIdentifier(state.column.column);
+        if (state.specIndex >= 0 &&
+            state.specIndex < static_cast<int>(keysetSpecs.size())) {
+            const auto& spec = keysetSpecs[(size_t)state.specIndex];
+            input.buildRowsExpr = relationRowsExpr(spec.scanRelation);
+            input.hasSourceBitmap = spec.sourceSpecIndex >= 0;
+            input.estimatedActiveKeyFraction =
+                spec.estimatedActiveKeyFraction;
+            input.propagationDepth = spec.propagationDepth;
+        } else {
+            input.estimatedActiveKeyFraction =
+                state.estimatedActiveKeyFraction;
+            input.propagationDepth = state.propagationDepth;
+        }
+        input.targetRowsExpr = relationRowsExpr(targetRel);
+        input.keyDomainExpr =
+            keyDomainExprForColumn(state.column, aq ? aq->schema : nullptr);
+        input.keyByteWidth = genericCostTypeByteWidth(state.column.type);
+        input.targetRowByteWidth = relationFilterWidth(targetRel, state.column);
+        auto choice = chooseKeysetPropagation(input);
+        appendGenericCostDecisionTrace(lowering.plan, choice.trace);
+        return choice;
+    };
     std::set<int> requiredKeysetSpecs;
     std::function<void(int)> markRequiredKeysetSpec = [&](int specIndex) {
         if (specIndex < 0 ||
@@ -2212,6 +2333,8 @@ std::optional<MultiTableJoinLowering> buildMultiTableJoinLowering(
         if (!state.externalToRelation) continue;
         const int rel = state.column.relationInstance.value;
         if (rel == probeRel) {
+            auto choice = choosePropagatedKeyset(state, probeRel);
+            if (!choice.useKeyset) continue;
             addPropagatedFilter(probePropagatedBitmapFilters,
                                 state.bitmapName, state.column.column);
             markRequiredKeysetSpec(state.specIndex);
@@ -2221,6 +2344,8 @@ std::optional<MultiTableJoinLowering> buildMultiTableJoinLowering(
         if (buildIt == buildByRel.end()) continue;
         if (buildAlreadyFiltersColumn(buildIt->second, state.column.column))
             continue;
+        auto choice = choosePropagatedKeyset(state, rel);
+        if (!choice.useKeyset) continue;
         addPropagatedFilter(buildIt->second.propagatedBitmapFilters,
                             state.bitmapName, state.column.column);
         markRequiredKeysetSpec(state.specIndex);
@@ -2426,7 +2551,10 @@ std::optional<MultiTableJoinLowering> buildMultiTableJoinLowering(
         for (int childRel : orderedJoinChildren(build.children, buildByRel)) {
             const auto& child = buildByRel.at(childRel);
             const std::string childProbeKeyExpr = child.parentCol.column + "[" + idxVar + "]";
-            if (child.antiJoinFilter) {
+            if (child.elideBitmapWithCarrySentinel) {
+                // Sentinel-guarded carry lookups below replace the bitmap
+                // existence probe for this key-preserving build side.
+            } else if (child.antiJoinFilter) {
                 buildPipe = std::make_unique<MetalAntiBitmapProbe>(
                     std::move(buildPipe), child.bitmapName, childProbeKeyExpr);
             } else {
@@ -2473,10 +2601,23 @@ std::optional<MultiTableJoinLowering> buildMultiTableJoinLowering(
             }
 
             const std::string aggArrayName = "d_ir_in_" + buildTag + "_agg";
+            const std::string aggKeyListBuffer =
+                "d_ir_in_" + buildTag + "_keys";
+            const std::string aggKeyListCountBuffer =
+                aggKeyListBuffer + "_count";
             const std::string bucketExpr = subAgg->groupCol + "[" + idxVar + "]";
             const std::string valueExpr = aggFunc == "count"
                 ? "1.0f"
                 : subAgg->aggExpr + "[" + idxVar + "]";
+            lowering.inSubAggs.push_back(GenericInSubAggInfo{
+                build.scan ? build.scan->table : std::string{},
+                subAgg->groupCol,
+                aggFunc == "count" ? std::string{} : subAgg->aggExpr,
+                aggFunc,
+                aggArrayName,
+                build.keyDomain,
+                aggKeyListBuffer,
+                aggKeyListCountBuffer});
             const bool canSegmentRuns =
                 build.scan && build.filters.empty() && build.children.empty() &&
                 !buildUsesScalarLookupBuffer &&
@@ -2511,9 +2652,10 @@ std::optional<MultiTableJoinLowering> buildMultiTableJoinLowering(
             }
             auto filterPipe = std::make_unique<MetalSelection>(
                 std::move(rangeScan), *havingCond);
-            auto bitmapPipe = std::make_unique<MetalBitmapBuild>(
+            auto bitmapPipe = std::make_unique<MetalBitmapBuildWithKeyList>(
                 std::move(filterPipe), build.bitmapName, idxVar,
-                "(" + build.keyDomain + " + 31) / 32");
+                "(" + build.keyDomain + " + 31) / 32",
+                aggKeyListBuffer, aggKeyListCountBuffer, build.keyDomain);
             auto& bitmapPhase = appendPhase(
                 lowering.plan, "GENERIC_ir_multi_table_build_" + buildTag,
                 std::move(bitmapPipe));
@@ -2522,7 +2664,10 @@ std::optional<MultiTableJoinLowering> buildMultiTableJoinLowering(
             continue;
         }
 
-        if (build.emitKeyList) {
+        if (build.elideBitmapWithCarrySentinel) {
+            // Carried array lookups are sentinel-guarded, so the carry itself
+            // encodes whether the build-side key survived the filters above.
+        } else if (build.emitKeyList) {
             buildPipe = std::make_unique<MetalBitmapBuildWithKeyList>(
                 std::move(buildPipe), build.bitmapName, buildKeyExpr,
                 "(" + build.keyDomain + " + 31) / 32",
@@ -2538,6 +2683,23 @@ std::optional<MultiTableJoinLowering> buildMultiTableJoinLowering(
             buildPipe = appendCarryStore(std::move(buildPipe), *build.scan,
                                          carry, buildKeyExpr, rel, idxVar,
                                          build.keyDomain);
+        }
+        if (!build.elideBitmapWithCarrySentinel) {
+            const std::string phaseName =
+                "GENERIC_ir_multi_table_build_" + buildTag;
+            lowering.domainBitmaps.push_back(GenericJoinDomainBitmapInfo{
+                build.relationInstance,
+                build.scan ? build.scan->table : std::string{},
+                build.scan ? build.scan->alias : std::string{},
+                build.joinCol.column,
+                build.bitmapName,
+                build.keyDomain,
+                phaseName});
+            auto& phase = appendPhase(lowering.plan, phaseName,
+                                      std::move(buildPipe));
+            if (buildUsesScalarLookupBuffer && scalarLookups)
+                attachGenericScalarLookupBuffers(phase, *scalarLookups);
+            continue;
         }
         auto& phase = appendPhase(lowering.plan,
                                   "GENERIC_ir_multi_table_build_" + buildTag,
@@ -2608,7 +2770,7 @@ std::optional<MultiTableJoinLowering> buildMultiTableJoinLowering(
         if (build.antiJoinFilter) {
             lowering.probePipe = std::make_unique<MetalAntiBitmapProbe>(
                 std::move(lowering.probePipe), build.bitmapName, probeKeyExpr);
-        } else {
+        } else if (!build.elideBitmapWithCarrySentinel) {
             lowering.probePipe = std::make_unique<MetalBitmapProbe>(
                 std::move(lowering.probePipe), build.bitmapName, probeKeyExpr);
         }
@@ -2642,6 +2804,7 @@ std::optional<MultiTableJoinLowering> buildMultiTableJoinLowering(
             std::move(lowering.probePipe), cond);
     }
 
+    lowering.probeUsesScalarLookupBuffer = probeUsesScalarLookupBuffer;
     return lowering;
 }
 

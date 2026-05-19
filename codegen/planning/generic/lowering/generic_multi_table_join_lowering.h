@@ -12,12 +12,36 @@
 
 namespace codegen {
 
+struct GenericJoinDomainBitmapInfo {
+    int relationInstance = -1;
+    std::string storageTable;
+    std::string storageAlias;
+    std::string keyColumn;
+    std::string bitmapName;
+    std::string keyDomain;
+    std::string buildPhaseName;
+};
+
+struct GenericInSubAggInfo {
+    std::string table;
+    std::string keyColumn;
+    std::string valueColumn;
+    std::string aggFunc;
+    std::string aggBuffer;
+    std::string keyDomain;
+    std::string keyListBuffer;
+    std::string keyListCountBuffer;
+};
+
 struct MultiTableJoinLowering {
     MetalQueryPlan plan;
     std::unique_ptr<MetalOperator> probePipe;
     const GenericScanDetail* probeScan = nullptr;
     std::string outputSize;
     IrCarryMap carryMap;
+    std::vector<GenericJoinDomainBitmapInfo> domainBitmaps;
+    std::vector<GenericInSubAggInfo> inSubAggs;
+    bool probeUsesScalarLookupBuffer = false;
 };
 
 std::optional<MultiTableJoinLowering> buildMultiTableJoinLowering(

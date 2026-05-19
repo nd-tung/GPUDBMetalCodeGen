@@ -216,7 +216,7 @@ inline bool fixed_string_segment_eq(const device char* value,
 }
 
 inline bool fixed_like_one_segment(const device char* data,
-                                   uint row,
+                                   ulong row,
                                    uint width,
                                    ulong seg_lo,
                                    ulong seg_hi,
@@ -224,7 +224,7 @@ inline bool fixed_like_one_segment(const device char* data,
                                    bool leading_wildcard,
                                    bool trailing_wildcard) {
     if (seg_len > width) return false;
-    const device char* value = data + row * width;
+    const device char* value = data + row * (ulong)width;
     uint last_start = leading_wildcard ? (width - seg_len) : 0u;
     for (uint start = 0u; start <= last_start; start++) {
         if (fixed_string_segment_eq(value, width, start, seg_lo, seg_hi, seg_len) &&
@@ -236,7 +236,7 @@ inline bool fixed_like_one_segment(const device char* data,
 }
 
 inline bool fixed_like_two_segment(const device char* data,
-                                   uint row,
+                                   ulong row,
                                    uint width,
                                    ulong first_lo,
                                    ulong first_hi,
@@ -247,8 +247,8 @@ inline bool fixed_like_two_segment(const device char* data,
                                    bool leading_wildcard,
                                    bool trailing_wildcard) {
     if (first_len + second_len > width) return false;
-    const device char* value = data + row * width;
-    uint first_last = leading_wildcard ? (width - first_len - second_len) : 0u;
+    const device char* value = data + row * (ulong)width;
+    uint first_last = leading_wildcard ? (width - first_len) : 0u;
     for (uint first_start = 0u; first_start <= first_last; first_start++) {
         if (!fixed_string_segment_eq(value, width, first_start, first_lo, first_hi, first_len)) {
             if (!leading_wildcard) break;

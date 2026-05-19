@@ -46,6 +46,9 @@ struct MetalQueryPlan {
     // Helper device functions emitted before all kernels.
     std::vector<std::string> helpers;
 
+    // Optional planner cost traces for debugging physical-plan choices.
+    std::vector<std::string> costTraces;
+
     // Data-larger-than-memory (DLM) opt-in. When true, the driver may run
     // this plan under the chunked-streaming path: the largest scanned
     // .colbin table is split into row-chunks, stream phases run per chunk

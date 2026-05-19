@@ -559,6 +559,8 @@ public:
                                  const std::string& listBuffer,
                                  const std::string& counterBuffer,
                                  const std::string& bucketCountExpr);
+    void addExtraBufferParam(const std::string& name,
+                             const std::string& elementType);
     void produce(MetalCodegen& cg, ConsumerFn consume) override;
     std::string describe() const override;
     void iusUsed(std::vector<IU>& out) const override {
@@ -596,6 +598,7 @@ private:
         std::string bucketCountExpr;
     };
     std::optional<ActiveBucketTracking> activeBucketTracking_;
+    std::vector<std::pair<std::string, std::string>> extraBuffers_;
 
     struct DistinctBitmap {
         std::string outputName;     // buffer name for popcount output

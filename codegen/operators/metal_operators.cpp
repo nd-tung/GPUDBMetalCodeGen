@@ -60,55 +60,69 @@ void MetalOperator::appendIUsFromExpr(const std::string& expr,
         out.emplace_back(colName, expr.substr(is, p - is));
     }
 
-    // Pass 3: bare column refs in fixed-string helpers.
-    // These helpers take the column buffer as first arg (bare identifier
-    // without [idx]) and the row index as second arg: (uint)(idxVar).
-    // Fixed-string helpers pass the column buffer first and row index second.
-    const char* helpers[] = {
-        "fixed_like_one_segment(", "fixed_like_two_segment(",
-        "fixed_string_segment_eq(", "fixed_string_padding_ok(",
-        "q2_type_ends_brass(", "q13_comment_match(",
-        "q16_has_complaint(", "brand_eq(", "container_match("
+    auto skipSpaces = [&](size_t& p) {
+        while (p < n && expr[p] == ' ') ++p;
     };
-    for (const char* hdr : helpers) {
-        size_t pos = 0;
-        while ((pos = expr.find(hdr, pos)) != std::string::npos) {
-            pos += strlen(hdr);
-            // Skip whitespace
-            while (pos < n && expr[pos] == ' ') ++pos;
-            if (pos >= n || !isIdent(expr[pos])) { ++pos; continue; }
-            size_t cs = pos;
-            while (pos < n && isIdent(expr[pos])) ++pos;
-            std::string colName = expr.substr(cs, pos - cs);
-            // Find idxVar from second arg: (uint)(i), — skip type casts
-            std::string idxVar;
-            while (pos < n && expr[pos] != ',') ++pos;
-            if (pos < n) {
-                ++pos; // skip ','
-                while (pos < n && expr[pos] == ' ') ++pos;
-                // Skip type-cast: "(uint)" style
-                if (pos < n && expr[pos] == '(') {
-                    while (pos < n && expr[pos] != ')') ++pos;
-                    if (pos < n) ++pos; // skip ')'
-                    while (pos < n && expr[pos] == ' ') ++pos;
-                }
-                // The next token may be wrapped in parens: "(i)" — extract it
-                if (pos < n && expr[pos] == '(') {
-                    ++pos; // skip '('
-                    while (pos < n && expr[pos] == ' ') ++pos;
-                    if (pos < n && isIdent(expr[pos])) {
-                        size_t is = pos;
-                        while (pos < n && isIdent(expr[pos])) ++pos;
-                        idxVar = expr.substr(is, pos - is);
-                    }
-                } else if (pos < n && isIdent(expr[pos])) {
-                    size_t is = pos;
-                    while (pos < n && isIdent(expr[pos])) ++pos;
-                    idxVar = expr.substr(is, pos - is);
-                }
+    auto parseIdentifier = [&](size_t& p) -> std::string {
+        if (p >= n || !isIdent(expr[p])) return {};
+        size_t start = p;
+        while (p < n && isIdent(expr[p])) ++p;
+        return expr.substr(start, p - start);
+    };
+    auto isScalarCastType = [](const std::string& name) {
+        return name == "uint" || name == "int" || name == "float" ||
+               name == "long" || name == "ulong" || name == "short" ||
+               name == "ushort" || name == "char" || name == "uchar";
+    };
+    auto parseRowIndexArg = [&](size_t& p) -> std::string {
+        skipSpaces(p);
+        if (p < n && expr[p] == '(') {
+            size_t castStart = p + 1;
+            while (castStart < n && expr[castStart] == ' ') ++castStart;
+            size_t castEnd = castStart;
+            while (castEnd < n && isIdent(expr[castEnd])) ++castEnd;
+            size_t close = castEnd;
+            while (close < n && expr[close] == ' ') ++close;
+            const std::string castName =
+                expr.substr(castStart, castEnd - castStart);
+            if (isScalarCastType(castName) && close < n &&
+                expr[close] == ')') {
+                p = close + 1;
+                skipSpaces(p);
             }
-            out.emplace_back(colName, idxVar);
         }
+        if (p < n && expr[p] == '(') {
+            ++p;
+            skipSpaces(p);
+            std::string idx = parseIdentifier(p);
+            if (!idx.empty()) {
+                skipSpaces(p);
+                if (p < n && expr[p] == ')') ++p;
+            }
+            return idx;
+        }
+        return parseIdentifier(p);
+    };
+
+    // Pass 3: bare column refs passed to helper-like function calls.
+    // Helper calls that operate on fixed-string columns pass the column buffer
+    // first and the row index second, e.g. helper(col_name, (uint)(i), ...).
+    i = 0;
+    while (i < n) {
+        if (!isIdent(expr[i])) { ++i; continue; }
+        while (i < n && isIdent(expr[i])) ++i;
+        skipSpaces(i);
+        if (i >= n || expr[i] != '(') continue;
+        size_t p = i + 1;
+        skipSpaces(p);
+        std::string colName = parseIdentifier(p);
+        if (colName.empty()) continue;
+        skipSpaces(p);
+        if (p >= n || expr[p] != ',') continue;
+        ++p;
+        std::string idxVar = parseRowIndexArg(p);
+        if (!idxVar.empty())
+            out.emplace_back(colName, idxVar);
     }
 }
 
@@ -964,6 +978,12 @@ void MetalKeyedAgg::setActiveBucketTracking(const std::string& flagBuffer,
         flagBuffer, listBuffer, counterBuffer, bucketCountExpr};
 }
 
+void MetalKeyedAgg::addExtraBufferParam(const std::string& name,
+                                        const std::string& elementType) {
+    if (name.empty() || elementType.empty()) return;
+    extraBuffers_.push_back({name, elementType});
+}
+
 void MetalKeyedAgg::addDistinctBitmap(const std::string& outputName,
                                        const std::string& valueExpr,
                                        const std::string& maxValueExpr) {
@@ -1000,6 +1020,9 @@ void MetalKeyedAgg::produce(MetalCodegen& cg, ConsumerFn consume) {
                                     havingTotalAgg->isLongPair ? "2" : "1");
         }
     }
+
+    for (const auto& extra : extraBuffers_)
+        cg.addBufferParam(extra.first, extra.second, "", false);
 
     // Register COUNT(DISTINCT) bitmap buffers.
     for (const auto& db : distinctBitmaps_) {
@@ -1545,7 +1568,7 @@ void MetalMaterialize::produce(MetalCodegen& cg, ConsumerFn consume) {
         for (const auto& col : columns_) {
             if (col.stringLen > 0) {
                 cg.addBlock("for (uint _ci = 0; _ci < " + std::to_string(col.stringLen) + "; _ci++)", [&]() {
-                    cg.addLine(col.arrayName + "[_pos * " + std::to_string(col.stringLen) + " + _ci] = " +
+                    cg.addLine(col.arrayName + "[(ulong)_pos * " + std::to_string(col.stringLen) + "ul + _ci] = " +
                                "(" + col.valueExpr + ")[_ci];");
                 });
             } else {
