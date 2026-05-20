@@ -160,7 +160,6 @@ static void q20_qual_emit(const device ulong* ht_keys,
             "(q20_qual_emit(d_q20_ht_keys, d_q20_ht_vals, d_q20_ht_psidx, "
             "ps_availqty, ps_suppkey, d_q20_qual_supp_bitmap, " + idx + "), 0)");
         auto& phase = appendPhase(plan, "Q20_filter_ht_to_bitmap", std::move(sideEffect));
-        // Re-bind HT buffers as read-only views after the phase barrier.
         phase.extraBuffers.push_back({"d_q20_ht_keys",          "ulong", true,  false});
         phase.extraBuffers.push_back({"d_q20_ht_vals",          "float", true,  false});
         phase.extraBuffers.push_back({"d_q20_ht_psidx",         "int",   true,  false});
@@ -222,9 +221,10 @@ static void q20_result_emit(device atomic_uint* counter,
         };
         GenericSortSpec sortSpec;
         sortSpec.keys.push_back({"s_name", false});
-        std::string sortError;
-        appendGenericGpuSort(plan, "q20_result", resultRows,
-                             "n_supplier", columns, sortSpec, &sortError);
+        std::string orderError;
+        appendBestGenericGpuOrder(plan, "q20_result", resultRows,
+                                  "n_supplier", columns, sortSpec,
+                                  &orderError);
     }
 
     return plan;

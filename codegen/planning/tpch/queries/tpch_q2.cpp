@@ -4,6 +4,95 @@
 
 namespace codegen {
 
+namespace {
+
+class Q2RegionBitmapBuild : public MetalUnaryOperator {
+public:
+    explicit Q2RegionBitmapBuild(std::unique_ptr<MetalOperator> child,
+                                 std::string idx)
+        : MetalUnaryOperator(std::move(child)), idx_(std::move(idx)) {}
+
+    void produce(MetalCodegen& cg, ConsumerFn consume) override {
+        cg.addAtomicBufferParam("d_q2_region_bitmap", "atomic_uint", "1");
+        child_->produce(cg, [&]() {
+            cg.addIf("q2_region_is_europe(r_name, " + idx_ + ")", [&]() {
+                cg.addLine("bitmap_set(d_q2_region_bitmap, r_regionkey[" + idx_ + "]);");
+                consume();
+            });
+        });
+    }
+
+    std::string describe() const override { return "Q2RegionBitmapBuild"; }
+    void iusUsed(std::vector<IU>& out) const override {
+        appendIUsFromExpr("r_name[" + idx_ + "]", out);
+        appendIUsFromExpr("r_regionkey[" + idx_ + "]", out);
+    }
+
+private:
+    std::string idx_;
+};
+
+class Q2NationIndexAndBitmapBuild : public MetalUnaryOperator {
+public:
+    explicit Q2NationIndexAndBitmapBuild(std::unique_ptr<MetalOperator> child,
+                                         std::string idx)
+        : MetalUnaryOperator(std::move(child)), idx_(std::move(idx)) {}
+
+    void produce(MetalCodegen& cg, ConsumerFn consume) override {
+        cg.addBufferParam("d_q2_nation_idx", "int", "25", true, 0xFF);
+        cg.addBufferParam("d_q2_region_bitmap", "const atomic_uint", "", false);
+        cg.addAtomicBufferParam("d_q2_nation_bitmap", "atomic_uint", "1");
+        child_->produce(cg, [&]() {
+            cg.addLine("d_q2_nation_idx[n_nationkey[" + idx_ + "]] = (int)" + idx_ + ";");
+            cg.addIf("bitmap_test_atomic(d_q2_region_bitmap, n_regionkey[" + idx_ + "])", [&]() {
+                cg.addLine("bitmap_set(d_q2_nation_bitmap, n_nationkey[" + idx_ + "]);");
+            });
+            consume();
+        });
+    }
+
+    std::string describe() const override { return "Q2NationIndexAndBitmapBuild"; }
+    void iusUsed(std::vector<IU>& out) const override {
+        appendIUsFromExpr("n_nationkey[" + idx_ + "]", out);
+        appendIUsFromExpr("n_regionkey[" + idx_ + "]", out);
+    }
+
+private:
+    std::string idx_;
+};
+
+class Q2SupplierIndexAndBitmapBuild : public MetalUnaryOperator {
+public:
+    explicit Q2SupplierIndexAndBitmapBuild(std::unique_ptr<MetalOperator> child,
+                                           std::string idx)
+        : MetalUnaryOperator(std::move(child)), idx_(std::move(idx)) {}
+
+    void produce(MetalCodegen& cg, ConsumerFn consume) override {
+        cg.addBufferParam("d_q2_supp_idx", "int", "maxSuppkey", true, 0xFF);
+        cg.addBufferParam("d_q2_nation_bitmap", "const atomic_uint", "", false);
+        cg.addAtomicBufferParam("d_q2_supp_bitmap", "atomic_uint",
+                                "(maxSuppkey + 31) / 32");
+        child_->produce(cg, [&]() {
+            cg.addLine("d_q2_supp_idx[s_suppkey[" + idx_ + "]] = (int)" + idx_ + ";");
+            cg.addIf("bitmap_test_atomic(d_q2_nation_bitmap, s_nationkey[" + idx_ + "])", [&]() {
+                cg.addLine("bitmap_set(d_q2_supp_bitmap, s_suppkey[" + idx_ + "]);");
+            });
+            consume();
+        });
+    }
+
+    std::string describe() const override { return "Q2SupplierIndexAndBitmapBuild"; }
+    void iusUsed(std::vector<IU>& out) const override {
+        appendIUsFromExpr("s_suppkey[" + idx_ + "]", out);
+        appendIUsFromExpr("s_nationkey[" + idx_ + "]", out);
+    }
+
+private:
+    std::string idx_;
+};
+
+} // namespace
+
 // Q2: Minimum Cost Supplier.
 std::optional<MetalQueryPlan> buildQ2Plan_byName() {
     std::string idx = "i";
@@ -21,6 +110,14 @@ static bool q2_type_ends_brass(const device char* p_type, uint idx) {
 }
 )");
 
+    plan.helpers.push_back(R"(
+static bool q2_region_is_europe(const device char* r_name, uint idx) {
+    const device char* rn = r_name + (uint)idx * 25u;
+    return rn[0] == 'E' && rn[1] == 'U' && rn[2] == 'R' &&
+           rn[3] == 'O' && rn[4] == 'P' && rn[5] == 'E';
+}
+)");
+
     // Positive floats preserve ordering when reinterpreted as uint.
     plan.helpers.push_back(R"(
 static void q2_atomic_min(device atomic_uint* min_cost, uint partkey, float cost) {
@@ -32,6 +129,16 @@ static void q2_atomic_min(device atomic_uint* min_cost, uint partkey, float cost
     // --- Row Index Maps ---
     // Build row-index maps used by final materialization.
     {
+        auto scan = makeAutoScan("region", idx);
+        auto bitmap = std::make_unique<Q2RegionBitmapBuild>(std::move(scan), idx);
+        appendPhase(plan, "Q2_build_region_bitmap", std::move(bitmap), 64);
+    }
+    {
+        auto scan = makeAutoScan("nation", idx);
+        auto store = std::make_unique<Q2NationIndexAndBitmapBuild>(std::move(scan), idx);
+        appendPhase(plan, "Q2_build_nation_idx", std::move(store), 64);
+    }
+    {
         auto scan = makeAutoScan("part", idx);
         auto store = std::make_unique<MetalArrayStore>(
             std::move(scan), "d_q2_part_idx",
@@ -41,19 +148,8 @@ static void q2_atomic_min(device atomic_uint* min_cost, uint partkey, float cost
     }
     {
         auto scan = makeAutoScan("supplier", idx);
-        auto store = std::make_unique<MetalArrayStore>(
-            std::move(scan), "d_q2_supp_idx",
-            "s_suppkey[" + idx + "]", "(int)" + idx,
-            "int", "maxSuppkey", 0xFF);
+        auto store = std::make_unique<Q2SupplierIndexAndBitmapBuild>(std::move(scan), idx);
         appendPhase(plan, "Q2_build_supp_idx", std::move(store), 256);
-    }
-    {
-        auto scan = makeAutoScan("nation", idx);
-        auto store = std::make_unique<MetalArrayStore>(
-            std::move(scan), "d_q2_nation_idx",
-            "n_nationkey[" + idx + "]", "(int)" + idx,
-            "int", "25", 0xFF);
-        appendPhase(plan, "Q2_build_nation_idx", std::move(store), 64);
     }
 
     // --- Part Filter ---
@@ -201,13 +297,10 @@ static void q2_key_emit(device atomic_uint* counter,
         sortSpec.keys.push_back({"s_name", false});
         sortSpec.keys.push_back({"p_partkey", false});
         sortSpec.limit = 100;
-        std::string sortError;
-        if (!appendGenericGpuTopKSelection(plan, "q2_result", resultRows,
-                                           "q2_compact_cap", columns, sortSpec,
-                                           &sortError)) {
-            appendGenericGpuSort(plan, "q2_result", resultRows,
-                                 "q2_compact_cap", columns, sortSpec, &sortError);
-        }
+        std::string orderError;
+        appendBestGenericGpuOrder(plan, "q2_result", resultRows,
+                                  "q2_compact_cap", columns, sortSpec,
+                                  &orderError);
         if (plan.gpuSort) {
             struct Q2LateMaterializeTerminal : MetalOperator {
                 std::string sortedIndexBuffer_;

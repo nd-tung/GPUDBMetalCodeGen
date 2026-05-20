@@ -5,13 +5,10 @@
 #include <cstring>
 #include <iostream>
 #include <map>
-#include <set>
 #include <string>
 #include <vector>
 
 namespace codegen {
-
-Q16PostData g_q16Post;
 
 QueryColumns loadPreprocessColumns(MTL::Device* device,
                                    const std::string& tableName,
@@ -137,6 +134,26 @@ MTL::Buffer* registerFilledBuffer(MTL::Device* device,
     return buffer;
 }
 
+size_t nextPow2AtLeast(size_t value) {
+    size_t out = 1;
+    while (out < value) out <<= 1;
+    return out;
+}
+
+size_t estimateFixedPrefixHashSlots(size_t inputRows,
+                                    size_t fixedPrefixBytes,
+                                    size_t probeRows,
+                                    size_t minSlots = 1024) {
+    // Fixed string prefixes are selective, but probe-heavy hash tables still
+    // need low load factors because misses pay linear-probe cost.
+    const size_t prefixDenom = fixedPrefixBytes >= 4 ? 64 : 16;
+    const size_t probeHeavyGuard = probeRows >= inputRows * 4 ? 16 : 8;
+    const size_t estimatedRows = std::max<size_t>(
+        1, (inputRows + prefixDenom - 1) / prefixDenom);
+    const size_t guardedRows = std::max(minSlots, estimatedRows * probeHeavyGuard);
+    return nextPow2AtLeast(std::min(inputRows * 2, guardedRows));
+}
+
 template<typename T>
 MTL::Buffer* uploadAndRegister(MTL::Device* device,
                                MetalGenericExecutor& executor,
@@ -152,7 +169,6 @@ MTL::Buffer* uploadAndRegister(MTL::Device* device,
 } // namespace
 
 void resetQueryPreprocessingState() {
-    g_q16Post = {};
 }
 
 bool prepareQueryPreprocessing(const std::string& queryName,
@@ -196,6 +212,7 @@ bool prepareQueryPreprocessing(const std::string& queryName,
         constexpr uint32_t kQ13HistBins = 256;
         executor.registerSymbol("n_q13_hist_bins", kQ13HistBins);
         executor.registerScalarInt("n_q13_hist_bins", (int)kQ13HistBins);
+        executor.registerSymbol("q13_hist_cap", kQ13HistBins);
         executor.registerScalarInt("q13_hist_cap", (int)kQ13HistBins);
         registerFilledBuffer(device, executor, "d_q13_result_count", sizeof(uint32_t));
         registerFilledBuffer(device, executor, "d_q13_result_c_count",
@@ -238,10 +255,13 @@ bool prepareQueryPreprocessing(const std::string& queryName,
 
     // Q20 host work: nation key and GPU buffer sizing.
     if (queryName == "Q20") {
-        size_t nPartSupp = 0, maxSk = 0, nSupplier = 0;
+        size_t nPartSupp = 0, maxSk = 0, nSupplier = 0, nLineitem = 0;
         if (!executor.tryGetSymbol("n_partsupp", nPartSupp) || nPartSupp == 0) {
             std::cerr << "Q20 preprocessing: n_partsupp symbol unavailable\n";
             return false;
+        }
+        if (!executor.tryGetSymbol("n_lineitem", nLineitem) || nLineitem == 0) {
+            nLineitem = nPartSupp;
         }
         if (!executor.tryGetSymbol("maxSuppkey", maxSk) || maxSk == 0) {
             std::cerr << "Q20 preprocessing: maxSuppkey symbol unavailable\n";
@@ -251,8 +271,7 @@ bool prepareQueryPreprocessing(const std::string& queryName,
             std::cerr << "Q20 preprocessing: n_supplier symbol unavailable\n";
             return false;
         }
-        size_t htSlots = 1;
-        while (htSlots < nPartSupp * 2) htSlots <<= 1;
+        const size_t htSlots = estimateFixedPrefixHashSlots(nPartSupp, 6, nLineitem);
         executor.registerSymbol("q20HtSize", htSlots);
         executor.registerScalarInt("d_q20_ht_mask", (int)(htSlots - 1));
         executor.registerScalarInt("supp_mul", (int)maxSk);
@@ -262,7 +281,7 @@ bool prepareQueryPreprocessing(const std::string& queryName,
             return false;
         }
 
-        // GPU phase scans HT slots into the qualifying-supplier bitmap.
+        // Size hash-table materialization by a fixed-prefix filter estimate.
         executor.registerSymbol("n_q20_ht_slots", htSlots);
         executor.registerScalarInt("n_q20_ht_slots", (int)htSlots);
         size_t qualBmpInts = (maxSk + 32) / 32;
@@ -276,84 +295,24 @@ bool prepareQueryPreprocessing(const std::string& queryName,
         registerFilledBuffer(device, executor, "d_q20_result_address", nSupplier * 40);
     }
 
-    // Q2: CPU builds EUROPE supplier bitmap; GPU fills part/min-cost buffers.
+    // Q2: GPU phases build the EUROPE supplier bitmap; preprocessing only
+    // allocates reusable scratch/result buffers.
     if (queryName == "Q2") {
-        auto pView = resolvePreprocessColumns(device, "part",
-            {{0, ColType::INT}}, loadedTables);
-        auto sView = resolvePreprocessColumns(device, "supplier", {
-            {0, ColType::INT}, {3, ColType::INT}
-        }, loadedTables);
-        auto nView = resolvePreprocessColumns(device, "nation",
-            {{0, ColType::INT}, {2, ColType::INT}}, loadedTables);
-        auto rView = resolvePreprocessColumns(device, "region",
-            {{0, ColType::INT}, {1, ColType::CHAR_FIXED, 25}}, loadedTables);
-
-        const QueryColumns& pCols  = pView.get();
-        const QueryColumns& sCols  = sView.get();
-        const auto& nCols = nView.get();
-        const auto& rCols = rView.get();
-
-        const size_t nP  = pCols.rows();
-        const size_t nS  = sCols.rows();
-        const size_t nN  = nCols.rows();
-        const size_t nR  = rCols.rows();
-        const int* s_suppkey = sCols.ints(0);
-        const int* s_nationkey = sCols.ints(3);
-        const int* p_partkey = pCols.ints(0);
-
-        // Small table scans for the EUROPE supplier bitmap.
-        const int*  n_nationkey = nCols.ints(0);
-        const int*  n_regionkey = nCols.ints(2);
-        const int*  r_regionkey = rCols.ints(0);
-        const char* r_name      = rCols.chars(1);
-
-        int europe_rk = -1;
-        for (size_t i = 0; i < nR; i++) {
-            if (r_name[i*25]=='E' && r_name[i*25+1]=='U' &&
-                r_name[i*25+2]=='R' && r_name[i*25+3]=='O') {
-                europe_rk = r_regionkey[i];
-                break;
-            }
-        }
-
-        std::set<int> europeNks;
-        for (size_t i = 0; i < nN; i++) {
-            if (n_regionkey[i] == europe_rk) europeNks.insert(n_nationkey[i]);
-        }
-
-        // Symbols store counts, so subtract one for max key.
         size_t maxSkSym = 0, maxPkSym = 0;
-        int maxSk, maxPk;
-        if (executor.tryGetSymbol("maxSuppkey", maxSkSym) && maxSkSym > 0) {
-            maxSk = (int)(maxSkSym - 1);
-        } else {
-            maxSk = 0;
-            for (size_t i = 0; i < nS; i++) maxSk = std::max(maxSk, s_suppkey[i]);
-        }
-        if (executor.tryGetSymbol("maxPartkey", maxPkSym) && maxPkSym > 0) {
-            maxPk = (int)(maxPkSym - 1);
-        } else {
-            maxPk = 0;
-            for (size_t i = 0; i < nP; i++) maxPk = std::max(maxPk, p_partkey[i]);
+        if (!executor.tryGetSymbol("maxSuppkey", maxSkSym) || maxSkSym == 0 ||
+            !executor.tryGetSymbol("maxPartkey", maxPkSym) || maxPkSym == 0) {
+            std::cerr << "Q2 preprocessing: key-domain symbols unavailable\n";
+            return false;
         }
 
-        size_t suppBmpInts = ((size_t)maxSk + 32) / 32;
-        std::vector<uint32_t> eurSuppBitmap(suppBmpInts, 0);
-        for (size_t i = 0; i < nS; i++) {
-            if (europeNks.count(s_nationkey[i])) {
-                int sk = s_suppkey[i];
-                eurSuppBitmap[sk / 32] |= (1u << (sk % 32));
-            }
-        }
-
-        size_t partBmpInts = ((size_t)maxPk + 32) / 32;
+        const size_t maxPk = maxPkSym - 1;
+        size_t partBmpInts = (maxPk + 32) / 32;
         registerFilledBuffer(device, executor, "d_q2_part_bitmap",
                      partBmpInts * sizeof(uint32_t));
 
-        size_t minCostSize = (size_t)maxPk + 1;
+        size_t minCostSize = maxPk + 1;
         registerFilledBuffer(device, executor, "d_q2_min_cost",
                             minCostSize * sizeof(uint32_t), 0xFF);
-        uploadAndRegister(device, executor, "d_q2_supp_bitmap", eurSuppBitmap);
 
         // GPU compaction emits sort keys and row ids; late materialization emits
         // only the visible top-k payload.
@@ -397,56 +356,40 @@ bool prepareQueryPreprocessing(const std::string& queryName,
                              (size_t)kQ2LateLimit * 101);
     }
 
-    // Q16: GPU filters qualifying parts; a post-dispatch CPU hook builds the
-    // low-cardinality part-group dictionary and fills GPU label buffers.
+    // Q16: finite group-domain metadata. The plan builds partkey->group and
+    // group labels on GPU from the part table.
     if (queryName == "Q16") {
-        auto pView = resolvePreprocessColumns(device, "part",
-            {{0, ColType::INT}, {3, ColType::CHAR_FIXED, 10},
-             {4, ColType::CHAR_FIXED, 25}, {5, ColType::INT}},
-            loadedTables);
-        if (!pView.borrowed) g_q16Post.ownedPart = std::move(pView.owned);
-        const QueryColumns& pCols = pView.borrowed ? *pView.borrowed : g_q16Post.ownedPart;
-        const int* p_partkey = pCols.ints(0);
-        const size_t nPart = pCols.rows();
-        g_q16Post.p_partkey = p_partkey;
-        g_q16Post.p_brand = pCols.chars(3);
-        g_q16Post.p_type = pCols.chars(4);
-        g_q16Post.nPart = nPart;
-
         size_t maxSkSym = 0;
         if (!executor.tryGetSymbol("maxSuppkey", maxSkSym) || maxSkSym == 0) {
             std::cerr << "Q16 preprocessing: maxSuppkey symbol unavailable\n";
             return false;
         }
-        g_q16Post.maxSk = (int)(maxSkSym - 1);
         size_t maxPkSym = 0;
         if (!executor.tryGetSymbol("maxPartkey", maxPkSym) || maxPkSym == 0) {
             std::cerr << "Q16 preprocessing: maxPartkey symbol unavailable\n";
             return false;
         }
-        g_q16Post.maxPartkey = (int)(maxPkSym - 1);
 
         size_t complaintBmpInts = (maxSkSym + 31) / 32;
         registerFilledBuffer(device, executor, "d_q16_complaint_bitmap",
                      complaintBmpInts * sizeof(uint32_t));
 
         constexpr uint32_t kQ16ResultCap = 1u << 16;
+        constexpr uint32_t kQ16GroupCap = 24u * 145u * 8u;
+        uint32_t bvInts = static_cast<uint32_t>((maxSkSym + 31) / 32);
+        size_t popWords = static_cast<size_t>(kQ16GroupCap) * bvInts;
         executor.registerScalarInt("q16_result_cap", (int)kQ16ResultCap);
         executor.registerSymbol("q16_result_cap", kQ16ResultCap);
-        registerFilledBuffer(device, executor, "d_q16_filt_count",
-                             sizeof(uint32_t));
-        registerFilledBuffer(device, executor, "d_q16_filt_idx",
-                             nPart * sizeof(uint32_t));
-        registerFilledBuffer(device, executor, "d_q16_filt_key",
-                             nPart * sizeof(uint64_t));
-        registerFilledBuffer(device, executor, "d_q16_part_group_map",
-                             ((size_t)g_q16Post.maxPartkey + 1) * sizeof(int32_t), 0xFF);
-        registerFilledBuffer(device, executor, "d_q16_group_brand",
-                             (size_t)kQ16ResultCap * 10);
-        registerFilledBuffer(device, executor, "d_q16_group_type",
-                             (size_t)kQ16ResultCap * 25);
-        registerFilledBuffer(device, executor, "d_q16_group_size",
-                             (size_t)kQ16ResultCap * sizeof(int32_t));
+        executor.registerScalarInt("q16_group_cap", (int)kQ16GroupCap);
+        executor.registerSymbol("q16_group_cap", kQ16GroupCap);
+        executor.registerScalarInt("d_q16_bv_ints", (int)bvInts);
+        executor.registerSymbol("d_q16_bv_ints", bvInts);
+        executor.registerSymbol("q16_num_groups", kQ16GroupCap);
+        executor.registerSymbol("n_q16_num_groups", kQ16GroupCap);
+        executor.registerScalarInt("n_q16_num_groups", (int)kQ16GroupCap);
+        executor.registerSymbol("q16_pop_words", popWords);
+        executor.registerSymbol("n_q16_pop_words", popWords);
+        executor.registerScalarInt("n_q16_pop_words", (int)popWords);
         registerFilledBuffer(device, executor, "d_q16_result_count",
                              sizeof(uint32_t));
         registerFilledBuffer(device, executor, "d_q16_result_brand",
@@ -457,8 +400,6 @@ bool prepareQueryPreprocessing(const std::string& queryName,
                              (size_t)kQ16ResultCap * sizeof(int32_t));
         registerFilledBuffer(device, executor, "d_q16_result_supplier_cnt",
                              (size_t)kQ16ResultCap * sizeof(uint32_t));
-        // d_q16_group_bitmaps and d_q16_group_counts are allocated after
-        // the CPU dictionary hook reports q16_num_groups.
     }
 
     // Q3 compact output is sized by orderkey range.
@@ -497,6 +438,30 @@ bool prepareQueryPreprocessing(const std::string& queryName,
                              cap * sizeof(uint32_t));
         registerFilledBuffer(device, executor, "d_q10_compact_rev",
                              cap * sizeof(float));
+        registerFilledBuffer(device, executor, "d_q10_key_customer_idx",
+                             cap * sizeof(uint32_t));
+        registerFilledBuffer(device, executor, "d_q10_key_nation_idx",
+                             cap * sizeof(uint32_t));
+
+        constexpr uint32_t kQ10LateLimit = 20;
+        executor.registerScalarInt("q10_late_limit", (int)kQ10LateLimit);
+        executor.registerSymbol("q10_late_limit", kQ10LateLimit);
+        registerFilledBuffer(device, executor, "d_q10_result_ck",
+                             (size_t)kQ10LateLimit * sizeof(uint32_t));
+        registerFilledBuffer(device, executor, "d_q10_result_name",
+                             (size_t)kQ10LateLimit * 25);
+        registerFilledBuffer(device, executor, "d_q10_result_rev",
+                             (size_t)kQ10LateLimit * sizeof(float));
+        registerFilledBuffer(device, executor, "d_q10_result_acctbal",
+                             (size_t)kQ10LateLimit * sizeof(float));
+        registerFilledBuffer(device, executor, "d_q10_result_n_name",
+                             (size_t)kQ10LateLimit * 25);
+        registerFilledBuffer(device, executor, "d_q10_result_address",
+                             (size_t)kQ10LateLimit * 40);
+        registerFilledBuffer(device, executor, "d_q10_result_phone",
+                             (size_t)kQ10LateLimit * 15);
+        registerFilledBuffer(device, executor, "d_q10_result_comment",
+                             (size_t)kQ10LateLimit * 117);
     }
 
     if (queryName == "Q18") {
@@ -513,6 +478,8 @@ bool prepareQueryPreprocessing(const std::string& queryName,
                              sizeof(uint32_t));
         registerFilledBuffer(device, executor, "d_q18_compact_ok",
                              (size_t)kQ18CompactCap * sizeof(uint32_t));
+        registerFilledBuffer(device, executor, "d_q18_compact_name",
+                             (size_t)kQ18CompactCap * 25);
         registerFilledBuffer(device, executor, "d_q18_compact_custkey",
                              (size_t)kQ18CompactCap * sizeof(int32_t));
         registerFilledBuffer(device, executor, "d_q18_compact_totalprice",

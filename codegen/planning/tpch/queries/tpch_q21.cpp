@@ -168,13 +168,10 @@ static void q21_emit_result(device atomic_uint* counter,
         sortSpec.keys.push_back({"numwait", true});
         sortSpec.keys.push_back({"s_name", false});
         sortSpec.limit = 100;
-        std::string sortError;
-        if (!appendGenericGpuTopKSelection(plan, "q21_result", resultRows,
-                                           "q21_result_cap", columns, sortSpec,
-                                           &sortError)) {
-            appendGenericGpuSort(plan, "q21_result", resultRows,
-                                 "q21_result_cap", columns, sortSpec, &sortError);
-        }
+        std::string orderError;
+        appendBestGenericGpuOrder(plan, "q21_result", resultRows,
+                                  "q21_result_cap", columns, sortSpec,
+                                  &orderError);
     }
 
     return plan;

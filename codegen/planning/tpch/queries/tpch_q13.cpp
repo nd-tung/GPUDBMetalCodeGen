@@ -75,7 +75,8 @@ static void q13_hist_emit(device atomic_uint* counter,
     out_custdist[slot] = dist;
 }
 )");
-    const std::string resultRows = "q13_result_rows";
+    // Sort the finite histogram domain; the materialized counter still controls emitted rows.
+    const std::string resultRows = "q13_hist_cap";
     {
         auto rscan = std::make_unique<MetalRangeScan>("q13_hist_bins", idx);
         auto sideEffect = std::make_unique<MetalComputeExpr>(
@@ -84,11 +85,10 @@ static void q13_hist_emit(device atomic_uint* counter,
             "d_q13_result_custdist, d_histogram, q13_hist_cap, " + idx + "), 0)");
         auto& phase = appendPhase(plan, "Q13_materialize_histogram", std::move(sideEffect), 256);
         phase.extraBuffers.push_back({"d_q13_result_count",    "atomic_uint", false, true});
-        phase.extraBuffers.push_back({"d_q13_result_c_count",  "uint",        false, false});
-        phase.extraBuffers.push_back({"d_q13_result_custdist", "uint",        false, false});
+        phase.extraBuffers.push_back({"d_q13_result_c_count",  "uint",        false, true});
+        phase.extraBuffers.push_back({"d_q13_result_custdist", "uint",        false, true});
         phase.extraBuffers.push_back({"d_histogram",           "uint",        true,  false});
         phase.scalarParams.push_back({"q13_hist_cap", "uint"});
-        attachMaterializedCountHook(phase, "d_q13_result_count", resultRows);
     }
 
     // --- Result Order ---

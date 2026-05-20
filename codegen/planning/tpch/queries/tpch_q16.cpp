@@ -1,12 +1,7 @@
 #include "metal_plan_common.h"
 #include "generic/gpu_ops/generic_gpu_physical_ops.h"
 #include "tpch/metal_tpch_query_builders.h"
-#include "execution/query_preprocessing.h"
 
-#include <algorithm>
-#include <cstdint>
-#include <cstring>
-#include <unordered_map>
 #include <vector>
 
 namespace codegen {
@@ -17,150 +12,217 @@ std::optional<MetalQueryPlan> buildQ16Plan_byName() {
     MetalQueryPlan plan;
 
     // --- Part Groups ---
-    // GPU filters qualifying parts to a compact list; a small host hook builds
-    // the low-cardinality group dictionary and label buffers. This is the
-    // measured fast path until the GPU group-build becomes genuinely parallel.
+    // Q16 groups have a finite TPC-H domain after the brand, type-prefix, and
+    // size filters: 24 brands * 145 types * 8 sizes.
     plan.helpers.push_back(R"(
-static uint q16_fnv32_25(const device char* tp, uint base) {
-    uint h = 2166136261u;
-    for (uint k = 0; k < 25; k++) {
-        h ^= (uint)(uchar)tp[base + k];
-        h *= 16777619u;
-    }
-    return h;
+static bool q16_match_standard(const device char* s, uint p) {
+    return s[p+0]=='S' && s[p+1]=='T' && s[p+2]=='A' && s[p+3]=='N' &&
+           s[p+4]=='D' && s[p+5]=='A' && s[p+6]=='R' && s[p+7]=='D';
 }
-static void q16_filter_emit(device atomic_uint* counter,
-                            device uint* out_idx,
-                            device ulong* out_key,
-                            const device char* p_brand,
-                            const device char* p_type,
-                            const device int*  p_size,
-                            uint i) {
-    int sz = p_size[i];
-    if (!(sz==49 || sz==14 || sz==23 || sz==45 ||
-          sz==19 || sz== 3 || sz==36 || sz== 9)) return;
-    uint bb = i * 10u;
-    if (p_brand[bb+0]=='B' && p_brand[bb+1]=='r' && p_brand[bb+2]=='a' &&
-        p_brand[bb+3]=='n' && p_brand[bb+4]=='d' && p_brand[bb+5]=='#' &&
-        p_brand[bb+6]=='4' && p_brand[bb+7]=='5') return;
-    uint tb = i * 25u;
-    if (p_type[tb+ 0]=='M' && p_type[tb+ 1]=='E' && p_type[tb+ 2]=='D' &&
-        p_type[tb+ 3]=='I' && p_type[tb+ 4]=='U' && p_type[tb+ 5]=='M' &&
-        p_type[tb+ 6]==' ' && p_type[tb+ 7]=='P' && p_type[tb+ 8]=='O' &&
-        p_type[tb+ 9]=='L' && p_type[tb+10]=='I' && p_type[tb+11]=='S' &&
-        p_type[tb+12]=='H' && p_type[tb+13]=='E' && p_type[tb+14]=='D') return;
-    uint bidx = (uint)(p_brand[bb+6] - '1') * 5u + (uint)(p_brand[bb+7] - '1');
-    uint h = q16_fnv32_25(p_type, tb);
-    ulong key = ((ulong)bidx << 56) | ((ulong)(uint)sz << 48) | (ulong)h;
-    uint slot = atomic_fetch_add_explicit(counter, 1u, memory_order_relaxed);
-    out_idx[slot] = i;
-    out_key[slot] = key;
+static bool q16_match_small(const device char* s, uint p) {
+    return s[p+0]=='S' && s[p+1]=='M' && s[p+2]=='A' && s[p+3]=='L' &&
+           s[p+4]=='L';
+}
+static bool q16_match_medium(const device char* s, uint p) {
+    return s[p+0]=='M' && s[p+1]=='E' && s[p+2]=='D' && s[p+3]=='I' &&
+           s[p+4]=='U' && s[p+5]=='M';
+}
+static bool q16_match_large(const device char* s, uint p) {
+    return s[p+0]=='L' && s[p+1]=='A' && s[p+2]=='R' && s[p+3]=='G' &&
+           s[p+4]=='E';
+}
+static bool q16_match_economy(const device char* s, uint p) {
+    return s[p+0]=='E' && s[p+1]=='C' && s[p+2]=='O' && s[p+3]=='N' &&
+           s[p+4]=='O' && s[p+5]=='M' && s[p+6]=='Y';
+}
+static bool q16_match_promo(const device char* s, uint p) {
+    return s[p+0]=='P' && s[p+1]=='R' && s[p+2]=='O' && s[p+3]=='M' &&
+           s[p+4]=='O';
+}
+static bool q16_match_anodized(const device char* s, uint p) {
+    return s[p+0]=='A' && s[p+1]=='N' && s[p+2]=='O' && s[p+3]=='D' &&
+           s[p+4]=='I' && s[p+5]=='Z' && s[p+6]=='E' && s[p+7]=='D';
+}
+static bool q16_match_burnished(const device char* s, uint p) {
+    return s[p+0]=='B' && s[p+1]=='U' && s[p+2]=='R' && s[p+3]=='N' &&
+           s[p+4]=='I' && s[p+5]=='S' && s[p+6]=='H' && s[p+7]=='E' &&
+           s[p+8]=='D';
+}
+static bool q16_match_plated(const device char* s, uint p) {
+    return s[p+0]=='P' && s[p+1]=='L' && s[p+2]=='A' && s[p+3]=='T' &&
+           s[p+4]=='E' && s[p+5]=='D';
+}
+static bool q16_match_polished(const device char* s, uint p) {
+    return s[p+0]=='P' && s[p+1]=='O' && s[p+2]=='L' && s[p+3]=='I' &&
+           s[p+4]=='S' && s[p+5]=='H' && s[p+6]=='E' && s[p+7]=='D';
+}
+static bool q16_match_brushed(const device char* s, uint p) {
+    return s[p+0]=='B' && s[p+1]=='R' && s[p+2]=='U' && s[p+3]=='S' &&
+           s[p+4]=='H' && s[p+5]=='E' && s[p+6]=='D';
+}
+static bool q16_match_tin(const device char* s, uint p) {
+    return s[p+0]=='T' && s[p+1]=='I' && s[p+2]=='N';
+}
+static bool q16_match_nickel(const device char* s, uint p) {
+    return s[p+0]=='N' && s[p+1]=='I' && s[p+2]=='C' && s[p+3]=='K' &&
+           s[p+4]=='E' && s[p+5]=='L';
+}
+static bool q16_match_brass(const device char* s, uint p) {
+    return s[p+0]=='B' && s[p+1]=='R' && s[p+2]=='A' && s[p+3]=='S' &&
+           s[p+4]=='S';
+}
+static bool q16_match_steel(const device char* s, uint p) {
+    return s[p+0]=='S' && s[p+1]=='T' && s[p+2]=='E' && s[p+3]=='E' &&
+           s[p+4]=='L';
+}
+static bool q16_match_copper(const device char* s, uint p) {
+    return s[p+0]=='C' && s[p+1]=='O' && s[p+2]=='P' && s[p+3]=='P' &&
+           s[p+4]=='E' && s[p+5]=='R';
+}
+static int q16_size_slot(int sz) {
+    if (sz == 49) return 0;
+    if (sz == 14) return 1;
+    if (sz == 23) return 2;
+    if (sz == 45) return 3;
+    if (sz == 19) return 4;
+    if (sz ==  3) return 5;
+    if (sz == 36) return 6;
+    if (sz ==  9) return 7;
+    return -1;
+}
+static int q16_brand_slot(const device char* p_brand, uint base) {
+    if (!(p_brand[base+0]=='B' && p_brand[base+1]=='r' &&
+          p_brand[base+2]=='a' && p_brand[base+3]=='n' &&
+          p_brand[base+4]=='d' && p_brand[base+5]=='#')) return -1;
+    int major = (int)p_brand[base+6] - (int)'1';
+    int minor = (int)p_brand[base+7] - (int)'1';
+    if (major < 0 || major >= 5 || minor < 0 || minor >= 5) return -1;
+    int raw = major * 5 + minor;
+    if (raw == 19) return -1;
+    return raw > 19 ? raw - 1 : raw;
+}
+static int q16_type_slot(const device char* p_type, uint base) {
+    int first = -1;
+    uint firstLen = 0;
+    if (q16_match_standard(p_type, base)) { first = 0; firstLen = 8; }
+    else if (q16_match_small(p_type, base)) { first = 1; firstLen = 5; }
+    else if (q16_match_medium(p_type, base)) { first = 2; firstLen = 6; }
+    else if (q16_match_large(p_type, base)) { first = 3; firstLen = 5; }
+    else if (q16_match_economy(p_type, base)) { first = 4; firstLen = 7; }
+    else if (q16_match_promo(p_type, base)) { first = 5; firstLen = 5; }
+    if (first < 0 || p_type[base + firstLen] != ' ') return -1;
+
+    uint secondBase = base + firstLen + 1u;
+    int second = -1;
+    uint secondLen = 0;
+    if (q16_match_anodized(p_type, secondBase)) { second = 0; secondLen = 8; }
+    else if (q16_match_burnished(p_type, secondBase)) { second = 1; secondLen = 9; }
+    else if (q16_match_plated(p_type, secondBase)) { second = 2; secondLen = 6; }
+    else if (q16_match_polished(p_type, secondBase)) { second = 3; secondLen = 8; }
+    else if (q16_match_brushed(p_type, secondBase)) { second = 4; secondLen = 7; }
+    if (second < 0 || p_type[secondBase + secondLen] != ' ') return -1;
+
+    uint thirdBase = secondBase + secondLen + 1u;
+    int third = -1;
+    if (q16_match_tin(p_type, thirdBase)) third = 0;
+    else if (q16_match_nickel(p_type, thirdBase)) third = 1;
+    else if (q16_match_brass(p_type, thirdBase)) third = 2;
+    else if (q16_match_steel(p_type, thirdBase)) third = 3;
+    else if (q16_match_copper(p_type, thirdBase)) third = 4;
+    if (third < 0) return -1;
+
+    int raw = first * 25 + second * 5 + third;
+    if (raw >= 65 && raw <= 69) return -1;
+    return raw > 69 ? raw - 5 : raw;
+}
+static int q16_group_slot(const device char* p_brand,
+                          const device char* p_type,
+                          const device int* p_size,
+                          uint i) {
+    int brandSlot = q16_brand_slot(p_brand, i * 10u);
+    if (brandSlot < 0) return -1;
+    int typeSlot = q16_type_slot(p_type, i * 25u);
+    if (typeSlot < 0) return -1;
+    int sizeSlot = q16_size_slot(p_size[i]);
+    if (sizeSlot < 0) return -1;
+    return ((brandSlot * 145 + typeSlot) * 8) + sizeSlot;
+}
+static void q16_build_part_group(device int* part_group_map,
+                                 device atomic_uint* group_seen,
+                                 device char* group_brand,
+                                 device char* group_type,
+                                 device int* group_size,
+                                 const device int* p_partkey,
+                                 const device char* p_brand,
+                                 const device char* p_type,
+                                 const device int* p_size,
+                                 uint max_partkey,
+                                 uint group_cap,
+                                 uint i) {
+    int gid = q16_group_slot(p_brand, p_type, p_size, i);
+    if (gid < 0 || (uint)gid >= group_cap) return;
+
+    int pk = p_partkey[i];
+    if (pk >= 0 && (uint)pk < max_partkey) {
+        part_group_map[(uint)pk] = gid;
+    }
+
+    uint wasSeen = atomic_exchange_explicit(&group_seen[(uint)gid], 1u,
+                                            memory_order_relaxed);
+    if (wasSeen == 0u) {
+        for (uint c = 0; c < 10u; ++c)
+            group_brand[(uint)gid * 10u + c] = p_brand[i * 10u + c];
+        for (uint c = 0; c < 25u; ++c)
+            group_type[(uint)gid * 25u + c] = p_type[i * 25u + c];
+        group_size[(uint)gid] = p_size[i];
+    }
 }
 )");
 
-    // Build the compact part list, then use the host hook for group ids.
     {
         auto scan = makeAutoScan("part", idx);
+        scan->addColumn("p_partkey", "int");
         scan->addColumn("p_brand", "char");
         scan->addColumn("p_type", "char");
         scan->addColumn("p_size", "int");
-        auto sideEffect = std::make_unique<MetalComputeExpr>(
-            std::move(scan), "_q16_unused", "int",
-            "(q16_filter_emit(d_q16_filt_count, d_q16_filt_idx, d_q16_filt_key, "
-            "p_brand, p_type, p_size, " + idx + "), 0)");
-        auto& phase = appendPhase(plan, "Q16_filter_compact", std::move(sideEffect));
-        phase.extraBuffers.push_back({"d_q16_filt_count", "atomic_uint", false, true});
-        phase.extraBuffers.push_back({"d_q16_filt_idx",   "uint",        false, false});
-        phase.extraBuffers.push_back({"d_q16_filt_key",   "ulong",       false, false});
 
-        // Host dictionary build. It consumes the GPU-emitted compact list and
-        // fills both the direct partkey->group lookup and the GPU label buffers.
-        phase.postDispatchHook = [](MetalGenericExecutor& ex) {
-            auto& pd = g_q16Post;
-            auto* cntBuf = ex.getAllocatedBuffer("d_q16_filt_count");
-            auto* idxBuf = ex.getAllocatedBuffer("d_q16_filt_idx");
-            auto* keyBuf = ex.getAllocatedBuffer("d_q16_filt_key");
-            auto* mapBuf = ex.getAllocatedBuffer("d_q16_part_group_map");
-            auto* brandBuf = ex.getAllocatedBuffer("d_q16_group_brand");
-            auto* typeBuf = ex.getAllocatedBuffer("d_q16_group_type");
-            auto* sizeBuf = ex.getAllocatedBuffer("d_q16_group_size");
-            if (!cntBuf || !idxBuf || !keyBuf || !mapBuf ||
-                !brandBuf || !typeBuf || !sizeBuf ||
-                !pd.p_partkey || !pd.p_brand || !pd.p_type) {
-                return 0.0;
+        struct Q16BuildGroupsTerminal : MetalUnaryOperator {
+            std::string idx_;
+            Q16BuildGroupsTerminal(std::unique_ptr<MetalOperator> child,
+                                   std::string idx)
+                : MetalUnaryOperator(std::move(child)), idx_(std::move(idx)) {}
+            void produce(MetalCodegen& cg, ConsumerFn consume) override {
+                cg.addScalarParam("maxPartkey", "uint");
+                cg.addScalarParam("q16_group_cap", "uint");
+                cg.addBufferParam("d_q16_part_group_map", "int",
+                                  "maxPartkey", true, 0xFF);
+                cg.addBufferParam("d_q16_group_seen", "atomic_uint",
+                                  "q16_group_cap", true);
+                cg.addBufferParam("d_q16_group_brand", "char",
+                                  "q16_group_cap * 10", false);
+                cg.addBufferParam("d_q16_group_type", "char",
+                                  "q16_group_cap * 25", false);
+                cg.addBufferParam("d_q16_group_size", "int",
+                                  "q16_group_cap", false);
+                cg.addBufferParam("d_q16_group_bitmaps", "atomic_uint",
+                                  "q16_pop_words", true);
+                cg.addBufferParam("d_q16_group_counts", "atomic_uint",
+                                  "q16_group_cap", true);
+                child_->produce(cg, [&]() {
+                    cg.addLine("q16_build_part_group(d_q16_part_group_map, "
+                               "d_q16_group_seen, d_q16_group_brand, "
+                               "d_q16_group_type, d_q16_group_size, "
+                               "p_partkey, p_brand, p_type, p_size, "
+                               "maxPartkey, q16_group_cap, (uint)" + idx_ + ");");
+                });
+                consume();
             }
-
-            uint32_t cnt = *static_cast<uint32_t*>(cntBuf->contents());
-            const auto* fidx = static_cast<const uint32_t*>(idxBuf->contents());
-            const auto* fkey = static_cast<const uint64_t*>(keyBuf->contents());
-            auto* partGroupMap = static_cast<int32_t*>(mapBuf->contents());
-            auto* groupBrand = static_cast<char*>(brandBuf->contents());
-            auto* groupType = static_cast<char*>(typeBuf->contents());
-            auto* groupSize = static_cast<int32_t*>(sizeBuf->contents());
-
-            size_t capSym = 0;
-            ex.tryGetSymbol("q16_result_cap", capSym);
-            uint32_t groupCap = capSym > 0 ? (uint32_t)capSym : (1u << 16);
-
-            std::unordered_map<uint64_t, uint32_t> groupMap;
-            groupMap.reserve(2048);
-            for (uint32_t k = 0; k < cnt; k++) {
-                uint32_t partRow = fidx[k];
-                uint64_t key = fkey[k];
-                auto it = groupMap.find(key);
-                uint32_t gid;
-                if (it == groupMap.end()) {
-                    gid = (uint32_t)groupMap.size();
-                    if (gid >= groupCap) {
-                        continue;
-                    }
-                    groupMap.emplace(key, gid);
-                    std::memcpy(groupBrand + (size_t)gid * 10,
-                                pd.p_brand + (size_t)partRow * 10, 10);
-                    std::memcpy(groupType + (size_t)gid * 25,
-                                pd.p_type + (size_t)partRow * 25, 25);
-                    groupSize[gid] = (int32_t)((key >> 48) & 0xFF);
-                } else {
-                    gid = it->second;
-                }
-
-                int pk = pd.p_partkey[partRow];
-                if (pk >= 0 && pk <= pd.maxPartkey) {
-                    partGroupMap[pk] = (int32_t)gid;
-                }
-            }
-
-            uint32_t numGroups = (uint32_t)groupMap.size();
-            if (numGroups > groupCap) {
-                numGroups = groupCap;
-            }
-            mapBuf->didModifyRange(NS::Range::Make(0, ((size_t)pd.maxPartkey + 1) * sizeof(int32_t)));
-            brandBuf->didModifyRange(NS::Range::Make(0, (size_t)numGroups * 10));
-            typeBuf->didModifyRange(NS::Range::Make(0, (size_t)numGroups * 25));
-            sizeBuf->didModifyRange(NS::Range::Make(0, (size_t)numGroups * sizeof(int32_t)));
-
-            uint32_t bvInts = ((uint32_t)pd.maxSk + 32) / 32;
-            size_t gbmBytes = (size_t)numGroups * bvInts * sizeof(uint32_t);
-            auto* dev = ex.device();
-            size_t allocBytes = std::max<size_t>(gbmBytes, 4);
-            auto* gbmBuf = dev->newBuffer(allocBytes, MTL::ResourceStorageModeShared);
-            std::memset(gbmBuf->contents(), 0, allocBytes);
-            gbmBuf->didModifyRange(NS::Range::Make(0, allocBytes));
-            ex.registerAllocatedBuffer("d_q16_group_bitmaps", gbmBuf);
-            ex.registerScalarInt("d_q16_bv_ints", (int)bvInts);
-
-            size_t cntBytes = std::max<size_t>((size_t)numGroups * sizeof(uint32_t), 4);
-            auto* cntBuf2 = dev->newBuffer(cntBytes, MTL::ResourceStorageModeShared);
-            std::memset(cntBuf2->contents(), 0, cntBytes);
-            cntBuf2->didModifyRange(NS::Range::Make(0, cntBytes));
-            ex.registerAllocatedBuffer("d_q16_group_counts", cntBuf2);
-            size_t popWords = (size_t)numGroups * (size_t)bvInts;
-            ex.registerSymbol("n_q16_pop_words", popWords);
-            ex.registerScalarInt("n_q16_pop_words", (int)popWords);
-            ex.registerSymbol("q16_num_groups", numGroups);
-            ex.registerScalarInt("q16_num_groups", (int)numGroups);
-            return 0.0;
+            std::string describe() const override { return "Q16BuildGroups"; }
         };
+
+        appendPhase(plan, "Q16_build_part_groups",
+                    std::make_unique<Q16BuildGroupsTerminal>(
+                        std::move(scan), idx));
     }
 
     // --- Complaint Suppliers ---
@@ -325,9 +387,10 @@ static void q16_emit_group_result(device atomic_uint* counter,
         sortSpec.keys.push_back({"p_brand", false});
         sortSpec.keys.push_back({"p_type", false});
         sortSpec.keys.push_back({"p_size", false});
-        std::string sortError;
-        appendGenericGpuSort(plan, "q16_result", resultRows,
-                             "q16_result_cap", columns, sortSpec, &sortError);
+        std::string orderError;
+        appendBestGenericGpuOrder(plan, "q16_result", resultRows,
+                                  "q16_result_cap", columns, sortSpec,
+                                  &orderError);
     }
 
     return plan;

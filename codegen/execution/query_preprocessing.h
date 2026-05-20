@@ -13,18 +13,6 @@ namespace codegen {
 
 using LoadedQueryTable = std::pair<std::string, QueryColumns>;
 
-struct Q16PostData {
-    const int* p_partkey = nullptr;
-    const char* p_brand = nullptr; // width 10
-    const char* p_type = nullptr;  // width 25
-    size_t nPart = 0;
-    int maxPartkey = 0;
-    int maxSk = 0;
-    QueryColumns ownedPart;
-};
-
-extern Q16PostData g_q16Post;
-
 void resetQueryPreprocessingState();
 
 QueryColumns loadPreprocessColumns(MTL::Device* device,

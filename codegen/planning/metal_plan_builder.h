@@ -77,6 +77,89 @@ struct MetalQueryPlan {
     };
     std::optional<GpuSort> gpuSort;
 
+    // Optional host-side final-result assembly. This is route metadata, not
+    // runtime query dispatch: predefined builders describe how compact GPU
+    // buffers become the final TPC-H result shape, and the executor applies the
+    // same generic reader/sorter/formatter for every spec.
+    struct HostResultSpec {
+        enum class Kind {
+            BufferRows,
+            StaticRows,
+            ExistingSort,
+        };
+
+        enum class CellKind {
+            IntLiteral,
+            StringLiteral,
+            BufferUInt,
+            BufferFloat,
+            ExistingCell,
+            ExistingRatio,
+            BufferRatio,
+        };
+
+        struct Column {
+            std::string displayName;
+            std::string type;
+        };
+
+        struct BufferColumn {
+            std::string displayName;
+            std::string bufferName;
+            std::string elementType;
+            int stringLen = 0;
+            bool trimSpaces = true;
+            bool asDateString = false;
+        };
+
+        struct SortKey {
+            int columnIndex = 0;
+            bool descending = false;
+        };
+
+        struct Cell {
+            CellKind kind = CellKind::IntLiteral;
+            int64_t intValue = 0;
+            double doubleValue = 0.0;
+            std::string stringValue;
+            std::string bufferName;
+            int index = 0;
+            int numeratorIndex = 0;
+            int denominatorIndex = 0;
+            int row = 0;
+            int column = 0;
+            int numeratorRow = 0;
+            int numeratorColumn = 0;
+            int denominatorRow = 0;
+            int denominatorColumn = 0;
+            double multiplier = 1.0;
+        };
+
+        struct StaticRow {
+            std::vector<Cell> values;
+            std::optional<Cell> includeIf;
+        };
+
+        Kind kind = Kind::BufferRows;
+        std::vector<Column> columns;
+        int displayLimit = -1;
+
+        // BufferRows.
+        std::string countBuffer;
+        std::string identityCountBuffer;
+        std::vector<BufferColumn> bufferColumns;
+        bool useGpuSort = true;
+        int limit = -1;
+        std::vector<SortKey> fallbackSort;
+
+        // StaticRows.
+        std::vector<StaticRow> staticRows;
+
+        // ExistingSort.
+        std::vector<SortKey> existingSort;
+    };
+    std::optional<HostResultSpec> hostResult;
+
     // Serialize the plan to JSON for debugging / CI integration.
     nlohmann::json toTreeJSON() const;
 

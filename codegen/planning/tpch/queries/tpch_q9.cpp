@@ -208,7 +208,8 @@ static void q9_emit_profit_result(device atomic_uint* counter,
 }
 )");
 
-    const std::string resultRows = "q9_result_rows";
+    // Sort the finite nation/year domain; the materialized counter still controls emitted rows.
+    const std::string resultRows = "q9_result_cap";
     {
         auto rscan = std::make_unique<MetalRangeScan>("q9_profit_bins", idx);
         struct Q9CompactTerminal : MetalUnaryOperator {
@@ -231,13 +232,12 @@ static void q9_emit_profit_result(device atomic_uint* counter,
         auto compact = std::make_unique<Q9CompactTerminal>(std::move(rscan), idx);
         auto& phase = appendPhase(plan, "Q9_compact_results", std::move(compact), 64);
         phase.extraBuffers.push_back({"d_q9_result_count",  "atomic_uint", false, true});
-        phase.extraBuffers.push_back({"d_q9_result_nation", "char",        false, false});
-        phase.extraBuffers.push_back({"d_q9_result_year",   "int",         false, false});
-        phase.extraBuffers.push_back({"d_q9_result_profit", "float",       false, false});
+        phase.extraBuffers.push_back({"d_q9_result_nation", "char",        false, true});
+        phase.extraBuffers.push_back({"d_q9_result_year",   "int",         false, true});
+        phase.extraBuffers.push_back({"d_q9_result_profit", "float",       false, true});
         phase.extraBuffers.push_back({"d_q9_profit",        "float",       true,  false});
         phase.extraBuffers.push_back({"d_q9_nation_idx",    "int",         true,  false});
         phase.scalarParams.push_back({"q9_result_cap", "uint"});
-        attachMaterializedCountHook(phase, "d_q9_result_count", resultRows);
     }
 
     {

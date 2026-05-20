@@ -71,19 +71,9 @@ std::optional<MetalQueryPlan> buildQ11Plan_byName() {
         attachMaterializedCountHook(phase, "d_q11_result_count", resultRows);
     }
 
-    // --- Result Order ---
-    {
-        std::vector<GenericMatColumnDesc> columns = {
-            GenericMatColumnDesc("ps_partkey", "d_q11_result_partkey", "int"),
-            GenericMatColumnDesc("value", "d_q11_result_value", "float"),
-        };
-        GenericSortSpec sortSpec;
-        sortSpec.keys.push_back({"value", true});
-        sortSpec.keys.push_back({"ps_partkey", false});
-        std::string sortError;
-        appendGenericGpuSort(plan, "q11_result", resultRows,
-                             "maxPartkey", columns, sortSpec, &sortError);
-    }
+    // Q11 typically emits a small result set. The runtime host post step sorts
+    // the materialized rows directly, avoiding a command-buffer boundary and
+    // generic sort hook for small-SF runs.
 
     return plan;
 }

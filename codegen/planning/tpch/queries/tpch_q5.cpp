@@ -122,7 +122,8 @@ static void q5_emit_nation_result(device atomic_uint* counter,
 }
 )");
 
-    const std::string resultRows = "q5_result_rows";
+    // Sort the finite nation domain; the materialized counter still controls emitted rows.
+    const std::string resultRows = "q5_result_cap";
     {
         auto scan = makeScan("nation", idx, {
             {"n_nationkey", "int"},
@@ -146,11 +147,10 @@ static void q5_emit_nation_result(device atomic_uint* counter,
         auto compact = std::make_unique<Q5CompactTerminal>(std::move(scan), idx);
         auto& phase = appendPhase(plan, "Q5_compact_results", std::move(compact), 32);
         phase.extraBuffers.push_back({"d_q5_result_count",   "atomic_uint", false, true});
-        phase.extraBuffers.push_back({"d_q5_result_name",    "char",        false, false});
-        phase.extraBuffers.push_back({"d_q5_result_revenue", "float",       false, false});
+        phase.extraBuffers.push_back({"d_q5_result_name",    "char",        false, true});
+        phase.extraBuffers.push_back({"d_q5_result_revenue", "float",       false, true});
         phase.extraBuffers.push_back({"d_nation_revenue",    "float",       true,  false});
         phase.scalarParams.push_back({"q5_result_cap", "uint"});
-        attachMaterializedCountHook(phase, "d_q5_result_count", resultRows);
     }
 
     {
