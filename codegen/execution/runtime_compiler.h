@@ -2,6 +2,7 @@
 #include <Metal/Metal.hpp>
 #include <string>
 #include <unordered_map>
+#include <vector>
 
 namespace codegen {
 
@@ -27,6 +28,11 @@ public:
     static void setFastMathEnabled(bool on) { sFastMath_ = on; }
     static bool fastMathEnabled() { return sFastMath_; }
 
+    // Toggle the process-level source/PSO cache. Cold-cache experiments use
+    // this to force compilation without changing normal execution behavior.
+    static void setGlobalCacheEnabled(bool on) { sGlobalCacheEnabled_ = on; }
+    static bool globalCacheEnabled() { return sGlobalCacheEnabled_; }
+
     // Runtime objects needed to execute a compiled query.
     struct CompiledQuery {
         MTL::Library* library = nullptr;
@@ -37,7 +43,11 @@ public:
 private:
     MTL::Device* device_;
     std::unordered_map<std::string, MTL::ComputePipelineState*> pipelineCache_;
+    std::string currentLibraryCacheKey_;
     static bool sFastMath_;
+    static bool sGlobalCacheEnabled_;
+    static std::unordered_map<std::string, MTL::Library*> sLibraryCache_;
+    static std::unordered_map<std::string, MTL::ComputePipelineState*> sGlobalPipelineCache_;
 };
 
 } // namespace codegen

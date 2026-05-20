@@ -37,7 +37,7 @@ run_sql() {
 assert_contains() {
     local pattern="$1"
     local file="$2"
-    if ! rg -q "$pattern" "$file"; then
+    if ! grep -Eq "$pattern" "$file"; then
         echo "fd-topk-cost-guard: expected pattern not found: $pattern" >&2
         tail -80 "$file" >&2
         exit 1
@@ -47,7 +47,7 @@ assert_contains() {
 assert_not_contains() {
     local pattern="$1"
     local file="$2"
-    if rg -q "$pattern" "$file"; then
+    if grep -Eq "$pattern" "$file"; then
         echo "fd-topk-cost-guard: unexpected pattern found: $pattern" >&2
         tail -80 "$file" >&2
         exit 1

@@ -973,9 +973,9 @@ std::optional<MetalQueryPlan> lowerFromSubqueryTopScalarIRToMetal(
             attachMaterializedCountHook(
                 phase, "d_ir_from_subquery_" + tag + "_result_count",
                 sortRowsSym);
-            if (!appendGenericGpuSort(plan, "ir_from_subquery_" + tag,
-                                      sortRowsSym, outputSize,
-                                      materializedCols, sortSpec, error)) {
+            if (!appendBestGenericGpuOrder(plan, "ir_from_subquery_" + tag,
+                                           sortRowsSym, outputSize,
+                                           materializedCols, sortSpec, error)) {
                 return std::nullopt;
             }
         }
@@ -1159,11 +1159,11 @@ std::optional<MetalQueryPlan> lowerFromSubqueryHistogramIRToMetal(
             sortSpec.keys.push_back({*column, aq.orderBy[oi].descending});
         }
         if (!sortSpec.keys.empty() || sortSpec.limit >= 0) {
-            if (!appendGenericGpuSort(plan, "group_" + groupTag,
-                                      sortRowsSym,
-                                      std::to_string(kHistogramBucketCap),
-                                      compactCols,
-                                      sortSpec, error)) {
+            if (!appendBestGenericGpuOrder(plan, "group_" + groupTag,
+                                           sortRowsSym,
+                                           std::to_string(kHistogramBucketCap),
+                                           compactCols,
+                                           sortSpec, error)) {
                 return std::nullopt;
             }
         }

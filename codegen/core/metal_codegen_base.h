@@ -44,6 +44,7 @@ public:
     void setPhaseThreadgroupSize(int size);
     void setPhaseSingleThread(bool single);
     void setPhaseMaxThreadgroups(int max);
+    void setPhaseHookOnly(bool hookOnly);
     // Hooks run after the command buffer for the phase has completed.
     void setPhasePostDispatchHook(PostDispatchHook hook);
 
@@ -132,6 +133,7 @@ public:
         int threadgroupSize = 1024;
         int maxThreadgroups = 0;
         bool isSingleThread = false;
+        bool hookOnly = false;
         std::vector<MetalParamBinding> bindings;
         PostDispatchHook postDispatchHook;
     };

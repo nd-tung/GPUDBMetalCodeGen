@@ -193,6 +193,14 @@ bool appendGenericGpuSort(MetalQueryPlan& plan,
                           const GenericSortSpec& sortSpec,
                           std::string* error);
 
+bool appendBestGenericGpuOrder(MetalQueryPlan& plan,
+                               const std::string& tag,
+                               const std::string& nRowsSymbol,
+                               const std::string& capacityExpr,
+                               const std::vector<GenericMatColumnDesc>& columns,
+                               const GenericSortSpec& sortSpec,
+                               std::string* error);
+
 bool appendGenericGpuSmallSort(MetalQueryPlan& plan,
                                const std::string& tag,
                                const std::string& nRowsSymbol,

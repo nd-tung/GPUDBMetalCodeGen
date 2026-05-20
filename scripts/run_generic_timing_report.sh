@@ -13,6 +13,11 @@ OUT_DIR="${OUT_DIR:-build/generic_timing_$(date +%Y%m%d_%H%M%S)}"
 DUCKDB="${DUCKDB:-duckdb}"
 GENERIC_GOLDEN_DIR="${GENERIC_GOLDEN_DIR:-$OUT_DIR/generic_goldens}"
 SKIP_GOLDEN_GEN="${SKIP_GOLDEN_GEN:-0}"
+PROFILE_PHASES="${PROFILE_PHASES:-0}"
+PHASE_CLI_ARG=""
+if [[ "$PROFILE_PHASES" == "1" ]]; then
+    PHASE_CLI_ARG="--profile-phases"
+fi
 
 if [[ ! -x "$BIN" ]]; then
     make -j"$(sysctl -n hw.ncpu 2>/dev/null || echo 8)"
@@ -29,6 +34,7 @@ if [[ "$SKIP_GOLDEN_GEN" != "1" ]]; then
 fi
 
 CSV="$OUT_DIR/generic_timing_raw.csv"
+PHASE_CSV="$OUT_DIR/generic_phase_timing_raw.csv"
 SUMMARY="$OUT_DIR/generic_timing_summary.csv"
 REPORT="$OUT_DIR/reports/generic_timing_report.md"
 MARKER_SCAN="$OUT_DIR/marker_scan.txt"
@@ -39,11 +45,19 @@ MARKER_SCAN="$OUT_DIR/marker_scan.txt"
     echo "# scales=$SCALES"
     echo "# warmup=$WARMUP"
     echo "# repeat=$REPEAT"
+    echo "# profile_phases=$PROFILE_PHASES"
     echo "# git_commit=$(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
     echo "# git_dirty_count=$(git status --porcelain 2>/dev/null | wc -l | tr -d ' ')"
     echo "# timestamp=$(date +%Y-%m-%dT%H:%M:%S%z)"
-    echo "scale_factor,query,status,analyze_ms,plan_ms,codegen_ms,compile_ms,pso_ms,dataload_ms,bufalloc_ms,gpu_compute_ms,cpu_compute_ms,compile_overhead_ms,cpu_total_ms,end2end_ms,load_source,load_bytes,load_mibps,ingest_ms,query_compute_ms,gpu_trials_n,gpu_p10_ms,gpu_p90_ms,gpu_mad_ms,io_ms,preprocess_ms,query_execution_ms"
+    echo "scale_factor,query,status,timing_query,route,analyze_ms,plan_ms,codegen_ms,metal_compile_ms,pso_ms,compile_overhead_ms,load_source,load_bytes,load_mibps,ingest_ms,data_load_ms,io_ms,preprocess_ms,buffer_setup_ms,gpu_compute_ms,cpu_compute_ms,query_compute_ms,query_execution_ms,end_to_end_ms,execute_wall_ms,execute_overhead_ms,hook_cpu_ms,hook_gpu_ms,result_collect_ms,host_post_ms,validation_ms,gpu_trials_n,gpu_p10_ms,gpu_p50_ms,gpu_p90_ms,gpu_mad_ms,hot_execution_ms"
 } > "$CSV"
+
+{
+    echo "# command=$0"
+    echo "# route=generic --sql-file"
+    echo "# profile_phases=$PROFILE_PHASES"
+    echo "scale_factor,query,route,trial,phase,threadgroup,gpu_compute_ms,phase_wall_ms,phase_execute_overhead_ms,hook_cpu_ms,hook_gpu_ms"
+} > "$PHASE_CSV"
 
 for q in $(seq 1 22); do
     qdir="$OUT_DIR/check/q$q"
@@ -72,7 +86,10 @@ for sf in $SCALES; do
             --csv \
             --warmup "$WARMUP" \
             --repeat "$REPEAT" \
+            ${PHASE_CLI_ARG:+$PHASE_CLI_ARG} \
             --print-plan > "$log" 2>&1 || rc=$?
+
+        grep '^PHASE_CSV,' "$log" | sed 's/^PHASE_CSV,//' >> "$PHASE_CSV" || true
 
         status="OK"
         if [[ $rc -ne 0 ]]; then
@@ -86,14 +103,14 @@ for sf in $SCALES; do
         if [[ -z "$timing" ]]; then
             status="NO_TIMING"
             non_ok=$((non_ok + 1))
-            echo "${sf},${query},NO_TIMING$(printf ',%.0s' {1..24})" >> "$CSV"
+            echo "${sf},${query},NO_TIMING$(printf ',%.0s' {1..34})" >> "$CSV"
             continue
         fi
         body="${timing#TIMING_CSV,}"
         awk -v status="$status" -v query="$query" -F',' '
         {
-            printf "%s,%s,%s", $1, query, status;
-            for (i = 3; i <= 26; i++) printf ",%s", $i;
+            printf "%s,%s,%s,%s,%s", $1, query, status, $2, $3;
+            for (i = 4; i <= 35; i++) printf ",%s", $i;
             printf "\n";
         }' <<< "$body" >> "$CSV"
 
@@ -103,7 +120,7 @@ for sf in $SCALES; do
     done
 done
 
-if rg -n "ADHOC_|cpuSort|cpuGroupBy|cpuScalarAgg|buildQ[0-9]|predefined|Predefined" \
+if grep -R -n -E "ADHOC_|cpuSort|cpuGroupBy|cpuScalarAgg|buildQ[0-9]|predefined|Predefined" \
       "$OUT_DIR/logs" > "$MARKER_SCAN"; then
     echo "Forbidden marker found in logs; see $MARKER_SCAN" >&2
     contract_failures=1
@@ -124,6 +141,7 @@ report_path = pathlib.Path(sys.argv[3])
 out_dir = pathlib.Path(sys.argv[4])
 warmup = sys.argv[5]
 repeat = sys.argv[6]
+phase_profile = pathlib.Path(sys.argv[2]).with_name("generic_phase_timing_raw.csv")
 
 rows = []
 with raw_path.open() as f:
@@ -178,9 +196,9 @@ marker_pass = marker_scan.exists() and marker_scan.stat().st_size == 0
 non_ok_rows = [r for r in rows if r["status"] != "OK"]
 
 summary_fields = [
-    "scale_factor", "queries", "status_ok", "gpu_total_ms", "query_execution_total_ms",
-    "end2end_total_ms", "data_load_total_ms", "cpu_compute_total_ms",
-    "median_gpu_ms", "max_gpu_query", "max_gpu_ms",
+    "scale_factor", "queries", "status_ok", "gpu_compute_total_ms", "query_execution_total_ms",
+    "end_to_end_total_ms", "data_load_total_ms", "cpu_compute_total_ms",
+    "median_gpu_compute_ms", "max_gpu_query", "max_gpu_compute_ms",
 ]
 with summary_path.open("w", newline="") as fsum:
     w = csv.DictWriter(fsum, fieldnames=summary_fields)
@@ -194,14 +212,14 @@ with summary_path.open("w", newline="") as fsum:
             "scale_factor": s,
             "queries": len(rs),
             "status_ok": ok,
-            "gpu_total_ms": fmt(sum(gpu_vals)),
+            "gpu_compute_total_ms": fmt(sum(gpu_vals)),
             "query_execution_total_ms": fmt(sum(f(r, "query_execution_ms") for r in rs)),
-            "end2end_total_ms": fmt(sum(f(r, "end2end_ms") for r in rs)),
-            "data_load_total_ms": fmt(sum(f(r, "dataload_ms") for r in rs)),
+            "end_to_end_total_ms": fmt(sum(f(r, "end_to_end_ms") for r in rs)),
+            "data_load_total_ms": fmt(sum(f(r, "data_load_ms") for r in rs)),
             "cpu_compute_total_ms": fmt(sum(f(r, "cpu_compute_ms") for r in rs)),
-            "median_gpu_ms": fmt(statistics.median(gpu_vals)) if gpu_vals else "0.000",
+            "median_gpu_compute_ms": fmt(statistics.median(gpu_vals)) if gpu_vals else "0.000",
             "max_gpu_query": max_row["query"] if max_row else "",
-            "max_gpu_ms": fmt(f(max_row, "gpu_compute_ms")) if max_row else "0.000",
+            "max_gpu_compute_ms": fmt(f(max_row, "gpu_compute_ms")) if max_row else "0.000",
         })
 
 lines = []
@@ -212,6 +230,7 @@ lines.append(f"- Scales: {', '.join(f'`{s.lower()}`' for s in scales)}")
 lines.append(f"- Queries: Q1-Q22")
 lines.append(f"- Warmup: `{warmup}`")
 lines.append(f"- Repeat: `{repeat}`")
+lines.append(f"- Phase profiling CSV: `{phase_profile}`")
 lines.append(f"- Output directory: `{out_dir}`")
 lines.append(f"- Correctness: `--check` against generic DuckDB SQL-shaped `qN/SQL_SF*.csv` goldens")
 lines.append(f"- Forbidden marker scan: `{out_dir / 'marker_scan.txt'}`")
@@ -219,7 +238,7 @@ lines.append(f"- Generic-only marker scan: `{'PASS' if marker_pass else 'FAIL'}`
 lines.append("")
 lines.append("## Scale Summary")
 lines.append("")
-lines.append("| Scale | OK/Total | GPU total ms | Query execution total ms | End-to-end total ms | Data load total ms | Median GPU ms | Slowest GPU query |")
+lines.append("| Scale | OK/Total | GPU compute total ms | Query execution total ms | End-to-end total ms | Data load total ms | Median GPU compute ms | Slowest GPU query |")
 lines.append("|---|---:|---:|---:|---:|---:|---:|---|")
 for s in scales:
     rs = by_scale[s]
@@ -230,8 +249,8 @@ for s in scales:
     lines.append(
         f"| {s} | {ok}/{len(rs)} | {fmt(sum(gpu_vals))} | "
         f"{fmt(sum(f(r, 'query_execution_ms') for r in rs))} | "
-        f"{fmt(sum(f(r, 'end2end_ms') for r in rs))} | "
-        f"{fmt(sum(f(r, 'dataload_ms') for r in rs))} | "
+        f"{fmt(sum(f(r, 'end_to_end_ms') for r in rs))} | "
+        f"{fmt(sum(f(r, 'data_load_ms') for r in rs))} | "
         f"{fmt(statistics.median(gpu_vals)) if gpu_vals else '0.000'} | "
         f"{slowest} |"
     )

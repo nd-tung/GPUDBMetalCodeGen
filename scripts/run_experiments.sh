@@ -42,7 +42,7 @@ done
 mkdir -p "$LOGDIR"
 
 # CSV header
-echo "query,chunk_M,double_buffer,rep,chunks,load_ms,gpu_ms,copy_ms" > "$RESULT_FILE"
+echo "query,chunk_M,double_buffer,rep,chunks,data_load_ms,gpu_compute_ms,chunk_copy_ms" > "$RESULT_FILE"
 
 echo "=========================================="
 echo "SF100 Chunk & Double-Buffer Experiment"
@@ -108,8 +108,8 @@ echo "=========================================="
 
 # Print summary table
 echo ""
-echo "=== Summary (median GPU ms per config) ==="
-echo "query | chunk_M | db    | gpu_ms (runs)"
+echo "=== Summary (median GPU compute ms per config) ==="
+echo "query | chunk_M | db    | gpu_compute_ms (runs)"
 
 prev_key=""
 for chunk in $CHUNK_SIZES; do

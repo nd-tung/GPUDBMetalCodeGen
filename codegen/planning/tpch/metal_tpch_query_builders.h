@@ -6,26 +6,19 @@
 
 namespace codegen {
 
-std::optional<MetalQueryPlan> buildQ1Plan(const AnalyzedQuery& aq);
 std::optional<MetalQueryPlan> buildQ1Plan_byName();
 std::optional<MetalQueryPlan> buildQ2Plan_byName();
 std::optional<MetalQueryPlan> buildQ3Plan_byName();
-std::optional<MetalQueryPlan> buildQ4Plan(const AnalyzedQuery& aq);
 std::optional<MetalQueryPlan> buildQ4Plan_byName();
 std::optional<MetalQueryPlan> buildQ5Plan_byName();
-std::optional<MetalQueryPlan> buildQ6Plan(const AnalyzedQuery& aq);
 std::optional<MetalQueryPlan> buildQ6Plan_byName();
-std::optional<MetalQueryPlan> buildQ7Plan(const AnalyzedQuery& aq);
 std::optional<MetalQueryPlan> buildQ7Plan_byName();
 std::optional<MetalQueryPlan> buildQ8Plan_byName();
 std::optional<MetalQueryPlan> buildQ9Plan_byName();
-std::optional<MetalQueryPlan> buildQ10Plan(const AnalyzedQuery& aq);
 std::optional<MetalQueryPlan> buildQ10Plan_byName();
 std::optional<MetalQueryPlan> buildQ11Plan_byName();
-std::optional<MetalQueryPlan> buildQ12Plan(const AnalyzedQuery& aq);
 std::optional<MetalQueryPlan> buildQ12Plan_byName();
 std::optional<MetalQueryPlan> buildQ13Plan_byName();
-std::optional<MetalQueryPlan> buildQ14Plan(const AnalyzedQuery& aq);
 std::optional<MetalQueryPlan> buildQ14Plan_byName();
 std::optional<MetalQueryPlan> buildQ15Plan_byName();
 std::optional<MetalQueryPlan> buildQ16Plan_byName();

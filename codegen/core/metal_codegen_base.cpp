@@ -99,6 +99,12 @@ void MetalCodegen::setPhaseMaxThreadgroups(int max) {
     currentPhase_->maxThreadgroups = max;
 }
 
+void MetalCodegen::setPhaseHookOnly(bool hookOnly) {
+    if (!currentPhase_)
+        throw std::runtime_error("setPhaseHookOnly: no active phase");
+    currentPhase_->hookOnly = hookOnly;
+}
+
 void MetalCodegen::setPhasePostDispatchHook(PostDispatchHook hook) {
     if (!currentPhase_)
         throw std::runtime_error("setPhasePostDispatchHook: no active phase");

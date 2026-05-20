@@ -1,5 +1,6 @@
 #include "metal_generic_executor.h"
 #include <iostream>
+#include <algorithm>
 #include <chrono>
 #include <cstring>
 #include <stdexcept>
@@ -336,15 +337,22 @@ MetalExecutionResult MetalGenericExecutor::execute(
     int firstPhase,
     int lastPhase) {
 
+    auto executeStart = std::chrono::high_resolution_clock::now();
     MetalExecutionResult execResult;
+    auto finishExecution = [&]() {
+        execResult.executeWallTimeMs = static_cast<float>(
+            std::chrono::duration<double, std::milli>(
+                std::chrono::high_resolution_clock::now() - executeStart).count());
+        return execResult;
+    };
     const auto& allPhases = codegen.getPhases();
 
     if (allPhases.empty()) {
         std::cerr << "MetalGenericExecutor: no phases to execute\n";
-        return execResult;
+        return finishExecution();
     }
     if (lastPhase < 0) lastPhase = (int)allPhases.size();
-    if (firstPhase >= lastPhase) return execResult;
+    if (firstPhase >= lastPhase) return finishExecution();
 
     if (firstPhase == 0 && lastPhase == (int)allPhases.size()) {
         // Full executions refresh phase-owned buffers but keep registered inputs.
@@ -418,8 +426,90 @@ MetalExecutionResult MetalGenericExecutor::execute(
         double totalGpuSec = 0.0;
         execResult.phaseTimesMs.clear();
         execResult.phaseNames.clear();
+        execResult.phaseHookCpuTimesMs.clear();
+        execResult.phaseHookGpuTimesMs.clear();
+        execResult.phaseWallTimesMs.clear();
+        execResult.phaseOverheadTimesMs.clear();
+        execResult.hookCpuTimeMs = 0.0f;
+        execResult.hookGpuTimeMs = 0.0f;
         execResult.phaseTimesMs.reserve((size_t)(lastPhase - firstPhase));
         execResult.phaseNames.reserve((size_t)(lastPhase - firstPhase));
+        execResult.phaseHookCpuTimesMs.reserve((size_t)(lastPhase - firstPhase));
+        execResult.phaseHookGpuTimesMs.reserve((size_t)(lastPhase - firstPhase));
+        execResult.phaseWallTimesMs.reserve((size_t)(lastPhase - firstPhase));
+        execResult.phaseOverheadTimesMs.reserve((size_t)(lastPhase - firstPhase));
+
+        if (!detailedPhaseTiming_) {
+            for (size_t pi = (size_t)firstPhase; pi < (size_t)lastPhase; ) {
+                const size_t segmentStart = pi;
+                const MetalCodegen::PhaseInfo* hookPhase = nullptr;
+
+                // Hooks may replace or add named buffers between segments.
+                for (auto& kv : allBuffers) {
+                    auto it = allocatedBuffers_.find(kv.first);
+                    if (it != allocatedBuffers_.end() && it->second) kv.second = it->second;
+                }
+
+                auto* cmdBuf = cmdQueue_->commandBuffer();
+                auto* encoder = cmdBuf->computeCommandEncoder();
+                bool encodedAny = false;
+
+                for (; pi < (size_t)lastPhase; ++pi) {
+                    const auto& phase = allPhases[pi];
+                    auto* pso = findPSO(compiled, phase.name);
+                    if (!pso) {
+                        std::cerr << "MetalGenericExecutor: PSO not found for '"
+                                  << phase.name << "'\n";
+                        continue;
+                    }
+
+                    if (!phase.hookOnly) {
+                        encodePhase(encoder, pso, phase, allBuffers);
+                        encodedAny = true;
+                    }
+
+                    if (phase.postDispatchHook) {
+                        hookPhase = &phase;
+                        ++pi;
+                        break;
+                    }
+                    if ((int)pi + 1 < lastPhase) {
+                        encoder->memoryBarrier(MTL::BarrierScopeBuffers);
+                    }
+                }
+
+                encoder->endEncoding();
+                double segmentGpuSec = 0.0;
+                if (encodedAny) {
+                    cmdBuf->commit();
+                    cmdBuf->waitUntilCompleted();
+                    const std::string label = hookPhase
+                        ? hookPhase->name
+                        : allPhases[segmentStart].name;
+                    checkCommandBufferStatus(cmdBuf, label);
+                    segmentGpuSec = cmdBuf->GPUEndTime() - cmdBuf->GPUStartTime();
+                }
+
+                double hookGpuMs = 0.0;
+                double hookCpuMs = 0.0;
+                if (hookPhase && hookPhase->postDispatchHook) {
+                    auto hookStart = std::chrono::high_resolution_clock::now();
+                    hookGpuMs = hookPhase->postDispatchHook(*this);
+                    auto hookEnd = std::chrono::high_resolution_clock::now();
+                    if (hookGpuMs < 0.0) hookGpuMs = 0.0;
+                    double hookWallMs = std::chrono::duration<double, std::milli>(
+                        hookEnd - hookStart).count();
+                    hookCpuMs = std::max(0.0, hookWallMs - hookGpuMs);
+                }
+
+                totalGpuSec += segmentGpuSec + hookGpuMs / 1000.0;
+                execResult.hookCpuTimeMs += static_cast<float>(hookCpuMs);
+                execResult.hookGpuTimeMs += static_cast<float>(hookGpuMs);
+            }
+
+            execResult.totalKernelTimeMs = static_cast<float>(totalGpuSec * 1000.0);
+            continue;
+        }
 
         for (size_t pi = (size_t)firstPhase; pi < (size_t)lastPhase; pi++) {
             const auto& phase = allPhases[pi];
@@ -429,6 +519,10 @@ MetalExecutionResult MetalGenericExecutor::execute(
                           << phase.name << "'\n";
                 execResult.phaseTimesMs.push_back(0.0f);
                 execResult.phaseNames.push_back(phase.name);
+                execResult.phaseHookCpuTimesMs.push_back(0.0f);
+                execResult.phaseHookGpuTimesMs.push_back(0.0f);
+                execResult.phaseWallTimesMs.push_back(0.0f);
+                execResult.phaseOverheadTimesMs.push_back(0.0f);
                 continue;
             }
 
@@ -438,37 +532,64 @@ MetalExecutionResult MetalGenericExecutor::execute(
                 if (it != allocatedBuffers_.end() && it->second) kv.second = it->second;
             }
 
-            auto* cmdBuf = cmdQueue_->commandBuffer();
-            auto* encoder = cmdBuf->computeCommandEncoder();
+            auto phaseWallStart = std::chrono::high_resolution_clock::now();
+            double phaseSec = 0.0;
+            if (!phase.hookOnly) {
+                auto* cmdBuf = cmdQueue_->commandBuffer();
+                auto* encoder = cmdBuf->computeCommandEncoder();
 
-            encodePhase(encoder, pso, phase, allBuffers);
+                encodePhase(encoder, pso, phase, allBuffers);
 
-            encoder->endEncoding();
-            cmdBuf->commit();
-            cmdBuf->waitUntilCompleted();
-            checkCommandBufferStatus(cmdBuf, phase.name);
+                encoder->endEncoding();
+                cmdBuf->commit();
+                cmdBuf->waitUntilCompleted();
+                checkCommandBufferStatus(cmdBuf, phase.name);
 
-            double phaseSec = cmdBuf->GPUEndTime() - cmdBuf->GPUStartTime();
+                phaseSec = cmdBuf->GPUEndTime() - cmdBuf->GPUStartTime();
+            }
             double hookGpuMs = 0.0;
+            double hookCpuMs = 0.0;
 
-            // Fold hook-launched GPU work into the same phase total.
+            // Fold hook-launched GPU work into the same phase total, and keep
+            // host-side hook orchestration visible for wall-time accounting.
             if (phase.postDispatchHook) {
+                auto hookStart = std::chrono::high_resolution_clock::now();
                 hookGpuMs = phase.postDispatchHook(*this);
+                auto hookEnd = std::chrono::high_resolution_clock::now();
                 if (hookGpuMs < 0.0) hookGpuMs = 0.0;
+                double hookWallMs = std::chrono::duration<double, std::milli>(
+                    hookEnd - hookStart).count();
+                hookCpuMs = std::max(0.0, hookWallMs - hookGpuMs);
             }
 
-            totalGpuSec += phaseSec + hookGpuMs / 1000.0;
-            execResult.phaseTimesMs.push_back(
-                static_cast<float>(phaseSec * 1000.0 + hookGpuMs));
+            auto phaseWallEnd = std::chrono::high_resolution_clock::now();
+            const double phaseGpuMs = phaseSec * 1000.0 + hookGpuMs;
+            const double phaseWallMs = std::chrono::duration<double, std::milli>(
+                phaseWallEnd - phaseWallStart).count();
+            const double phaseOverheadMs = std::max(0.0,
+                phaseWallMs - phaseGpuMs - hookCpuMs);
+
+            totalGpuSec += phaseGpuMs / 1000.0;
+            execResult.hookCpuTimeMs += static_cast<float>(hookCpuMs);
+            execResult.hookGpuTimeMs += static_cast<float>(hookGpuMs);
+            execResult.phaseTimesMs.push_back(static_cast<float>(phaseGpuMs));
             execResult.phaseNames.push_back(phase.name);
+            execResult.phaseHookCpuTimesMs.push_back(static_cast<float>(hookCpuMs));
+            execResult.phaseHookGpuTimesMs.push_back(static_cast<float>(hookGpuMs));
+            execResult.phaseWallTimesMs.push_back(static_cast<float>(phaseWallMs));
+            execResult.phaseOverheadTimesMs.push_back(static_cast<float>(phaseOverheadMs));
         }
 
         execResult.totalKernelTimeMs = static_cast<float>(totalGpuSec * 1000.0);
     }
 
+    auto collectStart = std::chrono::high_resolution_clock::now();
     execResult.result = MetalResultCollector::collect(codegen.getResultSchema(), allBuffers);
+    execResult.resultCollectTimeMs = static_cast<float>(
+        std::chrono::duration<double, std::milli>(
+            std::chrono::high_resolution_clock::now() - collectStart).count());
 
-    return execResult;
+    return finishExecution();
 }
 
 void MetalGenericExecutor::releaseAllocatedBuffers() {

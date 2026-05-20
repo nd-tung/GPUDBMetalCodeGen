@@ -19,6 +19,16 @@ struct MetalExecutionResult {
     std::vector<float> phaseTimesMs;
     std::vector<std::string> phaseNames;    // parallel to phaseTimesMs
 
+    // Wall/CPU accounting for work that is not visible in Metal GPU timestamps.
+    float executeWallTimeMs = 0.0f;
+    float hookCpuTimeMs = 0.0f;
+    float hookGpuTimeMs = 0.0f; // Included in totalKernelTimeMs.
+    float resultCollectTimeMs = 0.0f;
+    std::vector<float> phaseHookCpuTimesMs; // parallel to phaseTimesMs
+    std::vector<float> phaseHookGpuTimesMs; // parallel to phaseTimesMs
+    std::vector<float> phaseWallTimesMs;    // parallel to phaseTimesMs
+    std::vector<float> phaseOverheadTimesMs; // wall - GPU - hook CPU
+
     // CPU-side sub-phases are filled by the caller.
     float analyzeTimeMs    = 0.0f;  // SQL to AnalyzedQuery
     float planTimeMs       = 0.0f;  // AnalyzedQuery to MetalQueryPlan
@@ -27,10 +37,6 @@ struct MetalExecutionResult {
     float psoTimeMs        = 0.0f;  // MTLLibrary to pipeline states
     float dataLoadTimeMs   = 0.0f;  // .tbl parse + host buffer fill + per-query setup
     float bufferAllocTimeMs = 0.0f; // GPU buffer allocation / upload inside execute()
-
-    // Back-compat name used by TIMING_CSV consumers.
-    float parseTimeMs      = 0.0f;
-    float postTimeMs       = 0.0f;
 };
 
 class MetalGenericExecutor {
@@ -86,6 +92,11 @@ public:
     // Skip zero-fill when chunked execution must preserve partial outputs.
     void setSkipZeroInit(bool skip) { skipZeroInit_ = skip; }
 
+    // When enabled, measured runs execute one command buffer per phase and
+    // return per-phase wall/residual timings. Normal execution batches phases
+    // between host hooks to avoid profiling overhead in end-to-end timings.
+    void setDetailedPhaseTiming(bool enabled) { detailedPhaseTiming_ = enabled; }
+
     // Collect current buffers without re-running GPU work.
     GenericResult collectResult(const MetalCodegen& codegen) const;
 
@@ -117,6 +128,7 @@ private:
     MTL::CommandQueue* cmdQueue_;
     MetalSizeResolver sizeResolver_;
     bool skipZeroInit_ = false;
+    bool detailedPhaseTiming_ = false;
 
     struct TableInfo {
         MTL::Buffer* buffer = nullptr;

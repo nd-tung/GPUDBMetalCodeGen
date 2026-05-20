@@ -95,31 +95,25 @@ static void q2_atomic_min(device atomic_uint* min_cost, uint partkey, float cost
     }
 
     // --- Compact Results ---
-    // Compact fully decorated result rows on GPU.
+    // Compact ORDER BY keys and row ids. Payload columns are gathered after top-k.
     plan.helpers.push_back(R"(
-static void q2_compact_emit(device atomic_uint* counter,
-                             device float* out_acctbal,
-                             device char* out_s_name,
-                             device char* out_n_name,
-                             device uint* out_p_partkey,
-                             device char* out_p_mfgr,
-                             device char* out_s_address,
-                             device char* out_s_phone,
-                             device char* out_s_comment,
-                             const device uint* d_q2_min_cost,
-                             const device int* d_q2_part_idx,
-                             const device int* d_q2_supp_idx,
-                             const device int* d_q2_nation_idx,
-                             const device float* s_acctbal,
-                             const device char* s_name,
-                             const device int* s_nationkey,
-                             const device char* s_address,
-                             const device char* s_phone,
-                             const device char* s_comment,
-                             const device char* p_mfgr,
-                             const device char* n_name,
-                             uint cap, uint pk, uint sk, float supplycost, uint i) {
-    (void)i;
+static void q2_key_emit(device atomic_uint* counter,
+                         device float* out_acctbal,
+                         device char* out_s_name,
+                         device char* out_n_name,
+                         device uint* out_p_partkey,
+                         device uint* out_supp_idx,
+                         device uint* out_part_idx,
+                         device uint* out_nation_idx,
+                         const device uint* d_q2_min_cost,
+                         const device int* d_q2_part_idx,
+                         const device int* d_q2_supp_idx,
+                         const device int* d_q2_nation_idx,
+                         const device float* s_acctbal,
+                         const device char* s_name,
+                         const device int* s_nationkey,
+                         const device char* n_name,
+                         uint cap, uint pk, uint sk, float supplycost) {
     uint minU = d_q2_min_cost[pk];
     if (minU == 0xFFFFFFFFu) return;
     float minCost = as_type<float>(minU);
@@ -135,12 +129,11 @@ static void q2_compact_emit(device atomic_uint* counter,
     if (slot < cap) {
         out_acctbal[slot] = s_acctbal[si];
         out_p_partkey[slot] = pk;
+        out_supp_idx[slot] = (uint)si;
+        out_part_idx[slot] = (uint)pi;
+        out_nation_idx[slot] = (uint)ni;
         for (uint c = 0; c < 25u; ++c) out_s_name[slot * 25u + c] = s_name[si * 25u + c];
         for (uint c = 0; c < 25u; ++c) out_n_name[slot * 25u + c] = n_name[ni * 25u + c];
-        for (uint c = 0; c < 25u; ++c) out_p_mfgr[slot * 25u + c] = p_mfgr[pi * 25u + c];
-        for (uint c = 0; c < 40u; ++c) out_s_address[slot * 40u + c] = s_address[si * 40u + c];
-        for (uint c = 0; c < 15u; ++c) out_s_phone[slot * 15u + c] = s_phone[si * 15u + c];
-        for (uint c = 0; c < 101u; ++c) out_s_comment[slot * 101u + c] = s_comment[si * 101u + c];
     }
 }
 )");
@@ -159,23 +152,17 @@ static void q2_compact_emit(device atomic_uint* counter,
                 cg.addColumnParam("s_acctbal", "float", "supplier");
                 cg.addColumnParam("s_name", "char", "supplier");
                 cg.addColumnParam("s_nationkey", "int", "supplier");
-                cg.addColumnParam("s_address", "char", "supplier");
-                cg.addColumnParam("s_phone", "char", "supplier");
-                cg.addColumnParam("s_comment", "char", "supplier");
-                cg.addColumnParam("p_mfgr", "char", "part");
                 cg.addColumnParam("n_name", "char", "nation");
                 cg.addColumnParam("ps_supplycost", "float", "partsupp");
                 child_->produce(cg, [&]() {
-                    cg.addLine("q2_compact_emit(d_q2_compact_count, d_q2_result_acctbal, "
-                               "d_q2_result_s_name, d_q2_result_n_name, "
-                               "d_q2_result_p_partkey, d_q2_result_p_mfgr, "
-                               "d_q2_result_s_address, d_q2_result_s_phone, "
-                               "d_q2_result_s_comment, d_q2_min_cost, "
+                    cg.addLine("q2_key_emit(d_q2_compact_count, d_q2_key_acctbal, "
+                               "d_q2_key_s_name, d_q2_key_n_name, "
+                               "d_q2_key_p_partkey, d_q2_key_supp_idx, "
+                               "d_q2_key_part_idx, d_q2_key_nation_idx, d_q2_min_cost, "
                                "d_q2_part_idx, d_q2_supp_idx, d_q2_nation_idx, "
-                               "s_acctbal, s_name, s_nationkey, s_address, "
-                               "s_phone, s_comment, p_mfgr, n_name, q2_compact_cap, "
+                               "s_acctbal, s_name, s_nationkey, n_name, q2_compact_cap, "
                                "(uint)ps_partkey[" + idx_ + "], (uint)ps_suppkey[" +
-                               idx_ + "], ps_supplycost[" + idx_ + "], " + idx_ + ");");
+                               idx_ + "], ps_supplycost[" + idx_ + "]);");
                 });
                 consume();
             }
@@ -184,14 +171,13 @@ static void q2_compact_emit(device atomic_uint* counter,
         auto sideEffect = std::make_unique<Q2CompactTerminal>(std::move(suppProbe), idx);
         auto& phase = appendPhase(plan, "Q2_compact", std::move(sideEffect));
         phase.extraBuffers.push_back({"d_q2_compact_count",       "atomic_uint", false, true});
-        phase.extraBuffers.push_back({"d_q2_result_acctbal",      "float",       false, false});
-        phase.extraBuffers.push_back({"d_q2_result_s_name",       "char",        false, false});
-        phase.extraBuffers.push_back({"d_q2_result_n_name",       "char",        false, false});
-        phase.extraBuffers.push_back({"d_q2_result_p_partkey",    "uint",        false, false});
-        phase.extraBuffers.push_back({"d_q2_result_p_mfgr",       "char",        false, false});
-        phase.extraBuffers.push_back({"d_q2_result_s_address",    "char",        false, false});
-        phase.extraBuffers.push_back({"d_q2_result_s_phone",      "char",        false, false});
-        phase.extraBuffers.push_back({"d_q2_result_s_comment",    "char",        false, false});
+        phase.extraBuffers.push_back({"d_q2_key_acctbal",         "float",       false, false});
+        phase.extraBuffers.push_back({"d_q2_key_s_name",          "char",        false, false});
+        phase.extraBuffers.push_back({"d_q2_key_n_name",          "char",        false, false});
+        phase.extraBuffers.push_back({"d_q2_key_p_partkey",       "uint",        false, false});
+        phase.extraBuffers.push_back({"d_q2_key_supp_idx",        "uint",        false, false});
+        phase.extraBuffers.push_back({"d_q2_key_part_idx",        "uint",        false, false});
+        phase.extraBuffers.push_back({"d_q2_key_nation_idx",      "uint",        false, false});
         // Read the atomic min-cost buffer through a plain uint view.
         phase.extraBuffers.push_back({"d_q2_min_cost",           "uint", true, false});
         phase.extraBuffers.push_back({"d_q2_part_idx",           "int",  true, false});
@@ -204,14 +190,10 @@ static void q2_compact_emit(device atomic_uint* counter,
     // --- Result Order ---
     {
         std::vector<GenericMatColumnDesc> columns = {
-            GenericMatColumnDesc("s_acctbal", "d_q2_result_acctbal", "float"),
-            GenericMatColumnDesc("s_name", "d_q2_result_s_name", "char", 25),
-            GenericMatColumnDesc("n_name", "d_q2_result_n_name", "char", 25),
-            GenericMatColumnDesc("p_partkey", "d_q2_result_p_partkey", "uint"),
-            GenericMatColumnDesc("p_mfgr", "d_q2_result_p_mfgr", "char", 25),
-            GenericMatColumnDesc("s_address", "d_q2_result_s_address", "char", 40),
-            GenericMatColumnDesc("s_phone", "d_q2_result_s_phone", "char", 15),
-            GenericMatColumnDesc("s_comment", "d_q2_result_s_comment", "char", 101),
+            GenericMatColumnDesc("s_acctbal", "d_q2_key_acctbal", "float"),
+            GenericMatColumnDesc("s_name", "d_q2_key_s_name", "char", 25),
+            GenericMatColumnDesc("n_name", "d_q2_key_n_name", "char", 25),
+            GenericMatColumnDesc("p_partkey", "d_q2_key_p_partkey", "uint"),
         };
         GenericSortSpec sortSpec;
         sortSpec.keys.push_back({"s_acctbal", true});
@@ -225,6 +207,90 @@ static void q2_compact_emit(device atomic_uint* counter,
                                            &sortError)) {
             appendGenericGpuSort(plan, "q2_result", resultRows,
                                  "q2_compact_cap", columns, sortSpec, &sortError);
+        }
+        if (plan.gpuSort) {
+            struct Q2LateMaterializeTerminal : MetalOperator {
+                std::string sortedIndexBuffer_;
+                std::string rowsSymbol_;
+                Q2LateMaterializeTerminal(std::string sortedIndexBuffer,
+                                          std::string rowsSymbol)
+                    : sortedIndexBuffer_(std::move(sortedIndexBuffer)),
+                      rowsSymbol_(std::move(rowsSymbol)) {}
+                void produce(MetalCodegen& cg, ConsumerFn consume) override {
+                    cg.addScalarParam(rowsSymbol_, "uint");
+                    cg.addScalarParam("q2_late_limit", "uint");
+                    cg.addBufferParam(sortedIndexBuffer_, "int", "", false);
+                    cg.addBufferParam("d_q2_key_acctbal", "float", "", false);
+                    cg.addBufferParam("d_q2_key_s_name", "char", "", false);
+                    cg.addBufferParam("d_q2_key_n_name", "char", "", false);
+                    cg.addBufferParam("d_q2_key_p_partkey", "uint", "", false);
+                    cg.addBufferParam("d_q2_key_supp_idx", "uint", "", false);
+                    cg.addBufferParam("d_q2_key_part_idx", "uint", "", false);
+                    cg.addBufferParam("d_q2_key_nation_idx", "uint", "", false);
+                    cg.addColumnParam("p_mfgr", "char", "part");
+                    cg.addColumnParam("s_address", "char", "supplier");
+                    cg.addColumnParam("s_phone", "char", "supplier");
+                    cg.addColumnParam("s_comment", "char", "supplier");
+                    cg.addAtomicBufferParam("d_q2_late_count", "atomic_uint", "1");
+                    cg.addBufferParam("d_q2_result_acctbal", "float", "q2_late_limit", false);
+                    cg.addBufferParam("d_q2_result_s_name", "char", "q2_late_limit * 25", false);
+                    cg.addBufferParam("d_q2_result_n_name", "char", "q2_late_limit * 25", false);
+                    cg.addBufferParam("d_q2_result_p_partkey", "uint", "q2_late_limit", false);
+                    cg.addBufferParam("d_q2_result_p_mfgr", "char", "q2_late_limit * 25", false);
+                    cg.addBufferParam("d_q2_result_s_address", "char", "q2_late_limit * 40", false);
+                    cg.addBufferParam("d_q2_result_s_phone", "char", "q2_late_limit * 15", false);
+                    cg.addBufferParam("d_q2_result_s_comment", "char", "q2_late_limit * 101", false);
+
+                    cg.registerMaterializeOutput("d_q2_late_count");
+                    cg.registerOutputColumn("s_acctbal", "d_q2_result_acctbal", "float");
+                    cg.registerOutputColumn("s_name", "d_q2_result_s_name", "char", 25);
+                    cg.registerOutputColumn("n_name", "d_q2_result_n_name", "char", 25);
+                    cg.registerOutputColumn("p_partkey", "d_q2_result_p_partkey", "uint");
+                    cg.registerOutputColumn("p_mfgr", "d_q2_result_p_mfgr", "char", 25);
+                    cg.registerOutputColumn("s_address", "d_q2_result_s_address", "char", 40);
+                    cg.registerOutputColumn("s_phone", "d_q2_result_s_phone", "char", 15);
+                    cg.registerOutputColumn("s_comment", "d_q2_result_s_comment", "char", 101);
+
+                    cg.addIf("tid == 0", [&]() {
+                        cg.addLine("uint _late_n = min((uint)" + rowsSymbol_ + ", q2_late_limit);");
+                        cg.addLine("atomic_store_explicit(d_q2_late_count, _late_n, memory_order_relaxed);");
+                    });
+                    cg.addBlock("for (uint rank = tid; rank < q2_late_limit && rank < (uint)" +
+                                rowsSymbol_ + "; rank += tpg)", [&]() {
+                        cg.addLine("int src_i = " + sortedIndexBuffer_ + "[rank];");
+                        cg.addIf("src_i < 0 || (uint)src_i >= (uint)" + rowsSymbol_, [&]() {
+                            cg.addLine("continue;");
+                        });
+                        cg.addLine("uint src = (uint)src_i;");
+                        cg.addLine("uint si = d_q2_key_supp_idx[src];");
+                        cg.addLine("uint pi = d_q2_key_part_idx[src];");
+                        cg.addLine("d_q2_result_acctbal[rank] = d_q2_key_acctbal[src];");
+                        cg.addLine("d_q2_result_p_partkey[rank] = d_q2_key_p_partkey[src];");
+                        cg.addBlock("for (uint c = 0; c < 25u; ++c)", [&]() {
+                            cg.addLine("d_q2_result_s_name[rank * 25u + c] = d_q2_key_s_name[src * 25u + c];");
+                            cg.addLine("d_q2_result_n_name[rank * 25u + c] = d_q2_key_n_name[src * 25u + c];");
+                            cg.addLine("d_q2_result_p_mfgr[rank * 25u + c] = p_mfgr[pi * 25u + c];");
+                        });
+                        cg.addBlock("for (uint c = 0; c < 40u; ++c)", [&]() {
+                            cg.addLine("d_q2_result_s_address[rank * 40u + c] = s_address[si * 40u + c];");
+                        });
+                        cg.addBlock("for (uint c = 0; c < 15u; ++c)", [&]() {
+                            cg.addLine("d_q2_result_s_phone[rank * 15u + c] = s_phone[si * 15u + c];");
+                        });
+                        cg.addBlock("for (uint c = 0; c < 101u; ++c)", [&]() {
+                            cg.addLine("d_q2_result_s_comment[rank * 101u + c] = s_comment[si * 101u + c];");
+                        });
+                    });
+                    consume();
+                }
+                std::string describe() const override { return "Q2LateMaterializeResult"; }
+            };
+            const auto sortInfo = *plan.gpuSort;
+            appendPhase(plan, "Q2_late_materialize",
+                        std::make_unique<Q2LateMaterializeTerminal>(
+                            sortInfo.sortedIndexBuffer, resultRows),
+                        256);
+            plan.gpuSort.reset();
         }
     }
 

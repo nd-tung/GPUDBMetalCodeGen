@@ -2641,14 +2641,6 @@ std::vector<GenericMatColumnDesc> fdKeyedGroupTopKNarrowColumns(
     return out;
 }
 
-bool appendBestGenericGpuOrder(MetalQueryPlan& plan,
-                               const std::string& tag,
-                               const std::string& nRowsSymbol,
-                               const std::string& capacityExpr,
-                               const std::vector<GenericMatColumnDesc>& columns,
-                               const GenericSortSpec& sortSpec,
-                               std::string* error);
-
 bool materializedCountDistinctTypeSupported(const GenericMatColumnDesc& col) {
     if (col.stringLen > 0) return false;
     return col.metalType == "int" || col.metalType == "uint" ||
@@ -2826,29 +2818,6 @@ bool tryAppendMaterializedCountDistinctGroup(
 
     if (applied) *applied = true;
     return true;
-}
-
-bool appendBestGenericGpuOrder(MetalQueryPlan& plan,
-                               const std::string& tag,
-                               const std::string& nRowsSymbol,
-                               const std::string& capacityExpr,
-                               const std::vector<GenericMatColumnDesc>& columns,
-                               const GenericSortSpec& sortSpec,
-                               std::string* error) {
-    if (sortSpec.limit > 0 && !sortSpec.keys.empty()) {
-        std::string topKError;
-        if (appendGenericGpuTopK(plan, tag, nRowsSymbol, capacityExpr,
-                                 columns, sortSpec, &topKError)) {
-            return true;
-        }
-        std::string selectError;
-        if (appendGenericGpuTopKSelection(plan, tag, nRowsSymbol, capacityExpr,
-                                          columns, sortSpec, &selectError)) {
-            return true;
-        }
-    }
-    return appendGenericGpuSort(plan, tag, nRowsSymbol, capacityExpr,
-                                columns, sortSpec, error);
 }
 
 void collectPredicateColumnsLocal(const GenericPredicatePtr& pred,
@@ -3129,9 +3098,9 @@ std::optional<MetalQueryPlan> lowerSharedDimensionCount(
     if (!sortSpec.keys.empty() || sortSpec.limit >= 0) {
         const std::string rowsSym = "n_gpu_sort_ir_shared_dim_rows";
         attachMaterializedCountHook(matPhase, resultCounter, rowsSym);
-        if (!appendGenericGpuSort(plan, "ir_shared_dim", rowsSym,
-                                  tableSizeName(dimensionScan->table),
-                                  outputCols, sortSpec, error)) {
+        if (!appendBestGenericGpuOrder(plan, "ir_shared_dim", rowsSym,
+                                       tableSizeName(dimensionScan->table),
+                                       outputCols, sortSpec, error)) {
             return std::nullopt;
         }
     }
@@ -3625,23 +3594,10 @@ std::optional<MetalQueryPlan> lowerMultiTableGroupedAggregateIRToMetalImpl(
 
             if (!sortSpec.keys.empty() || sortSpec.limit >= 0) {
                 std::string sortError;
-                if (sortSpec.limit > 0) {
-                    if (!appendGenericGpuTopK(lowering->plan,
-                                              "ir_multi_in_agg_reuse",
-                                              reuseRows, reuseAgg->keyDomain,
-                                              outputCols, sortSpec,
-                                              &sortError)) {
-                        if (!appendGenericGpuSort(
-                                lowering->plan, "ir_multi_in_agg_reuse",
-                                reuseRows, reuseAgg->keyDomain, outputCols,
-                                sortSpec, &sortError)) {
-                            return std::nullopt;
-                        }
-                    }
-                } else if (!appendGenericGpuSort(
-                               lowering->plan, "ir_multi_in_agg_reuse",
-                               reuseRows, reuseAgg->keyDomain, outputCols,
-                               sortSpec, &sortError)) {
+                if (!appendBestGenericGpuOrder(
+                        lowering->plan, "ir_multi_in_agg_reuse",
+                        reuseRows, reuseAgg->keyDomain, outputCols,
+                        sortSpec, &sortError)) {
                     return std::nullopt;
                 }
             }
@@ -3749,22 +3705,10 @@ std::optional<MetalQueryPlan> lowerMultiTableGroupedAggregateIRToMetalImpl(
 
         if (!sortSpec.keys.empty() || sortSpec.limit >= 0) {
             std::string sortError;
-            if (sortSpec.limit > 0) {
-                if (!appendGenericGpuTopK(lowering->plan,
-                                          "ir_multi_in_agg_reuse", reuseRows,
-                                          domainBitmap->keyDomain, outputCols,
-                                          sortSpec, &sortError)) {
-                    if (!appendGenericGpuSort(
-                            lowering->plan, "ir_multi_in_agg_reuse",
-                            reuseRows, domainBitmap->keyDomain, outputCols,
-                            sortSpec, &sortError)) {
-                        return std::nullopt;
-                    }
-                }
-            } else if (!appendGenericGpuSort(
-                           lowering->plan, "ir_multi_in_agg_reuse", reuseRows,
-                           domainBitmap->keyDomain, outputCols, sortSpec,
-                           &sortError)) {
+            if (!appendBestGenericGpuOrder(
+                    lowering->plan, "ir_multi_in_agg_reuse", reuseRows,
+                    domainBitmap->keyDomain, outputCols, sortSpec,
+                    &sortError)) {
                 return std::nullopt;
             }
         }
@@ -4914,9 +4858,9 @@ std::optional<MetalQueryPlan> lowerMultiTableGroupedAggregateIRToMetalImpl(
 	            if (!sortSpec.keys.empty() || sortSpec.limit >= 0) {
 	                const std::string sortRowsSym = "n_gpu_sort_ir_multi_direct_group_rows";
 	                attachMaterializedCountHook(compactPhase, compactCounter, sortRowsSym);
-                if (!appendGenericGpuSort(lowering->plan, "ir_multi_direct_group",
-                                          sortRowsSym, bucketCountExpr,
-                                          compactCols, sortSpec, error)) {
+                if (!appendBestGenericGpuOrder(lowering->plan, "ir_multi_direct_group",
+                                               sortRowsSym, bucketCountExpr,
+                                               compactCols, sortSpec, error)) {
 	                    return std::nullopt;
 	                }
 	            }
@@ -4961,10 +4905,10 @@ std::optional<MetalQueryPlan> lowerMultiTableGroupedAggregateIRToMetalImpl(
                                 sortRowsSym);
 
     if (!sortSpec.keys.empty() || sortSpec.limit >= 0) {
-	        if (!appendGenericGpuSort(lowering->plan, "group_" + groupTag,
-	                                  sortRowsSym, gbSpec.maxOutputRowsExpr,
-	                                  hashOutputColumns,
-	                                  sortSpec, error)) {
+	        if (!appendBestGenericGpuOrder(lowering->plan, "group_" + groupTag,
+	                                       sortRowsSym, gbSpec.maxOutputRowsExpr,
+	                                       hashOutputColumns,
+	                                       sortSpec, error)) {
             return std::nullopt;
         }
     }

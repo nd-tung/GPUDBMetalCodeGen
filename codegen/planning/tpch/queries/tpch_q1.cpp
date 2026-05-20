@@ -5,14 +5,15 @@ namespace codegen {
 
 namespace {
 
-std::optional<MetalQueryPlan> buildQ1PlanForShape(const std::string& filterCond) {
+std::optional<MetalQueryPlan> buildQ1PredefinedPlan() {
     MetalQueryPlan plan;
     plan.name = "Q1";
 
     // --- Returnflag/Status Aggregate ---
     // Six buckets cover returnflag and linestatus combinations.
     std::string idxVar = "i";
-    auto filtered = maybeSelect(makeAutoScan("lineitem", idxVar), filterCond);
+    auto filtered = maybeSelect(makeAutoScan("lineitem", idxVar),
+                                "l_shipdate[i] <= 19980902");
 
     std::string bucketExpr = "((l_returnflag[" + idxVar + "] == 'A' ? 0 : (l_returnflag[" + idxVar + "] == 'N' ? 2 : 4)) + (l_linestatus[" + idxVar + "] == 'F' ? 0 : 1))";
 
@@ -36,22 +37,8 @@ std::optional<MetalQueryPlan> buildQ1PlanForShape(const std::string& filterCond)
 } // namespace
 
 // Q1: Pricing Summary Report.
-std::optional<MetalQueryPlan> buildQ1Plan(const AnalyzedQuery& aq) {
-    // Match single-table lineitem aggregation grouped by returnflag and linestatus.
-    if (!aq.isSingleTable()) return std::nullopt;
-    if (aq.tables[0] != "lineitem") return std::nullopt;
-    if (!aq.hasAggregation() || !aq.hasGroupBy()) return std::nullopt;
-
-    if (aq.groupBy.size() != 2) return std::nullopt;
-
-    std::string idxVar = "i";
-    std::string filterCond = combineFilters(aq.filters, idxVar);
-
-    return buildQ1PlanForShape(filterCond);
-}
-
 std::optional<MetalQueryPlan> buildQ1Plan_byName() {
-    return buildQ1PlanForShape("l_shipdate[i] <= 19980902");
+    return buildQ1PredefinedPlan();
 }
 
 } // namespace codegen

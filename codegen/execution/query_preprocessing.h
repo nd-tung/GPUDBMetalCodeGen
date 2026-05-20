@@ -25,6 +25,8 @@ struct Q16PostData {
 
 extern Q16PostData g_q16Post;
 
+void resetQueryPreprocessingState();
+
 QueryColumns loadPreprocessColumns(MTL::Device* device,
                                    const std::string& tableName,
                                    const std::vector<ColSpec>& specs);

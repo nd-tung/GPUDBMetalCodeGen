@@ -20,8 +20,10 @@ echo "Output: $CSV"
 WARMUP=5      # Per-config warmup BEFORE the 30 timed trials.
 REPEAT=30     # N=30 satisfies the Mann-Whitney U asymptotic-normal regime.
 
-# TRIAL_CSV format:  TRIAL_CSV,query,sf,trial_idx,gpu_ms,compile_ms,e2e_ms
-echo "config,sf,query,trial,gpu_ms,compile_ms,e2e_ms" > "$CSV"
+# TRIAL_CSV format:
+#   TRIAL_CSV,sf,query,route,trial_idx,gpu_compute_ms,compile_ms,execute_wall_ms,
+#             buffer_setup_ms,hook_cpu_ms,hook_gpu_ms,result_collect_ms
+echo "config,sf,query,route,trial,gpu_compute_ms,compile_ms,execute_wall_ms,buffer_setup_ms,hook_cpu_ms,hook_gpu_ms,result_collect_ms" > "$CSV"
 
 # Configs to compare. Each config row is "<tag>|<extra-cli-flags>".
 # Use whitespace-free flag bundles; tag becomes a CSV cell.
@@ -45,9 +47,10 @@ run_one() {  # $1=config_tag  $2=sf  $3=q  $4...=extra flags
     printf "  %-14s %-4s %-4s FAIL\n" "$cfg" "$sf" "$q"
     return
   fi
-  # TRIAL_CSV,query,sf,trial,gpu,compile,e2e -> config,sf,query,trial,gpu,compile,e2e
+  # TRIAL_CSV,sf,query,route,trial,gpu,compile,execute_wall,...
   echo "$raw" | awk -F, -v cfg="$cfg" '
-    { printf "%s,%s,%s,%s,%s,%s,%s\n", cfg, $3, $2, $4, $5, $6, $7 }
+    { printf "%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n",
+             cfg, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12 }
   ' >> "$CSV"
   printf "  %-14s %-4s %-4s ok (%d trials)\n" "$cfg" "$sf" "$q" \
     "$(echo "$raw" | wc -l | tr -d ' ')"

@@ -13,7 +13,7 @@ TS=$(date +%Y%m%d_%H%M%S)
 OUT=build/exp_reduction_${TS}
 mkdir -p "$OUT"
 CSV=$OUT/reduction.csv
-echo "strategy,sf,query,gpu_ms,e2e_ms,pso_ms,load_mibps" > "$CSV"
+echo "strategy,sf,query,route,gpu_compute_ms,end_to_end_ms,pso_ms,load_mibps" > "$CSV"
 
 QUERIES=(mb1 mb2 mb3 mb4 mb5 mb6 mb7 q1 q6 q14)
 SFS=(sf1 sf10)
@@ -27,14 +27,16 @@ run() {  # $1=strategy_label $2=extra_args $3=sf $4=q
         printf "  %-15s %s %-4s FAIL\n" "$label" "$sf" "$q"
         return
     fi
-    local gpu pso e2e bw
-    gpu=$(awk -F, '{print $10}' <<<"$line")
-    pso=$(awk -F, '{print $7}' <<<"$line")
-    e2e=$(awk -F, '{print $14}' <<<"$line")
-    bw=$(awk -F, '{print $17}' <<<"$line")
-    echo "$label,$sf,$q,$gpu,$e2e,$pso,$bw" >> "$CSV"
-    printf "  %-15s %s %-4s  gpu=%6.2fms  e2e=%7.2fms  bw=%9.1f MiB/s\n" \
-        "$label" "$sf" "$q" "$gpu" "$e2e" "$bw"
+    local gpu pso end_to_end bw
+    local route
+    route=$(awk -F, '{print $3}' <<<"$line")
+    gpu=$(awk -F, '{print $18}' <<<"$line")
+    pso=$(awk -F, '{print $8}' <<<"$line")
+    end_to_end=$(awk -F, '{print $22}' <<<"$line")
+    bw=$(awk -F, '{print $12}' <<<"$line")
+    echo "$label,$sf,$q,$route,$gpu,$end_to_end,$pso,$bw" >> "$CSV"
+    printf "  %-15s %s %-4s  gpu=%6.2fms  end=%7.2fms  bw=%9.1f MiB/s\n" \
+        "$label" "$sf" "$q" "$gpu" "$end_to_end" "$bw"
 }
 
 for sf in "${SFS[@]}"; do
@@ -47,13 +49,13 @@ done
 
 echo "Done. CSV: $CSV"
 echo
-echo "Summary (gpu_ms, scalar-atomic vs tgreduce):"
+echo "Summary (gpu_compute_ms, scalar-atomic vs tgreduce):"
 python3 - <<EOF
 import csv
 from collections import defaultdict
 by = defaultdict(dict)
 for r in csv.DictReader(open("$CSV")):
-    by[(r['sf'], r['query'])][r['strategy']] = float(r['gpu_ms'])
+    by[(r['sf'], r['query'])][r['strategy']] = float(r['gpu_compute_ms'])
 print(f"{'sf':<4}  {'query':<5}  {'tgreduce':>9}  {'scalar':>9}  {'ratio':>7}  {'verdict'}")
 for k in sorted(by):
     d = by[k]

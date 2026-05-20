@@ -5,10 +5,12 @@ namespace codegen {
 
 namespace {
 
-std::optional<MetalQueryPlan> buildQ14PlanForDateFilter(const std::string& filterCond) {
+std::optional<MetalQueryPlan> buildQ14PredefinedPlan() {
     MetalQueryPlan plan;
     plan.name = "Q14";
     std::string idxVar = "i";
+    const std::string filterCond =
+        "l_shipdate[i] >= 19950901 && l_shipdate[i] < 19951001";
 
     // --- Promo Part Bitmap ---
     // Match fixed-width p_type values with the PROMO prefix.
@@ -53,49 +55,8 @@ std::optional<MetalQueryPlan> buildQ14PlanForDateFilter(const std::string& filte
 } // namespace
 
 // Q14: Promotion Effect.
-std::optional<MetalQueryPlan> buildQ14Plan(const AnalyzedQuery& aq) {
-    // Match lineitem/part scalar aggregation with a shipdate filter.
-    if (aq.tables.size() != 2) return std::nullopt;
-    bool hasLineitem = false, hasPart = false;
-    for (auto& t : aq.tables) {
-        if (t == "lineitem") hasLineitem = true;
-        if (t == "part") hasPart = true;
-    }
-    if (!hasLineitem || !hasPart) return std::nullopt;
-    // The target is a ratio expression, so require scalar shape instead of isAgg.
-    if (aq.hasGroupBy()) return std::nullopt;
-    if (aq.targets.size() != 1) return std::nullopt;
-
-    bool hasPartJoin = false;
-    bool hasShipdateFilter = false;
-    for (const auto& j : aq.joins) {
-        bool left = j.leftCol == "l_partkey" && j.rightCol == "p_partkey";
-        bool right = j.leftCol == "p_partkey" && j.rightCol == "l_partkey";
-        if (left || right) hasPartJoin = true;
-    }
-    for (const auto& f : aq.filters) {
-        std::set<std::string> cols;
-        collectColumns(f, cols);
-        if (cols.count("l_partkey") && cols.count("p_partkey")) hasPartJoin = true;
-        if (cols.count("l_shipdate")) hasShipdateFilter = true;
-    }
-    if (!hasPartJoin || !hasShipdateFilter) return std::nullopt;
-
-    std::string idxVar = "i";
-
-    std::vector<PredPtr> dateFilters;
-    for (auto& f : aq.filters) {
-        std::set<std::string> cols;
-        collectColumns(f, cols);
-        if (cols.count("l_shipdate") || cols.count("l_receiptdate")) {
-            dateFilters.push_back(f);
-        }
-    }
-    return buildQ14PlanForDateFilter(combineFilters(dateFilters, idxVar));
-}
-
 std::optional<MetalQueryPlan> buildQ14Plan_byName() {
-    return buildQ14PlanForDateFilter("l_shipdate[i] >= 19950901 && l_shipdate[i] < 19951001");
+    return buildQ14PredefinedPlan();
 }
 
 } // namespace codegen

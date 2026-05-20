@@ -471,7 +471,7 @@ struct LoadStats {
     size_t bytes       = 0;
     int    tblCalls    = 0;
     int    colbinCalls = 0;
-    double excludedMs  = 0.0;   // One-time .tbl->column ingest, excluded from e2e.
+    double excludedMs  = 0.0;   // One-time .tbl->column ingest, excluded from end-to-end timing.
     void reset() { bytes = 0; tblCalls = 0; colbinCalls = 0; excludedMs = 0.0; }
     void recordBinary(size_t b) { bytes += b; colbinCalls++; }
     void recordText(size_t b)   { bytes += b; tblCalls++; }
@@ -1144,7 +1144,7 @@ inline LoadedColumns loadColumnsMultiAuto(const std::string& filePath,
     loadStats().recordExcluded(_ingestMs);
     std::cerr << "[tbl-ingest] " << filePath << ": "
               << std::fixed << std::setprecision(1) << _ingestMs
-              << " ms (one-time, excluded from e2e)\n";
+              << " ms (one-time, excluded from end-to-end timing)\n";
     return _out;
 }
 // --- Shared Table Loaders ---
@@ -1208,6 +1208,7 @@ inline int findNationKey(const NationData& nat, const std::string& target) {
 
 // --- Detailed Timing Summary (codegen pipeline breakdown) ---
 struct DetailedTiming {
+    std::string route;
     std::string queryName;
     std::string scaleFactor;
     double analyzeMs     = 0.0;
@@ -1220,10 +1221,15 @@ struct DetailedTiming {
     double preprocessMs  = 0.0;  // CPU prep: max-key scans and preprocessing kernels.
     double bufferAllocMs = 0.0;
     double gpuTotalMs    = 0.0;
+    double hookCpuMs     = 0.0;  // Host work inside post-dispatch hooks.
+    double hookGpuMs     = 0.0;  // Hook-launched GPU work, already included in gpuTotalMs.
+    double resultCollectMs = 0.0;
+    double executeWallMs = 0.0;  // Median wall time of executor.execute().
+    double validationMs  = 0.0;  // Golden save/check time, excluded from query timing.
     double postMs        = 0.0;
     std::string loadSource;
     size_t loadBytes     = 0;
-    double ingestMs      = 0.0;  // One-time .tbl->column ingest excluded from e2e.
+    double ingestMs      = 0.0;  // One-time .tbl->column ingest excluded from end-to-end timing.
     std::vector<std::pair<std::string, double>> phaseKernelMs; // per-kernel GPU time
     // Per-trial GPU-time distribution, reported when --repeat N>1.
     int    gpuTrialsN  = 0;
@@ -1240,24 +1246,34 @@ inline void printDetailedTimingSummary(const DetailedTiming& t, bool quiet = fal
     //     Pure I/O       = file read/mmap of column data into host memory
     //     CPU Preprocess = max-key scans, per-query preprocessing kernels
     //   Buffer Setup     = Metal buffer allocation (pointers only, no copy)
-    //   GPU Compute      = GPU kernel execution time
-    //   CPU Compute      = host post-processing (sort/merge/format)
-    //   Query Compute    = GPU Compute + CPU Compute  (kernel-only query work)
-    //   Query Execution  = CPU Preprocess + Buffer Setup + Query Compute
+    //   GPU Compute      = GPU kernel execution time, including hook GPU work
+    //   CPU Compute      = host hook work + result collection + post-processing
+    //                      + measured execute overhead not visible in GPU stamps
+    //   Query Compute    = GPU Compute + CPU Compute
+    //   Hot Execution    = Buffer Setup + Query Compute
+    //                      (repeatable hot-query work, excluding I/O, compile, and preprocess)
+    //   Query Execution  = CPU Preprocess + Hot Execution
     //                      (everything actually executing the query, EXCLUDING pure I/O)
     //   End-to-End       = Compile Overhead + Data Load + Buffer Setup + Query Compute
     const double compileOverheadMs = t.analyzeMs + t.planMs + t.codegenMs +
                                      t.compileMs + t.psoMs;
-    const double cpuComputeMs      = t.postMs;
     const double gpuComputeMs      = t.gpuTotalMs;
+    const double executeAccountedMs = t.bufferAllocMs + gpuComputeMs +
+                                      t.hookCpuMs + t.resultCollectMs;
+    const double executeOverheadMs = (t.executeWallMs > 0.0)
+        ? std::max(0.0, t.executeWallMs - executeAccountedMs)
+        : 0.0;
+    const double cpuComputeMs      = t.postMs + t.hookCpuMs +
+                                     t.resultCollectMs + executeOverheadMs;
     const double queryComputeMs    = cpuComputeMs + gpuComputeMs;
     // If split timings are unavailable, attribute dataLoadMs to I/O.
     const double ioMs              = (t.ioMs > 0.0 || t.preprocessMs > 0.0)
                                      ? t.ioMs : t.dataLoadMs;
     const double preprocessMs      = (t.ioMs > 0.0 || t.preprocessMs > 0.0)
                                      ? t.preprocessMs : 0.0;
-    const double queryExecutionMs  = preprocessMs + t.bufferAllocMs + queryComputeMs;
-    const double end2end           = compileOverheadMs + t.dataLoadMs +
+    const double hotExecutionMs    = t.bufferAllocMs + queryComputeMs;
+    const double queryExecutionMs  = preprocessMs + hotExecutionMs;
+    const double endToEndMs        = compileOverheadMs + t.dataLoadMs +
                                      t.bufferAllocMs + queryComputeMs;
 
     if (!quiet) {
@@ -1335,6 +1351,9 @@ inline void printDetailedTimingSummary(const DetailedTiming& t, bool quiet = fal
             rowMs(label, ms);
         }
         rowMs("GPU Compute",    gpuComputeMs);
+        if (t.hookGpuMs > 0.0) {
+            rowMs("  Hook GPU", t.hookGpuMs);
+        }
         if (t.gpuTrialsN > 1) {
             char buf[64];
             snprintf(buf, sizeof(buf),
@@ -1343,8 +1362,25 @@ inline void printDetailedTimingSummary(const DetailedTiming& t, bool quiet = fal
                      t.gpuTrialsN);
             rowStr("  GPU dist", buf);
         }
+        if (t.hookCpuMs > 0.0) {
+            rowMs("  Hook CPU", t.hookCpuMs);
+        }
+        if (t.resultCollectMs > 0.0) {
+            rowMs("  Result Collect", t.resultCollectMs);
+        }
+        if (executeOverheadMs > 0.0) {
+            rowMs("  Execute Overhead", executeOverheadMs);
+        }
+        rowMs("  Host Post", t.postMs);
+        if (t.validationMs > 0.0) {
+            rowMs("  Validation (excl)", t.validationMs);
+        }
+        if (t.executeWallMs > 0.0) {
+            rowMs("Execute Wall", t.executeWallMs);
+        }
         rowMs("CPU Compute",    cpuComputeMs);
         rowMs("Query Compute",     queryComputeMs);
+        rowMs("Hot Execution",     hotExecutionMs);
         rowMsHi("Query Execution",   queryExecutionMs);
         bar();
 
@@ -1352,34 +1388,32 @@ inline void printDetailedTimingSummary(const DetailedTiming& t, bool quiet = fal
         bar();
         rowMs("Compile Overhead",  compileOverheadMs);
         rowMs("Pure I/O",          ioMs);
+        rowMs("Hot Execution",     hotExecutionMs);
         rowMs("Query Execution",   queryExecutionMs);
-        rowMsHi("End-to-End",      end2end);
+        rowMsHi("End-to-End",      endToEndMs);
         bar();
     }
 
-    // Machine-readable single line for CSV harvesting.
-    // Field order remains stable for downstream consumers. Renamed fields use the same slot:
-    //   gpu_ms      -> gpu_compute_ms
-    //   post_ms     -> cpu_compute_ms
-    //   cpu_codegen -> compile_overhead_ms
-    //   cpu_total   -> compile_overhead + data_load + buffer_setup + cpu_compute
-    //                  (retained for CSV consumers; excludes GPU)
-    // Appended: query_compute_ms = cpu_compute_ms + gpu_compute_ms
+    // Machine-readable timing row. The schema is intentionally organized
+    // by lifecycle stage rather than preserving the earlier CSV field order.
     double loadMibps = (ioMs > 0.0 && t.loadBytes > 0)
         ? ((double)t.loadBytes / (1024.0*1024.0)) / (ioMs / 1000.0)
         : 0.0;
-    const double cpuTotalForCsv = compileOverheadMs + t.dataLoadMs +
-                                  t.bufferAllocMs + cpuComputeMs;
-    // CSV trailer fields: io_ms, preprocess_ms, query_execution_ms.
-    printf("TIMING_CSV,%s,%s,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%s,%zu,%.3f,%.3f,%.3f,%d,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f\n",
+    printf("TIMING_CSV,%s,%s,%s,"
+           "%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,"
+           "%s,%zu,%.3f,%.3f,%.3f,%.3f,%.3f,"
+           "%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,"
+           "%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,"
+           "%d,%.3f,%.3f,%.3f,%.3f,%.3f\n",
            t.scaleFactor.c_str(), t.queryName.c_str(),
+           t.route.empty() ? "unknown" : t.route.c_str(),
            t.analyzeMs, t.planMs, t.codegenMs, t.compileMs, t.psoMs,
-           t.dataLoadMs, t.bufferAllocMs, gpuComputeMs, cpuComputeMs,
-           compileOverheadMs, cpuTotalForCsv, end2end,
+           compileOverheadMs,
            t.loadSource.empty() ? "none" : t.loadSource.c_str(),
-           t.loadBytes, loadMibps, t.ingestMs, queryComputeMs,
-           // C1: per-trial GPU-time distribution (zeros if --repeat 1)
-           t.gpuTrialsN, t.gpuMsP10, t.gpuMsP90, t.gpuMsMad,
-           // I/O vs preprocess split + query-execution metric
-           ioMs, preprocessMs, queryExecutionMs);
+           t.loadBytes, loadMibps, t.ingestMs, t.dataLoadMs, ioMs,
+           preprocessMs, t.bufferAllocMs, gpuComputeMs, cpuComputeMs,
+           queryComputeMs, queryExecutionMs, endToEndMs, t.executeWallMs,
+           executeOverheadMs, t.hookCpuMs, t.hookGpuMs, t.resultCollectMs,
+           t.postMs, t.validationMs, t.gpuTrialsN, t.gpuMsP10,
+           gpuComputeMs, t.gpuMsP90, t.gpuMsMad, hotExecutionMs);
 }

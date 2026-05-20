@@ -151,11 +151,15 @@ MTL::Buffer* uploadAndRegister(MTL::Device* device,
 
 } // namespace
 
+void resetQueryPreprocessingState() {
+    g_q16Post = {};
+}
+
 bool prepareQueryPreprocessing(const std::string& queryName,
                                MTL::Device* device,
                                MetalGenericExecutor& executor,
                                const std::vector<LoadedQueryTable>& loadedTables) {
-    g_q16Post = {};
+    resetQueryPreprocessingState();
 
     if (queryName == "Q7") {
         if (!registerNameKey(device, executor, loadedTables, "nation", "FRANCE",  "france_nk"))  return false;
@@ -351,28 +355,46 @@ bool prepareQueryPreprocessing(const std::string& queryName,
                             minCostSize * sizeof(uint32_t), 0xFF);
         uploadAndRegister(device, executor, "d_q2_supp_bitmap", eurSuppBitmap);
 
-        // GPU compaction emits compact Q2 post-processing rows.
+        // GPU compaction emits sort keys and row ids; late materialization emits
+        // only the visible top-k payload.
         constexpr uint32_t kQ2CompactCap = 1u << 18;
+        constexpr uint32_t kQ2LateLimit = 100;
         executor.registerScalarInt("q2_compact_cap", (int)kQ2CompactCap);
         executor.registerSymbol("q2_compact_cap", kQ2CompactCap);
+        executor.registerScalarInt("q2_late_limit", (int)kQ2LateLimit);
+        executor.registerSymbol("q2_late_limit", kQ2LateLimit);
         registerFilledBuffer(device, executor, "d_q2_compact_count",
                              sizeof(uint32_t));
-        registerFilledBuffer(device, executor, "d_q2_result_acctbal",
+        registerFilledBuffer(device, executor, "d_q2_key_acctbal",
                              (size_t)kQ2CompactCap * sizeof(float));
-        registerFilledBuffer(device, executor, "d_q2_result_s_name",
+        registerFilledBuffer(device, executor, "d_q2_key_s_name",
                              (size_t)kQ2CompactCap * 25);
-        registerFilledBuffer(device, executor, "d_q2_result_n_name",
+        registerFilledBuffer(device, executor, "d_q2_key_n_name",
                              (size_t)kQ2CompactCap * 25);
-        registerFilledBuffer(device, executor, "d_q2_result_p_partkey",
+        registerFilledBuffer(device, executor, "d_q2_key_p_partkey",
                              (size_t)kQ2CompactCap * sizeof(uint32_t));
+        registerFilledBuffer(device, executor, "d_q2_key_supp_idx",
+                             (size_t)kQ2CompactCap * sizeof(uint32_t));
+        registerFilledBuffer(device, executor, "d_q2_key_part_idx",
+                             (size_t)kQ2CompactCap * sizeof(uint32_t));
+        registerFilledBuffer(device, executor, "d_q2_key_nation_idx",
+                             (size_t)kQ2CompactCap * sizeof(uint32_t));
+        registerFilledBuffer(device, executor, "d_q2_result_acctbal",
+                             (size_t)kQ2LateLimit * sizeof(float));
+        registerFilledBuffer(device, executor, "d_q2_result_s_name",
+                             (size_t)kQ2LateLimit * 25);
+        registerFilledBuffer(device, executor, "d_q2_result_n_name",
+                             (size_t)kQ2LateLimit * 25);
+        registerFilledBuffer(device, executor, "d_q2_result_p_partkey",
+                             (size_t)kQ2LateLimit * sizeof(uint32_t));
         registerFilledBuffer(device, executor, "d_q2_result_p_mfgr",
-                             (size_t)kQ2CompactCap * 25);
+                             (size_t)kQ2LateLimit * 25);
         registerFilledBuffer(device, executor, "d_q2_result_s_address",
-                             (size_t)kQ2CompactCap * 40);
+                             (size_t)kQ2LateLimit * 40);
         registerFilledBuffer(device, executor, "d_q2_result_s_phone",
-                             (size_t)kQ2CompactCap * 15);
+                             (size_t)kQ2LateLimit * 15);
         registerFilledBuffer(device, executor, "d_q2_result_s_comment",
-                             (size_t)kQ2CompactCap * 101);
+                             (size_t)kQ2LateLimit * 101);
     }
 
     // Q16: GPU filters qualifying parts; a post-dispatch CPU hook builds the

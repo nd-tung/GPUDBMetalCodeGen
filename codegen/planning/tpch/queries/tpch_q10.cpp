@@ -6,10 +6,12 @@ namespace codegen {
 
 namespace {
 
-std::optional<MetalQueryPlan> buildQ10PlanForDateFilter(const std::string& filterCond) {
+std::optional<MetalQueryPlan> buildQ10PredefinedPlan() {
     MetalQueryPlan plan;
     plan.name = "Q10";
     std::string idxVar = "i";
+    const std::string filterCond =
+        "o_orderdate[i] >= 19931001 && o_orderdate[i] < 19940101";
 
     // --- Orders Map ---
     // Map selected orders to customers before probing from lineitem.
@@ -107,47 +109,8 @@ static void q10_compact_emit(device atomic_uint* counter,
 
 } // namespace
 
-std::optional<MetalQueryPlan> buildQ10Plan(const AnalyzedQuery& aq) {
-    // Match Q10 only when the analyzed shape has the required join, filter, and group key.
-    if (aq.tables.size() < 2) return std::nullopt;
-    bool hasLineitem = false, hasOrders = false;
-    for (auto& t : aq.tables)  {
-        if (t == "lineitem") hasLineitem = true;
-        if (t == "orders") hasOrders = true;
-    }
-    if (!hasLineitem || !hasOrders) return std::nullopt;
-
-    bool hasReturnflagFilter = false;
-    for (auto& f : aq.filters) {
-        std::set<std::string> cols;
-        collectColumns(f, cols);
-        if (cols.count("l_returnflag")) hasReturnflagFilter = true;
-    }
-    if (!hasReturnflagFilter) return std::nullopt;
-
-    bool groupByCustkey = false;
-    for (auto& g : aq.groupBy) {
-        std::visit([&](auto&& node) {
-            using T = std::decay_t<decltype(node)>;
-            if constexpr (std::is_same_v<T, ColRef>) {
-                if (node.column == "c_custkey") groupByCustkey = true;
-            }
-        }, g->node);
-    }
-    if (!groupByCustkey) return std::nullopt;
-
-    std::string idxVar = "i";
-    std::vector<PredPtr> dateFilters;
-    for (auto& f : aq.filters) {
-        std::set<std::string> cols;
-        collectColumns(f, cols);
-        if (cols.count("o_orderdate")) dateFilters.push_back(f);
-    }
-    return buildQ10PlanForDateFilter(combineFilters(dateFilters, idxVar));
-}
-
 std::optional<MetalQueryPlan> buildQ10Plan_byName() {
-    return buildQ10PlanForDateFilter("o_orderdate[i] >= 19931001 && o_orderdate[i] < 19940101");
+    return buildQ10PredefinedPlan();
 }
 
 } // namespace codegen

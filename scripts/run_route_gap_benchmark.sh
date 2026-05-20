@@ -64,7 +64,7 @@ if [[ "$RESUME" -eq 0 || ! -f "$STATUS_CSV" ]]; then
     printf 'route,sf,query,status\n' > "$STATUS_CSV"
 fi
 if [[ "$RESUME" -eq 0 || ! -f "$TIMING_CSV" ]]; then
-    printf 'route,sf,query,gpu_ms,e2e_ms,query_ms\n' > "$TIMING_CSV"
+    printf 'route,sf,query,gpu_compute_ms,end_to_end_ms,query_execution_ms\n' > "$TIMING_CSV"
 fi
 
 already_done() {
@@ -108,7 +108,7 @@ run_one() {
     printf '%s,%s,%s,%s\n' "$route" "$sf" "$q" "$stat" >> "$STATUS_CSV"
 
     local timing
-    timing="$(awk -F, '/^TIMING_CSV/ {n=split($0,f,","); gpu=f[11]; e2e=f[15]; query=f[n]} END {if (query != "") printf "%.3f,%.3f,%.3f", gpu, e2e, query}' "$log")"
+    timing="$(awk -F, '/^TIMING_CSV/ {gpu=$19; end_to_end=$23; query=$22} END {if (query != "") printf "%.3f,%.3f,%.3f", gpu, end_to_end, query}' "$log")"
     if [[ -n "$timing" ]]; then
         printf '%s,%s,%s,%s\n' "$route" "$sf" "$q" "$timing" >> "$TIMING_CSV"
     else
@@ -128,12 +128,12 @@ awk -F, '
 NR == 1 { next }
 {
     key = $2 "," $3
-    query_ms[key "," $1] = $6
-    gpu_ms[key "," $1] = $4
-    e2e_ms[key "," $1] = $5
+    query_execution_ms[key "," $1] = $6
+    gpu_compute_ms[key "," $1] = $4
+    end_to_end_ms[key "," $1] = $5
 }
 END {
-    print "sf,query,pre_query_ms,generic_query_ms,ratio,delta_ms,pre_gpu_ms,generic_gpu_ms,pre_e2e_ms,generic_e2e_ms"
+    print "sf,query,pre_query_execution_ms,generic_query_execution_ms,ratio,delta_ms,pre_gpu_compute_ms,generic_gpu_compute_ms,pre_end_to_end_ms,generic_end_to_end_ms"
     ns = split("'"${SCALE_FACTORS[*]}"'", sfs, " ")
     nq = split("'"${QUERIES[*]}"'", qs, " ")
     for (si = 1; si <= ns; ++si) {
@@ -141,16 +141,16 @@ END {
         for (qi = 1; qi <= nq; ++qi) {
             q = qs[qi]
             key = sf "," q
-            p = query_ms[key ",predefined"] + 0
-            g = query_ms[key ",generic"] + 0
+            p = query_execution_ms[key ",predefined"] + 0
+            g = query_execution_ms[key ",generic"] + 0
             ratio = p > 0 ? g / p : 0
             delta = g - p
             printf "%s,%s,%.3f,%.3f,%.3f,%+.3f,%.3f,%.3f,%.3f,%.3f\n",
                    sf, q, p, g, ratio, delta,
-                   gpu_ms[key ",predefined"] + 0,
-                   gpu_ms[key ",generic"] + 0,
-                   e2e_ms[key ",predefined"] + 0,
-                   e2e_ms[key ",generic"] + 0
+                   gpu_compute_ms[key ",predefined"] + 0,
+                   gpu_compute_ms[key ",generic"] + 0,
+                   end_to_end_ms[key ",predefined"] + 0,
+                   end_to_end_ms[key ",generic"] + 0
         }
     }
 }' "$TIMING_CSV" > "$GAP_CSV"

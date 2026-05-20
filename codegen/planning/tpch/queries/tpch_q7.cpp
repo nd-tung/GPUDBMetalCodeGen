@@ -4,27 +4,6 @@
 namespace codegen {
 
 // Q7: Volume Shipping.
-std::optional<MetalQueryPlan> buildQ7Plan(const AnalyzedQuery& aq) {
-    // Match the canonical five-table, two-nation Q7 shape.
-    bool hasNation = false, hasLineitem = false, hasOrders = false;
-    bool hasSupplier = false, hasCustomer = false;
-    int nationCount = 0;
-    for (auto& t : aq.tables) {
-        if (t == "nation") { hasNation = true; nationCount++; }
-        if (t == "lineitem") hasLineitem = true;
-        if (t == "orders") hasOrders = true;
-        if (t == "supplier") hasSupplier = true;
-        if (t == "customer") hasCustomer = true;
-    }
-    if (!(hasNation && hasLineitem && hasOrders && hasSupplier && hasCustomer))
-        return std::nullopt;
-    if (nationCount < 2) return std::nullopt;
-
-    if (aq.groupBy.size() < 3) return std::nullopt;
-
-    return buildQ7Plan_byName();
-}
-
 std::optional<MetalQueryPlan> buildQ7Plan_byName() {
     std::string idx = "i";
 

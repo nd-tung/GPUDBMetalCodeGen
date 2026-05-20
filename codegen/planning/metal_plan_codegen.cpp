@@ -32,6 +32,7 @@ MetalCodegen generateFromPlan(const MetalQueryPlan& plan,
         cg.beginPhase(phase.name);
         cg.setPhaseThreadgroupSize(phase.threadgroupSize);
         cg.setPhaseSingleThread(phase.singleThread);
+        cg.setPhaseHookOnly(phase.hookOnly);
 
         for (const auto& [bmpName, bmpSize] : phase.bitmapReads) {
             cg.addBitmapReadParam(bmpName, bmpSize);
@@ -90,6 +91,7 @@ nlohmann::json MetalQueryPlan::toTreeJSON() const {
         pj["name"] = phase.name;
         pj["threadgroupSize"] = phase.threadgroupSize;
         if (phase.singleThread) pj["singleThread"] = true;
+        if (phase.hookOnly) pj["hookOnly"] = true;
         if (!phase.bitmapReads.empty()) {
             for (auto& [n, s] : phase.bitmapReads)
                 pj["bitmapReads"].push_back({{"name", n}, {"sizeExpr", s}});

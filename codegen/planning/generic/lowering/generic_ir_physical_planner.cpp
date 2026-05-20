@@ -177,10 +177,10 @@ std::optional<MetalQueryPlan> lowerSingleTableHashGroupedAggregateIRToMetal(
     }
 
     if (!sortSpec.keys.empty() || sortSpec.limit >= 0) {
-        if (!appendGenericGpuSort(plan, "group_" + groupTag,
-                                  sortRowsSym, gbSpec.maxOutputRowsExpr,
-                                  genericGpuGroupOutputColumns(gbSpec),
-                                  sortSpec, error)) {
+        if (!appendBestGenericGpuOrder(plan, "group_" + groupTag,
+                                       sortRowsSym, gbSpec.maxOutputRowsExpr,
+                                       genericGpuGroupOutputColumns(gbSpec),
+                                       sortSpec, error)) {
             return std::nullopt;
         }
     }

@@ -96,8 +96,9 @@ std::optional<MetalQueryPlan> lowerSingleTableMaterializeIRToMetal(
     if (!sortSpec.keys.empty() || sortSpec.limit >= 0) {
         const std::string rowsSym = "n_gpu_sort_ir_single_rows";
         attachMaterializedCountHook(matPhase, "d_generic_result_count", rowsSym);
-        if (!appendGenericGpuSort(plan, "ir_single_materialize", rowsSym,
-                                  outputSize, materializedCols, sortSpec, error)) {
+        if (!appendBestGenericGpuOrder(plan, "ir_single_materialize", rowsSym,
+                                       outputSize, materializedCols, sortSpec,
+                                       error)) {
             return std::nullopt;
         }
     }

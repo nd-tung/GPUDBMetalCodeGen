@@ -5,10 +5,12 @@ namespace codegen {
 
 namespace {
 
-std::optional<MetalQueryPlan> buildQ12PlanForDateFilter(const std::string& dateCond) {
+std::optional<MetalQueryPlan> buildQ12PredefinedPlan() {
     MetalQueryPlan plan;
     plan.name = "Q12";
     std::string idxVar = "i";
+    const std::string dateCond =
+        "l_receiptdate[i] >= 19940101 && l_receiptdate[i] < 19950101";
 
     // --- Priority Bitmap ---
     // Mark high-priority orders before scanning lineitem.
@@ -53,42 +55,8 @@ std::optional<MetalQueryPlan> buildQ12PlanForDateFilter(const std::string& dateC
 } // namespace
 
 // Q12: Shipping Modes and Order Priority.
-std::optional<MetalQueryPlan> buildQ12Plan(const AnalyzedQuery& aq) {
-    // Match lineitem/orders grouped by shipmode with order priority buckets.
-    if (aq.tables.size() != 2) return std::nullopt;
-    bool hasLineitem = false, hasOrders = false;
-    for (auto& t : aq.tables) {
-        if (t == "lineitem") hasLineitem = true;
-        if (t == "orders") hasOrders = true;
-    }
-    if (!hasLineitem || !hasOrders) return std::nullopt;
-    if (!aq.hasGroupBy()) return std::nullopt;
-
-    bool groupByShipmode = false;
-    for (auto& g : aq.groupBy) {
-        std::visit([&](auto&& node) {
-            using T = std::decay_t<decltype(node)>;
-            if constexpr (std::is_same_v<T, ColRef>) {
-                if (node.column == "l_shipmode") groupByShipmode = true;
-            }
-        }, g->node);
-    }
-    if (!groupByShipmode) return std::nullopt;
-
-    std::string idxVar = "i";
-
-    std::vector<PredPtr> dateFilters;
-    for (auto& f : aq.filters) {
-        std::set<std::string> cols;
-        collectColumns(f, cols);
-        if (cols.count("l_receiptdate") && !cols.count("l_commitdate"))
-            dateFilters.push_back(f);
-    }
-    return buildQ12PlanForDateFilter(combineFilters(dateFilters, idxVar));
-}
-
 std::optional<MetalQueryPlan> buildQ12Plan_byName() {
-    return buildQ12PlanForDateFilter("l_receiptdate[i] >= 19940101 && l_receiptdate[i] < 19950101");
+    return buildQ12PredefinedPlan();
 }
 
 } // namespace codegen

@@ -348,9 +348,9 @@ std::optional<MetalQueryPlan> lowerSingleTableGroupedAggregateIRToMetal(
     if (!sortSpec.keys.empty() || sortSpec.limit >= 0) {
         const std::string sortRowsSym = "n_gpu_sort_ir_single_keyed_rows";
         attachMaterializedCountHook(compactPhase, compactCounter, sortRowsSym);
-        if (!appendGenericGpuSort(plan, "ir_single_keyed", sortRowsSym,
-                                  std::to_string(totalBuckets), compactCols,
-                                  sortSpec, error)) {
+        if (!appendBestGenericGpuOrder(plan, "ir_single_keyed", sortRowsSym,
+                                       std::to_string(totalBuckets), compactCols,
+                                       sortSpec, error)) {
             return std::nullopt;
         }
     }

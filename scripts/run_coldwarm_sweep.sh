@@ -26,15 +26,16 @@ TS=$(date +%Y%m%d_%H%M%S)
 OUT=build/exp_coldwarm_${TS}
 mkdir -p "$OUT"
 OUTCSV=$OUT/coldwarm.csv
-echo "regime,sf,query,trial,gpu_ms,e2e_ms,load_mibps,load_bytes" > "$OUTCSV"
+echo "regime,sf,query,route,trial,gpu_compute_ms,end_to_end_ms,load_mibps,load_bytes" > "$OUTCSV"
 echo "Output: $OUTCSV"
 
-# Extract fields from a TIMING_CSV line:
-#   col 10=gpu_ms, col 14=e2e_ms, col 17=load_mibps, col 16=load_bytes
+# Extract fields from a TIMING_CSV body:
+#   col 18=gpu_compute_ms, col 22=end_to_end_ms,
+#   col 12=load_mibps, col 11=load_bytes
 extract() {
     local timing="$1"
     awk -F, -v r="$2" -v sf="$3" -v q="$4" -v t="$5" \
-        '{print r","sf","q","t","$10","$14","$17","$16}' <<< "$timing"
+        '{print r","sf","q","$3","t","$18","$22","$12","$11}' <<< "$timing"
 }
 
 run_regime() {  # $1=regime $2=sf $3=q $4=trials $5=purge_between(0|1) $6=warmup $7=repeat
@@ -48,12 +49,12 @@ run_regime() {  # $1=regime $2=sf $3=q $4=trials $5=purge_between(0|1) $6=warmup
                | grep '^TIMING_CSV' | tail -1 | sed 's/^TIMING_CSV,//')
         if [[ -n $line ]]; then
             extract "$line" "$regime" "$sf" "$q" "$t" >> "$OUTCSV"
-            local gpu e2e bw
-            gpu=$(awk -F, '{print $10}' <<< "$line")
-            e2e=$(awk -F, '{print $14}' <<< "$line")
-            bw=$(awk -F, '{print $17}' <<< "$line")
-            printf "  %-5s %s %-4s t%d  gpu=%6.2fms  e2e=%7.2fms  loadbw=%9.1f MiB/s\n" \
-                "$regime" "$sf" "$q" "$t" "$gpu" "$e2e" "$bw"
+            local gpu end_to_end bw
+            gpu=$(awk -F, '{print $18}' <<< "$line")
+            end_to_end=$(awk -F, '{print $22}' <<< "$line")
+            bw=$(awk -F, '{print $12}' <<< "$line")
+            printf "  %-5s %s %-4s t%d  gpu=%6.2fms  end=%7.2fms  loadbw=%9.1f MiB/s\n" \
+                "$regime" "$sf" "$q" "$t" "$gpu" "$end_to_end" "$bw"
         else
             printf "  %-5s %s %-4s t%d  FAIL\n" "$regime" "$sf" "$q" "$t"
         fi
@@ -91,12 +92,12 @@ rows = list(csv.DictReader(open("$OUTCSV")))
 by = defaultdict(list)
 for r in rows:
     by[(r['regime'], r['sf'], r['query'])].append(r)
-print(f"{'regime':<5}  {'sf':<4}  {'query':<5}  {'gpu_p50':>8}  {'e2e_p50':>9}  {'bw_GiB/s':>10}  {'bytes':>10}")
+print(f"{'regime':<5}  {'sf':<4}  {'query':<5}  {'gpu_p50':>8}  {'end_to_end_p50':>15}  {'bw_GiB/s':>10}  {'bytes':>10}")
 for k in sorted(by):
     rs = by[k]
-    gpu = statistics.median(float(r['gpu_ms']) for r in rs)
-    e2e = statistics.median(float(r['e2e_ms']) for r in rs)
+    gpu = statistics.median(float(r['gpu_compute_ms']) for r in rs)
+    end_to_end = statistics.median(float(r['end_to_end_ms']) for r in rs)
     mibps = statistics.median(float(r['load_mibps']) for r in rs)
     nbytes = int(rs[0]['load_bytes'])
-    print(f"{k[0]:<5}  {k[1]:<4}  {k[2]:<5}  {gpu:>8.2f}  {e2e:>9.2f}  {mibps/1024:>10.2f}  {nbytes:>10}")
+    print(f"{k[0]:<5}  {k[1]:<4}  {k[2]:<5}  {gpu:>8.2f}  {end_to_end:>15.2f}  {mibps/1024:>10.2f}  {nbytes:>10}")
 EOF

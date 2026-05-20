@@ -233,6 +233,113 @@ bool columnHasSmallFiniteKeyDomain(const GenericColumnExpr& col,
     return bound && *bound <= 4096;
 }
 
+std::optional<int64_t> integerLiteralValue(const GenericExprPtr& expr) {
+    if (!expr) return std::nullopt;
+    auto* lit = std::get_if<GenericLiteralExpr>(&expr->node);
+    if (!lit) return std::nullopt;
+    if (auto* v = std::get_if<int64_t>(&lit->value)) return *v;
+    return std::nullopt;
+}
+
+const GenericColumnExpr* comparisonColumnWithLiteral(
+        const GenericComparisonPred& cmp,
+        const GenericExprPtr*& literalExpr) {
+    if (auto* col = cmp.left ? std::get_if<GenericColumnExpr>(&cmp.left->node) : nullptr) {
+        if (cmp.right && std::holds_alternative<GenericLiteralExpr>(cmp.right->node)) {
+            literalExpr = &cmp.right;
+            return col;
+        }
+    }
+    if (auto* col = cmp.right ? std::get_if<GenericColumnExpr>(&cmp.right->node) : nullptr) {
+        if (cmp.left && std::holds_alternative<GenericLiteralExpr>(cmp.left->node)) {
+            literalExpr = &cmp.left;
+            return col;
+        }
+    }
+    return nullptr;
+}
+
+double finiteDomainSelectivity(const GenericColumnExpr& col,
+                               const SchemaProvider* schema,
+                               int64_t matchingValues) {
+    auto domain = positiveIntegerLiteral(keyDomainExprForColumn(col, schema));
+    if (!domain || *domain <= 0) return 0.05;
+    return std::clamp(static_cast<double>(std::max<int64_t>(1, matchingValues)) /
+                          static_cast<double>(*domain),
+                      0.001, 1.0);
+}
+
+double estimatePredicateSelectivity(const GenericPredicatePtr& pred,
+                                    const SchemaProvider* schema) {
+    if (!pred) return 1.0;
+    return std::visit([&](const auto& node) -> double {
+        using T = std::decay_t<decltype(node)>;
+        if constexpr (std::is_same_v<T, GenericComparisonPred>) {
+            const GenericExprPtr* literalExpr = nullptr;
+            const GenericColumnExpr* col =
+                comparisonColumnWithLiteral(node, literalExpr);
+            if (!col || !literalExpr || !*literalExpr) return 0.33;
+            if (node.op == CmpOp::EQ) {
+                if (col->type.type == DataType::INT || col->type.type == DataType::DATE)
+                    return finiteDomainSelectivity(*col, schema, 1);
+                return 0.05;
+            }
+            if (node.op == CmpOp::NE) {
+                if (col->type.type == DataType::INT || col->type.type == DataType::DATE)
+                    return 1.0 - finiteDomainSelectivity(*col, schema, 1);
+                return 0.95;
+            }
+            return 0.33;
+        } else if constexpr (std::is_same_v<T, GenericBetweenPred>) {
+            auto* col = node.expr ? std::get_if<GenericColumnExpr>(&node.expr->node) : nullptr;
+            auto low = integerLiteralValue(node.low);
+            auto high = integerLiteralValue(node.high);
+            if (col && low && high && *high >= *low) {
+                return finiteDomainSelectivity(*col, schema, *high - *low + 1);
+            }
+            return 0.25;
+        } else if constexpr (std::is_same_v<T, GenericInListPred>) {
+            auto* col = node.expr ? std::get_if<GenericColumnExpr>(&node.expr->node) : nullptr;
+            if (col && !node.values.empty()) {
+                return finiteDomainSelectivity(
+                    *col, schema, static_cast<int64_t>(node.values.size()));
+            }
+            return node.values.empty() ? 0.0 : 0.25;
+        } else if constexpr (std::is_same_v<T, GenericLikePred>) {
+            const bool anchoredPrefix =
+                !node.pattern.empty() && node.pattern.front() != '%';
+            const double positive = anchoredPrefix ? 0.10 : 0.25;
+            return node.negated ? 1.0 - positive : positive;
+        } else if constexpr (std::is_same_v<T, GenericLogicalPred>) {
+            if (node.children.empty()) return 1.0;
+            if (node.op == GenericLogicalPred::Op::And) {
+                double sel = 1.0;
+                for (const auto& child : node.children)
+                    sel *= estimatePredicateSelectivity(child, schema);
+                return std::clamp(sel, 0.001, 1.0);
+            }
+            if (node.op == GenericLogicalPred::Op::Or) {
+                double notSelected = 1.0;
+                for (const auto& child : node.children)
+                    notSelected *= (1.0 - estimatePredicateSelectivity(child, schema));
+                return std::clamp(1.0 - notSelected, 0.001, 1.0);
+            }
+            return 1.0 - estimatePredicateSelectivity(node.children.front(), schema);
+        } else {
+            return 0.5;
+        }
+    }, pred->node);
+}
+
+double estimateFilterSelectivity(
+        const std::vector<GenericPredicatePtr>& filters,
+        const SchemaProvider* schema) {
+    double selectivity = 1.0;
+    for (const auto& pred : filters)
+        selectivity *= estimatePredicateSelectivity(pred, schema);
+    return std::clamp(selectivity, 0.001, 1.0);
+}
+
 std::string keysetBitmapName(const GenericColumnExpr& col,
                              const std::string& suffix) {
     std::string scope = !col.alias.empty() ? col.alias : col.table;
@@ -1785,7 +1892,8 @@ std::optional<MultiTableJoinLowering> buildMultiTableJoinLowering(
                 return shapeFail<MultiTableJoinLowering>(
                     error, "IR multi-table join lowerer: required carried column type is not supported.");
             build.localCarries[name] = IrCarryColumn{
-                col, carryVarName(col), carryRowVarName(col), carryBufferName(col)};
+                col, carryVarName(col), carryRowVarName(col),
+                carryBufferName(col), "", ""};
         }
     }
 
@@ -2139,10 +2247,13 @@ std::optional<MultiTableJoinLowering> buildMultiTableJoinLowering(
                 spec.outputColumn = col;
                 spec.bitmapName = bitmapName;
                 spec.reason = "seed";
-                spec.estimatedActiveKeyFraction = 0.25;
+                spec.estimatedActiveKeyFraction =
+                    estimateFilterSelectivity(filters, aq ? aq->schema : nullptr);
                 const int specIndex = static_cast<int>(keysetSpecs.size());
                 keysetSpecs.push_back(std::move(spec));
-                addKeysetState(col, bitmapName, false, specIndex, 0.25, 0);
+                addKeysetState(col, bitmapName, false, specIndex,
+                               keysetSpecs[(size_t)specIndex].estimatedActiveKeyFraction,
+                               0);
             }
         }
     }
@@ -2778,7 +2889,12 @@ std::optional<MultiTableJoinLowering> buildMultiTableJoinLowering(
             lowering.probePipe = appendCarryLookup(std::move(lowering.probePipe),
                                                    *build.scan, carry,
                                                    probeKeyExpr);
-            lowering.carryMap[carry.column.relationInstance.value][carry.column.column] = carry;
+            IrCarryColumn finalCarry = carry;
+            finalCarry.bufferName = carryStorageBufferName(*build.scan, carry.column);
+            finalCarry.lookupKeyColumn = build.parentCol.column;
+            finalCarry.lookupKeyMetalType = metalTypeForType(build.parentCol.type);
+            lowering.carryMap[carry.column.relationInstance.value]
+                             [carry.column.column] = std::move(finalCarry);
         }
     }
 

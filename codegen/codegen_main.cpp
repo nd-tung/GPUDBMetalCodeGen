@@ -36,6 +36,7 @@ static int  g_tgSizeOverride    = 0;     // --threadgroup-size N (0 = use plan d
 static bool g_autotuneTg        = false; // --autotune-tg  (per-query global TG sweep)
 static bool g_autotuneTgPerPhase= false; // --autotune-tg-per-phase (per-kernel TG)
 static bool g_noPipelineCache   = false; // --no-pipeline-cache
+static bool g_profilePhases     = false; // --profile-phases
 static bool g_fastMath          = false; // --fastmath
 static bool g_printPlan         = false; // --print-plan
 static std::string g_dumpMslDir;         // --dump-msl PATH (directory or file template)
@@ -76,6 +77,32 @@ struct HostPostOpTracker {
         return out;
     }
 };
+
+static double medianValue(std::vector<double> v) {
+    if (v.empty()) return 0.0;
+    std::sort(v.begin(), v.end());
+    size_t mid = v.size() / 2;
+    if (v.size() % 2 == 1) return v[mid];
+    return 0.5 * (v[mid - 1] + v[mid]);
+}
+
+static double percentileValue(std::vector<double> v, double p) {
+    if (v.empty()) return 0.0;
+    std::sort(v.begin(), v.end());
+    double rank = std::ceil(p * (double)v.size());
+    size_t i = (size_t)std::min<double>(std::max<double>(rank - 1.0, 0.0),
+                                        (double)(v.size() - 1));
+    return v[i];
+}
+
+static double medianAbsoluteDeviation(std::vector<double> v) {
+    if (v.size() < 2) return 0.0;
+    double m = medianValue(v);
+    std::vector<double> dev;
+    dev.reserve(v.size());
+    for (double x : v) dev.push_back(std::fabs(x - m));
+    return medianValue(std::move(dev));
+}
 
 // Compare two canonical CSV blobs with float tolerance.
 // Golden schemas must match exactly; numeric values are compared with tolerance.
@@ -383,6 +410,7 @@ static bool runCodegenQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
                             const std::string& sql, const std::string& queryName,
                             QueryApiKind apiKind) {
     if (!g_csv) printf("\n=== Codegen: %s ===\n", queryName.c_str());
+    const bool isPredefinedTpchRoute = apiKind == QueryApiKind::PredefinedTPCH;
     // Prevent auto-chunk decisions from leaking across `all` / `mball`.
     g_chunkRows = g_chunkRowsExplicit;
     try {
@@ -392,6 +420,7 @@ static bool runCodegenQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
         };
         DetailedTiming timing{};
         timing.queryName = queryName;
+        timing.route = isPredefinedTpchRoute ? "predefined" : "generic";
         {
             // Derive short SF label from g_dataset_path.
             const std::string& p = g_dataset_path;
@@ -423,7 +452,7 @@ static bool runCodegenQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
         // Build operator-based plan.
         auto tPlan0 = clk::now();
         std::optional<codegen::MetalQueryPlan> maybePlan;
-        if (apiKind == QueryApiKind::PredefinedTPCH) {
+        if (isPredefinedTpchRoute) {
             maybePlan = codegen::buildPredefinedTPCHPlan(queryName);
             if (!maybePlan) {
                 std::cerr << "Codegen: predefined TPC-H plan not available for "
@@ -753,6 +782,7 @@ static bool runCodegenQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
 
         auto parseStart = std::chrono::high_resolution_clock::now();
         codegen::MetalGenericExecutor executor(device, cmdQueue);
+        executor.setDetailedPhaseTiming(g_profilePhases || g_autotuneTgPerPhase);
 
         const std::string streamTable = (g_chunkRows > 0)
             ? autoDetectStreamTable(tableCols) : std::string{};
@@ -793,7 +823,9 @@ static bool runCodegenQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
                     schema,
                     streamTable);
             }
-            if (!codegen::prepareQueryPreprocessing(plan.name, device, executor, loadedTables)) {
+            codegen::resetQueryPreprocessingState();
+            if (isPredefinedTpchRoute &&
+                !codegen::prepareQueryPreprocessing(plan.name, device, executor, loadedTables)) {
                 return false;
             }
             preprocessMs += elapsedMs(_ppStart, clk::now());
@@ -809,17 +841,34 @@ static bool runCodegenQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
             const int streamSlots = g_chunkDoubleBuffer ? 2 : 1;
             codegen::ChunkedColbinTable stream;
             std::string streamError;
+            auto streamOpenStart = clk::now();
             if (!stream.open(device, g_dataset_path + streamTable + ".tbl",
                              streamSpecs, g_chunkRows, streamSlots, streamError)) {
                 std::cerr << "Codegen: chunk open failed for " << streamTable
                           << ": " << streamError << std::endl;
                 return false;
             }
+            double streamOpenMs = elapsedMs(streamOpenStart, clk::now());
             const auto& streamTdef = schema.table(streamTable);
             const size_t totalRows = stream.rows(), chunkRows = stream.chunkRows();
             size_t chunkCount = 0;
             double chunkCopyMs = 0.0, gpuMs = 0.0, bufAllocMs = 0.0;
+            double hookCpuMs = 0.0, hookGpuMs = 0.0;
+            double resultCollectMs = 0.0, executeWallMs = 0.0;
             std::map<std::string, double> chunkPhaseSums;
+            auto addExecutionTiming = [&](const codegen::MetalExecutionResult& rr) {
+                gpuMs += rr.totalKernelTimeMs;
+                bufAllocMs += rr.bufferAllocTimeMs;
+                hookCpuMs += rr.hookCpuTimeMs;
+                hookGpuMs += rr.hookGpuTimeMs;
+                resultCollectMs += rr.resultCollectTimeMs;
+                executeWallMs += rr.executeWallTimeMs;
+                for (size_t i = 0; i < rr.phaseTimesMs.size(); ++i) {
+                    const std::string nm = (i < rr.phaseNames.size())
+                        ? rr.phaseNames[i] : ("phase" + std::to_string(i));
+                    chunkPhaseSums[nm] += rr.phaseTimesMs[i];
+                }
+            };
 
             // Split phases into pre-stream, stream, and post-stream ranges.
             const auto& cgPhases = cg.getPhases();
@@ -837,13 +886,7 @@ static bool runCodegenQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
             // Run pre-stream phases once.
             if (firstStreamPhase > 0) {
                 auto preResult = executor.execute(compiled, cg, 0, 1, 0, firstStreamPhase);
-                gpuMs      += preResult.totalKernelTimeMs;
-                bufAllocMs += preResult.bufferAllocTimeMs;
-                for (size_t i = 0; i < preResult.phaseTimesMs.size(); ++i) {
-                    const std::string nm = (i < preResult.phaseNames.size())
-                        ? preResult.phaseNames[i] : ("pre_phase" + std::to_string(i));
-                    chunkPhaseSums[nm] += preResult.phaseTimesMs[i];
-                }
+                addExecutionTiming(preResult);
             }
 
             // Stream phases run once per chunk.
@@ -870,13 +913,7 @@ static bool runCodegenQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
                 if (chunkCount == 1) executor.setSkipZeroInit(true);
                 auto chunkResult = executor.execute(compiled, cg, 0, 1,
                                                     firstStreamPhase, lastStreamPhase);
-                gpuMs      += chunkResult.totalKernelTimeMs;
-                bufAllocMs += chunkResult.bufferAllocTimeMs;
-                for (size_t i = 0; i < chunkResult.phaseTimesMs.size(); ++i) {
-                    const std::string nm = (i < chunkResult.phaseNames.size())
-                        ? chunkResult.phaseNames[i] : ("phase" + std::to_string(i));
-                    chunkPhaseSums[nm] += chunkResult.phaseTimesMs[i];
-                }
+                addExecutionTiming(chunkResult);
                 chunkCount++;
             }
             executor.setSkipZeroInit(false);
@@ -885,25 +922,25 @@ static bool runCodegenQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
             if (lastStreamPhase < totalPhases) {
                 auto postResult = executor.execute(compiled, cg, 0, 1,
                                                    lastStreamPhase, totalPhases);
-                gpuMs += postResult.totalKernelTimeMs;
-                for (size_t i = 0; i < postResult.phaseTimesMs.size(); ++i) {
-                    const std::string nm = (i < postResult.phaseNames.size())
-                        ? postResult.phaseNames[i] : ("post_phase" + std::to_string(i));
-                    chunkPhaseSums[nm] += postResult.phaseTimesMs[i];
-                }
+                addExecutionTiming(postResult);
             }
 
+            auto finalCollectStart = clk::now();
             result.result = executor.collectResult(cg);
-            double wallMs = elapsedMs(parseStart, clk::now());
-            timing.dataLoadMs    = std::max(0.0, wallMs - gpuMs);
+            resultCollectMs += elapsedMs(finalCollectStart, clk::now());
+            timing.dataLoadMs    = ioMs + streamOpenMs + chunkCopyMs + preprocessMs;
             timing.ingestMs      = loadStats().excludedMs;
             timing.loadSource    = "chunked-colbin";
             timing.loadBytes     = loadStats().bytes + stream.bytesLoaded();
             timing.bufferAllocMs = bufAllocMs;
             // Chunked I/O: pre-stream load(ioMs) + per-chunk loadChunk(chunkCopyMs).
-            timing.ioMs          = ioMs + chunkCopyMs;
+            timing.ioMs          = ioMs + streamOpenMs + chunkCopyMs;
             timing.preprocessMs  = preprocessMs;
             timing.gpuTotalMs    = gpuMs;
+            timing.hookCpuMs     = hookCpuMs;
+            timing.hookGpuMs     = hookGpuMs;
+            timing.resultCollectMs = resultCollectMs;
+            timing.executeWallMs = executeWallMs;
             timing.gpuTrialsN    = 1;
             timing.gpuMsP10      = gpuMs;
             timing.gpuMsP90      = gpuMs;
@@ -927,7 +964,7 @@ static bool runCodegenQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
         auto parseEnd = std::chrono::high_resolution_clock::now();
         double parseMs = std::chrono::duration<double, std::milli>(parseEnd - parseStart).count();
         // One-time .tbl->column ingest (only when .colbin is missing) is
-        // reported separately via timing.ingestMs and excluded from e2e.
+        // reported separately via timing.ingestMs and excluded from end-to-end timing.
         const double ingestMs = loadStats().excludedMs;
         timing.dataLoadMs = parseMs - ingestMs;
         if (timing.dataLoadMs < 0.0) timing.dataLoadMs = 0.0;
@@ -936,9 +973,10 @@ static bool runCodegenQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
         timing.loadBytes  = loadStats().bytes;
         // Split data-load window into pure I/O vs CPU preprocess. Anything
         // unaccounted for in the window is attributed to preprocess.
-        timing.ioMs         = ioMs;
-        timing.preprocessMs = (timing.dataLoadMs > ioMs)
-                              ? (timing.dataLoadMs - ioMs) : preprocessMs;
+        const double pureIoMs = std::max(0.0, ioMs - ingestMs);
+        timing.ioMs         = pureIoMs;
+        timing.preprocessMs = (timing.dataLoadMs > pureIoMs)
+                              ? (timing.dataLoadMs - pureIoMs) : preprocessMs;
 
         // Sweep threadgroup sizes, pick the best median, then continue timing.
         // The PSO is shared across candidates: tg_size
@@ -1046,10 +1084,21 @@ static bool runCodegenQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
             (void) executor.execute(compiled, cg, 0, 1);
         }
 
-        // Measured loop. Each trial captures GPU time + (optionally) JIT compile time.
+        // Measured loop. Each trial captures GPU time, execute wall time,
+        // host-side hook/result work, and optionally JIT compile time.
         std::vector<double> gpuTrials;     gpuTrials.reserve(g_repeat);
         std::vector<double> compileTrials; compileTrials.reserve(g_repeat);
-        std::vector<double> e2eTrials;     e2eTrials.reserve(g_repeat);
+        std::vector<double> executeWallTrials; executeWallTrials.reserve(g_repeat);
+        std::vector<double> bufferAllocTrials; bufferAllocTrials.reserve(g_repeat);
+        std::vector<double> hookCpuTrials; hookCpuTrials.reserve(g_repeat);
+        std::vector<double> hookGpuTrials; hookGpuTrials.reserve(g_repeat);
+        std::vector<double> resultCollectTrials; resultCollectTrials.reserve(g_repeat);
+        std::vector<std::string> phaseNamesForSummary;
+        std::vector<std::vector<double>> phaseTrialSamples;
+        std::vector<std::vector<double>> phaseWallTrialSamples;
+        std::vector<std::vector<double>> phaseOverheadTrialSamples;
+        std::vector<std::vector<double>> phaseHookCpuTrialSamples;
+        std::vector<std::vector<double>> phaseHookGpuTrialSamples;
 
         for (int r = 0; r < g_repeat; r++) {
             // --no-pipeline-cache: rebuild library + PSOs every measured trial
@@ -1083,88 +1132,124 @@ static bool runCodegenQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
 
             auto tr0 = clk::now();
             result = executor.execute(compiledTrial, cg, 0, 1);
-            double e2eTrialMs = elapsedMs(tr0, clk::now());
+            double executeWallTrialMs = elapsedMs(tr0, clk::now());
 
             gpuTrials.push_back((double)result.totalKernelTimeMs);
             compileTrials.push_back(trialCompileMs);
-            e2eTrials.push_back(e2eTrialMs);
+            executeWallTrials.push_back(executeWallTrialMs);
+            bufferAllocTrials.push_back((double)result.bufferAllocTimeMs);
+            hookCpuTrials.push_back((double)result.hookCpuTimeMs);
+            hookGpuTrials.push_back((double)result.hookGpuTimeMs);
+            resultCollectTrials.push_back((double)result.resultCollectTimeMs);
+
+            if (phaseTrialSamples.size() < result.phaseTimesMs.size()) {
+                size_t oldSize = phaseTrialSamples.size();
+                phaseTrialSamples.resize(result.phaseTimesMs.size());
+                phaseWallTrialSamples.resize(result.phaseTimesMs.size());
+                phaseOverheadTrialSamples.resize(result.phaseTimesMs.size());
+                phaseHookCpuTrialSamples.resize(result.phaseTimesMs.size());
+                phaseHookGpuTrialSamples.resize(result.phaseTimesMs.size());
+                phaseNamesForSummary.resize(result.phaseTimesMs.size());
+                for (size_t i = oldSize; i < result.phaseTimesMs.size(); i++) {
+                    phaseNamesForSummary[i] = (i < result.phaseNames.size())
+                        ? result.phaseNames[i] : ("phase" + std::to_string(i));
+                }
+            }
+            for (size_t i = 0; i < result.phaseTimesMs.size(); i++) {
+                if (i < phaseNamesForSummary.size() && phaseNamesForSummary[i].empty()) {
+                    phaseNamesForSummary[i] = (i < result.phaseNames.size())
+                        ? result.phaseNames[i] : ("phase" + std::to_string(i));
+                }
+                phaseTrialSamples[i].push_back((double)result.phaseTimesMs[i]);
+                phaseWallTrialSamples[i].push_back(
+                    i < result.phaseWallTimesMs.size()
+                        ? (double)result.phaseWallTimesMs[i] : 0.0);
+                phaseOverheadTrialSamples[i].push_back(
+                    i < result.phaseOverheadTimesMs.size()
+                        ? (double)result.phaseOverheadTimesMs[i] : 0.0);
+                phaseHookCpuTrialSamples[i].push_back(
+                    i < result.phaseHookCpuTimesMs.size()
+                        ? (double)result.phaseHookCpuTimesMs[i] : 0.0);
+                phaseHookGpuTrialSamples[i].push_back(
+                    i < result.phaseHookGpuTimesMs.size()
+                        ? (double)result.phaseHookGpuTimesMs[i] : 0.0);
+            }
 
             if (g_csv && g_repeat > 1) {
-                printf("TRIAL_CSV,%s,%s,%d,%.3f,%.3f,%.3f\n",
-                       timing.queryName.c_str(),
+                printf("TRIAL_CSV,%s,%s,%s,%d,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f\n",
                        timing.scaleFactor.c_str(),
+                       timing.queryName.c_str(),
+                       timing.route.c_str(),
                        r,
                        (double)result.totalKernelTimeMs,
                        trialCompileMs,
-                       e2eTrialMs);
-                // C2: per-phase GPU breakdown for this trial. Emitting one
-                // row per phase per trial lets analysis spot per-kernel
-                // variance and bottlenecks without parsing the text report.
+                       executeWallTrialMs,
+                       (double)result.bufferAllocTimeMs,
+                       (double)result.hookCpuTimeMs,
+                       (double)result.hookGpuTimeMs,
+                       (double)result.resultCollectTimeMs);
+                // Per-phase profiling rows are emitted when detailed phase
+                // timing is enabled; normal e2e runs may batch phases.
                 for (size_t pi = 0; pi < result.phaseTimesMs.size(); pi++) {
                     const std::string& nm = (pi < result.phaseNames.size())
                         ? result.phaseNames[pi] : "phase";
                     int tgUsed = (pi < cg.getPhases().size())
                         ? cg.getPhases()[pi].threadgroupSize : 0;
-                    printf("PHASE_CSV,%s,%s,%d,%s,%d,%.3f\n",
-                           timing.queryName.c_str(),
+                    double phaseWall = (pi < result.phaseWallTimesMs.size())
+                        ? (double)result.phaseWallTimesMs[pi] : 0.0;
+                    double phaseOverhead = (pi < result.phaseOverheadTimesMs.size())
+                        ? (double)result.phaseOverheadTimesMs[pi] : 0.0;
+                    double phaseHookCpu = (pi < result.phaseHookCpuTimesMs.size())
+                        ? (double)result.phaseHookCpuTimesMs[pi] : 0.0;
+                    double phaseHookGpu = (pi < result.phaseHookGpuTimesMs.size())
+                        ? (double)result.phaseHookGpuTimesMs[pi] : 0.0;
+                    printf("PHASE_CSV,%s,%s,%s,%d,%s,%d,%.3f,%.3f,%.3f,%.3f,%.3f\n",
                            timing.scaleFactor.c_str(),
+                           timing.queryName.c_str(),
+                           timing.route.c_str(),
                            r, nm.c_str(), tgUsed,
-                           (double)result.phaseTimesMs[pi]);
+                           (double)result.phaseTimesMs[pi],
+                           phaseWall, phaseOverhead,
+                           phaseHookCpu, phaseHookGpu);
                 }
             }
         }
 
-        // Median across measured trials.
-        auto median = [](std::vector<double> v) -> double {
-            if (v.empty()) return 0.0;
-            std::sort(v.begin(), v.end());
-            size_t mid = v.size() / 2;
-            if (v.size() % 2 == 1) return v[mid];
-            return 0.5 * (v[mid - 1] + v[mid]);
-        };
-
-        // C1: percentile + MAD on the GPU-time trial distribution.
-        auto pct = [](std::vector<double> v, double p) -> double {
-            if (v.empty()) return 0.0;
-            std::sort(v.begin(), v.end());
-            // Nearest-rank percentile: ceil(p * N) - 1, clamped.
-            double rank = std::ceil(p * (double)v.size());
-            size_t i = (size_t)std::min<double>(std::max<double>(rank - 1.0, 0.0),
-                                                (double)(v.size() - 1));
-            return v[i];
-        };
-        auto mad = [&median](std::vector<double> v) -> double {
-            if (v.size() < 2) return 0.0;
-            double m = median(v);
-            std::vector<double> dev;
-            dev.reserve(v.size());
-            for (double x : v) dev.push_back(std::fabs(x - m));
-            return median(std::move(dev));
-        };
-
-        result.parseTimeMs = static_cast<float>(parseMs);
-        timing.bufferAllocMs = result.bufferAllocTimeMs;
-        timing.gpuTotalMs    = median(gpuTrials);
+        timing.bufferAllocMs = medianValue(bufferAllocTrials);
+        timing.gpuTotalMs    = medianValue(gpuTrials);
+        timing.hookCpuMs     = medianValue(hookCpuTrials);
+        timing.hookGpuMs     = medianValue(hookGpuTrials);
+        timing.resultCollectMs = medianValue(resultCollectTrials);
+        timing.executeWallMs = medianValue(executeWallTrials);
         timing.gpuTrialsN    = (int)gpuTrials.size();
-        timing.gpuMsP10      = pct(gpuTrials, 0.10);
-        timing.gpuMsP90      = pct(gpuTrials, 0.90);
-        timing.gpuMsMad      = mad(gpuTrials);
+        timing.gpuMsP10      = percentileValue(gpuTrials, 0.10);
+        timing.gpuMsP90      = percentileValue(gpuTrials, 0.90);
+        timing.gpuMsMad      = medianAbsoluteDeviation(gpuTrials);
         if (g_noPipelineCache) {
             // Override the single-shot compile time with the per-trial median
             // so the headline number reflects the cost we're studying.
-            timing.compileMs = median(compileTrials);
+            timing.compileMs = medianValue(compileTrials);
         }
         timing.phaseKernelMs.clear();
-        for (size_t i = 0; i < result.phaseTimesMs.size(); i++) {
-            const std::string name = (i < result.phaseNames.size())
-                ? result.phaseNames[i] : ("phase" + std::to_string(i));
-            timing.phaseKernelMs.emplace_back(name, (double)result.phaseTimesMs[i]);
+        for (size_t i = 0; i < phaseTrialSamples.size(); i++) {
+            const std::string name = (i < phaseNamesForSummary.size() &&
+                                      !phaseNamesForSummary[i].empty())
+                ? phaseNamesForSummary[i] : ("phase" + std::to_string(i));
+            timing.phaseKernelMs.emplace_back(name, medianValue(phaseTrialSamples[i]));
         }
         } // end if (!didChunk)
 
         HostPostOpTracker hostPostOps;
+        auto runHostPost = [&](codegen::MetalExecutionResult& result,
+                               bool emitOutput,
+                               HostPostOpTracker* hostPostOpsForRun) -> double {
         auto markHostPost = [&](const std::string& op) {
-            if (apiKind == QueryApiKind::PredefinedTPCH) hostPostOps.mark(op);
+            if (isPredefinedTpchRoute && hostPostOpsForRun) {
+                hostPostOpsForRun->mark(op);
+            }
+        };
+        auto isPredefinedPlan = [&](const char* name) {
+            return isPredefinedTpchRoute && plan.name == name;
         };
 
         auto postStart = std::chrono::high_resolution_clock::now();
@@ -1172,7 +1257,7 @@ static bool runCodegenQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
         // Per-query output normalization.
 
         // Q14: convert raw promo/total sums to the final ratio column.
-        if (plan.name == "Q14" && result.result.numRows() == 1 &&
+        if (isPredefinedPlan("Q14") && result.result.numRows() == 1 &&
             result.result.columns.size() == 2) {
             double promo = std::get<double>(result.result.rows[0][0]);
             double total = std::get<double>(result.result.rows[0][1]);
@@ -1182,7 +1267,7 @@ static bool runCodegenQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
         }
 
         // Q12: pivot four GPU buckets into the two TPC-H output rows.
-        if (plan.name == "Q12" && result.result.numRows() == 4 &&
+        if (isPredefinedPlan("Q12") && result.result.numRows() == 4 &&
             result.result.columns.size() == 2) {
             auto getCount = [&](size_t r) -> int64_t {
                 const auto& v = result.result.rows[r][1];
@@ -1208,7 +1293,7 @@ static bool runCodegenQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
         }
 
         // Empty columns mean a query-specific block below will assemble output.
-        if (!g_csv && !result.result.columns.empty()) {
+        if (emitOutput && !result.result.columns.empty()) {
             printf("\n%s Results:\n", queryName.c_str());
             result.result.print();
         }
@@ -1216,7 +1301,7 @@ static bool runCodegenQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
         // Per-query post-processing runs before the golden check.
 
         // Q10: gather GPU-sorted top-k when available.
-        if (plan.name == "Q10" && result.result.columns.empty()) {
+        if (isPredefinedPlan("Q10") && result.result.columns.empty()) {
             auto* cntBuf = executor.getAllocatedBuffer("d_q10_compact_count");
             auto* ckBuf  = executor.getAllocatedBuffer("d_q10_compact_ck");
             auto* revBuf = executor.getAllocatedBuffer("d_q10_compact_rev");
@@ -1266,7 +1351,7 @@ static bool runCodegenQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
                 int show = (int)entries.size();
                 for (int j = 0; j < show; j++)
                     result.result.rows.push_back({(int64_t)entries[j].second, (double)entries[j].first});
-                if (!g_csv) {
+                if (emitOutput) {
                     printf("  Top-%d customers by returned-item revenue:\n", show);
                     printf("  +----------+--------------+\n");
                     printf("  | c_custkey|      revenue |\n");
@@ -1280,7 +1365,7 @@ static bool runCodegenQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
         }
 
         // Q7: print 4 revenue bins
-        if (plan.name == "Q7") {
+        if (isPredefinedPlan("Q7")) {
             auto* binsBuf = executor.getAllocatedBuffer("d_revenue_bins");
             if (binsBuf) {
                 float* bins = (float*)binsBuf->contents();
@@ -1291,21 +1376,23 @@ static bool runCodegenQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
                 for (int p = 0; p < 2; p++)
                     for (int y = 0; y < 2; y++)
                         result.result.rows.push_back({std::string(pair_supp[p]), std::string(pair_cust[p]), (int64_t)(1995+y), (double)bins[p*2+y]});
-                printf("  +----------+----------+--------+-----------------+\n");
-                printf("  | supp_nat | cust_nat | l_year |         revenue |\n");
-                printf("  +----------+----------+--------+-----------------+\n");
-                for (int p = 0; p < 2; p++) {
-                    for (int y = 0; y < 2; y++) {
-                        printf("  | %-8s | %-8s | %6d | $%14.2f |\n",
-                               pair_supp[p], pair_cust[p], 1995 + y, bins[p * 2 + y]);
+                if (emitOutput) {
+                    printf("  +----------+----------+--------+-----------------+\n");
+                    printf("  | supp_nat | cust_nat | l_year |         revenue |\n");
+                    printf("  +----------+----------+--------+-----------------+\n");
+                    for (int p = 0; p < 2; p++) {
+                        for (int y = 0; y < 2; y++) {
+                            printf("  | %-8s | %-8s | %6d | $%14.2f |\n",
+                                   pair_supp[p], pair_cust[p], 1995 + y, bins[p * 2 + y]);
+                        }
                     }
+                    printf("  +----------+----------+--------+-----------------+\n");
                 }
-                printf("  +----------+----------+--------+-----------------+\n");
             }
         }
 
         // Q5: nation revenue sorted desc
-        if (plan.name == "Q5") {
+        if (isPredefinedPlan("Q5")) {
             auto* cntBuf = executor.getAllocatedBuffer("d_q5_result_count");
             auto* nameBuf = executor.getAllocatedBuffer("d_q5_result_name");
             auto* revBuf = executor.getAllocatedBuffer("d_q5_result_revenue");
@@ -1351,7 +1438,7 @@ static bool runCodegenQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
                     for (uint32_t src : order) appendRow(src);
                 }
 
-                if (!g_csv) {
+                if (emitOutput) {
                     printf("  +------------------+-----------------+\n");
                     printf("  | n_name           |         revenue |\n");
                     printf("  +------------------+-----------------+\n");
@@ -1366,7 +1453,7 @@ static bool runCodegenQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
         }
 
         // Q8: market share = brazil / total per year
-        if (plan.name == "Q8") {
+        if (isPredefinedPlan("Q8")) {
             auto* binsBuf = executor.getAllocatedBuffer("d_result_bins");
             if (binsBuf) {
                 float* bins = (float*)binsBuf->contents();
@@ -1377,21 +1464,23 @@ static bool runCodegenQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
                     float share = (total > 0.0f) ? (brazil / total) : 0.0f;
                     result.result.rows.push_back({(int64_t)(1995+y), (double)share});
                 }
-                printf("  +--------+------------+\n");
-                printf("  | o_year |  mkt_share |\n");
-                printf("  +--------+------------+\n");
-                for (int y = 0; y < 2; y++) {
-                    float brazil = bins[y];
-                    float total = bins[2 + y];
-                    float share = (total > 0.0f) ? (brazil / total) : 0.0f;
-                    printf("  | %6d | %10.4f |\n", 1995 + y, share);
+                if (emitOutput) {
+                    printf("  +--------+------------+\n");
+                    printf("  | o_year |  mkt_share |\n");
+                    printf("  +--------+------------+\n");
+                    for (int y = 0; y < 2; y++) {
+                        float brazil = bins[y];
+                        float total = bins[2 + y];
+                        float share = (total > 0.0f) ? (brazil / total) : 0.0f;
+                        printf("  | %6d | %10.4f |\n", 1995 + y, share);
+                    }
+                    printf("  +--------+------------+\n");
                 }
-                printf("  +--------+------------+\n");
             }
         }
 
         // Q3: gather compacted rows, using GPU order when available.
-        if (plan.name == "Q3") {
+        if (isPredefinedPlan("Q3")) {
             auto* cntBuf  = executor.getAllocatedBuffer("d_q3_compact_count");
             auto* okBuf   = executor.getAllocatedBuffer("d_q3_compact_ok");
             auto* revBuf  = executor.getAllocatedBuffer("d_q3_compact_rev");
@@ -1448,7 +1537,7 @@ static bool runCodegenQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
                     auto& [r, d, ok, p] = entries[j];
                     result.result.rows.push_back({(int64_t)ok, (double)r, intDateToStr(d), (int64_t)p});
                 }
-                if (!g_csv) {
+                if (emitOutput) {
                     printf("  +----------+--------------+------------+---------------+\n");
                     printf("  |l_orderkey|      revenue | o_orderdate|o_shippriority |\n");
                     printf("  +----------+--------------+------------+---------------+\n");
@@ -1462,7 +1551,7 @@ static bool runCodegenQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
         }
 
         // Q13: histogram of order counts
-        if (plan.name == "Q13") {
+        if (isPredefinedPlan("Q13")) {
             auto* cntBuf = executor.getAllocatedBuffer("d_q13_result_count");
             auto* cCountBuf = executor.getAllocatedBuffer("d_q13_result_c_count");
             auto* custDistBuf = executor.getAllocatedBuffer("d_q13_result_custdist");
@@ -1504,7 +1593,7 @@ static bool runCodegenQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
                 result.result.rows.clear();
                 for (auto& [dist, cnt] : entries)
                     result.result.rows.push_back({(int64_t)cnt, (int64_t)dist});
-                if (!g_csv) {
+                if (emitOutput) {
                     printf("  +--------+----------+\n");
                     printf("  | c_count|  custdist|\n");
                     printf("  +--------+----------+\n");
@@ -1517,7 +1606,7 @@ static bool runCodegenQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
         }
 
         // Q22: 7 country-code bins
-        if (plan.name == "Q22") {
+        if (isPredefinedPlan("Q22")) {
             auto* cntBuf = executor.getAllocatedBuffer("d_q22_count");
             auto* sumBuf = executor.getAllocatedBuffer("d_q22_sum");
             if (cntBuf && sumBuf) {
@@ -1530,21 +1619,23 @@ static bool runCodegenQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
                     if (counts[b] > 0)
                         result.result.rows.push_back({(int64_t)valid_prefixes[b], (int64_t)counts[b], (double)sums[b]});
                 }
-                printf("  +----------+----------+---------------+\n");
-                printf("  | cntrycode|  numcust |    totacctbal |\n");
-                printf("  +----------+----------+---------------+\n");
-                for (int b = 0; b < 7; b++) {
-                    if (counts[b] > 0) {
-                        printf("  | %8d | %8u | %13.2f |\n",
-                               valid_prefixes[b], counts[b], sums[b]);
+                if (emitOutput) {
+                    printf("  +----------+----------+---------------+\n");
+                    printf("  | cntrycode|  numcust |    totacctbal |\n");
+                    printf("  +----------+----------+---------------+\n");
+                    for (int b = 0; b < 7; b++) {
+                        if (counts[b] > 0) {
+                            printf("  | %8d | %8u | %13.2f |\n",
+                                   valid_prefixes[b], counts[b], sums[b]);
+                        }
                     }
+                    printf("  +----------+----------+---------------+\n");
                 }
-                printf("  +----------+----------+---------------+\n");
             }
         }
 
         // Q11 host path: threshold, filter, and sort.
-        if (plan.name == "Q11" && result.result.columns.empty()) {
+        if (isPredefinedPlan("Q11") && result.result.columns.empty()) {
             auto* valBuf = executor.getAllocatedBuffer("d_part_value");
             if (valBuf) {
                 markHostPost("hostScalarScan");
@@ -1567,20 +1658,22 @@ static bool runCodegenQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
                 for (auto& e : results)
                     result.result.rows.push_back({(int64_t)e.partkey, e.value});
                 int show = std::min((int)results.size(), 20);
-                printf("  Top-%d of %zu qualifying parts (threshold %.2f):\n",
-                       show, results.size(), threshold);
-                printf("  +-----------+------------------+\n");
-                printf("  | ps_partkey|            value |\n");
-                printf("  +-----------+------------------+\n");
-                for (int j = 0; j < show; j++) {
-                    printf("  | %9d | %16.2f |\n", results[j].partkey, results[j].value);
+                if (emitOutput) {
+                    printf("  Top-%d of %zu qualifying parts (threshold %.2f):\n",
+                           show, results.size(), threshold);
+                    printf("  +-----------+------------------+\n");
+                    printf("  | ps_partkey|            value |\n");
+                    printf("  +-----------+------------------+\n");
+                    for (int j = 0; j < show; j++) {
+                        printf("  | %9d | %16.2f |\n", results[j].partkey, results[j].value);
+                    }
+                    printf("  +-----------+------------------+\n");
                 }
-                printf("  +-----------+------------------+\n");
             }
         }
 
         // Q15: find max revenue supplier
-        if (plan.name == "Q15" && result.result.columns.empty()) {
+        if (isPredefinedPlan("Q15") && result.result.columns.empty()) {
             auto* revBuf = executor.getAllocatedBuffer("d_supp_revenue");
             if (revBuf) {
                 markHostPost("hostScalarScan");
@@ -1595,21 +1688,23 @@ static bool runCodegenQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
                     if (rev[k] >= maxRev - 0.01f)
                         result.result.rows.push_back({(int64_t)k, (double)rev[k]});
                 }
-                printf("  Top supplier(s) with max revenue %.2f:\n", maxRev);
-                printf("  +----------+------------------+\n");
-                printf("  |  s_suppkey|    total_revenue |\n");
-                printf("  +----------+------------------+\n");
-                for (size_t k = 0; k < n; k++) {
-                    if (rev[k] >= maxRev - 0.01f) {
-                        printf("  | %9zu | %16.2f |\n", k, rev[k]);
+                if (emitOutput) {
+                    printf("  Top supplier(s) with max revenue %.2f:\n", maxRev);
+                    printf("  +----------+------------------+\n");
+                    printf("  |  s_suppkey|    total_revenue |\n");
+                    printf("  +----------+------------------+\n");
+                    for (size_t k = 0; k < n; k++) {
+                        if (rev[k] >= maxRev - 0.01f) {
+                            printf("  | %9zu | %16.2f |\n", k, rev[k]);
+                        }
                     }
+                    printf("  +----------+------------------+\n");
                 }
-                printf("  +----------+------------------+\n");
             }
         }
 
         // Q18: gather compacted rows, using GPU top-k order when available.
-        if (plan.name == "Q18") {
+        if (isPredefinedPlan("Q18")) {
             auto* cntBuf     = executor.getAllocatedBuffer("d_q18_compact_count");
             auto* okBuf      = executor.getAllocatedBuffer("d_q18_compact_ok");
             auto* custBuf    = executor.getAllocatedBuffer("d_q18_compact_custkey");
@@ -1672,7 +1767,7 @@ static bool runCodegenQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
                     auto& r = results[j];
                     result.result.rows.push_back({(int64_t)r.custkey, (int64_t)r.orderkey, intDateToStr(r.orderdate), (double)r.totalprice, (double)r.qty});
                 }
-                if (!g_csv) {
+                if (emitOutput) {
                     printf("  Top-%d large volume orders (qty > 300):\n", show);
                     printf("  +----------+----------+---------------+------------+----------+\n");
                     printf("  | c_custkey| o_orderkey| o_totalprice |  o_orderdate| o_qty   |\n");
@@ -1688,7 +1783,7 @@ static bool runCodegenQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
         }
 
         // Q9: sort profit bins by nation ASC, year DESC.
-        if (plan.name == "Q9") {
+        if (isPredefinedPlan("Q9")) {
             auto* cntBuf = executor.getAllocatedBuffer("d_q9_result_count");
             auto* nationBuf = executor.getAllocatedBuffer("d_q9_result_nation");
             auto* yearBuf = executor.getAllocatedBuffer("d_q9_result_year");
@@ -1740,7 +1835,7 @@ static bool runCodegenQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
                     for (uint32_t src : order) appendRow(src);
                 }
 
-                if (!g_csv) {
+                if (emitOutput) {
                     printf("  +------------+------+---------------+\n");
                     printf("  | Nation     | Year |        Profit |\n");
                     printf("  +------------+------+---------------+\n");
@@ -1759,7 +1854,7 @@ static bool runCodegenQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
         }
 
         // Q20: gather GPU-materialized supplier rows in GPU sort order.
-        if (plan.name == "Q20") {
+        if (isPredefinedPlan("Q20")) {
             auto* cntBuf  = executor.getAllocatedBuffer("d_q20_result_count");
             auto* nameBuf = executor.getAllocatedBuffer("d_q20_result_name");
             auto* addrBuf = executor.getAllocatedBuffer("d_q20_result_address");
@@ -1815,7 +1910,7 @@ static bool runCodegenQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
                 result.result.rows.clear();
                 for (auto& r : rows)
                     result.result.rows.push_back({r.name, r.address});
-                if (!g_csv) {
+                if (emitOutput) {
                     printf("  +---------------------------+------------------------------------------+\n");
                     printf("  | s_name                    | s_address                                |\n");
                     printf("  +---------------------------+------------------------------------------+\n");
@@ -1830,7 +1925,7 @@ static bool runCodegenQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
         }
 
         // Q2: gather GPU-decorated and GPU-sorted compact rows.
-        if (plan.name == "Q2") {
+        if (isPredefinedPlan("Q2")) {
             auto* cntBuf = executor.getAllocatedBuffer("d_q2_compact_count");
             auto* acctBuf = executor.getAllocatedBuffer("d_q2_result_acctbal");
             auto* nameBuf = executor.getAllocatedBuffer("d_q2_result_s_name");
@@ -1840,6 +1935,7 @@ static bool runCodegenQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
             auto* addrBuf = executor.getAllocatedBuffer("d_q2_result_s_address");
             auto* phoneBuf = executor.getAllocatedBuffer("d_q2_result_s_phone");
             auto* commentBuf = executor.getAllocatedBuffer("d_q2_result_s_comment");
+            auto* lateCntBuf = executor.getAllocatedBuffer("d_q2_late_count");
             if (cntBuf && acctBuf && nameBuf && nationBuf && partkeyBuf &&
                 mfgrBuf && addrBuf && phoneBuf && commentBuf) {
                 uint32_t n = *static_cast<uint32_t*>(cntBuf->contents());
@@ -1879,7 +1975,11 @@ static bool runCodegenQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
                 };
 
                 int limit = std::min((int)n, 100);
-                if (plan.gpuSort) {
+                if (lateCntBuf && !plan.gpuSort) {
+                    uint32_t lateN = *static_cast<uint32_t*>(lateCntBuf->contents());
+                    limit = std::min((int)lateN, 100);
+                    for (int j = 0; j < limit; j++) appendRow((uint32_t)j);
+                } else if (plan.gpuSort) {
                     auto* idxBuf = executor.getAllocatedBuffer(plan.gpuSort->sortedIndexBuffer);
                     if (idxBuf) {
                         const int* order = static_cast<const int*>(idxBuf->contents());
@@ -1913,7 +2013,7 @@ static bool runCodegenQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
                     for (int j = 0; j < limit; j++) appendRow(order[(size_t)j]);
                 }
 
-                if (!g_csv) {
+                if (emitOutput) {
                     printf("\nQ2 Results:\n");
                     printf("  %-10s | %-25s | %-15s | %-8s | %-25s\n",
                            "s_acctbal", "s_name", "n_name", "p_partkey", "p_mfgr");
@@ -1934,7 +2034,7 @@ static bool runCodegenQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
         }
 
         // Q16: gather GPU-decorated and GPU-sorted group rows.
-        if (plan.name == "Q16") {
+        if (isPredefinedPlan("Q16")) {
             auto* rowCntBuf = executor.getAllocatedBuffer("d_q16_result_count");
             auto* brandBuf = executor.getAllocatedBuffer("d_q16_result_brand");
             auto* typeBuf = executor.getAllocatedBuffer("d_q16_result_type");
@@ -1993,7 +2093,7 @@ static bool runCodegenQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
                     for (uint32_t src : order) appendRow(src);
                 }
 
-                if (!g_csv) {
+                if (emitOutput) {
                     printf("\nQ16 Results:\n");
                     printf("  +-----------+---------------------------+------+--------------+\n");
                     printf("  | p_brand   | p_type                    |p_size| supplier_cnt |\n");
@@ -2014,7 +2114,7 @@ static bool runCodegenQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
         }
 
         // Q21: gather GPU-decorated and GPU-sorted compact rows.
-        if (plan.name == "Q21") {
+        if (isPredefinedPlan("Q21")) {
             auto* cntBuf = executor.getAllocatedBuffer("d_q21_result_count");
             auto* nameBuf = executor.getAllocatedBuffer("d_q21_result_name");
             auto* numwaitBuf = executor.getAllocatedBuffer("d_q21_result_numwait");
@@ -2067,7 +2167,7 @@ static bool runCodegenQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
                     for (int j = 0; j < limit; j++) appendRow(order[(size_t)j]);
                 }
 
-                if (!g_csv) {
+                if (emitOutput) {
                     printf("\nQ21 Results:\n");
                     printf("  +---------------------------+----------+\n");
                     printf("  | s_name                    | numwait  |\n");
@@ -2085,8 +2185,29 @@ static bool runCodegenQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
             }
         }
 
-        // Golden check runs after query-specific output assembly.
+        return elapsedMs(postStart, clk::now());
+        };
+
+        std::vector<double> postTrials;
+        postTrials.reserve((size_t)g_repeat);
+        const codegen::MetalExecutionResult rawResult = result;
+        for (int pr = 0; pr < g_repeat; pr++) {
+            codegen::MetalExecutionResult postResult = rawResult;
+            const bool emitOutput = !g_csv && pr == g_repeat - 1;
+            HostPostOpTracker* tracker = (pr == g_repeat - 1) ? &hostPostOps : nullptr;
+            postTrials.push_back(runHostPost(postResult, emitOutput, tracker));
+            if (pr == g_repeat - 1) {
+                result = std::move(postResult);
+            }
+        }
+        timing.postMs = medianValue(postTrials);
+
+        double validationMs = 0.0;
+
+        // Golden check runs after query-specific output assembly, but it is
+        // validation work rather than query execution time.
         if (!g_saveGoldenDir.empty() || !g_checkDir.empty()) {
+            auto validationStart = clk::now();
             std::string canonical = result.result.toCanonical();
             std::string checkName = queryName;
             std::string fname = checkName + "_" + timing.scaleFactor + ".csv";
@@ -2123,11 +2244,10 @@ static bool runCodegenQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
                     }
                 }
             }
+            validationMs = elapsedMs(validationStart, clk::now());
         }
 
-        auto postEnd = std::chrono::high_resolution_clock::now();
-        double postMs = std::chrono::duration<double, std::milli>(postEnd - postStart).count();
-        timing.postMs = postMs;
+        timing.validationMs = validationMs;
 
         if (!hostPostOps.empty()) {
             printf("HOST_POST_CSV,%s,%s,%s\n",
@@ -2175,13 +2295,14 @@ int main(int argc, const char* argv[]) {
             printf("Experiment flags:\n");
             printf("  --warmup N           Run N untimed warmup iterations (default 3)\n");
             printf("  --repeat N           Run N timed iterations, report median (default 1)\n");
-            printf("  --csv                Suppress text breakdown; emit one TIMING_CSV per trial\n");
+            printf("  --csv                Suppress text breakdown; emit CSV timing rows\n");
             printf("  --threadgroup-size N Override default threadgroup size (default = plan-specified)\n");
             printf("  --autotune-tg        Per-query global TG sweep over {32,64,128,256,512,1024};\n");
             printf("                       picks the size with min p50 GPU time (logs AUTOTUNE_CSV)\n");
             printf("  --autotune-tg-per-phase  Per-phase TG sweep; picks min-p50 TG independently\n");
             printf("                       for each kernel (logs AUTOTUNE_PHASE_CSV)\n");
             printf("  --no-pipeline-cache  Recompile Metal source on every measured iteration\n");
+            printf("  --profile-phases     Emit per-phase GPU, wall, residual, and hook timings\n");
             printf("  --fastmath           Enable Metal -ffast-math (default: off)\n");
             printf("  --no-fastmath        Disable Metal -ffast-math (default behavior)\n");
             printf("  --print-plan         Print the MetalQueryPlan structure before codegen\n");
@@ -2233,6 +2354,7 @@ int main(int argc, const char* argv[]) {
         }
         if (arg == "--csv")               { g_csv = true; continue; }
         if (arg == "--no-pipeline-cache") { g_noPipelineCache = true; continue; }
+        if (arg == "--profile-phases")    { g_profilePhases = true; continue; }
         if (arg == "--fastmath")          { g_fastMath = true; continue; }
         if (arg == "--no-fastmath")       { g_fastMath = false; continue; }
         if (arg == "--print-plan")        { g_printPlan = true; continue; }
@@ -2303,6 +2425,7 @@ int main(int argc, const char* argv[]) {
 
     // Apply explicit fast-math selection globally before any compile() runs.
     codegen::RuntimeCompiler::setFastMathEnabled(g_fastMath);
+    codegen::RuntimeCompiler::setGlobalCacheEnabled(!g_noPipelineCache);
 
     NS::AutoreleasePool* pool = NS::AutoreleasePool::alloc()->init();
     MTL::Device* device = MTL::CreateSystemDefaultDevice();

@@ -14,6 +14,10 @@ struct IrCarryColumn {
     // Fixed strings carry source row ids for later byte reads.
     std::string rowVarName;
     std::string bufferName;
+    // Final probe-side lookup metadata. This is populated only when a carry
+    // can be reloaded from a preserved key after top-k/limit.
+    std::string lookupKeyColumn;
+    std::string lookupKeyMetalType;
 };
 
 // Relation-instance id -> source column name -> carried value.

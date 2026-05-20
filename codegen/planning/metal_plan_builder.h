@@ -5,7 +5,6 @@
 
 #include "metal_operators.h"
 #include "metal_codegen_base.h"
-#include "query_analyzer.h"
 #include <memory>
 #include <string>
 #include <vector>
@@ -40,6 +39,9 @@ struct MetalQueryPlan {
         std::vector<ExtraBuffer> extraBuffers;
         // Optional host callback after this phase's GPU dispatch.
         PostDispatchHook postDispatchHook;
+        // Compile the phase kernel for hook use, but do not dispatch it
+        // through the normal executor path.
+        bool hookOnly = false;
     };
     std::vector<Phase> phases;
 
@@ -79,10 +81,6 @@ struct MetalQueryPlan {
     nlohmann::json toTreeJSON() const;
 
 };
-
-// Compatibility wrapper for callers that do not select a route explicitly.
-std::optional<MetalQueryPlan> buildMetalPlan(const AnalyzedQuery& aq,
-                                              const std::string& queryName = "");
 
 // Generate Metal source and return the configured codegen state.
 MetalCodegen generateFromPlan(const MetalQueryPlan& plan,

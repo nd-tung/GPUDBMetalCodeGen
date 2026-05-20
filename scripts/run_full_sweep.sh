@@ -16,7 +16,7 @@ WARM=3
 REP=5
 
 # TIMING_CSV columns produced by the binary.
-HEADER='sf,query,analyze_ms,plan_ms,codegen_ms,compile_ms,pso_ms,dataload_ms,bufalloc_ms,gpu_ms,cpu_ms,compile_overhead_ms,cpu_total_ms,e2e_ms,load_source,load_bytes,load_mibps,ingest_ms,query_compute_ms,gpu_trials_n,gpu_p10_ms,gpu_p90_ms,gpu_mad_ms,io_ms,preprocess_ms,query_execution_ms'
+HEADER='scale_factor,query,route,analyze_ms,plan_ms,codegen_ms,metal_compile_ms,pso_ms,compile_overhead_ms,load_source,load_bytes,load_mibps,ingest_ms,data_load_ms,io_ms,preprocess_ms,buffer_setup_ms,gpu_compute_ms,cpu_compute_ms,query_compute_ms,query_execution_ms,end_to_end_ms,execute_wall_ms,execute_overhead_ms,hook_cpu_ms,hook_gpu_ms,result_collect_ms,host_post_ms,validation_ms,gpu_trials_n,gpu_p10_ms,gpu_p50_ms,gpu_p90_ms,gpu_mad_ms,hot_execution_ms'
 
 run_one() {  # $1=tag $2=sf $3=qn $4..=extra flags
   local tag=$1 sf=$2 q=$3; shift 3
@@ -77,7 +77,7 @@ done
 # 5. Pipeline-cache cost: emit per-trial (TRIAL_CSV) so we can see warmup curve
 echo "[5/5] Pipeline-cache cost (per-trial)"
 out=$OUT/no_pipeline_cache_trials.csv
-echo "query,sf,trial,gpu_ms,compile_ms,e2e_trial_ms" > "$out"
+echo "scale_factor,query,route,trial,gpu_compute_ms,compile_ms,execute_wall_ms,buffer_setup_ms,hook_cpu_ms,hook_gpu_ms,result_collect_ms" > "$out"
 for q in q1 q6 q14; do
   $BIN --csv --warmup 0 --repeat 10 --no-pipeline-cache sf1 $q 2>/dev/null \
     | grep '^TRIAL_CSV' | sed 's/^TRIAL_CSV,//' >> "$out"

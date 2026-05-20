@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # B1 — Full autotune-tg sweep across all 22 TPC-H queries.
-# Produces a per-trial CSV (compatible with scripts/significance.py) for
+# Produces a per-trial CSV matching scripts/significance.py for
 # {baseline, autotune_tg} on every query, so a single Mann-Whitney run
 # can populate a thesis-ready table.
 #
@@ -25,7 +25,7 @@ QUERIES_DEFAULT=(q1 q2 q3 q4 q5 q6 q7 q8 q9 q10 q11 q12 q13 q14 q15 q16 q17 q18 
 read -r -a QUERIES <<< "${QUERIES:-${QUERIES_DEFAULT[*]}}"
 SFS=(${SFS:-sf1})
 
-echo "config,sf,query,trial,gpu_ms,compile_ms,e2e_ms" > "$TRIALS"
+echo "config,sf,query,route,trial,gpu_compute_ms,compile_ms,execute_wall_ms,buffer_setup_ms,hook_cpu_ms,hook_gpu_ms,result_collect_ms" > "$TRIALS"
 echo "sf,query,tg,p10_ms,p50_ms,p90_ms" > "$AUTO"
 
 run_one() {  # $1=config_tag $2=sf $3=q $4...=extra flags
@@ -40,7 +40,8 @@ run_one() {  # $1=config_tag $2=sf $3=q $4...=extra flags
     return
   fi
   echo "$trials" | awk -F, -v cfg="$cfg" \
-    '{ printf "%s,%s,%s,%s,%s,%s,%s\n", cfg, $3, $2, $4, $5, $6, $7 }' >> "$TRIALS"
+    '{ printf "%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n",
+              cfg, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12 }' >> "$TRIALS"
   if [[ -n $autotune ]]; then
     echo "$autotune" | awk -F, '{ printf "%s,%s,%s,%s,%s,%s\n", $2, $3, $4, $5, $6, $7 }' >> "$AUTO"
   fi

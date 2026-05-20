@@ -5,10 +5,12 @@ namespace codegen {
 
 namespace {
 
-std::optional<MetalQueryPlan> buildQ4PlanForDateFilter(const std::string& filterCond) {
+std::optional<MetalQueryPlan> buildQ4PredefinedPlan() {
     MetalQueryPlan plan;
     plan.name = "Q4";
     std::string idxVar = "i";
+    const std::string filterCond =
+        "o_orderdate[i] >= 19930701 && o_orderdate[i] < 19931001";
 
     // --- Late Orders Bitmap ---
     // Mark orders that have at least one late lineitem.
@@ -50,47 +52,8 @@ std::optional<MetalQueryPlan> buildQ4PlanForDateFilter(const std::string& filter
 } // namespace
 
 // Q4: Order Priority Checking.
-std::optional<MetalQueryPlan> buildQ4Plan(const AnalyzedQuery& aq) {
-    // Match orders grouped by priority with an EXISTS late-lineitem predicate.
-    if (aq.tables.size() < 1) return std::nullopt;
-    bool hasOrders = false;
-    for (auto& t : aq.tables) if (t == "orders") hasOrders = true;
-    if (!hasOrders) return std::nullopt;
-    if (!aq.hasGroupBy()) return std::nullopt;
-
-    bool hasExists = false;
-    for (auto& f : aq.filters) {
-        std::visit([&](auto&& node) {
-            using T = std::decay_t<decltype(node)>;
-            if constexpr (std::is_same_v<T, ExistsPred>) hasExists = true;
-        }, f->node);
-    }
-    if (!hasExists) return std::nullopt;
-
-    bool groupByPriority = false;
-    for (auto& g : aq.groupBy) {
-        std::visit([&](auto&& node) {
-            using T = std::decay_t<decltype(node)>;
-            if constexpr (std::is_same_v<T, ColRef>) {
-                if (node.column == "o_orderpriority") groupByPriority = true;
-            }
-        }, g->node);
-    }
-    if (!groupByPriority) return std::nullopt;
-
-    std::string idxVar = "i";
-
-    std::vector<PredPtr> dateFilters;
-    for (auto& f : aq.filters) {
-        std::set<std::string> cols;
-        collectColumns(f, cols);
-        if (cols.count("o_orderdate")) dateFilters.push_back(f);
-    }
-    return buildQ4PlanForDateFilter(combineFilters(dateFilters, idxVar));
-}
-
 std::optional<MetalQueryPlan> buildQ4Plan_byName() {
-    return buildQ4PlanForDateFilter("o_orderdate[i] >= 19930701 && o_orderdate[i] < 19931001");
+    return buildQ4PredefinedPlan();
 }
 
 } // namespace codegen

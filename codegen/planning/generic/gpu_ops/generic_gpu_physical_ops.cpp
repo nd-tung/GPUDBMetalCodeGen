@@ -1625,44 +1625,75 @@ PostDispatchHook makeGenericSortHook(
         if (!executor.tryGetSymbol(nRowsSymbol, nRows) || nRows == 0) return 0.0;
         unsigned int n = (unsigned int)nRows;
         unsigned int np2 = MetalInitSortKeys::nextPow2(n);
-        int* idxs = static_cast<int*>(idxBuf->contents());
-        for (unsigned int i = n; i < np2; ++i) idxs[i] = -1;
         auto* queue = executor.commandQueue();
         if (!queue) return 0.0;
+        std::vector<MTL::Buffer*> keyBuffers;
+        keyBuffers.reserve(keys.size());
+        for (const auto& key : keys) {
+            auto* keyBuf = executor.getAllocatedBuffer(key.column.bufferName);
+            if (!keyBuf) return 0.0;
+            keyBuffers.push_back(keyBuf);
+        }
+
+        MTL::CommandBuffer* cmdBuf = nullptr;
+        MTL::ComputeCommandEncoder* enc = nullptr;
+        const int kIndex = 1 + static_cast<int>(keyBuffers.size());
+        const int jIndex = kIndex + 1;
+        const int nIndex = jIndex + 1;
+        uint tgSize = pso->maxTotalThreadsPerThreadgroup();
+        if (tgSize > 256) tgSize = 256;
+        uint numTG = (np2 + tgSize - 1) / tgSize;
+        if (numTG < 1) numTG = 1;
+
+        bool emitted = false;
         double gpuMs = 0.0;
+        unsigned int batchPasses = 0;
+        const unsigned int maxSortPassesPerBatch = n <= 65536u ? np2 : 16u;
+
+        auto beginBatch = [&]() {
+            cmdBuf = queue->commandBuffer();
+            enc = cmdBuf ? cmdBuf->computeCommandEncoder() : nullptr;
+            if (!enc) return false;
+            enc->setComputePipelineState(pso);
+            enc->setBuffer(idxBuf, 0, 0);
+            int bindIdx = 1;
+            for (auto* keyBuf : keyBuffers) {
+                enc->setBuffer(keyBuf, 0, bindIdx++);
+            }
+            return true;
+        };
+
+        auto flushBatch = [&]() {
+            if (!cmdBuf || !enc || batchPasses == 0) return;
+            enc->endEncoding();
+            cmdBuf->commit();
+            cmdBuf->waitUntilCompleted();
+            gpuMs += (cmdBuf->GPUEndTime() - cmdBuf->GPUStartTime()) * 1000.0;
+            cmdBuf = nullptr;
+            enc = nullptr;
+            batchPasses = 0;
+        };
+
         for (unsigned int k = 2; k <= np2; k <<= 1) {
             for (unsigned int j = k >> 1; j > 0; j >>= 1) {
-                auto* cmdBuf = queue->commandBuffer();
-                auto* enc = cmdBuf->computeCommandEncoder();
-                enc->setComputePipelineState(pso);
-                enc->setBuffer(idxBuf, 0, 0);
-                int bindIdx = 1;
-                for (const auto& key : keys) {
-                    auto* keyBuf = executor.getAllocatedBuffer(key.column.bufferName);
-                    if (!keyBuf) {
-                        enc->endEncoding();
-                        cmdBuf->commit();
-                        cmdBuf->waitUntilCompleted();
-                        gpuMs += (cmdBuf->GPUEndTime() - cmdBuf->GPUStartTime()) * 1000.0;
-                        return gpuMs;
-                    }
-                    enc->setBuffer(keyBuf, 0, bindIdx++);
-                }
-                enc->setBytes(&k, sizeof(uint), bindIdx++);
-                enc->setBytes(&j, sizeof(uint), bindIdx++);
-                enc->setBytes(&np2, sizeof(uint), bindIdx++);
-                uint tgSize = pso->maxTotalThreadsPerThreadgroup();
-                if (tgSize > 256) tgSize = 256;
-                uint numTG = (np2 + tgSize - 1) / tgSize;
-                if (numTG < 1) numTG = 1;
+                if (!enc && !beginBatch()) return gpuMs;
+                enc->setBytes(&k, sizeof(uint), kIndex);
+                enc->setBytes(&j, sizeof(uint), jIndex);
+                enc->setBytes(&np2, sizeof(uint), nIndex);
                 enc->dispatchThreadgroups(MTL::Size::Make(numTG, 1, 1),
                                           MTL::Size::Make(tgSize, 1, 1));
-                enc->endEncoding();
-                cmdBuf->commit();
-                cmdBuf->waitUntilCompleted();
-                gpuMs += (cmdBuf->GPUEndTime() - cmdBuf->GPUStartTime()) * 1000.0;
+                emitted = true;
+                ++batchPasses;
+                const bool finalPass = (k == np2 && j == 1);
+                if (!finalPass && batchPasses >= maxSortPassesPerBatch) {
+                    flushBatch();
+                } else if (!finalPass) {
+                    enc->memoryBarrier(MTL::BarrierScopeBuffers);
+                }
             }
         }
+        if (!emitted) return 0.0;
+        flushBatch();
         return gpuMs;
     };
 }
@@ -1790,6 +1821,7 @@ bool appendGenericGpuSort(MetalQueryPlan& plan,
         const std::string phaseName = "GENERIC_gpu_sort_step_" + suffix;
         auto& sortPhase = appendPhase(plan, phaseName,
             std::make_unique<MetalGenericSortStep>(idxBuf, keys, capacityExpr));
+        sortPhase.hookOnly = true;
         sortPhase.postDispatchHook = makeGenericSortHook(phaseName, idxBuf, nRowsSymbol, keys);
     }
     plan.gpuSort = MetalQueryPlan::GpuSort{idxBuf, nRowsSymbol, false, sortSpec.limit};
@@ -1940,6 +1972,30 @@ bool appendGenericGpuTopK(MetalQueryPlan& plan,
                 256);
     plan.gpuSort = MetalQueryPlan::GpuSort{idxBuf, nRowsSymbol, false, sortSpec.limit};
     return true;
+}
+
+bool appendBestGenericGpuOrder(MetalQueryPlan& plan,
+                               const std::string& tag,
+                               const std::string& nRowsSymbol,
+                               const std::string& capacityExpr,
+                               const std::vector<GenericMatColumnDesc>& columns,
+                               const GenericSortSpec& sortSpec,
+                               std::string* error) {
+    if (sortSpec.limit > 0 && !sortSpec.keys.empty()) {
+        std::string topKError;
+        if (appendGenericGpuTopK(plan, tag, nRowsSymbol, capacityExpr,
+                                 columns, sortSpec, &topKError)) {
+            return true;
+        }
+        std::string selectError;
+        if (appendGenericGpuTopKSelection(plan, tag, nRowsSymbol, capacityExpr,
+                                          columns, sortSpec, &selectError)) {
+            return true;
+        }
+        if (error) *error = !selectError.empty() ? selectError : topKError;
+    }
+    return appendGenericGpuSort(plan, tag, nRowsSymbol, capacityExpr,
+                                columns, sortSpec, error);
 }
 
 } // namespace codegen
