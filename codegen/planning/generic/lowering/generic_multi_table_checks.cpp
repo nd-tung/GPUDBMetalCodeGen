@@ -1,6 +1,6 @@
 #include "generic/lowering/generic_multi_table_checks.h"
 
-#include "generic/lowering/generic_scalar_sentinel.h"
+#include "generic/lowering/generic_scalar_placeholder.h"
 #include "query_analyzer.h"
 
 #include <type_traits>
@@ -43,11 +43,11 @@ bool hasScalarSubqueries(const AnalyzedQuery* aq) {
 bool groupedAggregateNeedsScalarPreAgg(
         const MultiTableGroupedAggShape& shape) {
     if (auto* filter = filterDetail(shape.filter)) {
-        if (predicateReferencesScalarSentinel(filter->predicate)) return true;
+        if (predicateReferencesScalarSubqueryPlaceholder(filter->predicate)) return true;
     }
     for (const auto* joinNode : shape.joins) {
         auto* join = joinDetail(joinNode);
-        if (join && predicateReferencesScalarSentinel(join->predicate))
+        if (join && predicateReferencesScalarSubqueryPlaceholder(join->predicate))
             return true;
     }
     return false;
@@ -55,11 +55,11 @@ bool groupedAggregateNeedsScalarPreAgg(
 
 bool materializeNeedsScalarPreAgg(const MultiTableMaterializeShape& shape) {
     if (auto* filter = filterDetail(shape.filter)) {
-        if (predicateReferencesScalarSentinel(filter->predicate)) return true;
+        if (predicateReferencesScalarSubqueryPlaceholder(filter->predicate)) return true;
     }
     for (const auto* joinNode : shape.joins) {
         auto* join = joinDetail(joinNode);
-        if (join && predicateReferencesScalarSentinel(join->predicate))
+        if (join && predicateReferencesScalarSubqueryPlaceholder(join->predicate))
             return true;
     }
     return false;

@@ -1,25 +1,15 @@
 #include "generic/lowering/generic_scalar_preagg_ops.h"
 
+#include "generic/lowering/generic_expression_metal.h"
+#include "generic/lowering/generic_scalar_hash_names.h"
+
 #include <algorithm>
-#include <cctype>
 #include <utility>
 #include <vector>
 
 namespace codegen {
 
 namespace {
-
-std::string sanitizeIdentifier(std::string name) {
-    if (name.empty()) name = "expr";
-    for (char& ch : name) {
-        unsigned char uch = static_cast<unsigned char>(ch);
-        if (!std::isalnum(uch) && ch != '_') ch = '_';
-    }
-    if (std::isdigit(static_cast<unsigned char>(name.front()))) {
-        name = "c_" + name;
-    }
-    return name;
-}
 
 class ScalarGlobalFloatAgg : public MetalUnaryOperator {
 public:
@@ -214,22 +204,23 @@ public:
           valueIsFloat_(valueIsFloat) {}
 
     void produce(MetalCodegen& cg, ConsumerFn consume) override {
-        cg.addAtomicBufferParam(map_ + "_states", "atomic_uint", capacity_, 0);
-        cg.addAtomicBufferParam(map_ + "_keys1", "atomic_uint", capacity_, 0);
-        cg.addAtomicBufferParam(map_ + "_keys2", "atomic_uint", capacity_, 0);
-        cg.addAtomicBufferParam(map_ + "_values", "atomic_uint", capacity_, 0);
-        cg.addResolvedScalarParam("n_" + map_, "uint", capacity_);
+        const auto names = scalarCompositeHashNames(map_);
+        cg.addAtomicBufferParam(names.states(), "atomic_uint", capacity_, 0);
+        cg.addAtomicBufferParam(names.keys1(), "atomic_uint", capacity_, 0);
+        cg.addAtomicBufferParam(names.keys2(), "atomic_uint", capacity_, 0);
+        cg.addAtomicBufferParam(names.values(), "atomic_uint", capacity_, 0);
+        cg.addResolvedScalarParam(names.capacity(), "uint", capacity_);
         child_->produce(cg, [&]() {
             if (valueIsFloat_) {
-                cg.addLine("scalar_hash_insert_add_float_64(" + map_ + "_states, " +
-                           map_ + "_keys1, " + map_ + "_keys2, " +
-                           map_ + "_values, n_" + map_ +
+                cg.addLine("scalar_hash_insert_add_float_64(" + names.states() + ", " +
+                           names.keys1() + ", " + names.keys2() + ", " +
+                           names.values() + ", " + names.capacity() +
                            ", (uint)(" + key1_ + "), (uint)(" + key2_ +
                            "), (float)(" + value_ + "));");
             } else {
-                cg.addLine("scalar_hash_insert_add_u32_64(" + map_ + "_states, " +
-                           map_ + "_keys1, " + map_ + "_keys2, " +
-                           map_ + "_values, n_" + map_ +
+                cg.addLine("scalar_hash_insert_add_u32_64(" + names.states() + ", " +
+                           names.keys1() + ", " + names.keys2() + ", " +
+                           names.values() + ", " + names.capacity() +
                            ", (uint)(" + key1_ + "), (uint)(" + key2_ +
                            "), (uint)(" + value_ + "));");
             }

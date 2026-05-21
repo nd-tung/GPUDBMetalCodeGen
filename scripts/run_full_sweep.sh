@@ -2,13 +2,15 @@
 # Full experiment sweep — produces CSV files in build/exp_<timestamp>/.
 # Each CSV row is one TIMING_CSV emission (median over --repeat trials).
 set -u
-cd "$(dirname "$0")/.."
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+source "$SCRIPT_DIR/bench_common.sh"
+cd "$SCRIPT_DIR/.."
 
 BIN=./build/bin/GPUDBCodegen
 [[ -x $BIN ]] || { echo "ERROR: $BIN not built"; exit 1; }
 
-TS=$(date +%Y%m%d_%H%M%S)
-OUT=build/exp_${TS}
+TS=$(bench_timestamp)
+OUT=$(bench_default_output_dir exp "$TS")
 mkdir -p "$OUT"
 echo "Output dir: $OUT"
 
@@ -16,7 +18,7 @@ WARM=3
 REP=5
 
 # TIMING_CSV columns produced by the binary.
-HEADER='scale_factor,query,route,analyze_ms,plan_ms,codegen_ms,metal_compile_ms,pso_ms,compile_overhead_ms,load_source,load_bytes,load_mibps,ingest_ms,data_load_ms,io_ms,preprocess_ms,buffer_setup_ms,gpu_compute_ms,cpu_compute_ms,query_compute_ms,query_execution_ms,end_to_end_ms,execute_wall_ms,execute_overhead_ms,hook_cpu_ms,hook_gpu_ms,result_collect_ms,host_post_ms,validation_ms,gpu_trials_n,gpu_p10_ms,gpu_p50_ms,gpu_p90_ms,gpu_mad_ms,hot_execution_ms'
+HEADER='scale_factor,query,route,analyze_ms,plan_ms,codegen_ms,metal_compile_ms,pso_ms,compile_overhead_ms,load_source,load_bytes,load_mibps,ingest_ms,data_load_ms,io_ms,preprocess_ms,buffer_setup_ms,gpu_compute_ms,cpu_compute_ms,query_compute_ms,query_execution_ms,end_to_end_ms,execute_wall_ms,execute_residual_ms,hook_cpu_ms,hook_gpu_ms,result_collect_ms,host_post_ms,validation_ms,gpu_trials_n,gpu_p10_ms,gpu_p50_ms,gpu_p90_ms,gpu_mad_ms,hot_execution_ms'
 
 run_one() {  # $1=tag $2=sf $3=qn $4..=extra flags
   local tag=$1 sf=$2 q=$3; shift 3

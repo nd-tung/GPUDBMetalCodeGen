@@ -7,6 +7,7 @@
 #include <vector>
 #include <cstdint>
 #include <algorithm>
+#include <stdexcept>
 
 namespace codegen {
 
@@ -272,6 +273,14 @@ std::string exprToMetalForPredicate(const ExprPtr& expr,
         }
     }
     return exprToMetal(expr, idxVar, schema);
+}
+
+[[noreturn]] void failUnsupportedAnalyzedPredicateEmitter(
+        const std::string& emitter,
+        const std::string& detail) {
+    throw std::logic_error(
+        emitter + ": unsupported predicate " + detail +
+        "; callers must reject unsupported predicates before emitting Metal.");
 }
 
 } // namespace
@@ -651,13 +660,14 @@ std::string predToMetal(const PredPtr& pred, const std::string& idxVar,
             if (auto fixedStringLike = fixedStringLikeMetal(node, idxVar, schema)) {
                 return *fixedStringLike;
             }
-            return "false";
+            failUnsupportedAnalyzedPredicateEmitter("predToMetal", "LIKE shape");
         }
         else if constexpr (std::is_same_v<T, ExistsPred>) {
-            return "/* EXISTS */true";
+            failUnsupportedAnalyzedPredicateEmitter(
+                "predToMetal", node.negated ? "NOT EXISTS" : "EXISTS");
         }
         else {
-            return "true";
+            failUnsupportedAnalyzedPredicateEmitter("predToMetal", "variant");
         }
     }, pred->node);
 }
@@ -854,7 +864,8 @@ std::string predToMetalForHaving(const PredPtr& pred,
             return "!(" + predToMetalForHaving(node.child, slots) + ")";
         }
         else {
-            return "true";
+            failUnsupportedAnalyzedPredicateEmitter("predToMetalForHaving",
+                                                   "variant");
         }
     }, pred->node);
 }

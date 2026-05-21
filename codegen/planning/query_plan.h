@@ -54,8 +54,13 @@ struct FuncCall {
     std::vector<ExprPtr> args;
 };
 
+struct ScalarSubqueryRef {
+    int index = -1;
+};
+
 struct Expr {
-    std::variant<ColRef, Literal, BinaryExpr, CaseWhen, FuncCall> node;
+    std::variant<ColRef, Literal, BinaryExpr, CaseWhen, FuncCall,
+                 ScalarSubqueryRef> node;
 
     static ExprPtr col(const std::string& table, const std::string& col, int idx, DataType dt, int fw = 0, const std::string& alias = "") {
         auto e = std::make_shared<Expr>();
@@ -80,6 +85,11 @@ struct Expr {
     static ExprPtr binary(ExprOp op, ExprPtr l, ExprPtr r) {
         auto e = std::make_shared<Expr>();
         e->node = BinaryExpr{op, l, r};
+        return e;
+    }
+    static ExprPtr scalarSubquery(int index) {
+        auto e = std::make_shared<Expr>();
+        e->node = ScalarSubqueryRef{index};
         return e;
     }
 };

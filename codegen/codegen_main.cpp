@@ -19,7 +19,6 @@
 #include <cerrno>
 #include <cstdlib>
 #include <limits>
-#include <sys/stat.h>
 #include <sys/sysctl.h>
 #include <mach/mach.h>
 #include <set>
@@ -27,7 +26,6 @@
 #include <algorithm>
 #include <memory>
 #include <optional>
-#include <cstring>
 
 // Runtime flags shared by main and runCodegenQuery.
 static int  g_warmup            = 3;     // --warmup N
@@ -272,20 +270,7 @@ static bool parseRowCountWithSuffix(const std::string& text, size_t& out) {
 // Read .colbin row count and file size without mapping the payload.
 static bool peekColbinHeader(const std::string& path,
                               uint64_t& out_n_rows, uint64_t& out_file_size) {
-    struct stat st{};
-    if (stat(path.c_str(), &st) != 0) return false;
-    out_file_size = (uint64_t)st.st_size;
-
-    FILE* f = fopen(path.c_str(), "rb");
-    if (!f) return false;
-    colbin::FileHeader hdr{};
-    bool ok = (fread(&hdr, sizeof(hdr), 1, f) == 1);
-    fclose(f);
-    if (!ok) return false;
-    if (memcmp(hdr.magic, colbin::MAGIC, 8) != 0) return false;
-    if (hdr.version != colbin::VERSION) return false;
-    out_n_rows = hdr.n_rows;
-    return true;
+    return colbin::peekRowCount(path, out_n_rows, &out_file_size);
 }
 
 // Use the largest referenced .colbin as the streaming table.

@@ -48,53 +48,17 @@ std::optional<std::pair<std::string, TypeInfo>> scanAnchorColumn(
     return columnFromScanOutput("");
 }
 
-std::optional<double> numericLiteralValueLocal(const GenericExprPtr& expr) {
-    if (!expr) return std::nullopt;
-    auto* lit = std::get_if<GenericLiteralExpr>(&expr->node);
-    if (!lit) return std::nullopt;
-    return std::visit([](const auto& value) -> std::optional<double> {
-        using V = std::decay_t<decltype(value)>;
-        if constexpr (std::is_same_v<V, int64_t>)
-            return static_cast<double>(value);
-        else if constexpr (std::is_same_v<V, double>)
-            return value;
-        else
-            return std::nullopt;
-    }, lit->value);
-}
-
-bool scaleNeutralFactor(const GenericExprPtr& expr) {
-    if (!expr) return false;
-    if (numericLiteralValueLocal(expr)) return true;
-    return expr->type.type == DataType::INT;
-}
-
-int scalarSumFixedPointScale(const GenericExprPtr& expr) {
-    const int directScale = numericScaleForExpr(expr);
-    if (directScale > 0) return directScale;
-    if (!expr) return 0;
-    auto* bin = std::get_if<GenericBinaryExpr>(&expr->node);
-    if (!bin) return 0;
-
-    const int leftScale = scalarSumFixedPointScale(bin->left);
-    const int rightScale = scalarSumFixedPointScale(bin->right);
-    switch (bin->op) {
-        case ExprOp::ADD:
-        case ExprOp::SUB:
-            if (leftScale > 0 && leftScale == rightScale) return leftScale;
-            if (leftScale > 0 && numericLiteralValueLocal(bin->right)) return leftScale;
-            if (rightScale > 0 && numericLiteralValueLocal(bin->left)) return rightScale;
-            return 0;
-        case ExprOp::MUL:
-            if (leftScale > 0 && rightScale > 0)
-                return std::max(leftScale, rightScale);
-            if (leftScale > 0 && scaleNeutralFactor(bin->right)) return leftScale;
-            if (rightScale > 0 && scaleNeutralFactor(bin->left)) return rightScale;
-            return 0;
-        case ExprOp::DIV:
-            return 0;
+MetalTGReduce::ReduceOp scalarReduceOpToMetal(
+        ScalarReduceAccumulatorSpec::Op op) {
+    switch (op) {
+        case ScalarReduceAccumulatorSpec::Op::Min:
+            return MetalTGReduce::ReduceOp::MIN;
+        case ScalarReduceAccumulatorSpec::Op::Max:
+            return MetalTGReduce::ReduceOp::MAX;
+        case ScalarReduceAccumulatorSpec::Op::Sum:
+            return MetalTGReduce::ReduceOp::SUM;
     }
-    return 0;
+    return MetalTGReduce::ReduceOp::SUM;
 }
 
 } // namespace
@@ -171,29 +135,18 @@ std::optional<MetalQueryPlan> lowerSingleTableScalarAggregateIRToMetal(
             continue;
         }
 
-        int outputScale = 0;
-        std::string outputType = agg->arg->type.type == DataType::FLOAT ? "float" : "long";
-        MetalTGReduce::ReduceOp op = MetalTGReduce::ReduceOp::SUM;
-        if (agg->func == AggFunc::MIN) op = MetalTGReduce::ReduceOp::MIN;
-        else if (agg->func == AggFunc::MAX) op = MetalTGReduce::ReduceOp::MAX;
-        else if (agg->func != AggFunc::SUM) {
+        auto reduceSpec = buildScalarReduceAccumulatorSpec(
+            agg->func, agg->arg, valueExpr);
+        if (!reduceSpec) {
             return fail(error, "IR scalar aggregate lowerer: unsupported aggregate '" +
                                aggFuncName(agg->func) + "'.");
         }
-        if (op == MetalTGReduce::ReduceOp::SUM &&
-            agg->arg->type.type == DataType::FLOAT) {
-            outputScale = scalarSumFixedPointScale(agg->arg);
-            if (outputScale > 0) {
-                valueExpr = scaledLongExpr(valueExpr, outputScale);
-                outputType = "long";
-            }
-        } else if (op != MetalTGReduce::ReduceOp::SUM &&
-                   agg->arg->type.type != DataType::FLOAT) {
-            outputType = "int";
-        }
 
-        int accIndex = reduce->addAccumulator(accName, valueExpr, outputType, "", "", op);
-        reduce->setAccumulatorResultAlias(alias, accIndex, outputScale, nullptr);
+        int accIndex = reduce->addAccumulator(
+            accName, reduceSpec->valueExpr, reduceSpec->metalType, "", "",
+            scalarReduceOpToMetal(reduceSpec->op));
+        reduce->setAccumulatorResultAlias(
+            alias, accIndex, reduceSpec->outputScale, nullptr);
     }
 
     if (!hasInputColumnReference) {

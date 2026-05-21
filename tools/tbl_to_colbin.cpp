@@ -47,33 +47,6 @@ static bool fileExists(const std::string& p) {
     return ::stat(p.c_str(), &st) == 0;
 }
 
-static bool descriptorMatches(const colbin::ColDesc& desc, const ColSpec& spec, uint64_t nRows,
-                              size_t fileSize) {
-    if (desc.columnIndex != spec.columnIndex) return false;
-    if (colbin::decodeType(desc.dtype) != spec.type) return false;
-    if (spec.type == ColType::CHAR_FIXED && desc.fixedWidth != spec.fixedWidth) return false;
-    if (desc.offset % colbin::ALIGN != 0) return false;
-    if (desc.offset + desc.size_bytes > fileSize) return false;
-
-    size_t expectedBytes = 0;
-    switch (spec.type) {
-        case ColType::INT:
-        case ColType::DATE:
-            expectedBytes = (size_t)nRows * sizeof(int32_t);
-            break;
-        case ColType::FLOAT:
-            expectedBytes = (size_t)nRows * sizeof(float);
-            break;
-        case ColType::CHAR1:
-            expectedBytes = (size_t)nRows;
-            break;
-        case ColType::CHAR_FIXED:
-            expectedBytes = (size_t)nRows * (size_t)spec.fixedWidth;
-            break;
-    }
-    return desc.size_bytes == expectedBytes;
-}
-
 static bool binaryUpToDate(const std::string& tblPath, const std::vector<ColSpec>& expectedSpecs) {
     size_t tblSz = 0; int64_t tblMt = 0;
     if (!colbin::statFile(tblPath, tblSz, tblMt)) return false;
@@ -82,25 +55,11 @@ static bool binaryUpToDate(const std::string& tblPath, const std::vector<ColSpec
     if (mf.size < sizeof(colbin::FileHeader)) return false;
     colbin::FileHeader hdr;
     memcpy(&hdr, mf.data, sizeof(hdr));
-    if (memcmp(hdr.magic, colbin::MAGIC, 8) != 0) return false;
-    if (hdr.version != colbin::VERSION) return false;
-    if (hdr.source_size != tblSz) return false;
-    if (hdr.source_mtime_ns != tblMt) return false;
-    if (hdr.n_cols != expectedSpecs.size()) return false;
-    if (sizeof(colbin::FileHeader) + hdr.n_cols * sizeof(colbin::ColDesc) > mf.size) return false;
+    if (!colbin::validateHeader(hdr, mf.size, true, tblSz, tblMt)) return false;
 
     const auto* descs = (const colbin::ColDesc*)((const char*)mf.data + sizeof(colbin::FileHeader));
-    for (const ColSpec& spec : expectedSpecs) {
-        bool found = false;
-        for (uint32_t i = 0; i < hdr.n_cols; i++) {
-            if (descs[i].columnIndex == spec.columnIndex) {
-                found = descriptorMatches(descs[i], spec, hdr.n_rows, mf.size);
-                break;
-            }
-        }
-        if (!found) return false;
-    }
-    return true;
+    return colbin::descriptorsMatch(descs, hdr.n_cols, expectedSpecs,
+                                    hdr.n_rows, mf.size, true);
 }
 
 int main(int argc, char** argv) {

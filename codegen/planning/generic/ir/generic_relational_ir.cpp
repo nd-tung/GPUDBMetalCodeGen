@@ -279,6 +279,9 @@ nlohmann::json genericExprToJSON(const GenericExprPtr& expr) {
             j["distinct"] = node.distinct;
             j["alias"] = node.alias;
             j["arg"] = genericExprToJSON(node.arg);
+        } else if constexpr (std::is_same_v<T, GenericScalarSubqueryExpr>) {
+            j["kind"] = "ScalarSubquery";
+            j["index"] = node.index;
         } else if constexpr (std::is_same_v<T, GenericScalarLookupExpr>) {
             j["kind"] = "ScalarLookup";
             j["source"] = idJSON(node.source.value);

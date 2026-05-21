@@ -16,7 +16,7 @@ struct GenericScalarLookupInfo {
         GlobalSum, GlobalAvg, GlobalMin, GlobalMax, GlobalCount
     };
 
-    int sentinel = 0;
+    int scalarSubqueryIndex = -1;
     Kind kind = SumByKey;
     std::string valueTable;
     std::string keyCol;
@@ -42,6 +42,13 @@ struct GenericScalarLookupInfo {
     std::string scalarName;
 };
 
+struct GenericScalarRewriteResult {
+    std::string text;
+    bool referencedScalarLookup = false;
+    bool needsScalarLookupLoads = false;
+    bool needsScalarLookupBuffers = false;
+};
+
 std::string genericScalarLookupKeyExpr(
     const GenericScalarLookupInfo& info,
     size_t keyIndex,
@@ -49,20 +56,19 @@ std::string genericScalarLookupKeyExpr(
     const std::string& probeTable,
     const SchemaProvider* schema);
 
-std::string rewriteGenericScalarSentinels(
+std::string rewriteGenericScalarPlaceholders(
     const std::string& cond,
     const std::string& idxVar,
     const std::vector<GenericScalarLookupInfo>& lookups,
     const std::string& probeTable,
     const SchemaProvider* schema);
 
-bool referencesGenericScalarSentinel(
-    const std::string& text,
-    const std::vector<GenericScalarLookupInfo>& lookups);
-
-bool referencesGenericScalarLookupBuffer(
-    const std::string& text,
-    const std::vector<GenericScalarLookupInfo>& lookups);
+GenericScalarRewriteResult rewriteGenericScalarPlaceholdersWithDeps(
+    const std::string& cond,
+    const std::string& idxVar,
+    const std::vector<GenericScalarLookupInfo>& lookups,
+    const std::string& probeTable,
+    const SchemaProvider* schema);
 
 void attachGenericScalarLookupBuffers(
     MetalQueryPlan::Phase& phase,

@@ -1,14 +1,14 @@
 #include "generic/lowering/generic_scalar_preagg_lowering.h"
 #include "generic/lowering/generic_cost_model.h"
+#include "generic/lowering/generic_expression_metal.h"
 #include "generic/lowering/generic_scalar_preagg_ops.h"
 #include "generic/lowering/generic_scalar_subquery_analysis.h"
 #include "generic/gpu_ops/generic_gpu_physical_ops.h"
 #include "execution/metal_generic_executor.h"
 #include "metal_plan_common.h"
+#include "scalar_subquery_placeholder.h"
 
 #include <algorithm>
-#include <cctype>
-#include <climits>
 #include <cstdint>
 #include <cstring>
 #include <limits>
@@ -22,18 +22,6 @@
 namespace codegen {
 
 namespace {
-
-std::string sanitizeIdentifier(std::string name) {
-    if (name.empty()) name = "expr";
-    for (char& ch : name) {
-        unsigned char uch = static_cast<unsigned char>(ch);
-        if (!std::isalnum(uch) && ch != '_') ch = '_';
-    }
-    if (std::isdigit(static_cast<unsigned char>(name.front()))) {
-        name = "c_" + name;
-    }
-    return name;
-}
 
 using ScalarLookupInfo = GenericScalarLookupInfo;
 
@@ -209,62 +197,60 @@ static bool predicateOnlyReferencesTable(const PredPtr& pred,
     return true;
 }
 
-static bool exprHasScalarSentinel(const ExprPtr& expr, int sqIdx);
+static bool exprHasScalarSubqueryRef(const ExprPtr& expr, int sqIdx);
 
-static bool predHasScalarSentinel(const PredPtr& pred, int sqIdx) {
+static bool predHasScalarSubqueryRef(const PredPtr& pred, int sqIdx) {
     if (!pred) return false;
     return std::visit([&](const auto& node) -> bool {
         using T = std::decay_t<decltype(node)>;
         if constexpr (std::is_same_v<T, Comparison>) {
-            return exprHasScalarSentinel(node.left, sqIdx) ||
-                   exprHasScalarSentinel(node.right, sqIdx);
+            return exprHasScalarSubqueryRef(node.left, sqIdx) ||
+                   exprHasScalarSubqueryRef(node.right, sqIdx);
         } else if constexpr (std::is_same_v<T, Between>) {
-            return exprHasScalarSentinel(node.expr, sqIdx) ||
-                   exprHasScalarSentinel(node.low, sqIdx) ||
-                   exprHasScalarSentinel(node.high, sqIdx);
+            return exprHasScalarSubqueryRef(node.expr, sqIdx) ||
+                   exprHasScalarSubqueryRef(node.low, sqIdx) ||
+                   exprHasScalarSubqueryRef(node.high, sqIdx);
         } else if constexpr (std::is_same_v<T, InList>) {
-            if (exprHasScalarSentinel(node.expr, sqIdx)) return true;
+            if (exprHasScalarSubqueryRef(node.expr, sqIdx)) return true;
             for (const auto& value : node.values)
-                if (exprHasScalarSentinel(value, sqIdx)) return true;
+                if (exprHasScalarSubqueryRef(value, sqIdx)) return true;
             return false;
         } else if constexpr (std::is_same_v<T, Like>) {
-            return exprHasScalarSentinel(node.expr, sqIdx);
+            return exprHasScalarSubqueryRef(node.expr, sqIdx);
         } else if constexpr (std::is_same_v<T, LogicalAnd> ||
                              std::is_same_v<T, LogicalOr>) {
             for (const auto& child : node.children)
-                if (predHasScalarSentinel(child, sqIdx)) return true;
+                if (predHasScalarSubqueryRef(child, sqIdx)) return true;
             return false;
         } else if constexpr (std::is_same_v<T, LogicalNot>) {
-            return predHasScalarSentinel(node.child, sqIdx);
+            return predHasScalarSubqueryRef(node.child, sqIdx);
         } else {
             return false;
         }
     }, pred->node);
 }
 
-static bool exprHasScalarSentinel(const ExprPtr& expr, int sqIdx) {
+static bool exprHasScalarSubqueryRef(const ExprPtr& expr, int sqIdx) {
     if (!expr) return false;
     return std::visit([&](const auto& node) -> bool {
         using T = std::decay_t<decltype(node)>;
-        if constexpr (std::is_same_v<T, Literal>) {
-            if (auto value = std::get_if<int>(&node.value))
-                return *value == INT_MIN + sqIdx;
-            return false;
+        if constexpr (std::is_same_v<T, ScalarSubqueryRef>) {
+            return node.index == sqIdx;
         } else if constexpr (std::is_same_v<T, BinaryExpr>) {
-            return exprHasScalarSentinel(node.left, sqIdx) ||
-                   exprHasScalarSentinel(node.right, sqIdx);
+            return exprHasScalarSubqueryRef(node.left, sqIdx) ||
+                   exprHasScalarSubqueryRef(node.right, sqIdx);
         } else if constexpr (std::is_same_v<T, FuncCall>) {
             for (const auto& arg : node.args)
-                if (exprHasScalarSentinel(arg, sqIdx)) return true;
+                if (exprHasScalarSubqueryRef(arg, sqIdx)) return true;
             return false;
         } else if constexpr (std::is_same_v<T, CaseWhen>) {
             for (const auto& branch : node.branches) {
-                if (predHasScalarSentinel(branch.condition, sqIdx) ||
-                    exprHasScalarSentinel(branch.result, sqIdx)) {
+                if (predHasScalarSubqueryRef(branch.condition, sqIdx) ||
+                    exprHasScalarSubqueryRef(branch.result, sqIdx)) {
                     return true;
                 }
             }
-            return exprHasScalarSentinel(node.elseResult, sqIdx);
+            return exprHasScalarSubqueryRef(node.elseResult, sqIdx);
         } else {
             return false;
         }
@@ -304,7 +290,7 @@ static std::optional<ScalarLookupInfo> buildDecorrelatedScalarPreAgg(
                 bool hasOuterFilterForBinding = false;
                 for (const auto& pred : aq.filters) {
                     if (!pred) continue;
-                    if (predHasScalarSentinel(pred, dsq.sqIdx)) continue;
+                    if (predHasScalarSubqueryRef(pred, dsq.sqIdx)) continue;
                     if (!predicateOnlyReferencesTable(pred, binding->table)) continue;
                     hasOuterFilterForBinding = true;
                     if (!copiedOuterFilters.count(pred.get())) {
@@ -317,7 +303,7 @@ static std::optional<ScalarLookupInfo> buildDecorrelatedScalarPreAgg(
                     if (instIt != aq.instanceFilters.end()) {
                         for (const auto& pred : instIt->second) {
                             if (!pred) continue;
-                            if (predHasScalarSentinel(pred, dsq.sqIdx)) continue;
+                            if (predHasScalarSubqueryRef(pred, dsq.sqIdx)) continue;
                             hasOuterFilterForBinding = true;
                             if (!copiedOuterFilters.count(pred.get())) {
                                 filtersByTable[binding->table].push_back(pred);
@@ -453,7 +439,7 @@ static std::optional<ScalarLookupInfo> buildDecorrelatedScalarPreAgg(
     std::map<std::string, std::vector<PredPtr>> outerFiltersByNode;
     for (const auto& pred : aq.filters) {
         if (!pred) continue;
-        if (predHasScalarSentinel(pred, dsq.sqIdx)) continue;
+        if (predHasScalarSubqueryRef(pred, dsq.sqIdx)) continue;
         std::map<std::string, std::string> colToTable;
         collectColumnTables(pred, colToTable);
         if (colToTable.empty()) continue;
@@ -472,7 +458,7 @@ static std::optional<ScalarLookupInfo> buildDecorrelatedScalarPreAgg(
         const std::string& table = outerNodeTable[node];
         if (outerBaseCounts[table] != 1) continue;
         for (const auto& pred : filters) {
-            if (predHasScalarSentinel(pred, dsq.sqIdx)) continue;
+            if (predHasScalarSubqueryRef(pred, dsq.sqIdx)) continue;
             if (pred) outerFiltersByNode[node].push_back(pred);
         }
     }
@@ -792,7 +778,7 @@ static std::optional<ScalarLookupInfo> buildDecorrelatedScalarPreAgg(
     };
 
     ScalarLookupInfo info;
-    info.sentinel = INT_MIN + dsq.sqIdx;
+    info.scalarSubqueryIndex = dsq.sqIdx;
     info.valueTable = dsq.valueTable;
     info.valueCol = dsq.valueCol;
     info.multiplier = dsq.multiplier;

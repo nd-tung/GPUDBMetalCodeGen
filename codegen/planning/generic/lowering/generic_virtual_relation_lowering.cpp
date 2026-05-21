@@ -5,10 +5,10 @@
 #include "generic/lowering/generic_expression_metal.h"
 #include "metal_plan_common.h"
 #include "query_analyzer.h"
+#include "scalar_subquery_placeholder.h"
 
 #include <algorithm>
 #include <cctype>
-#include <limits>
 #include <map>
 #include <memory>
 #include <optional>
@@ -445,50 +445,10 @@ struct FromSubqueryScalarExtremumForIr {
     std::string argAlias;
 };
 
-bool analyzedExprIsIntLiteral(const ExprPtr& expr, int value) {
-    auto* lit = expr ? std::get_if<Literal>(&expr->node) : nullptr;
-    if (!lit) return false;
-    auto* iv = std::get_if<int>(&lit->value);
-    return iv && *iv == value;
-}
-
-bool analyzedPredicateReferencesIntLiteral(const PredPtr& pred, int value) {
-    if (!pred) return false;
-    return std::visit([&](const auto& node) -> bool {
-        using T = std::decay_t<decltype(node)>;
-        if constexpr (std::is_same_v<T, Comparison>) {
-            return analyzedExprIsIntLiteral(node.left, value) ||
-                   analyzedExprIsIntLiteral(node.right, value);
-        } else if constexpr (std::is_same_v<T, Between>) {
-            return analyzedExprIsIntLiteral(node.expr, value) ||
-                   analyzedExprIsIntLiteral(node.low, value) ||
-                   analyzedExprIsIntLiteral(node.high, value);
-        } else if constexpr (std::is_same_v<T, InList>) {
-            if (analyzedExprIsIntLiteral(node.expr, value)) return true;
-            for (const auto& candidate : node.values) {
-                if (analyzedExprIsIntLiteral(candidate, value)) return true;
-            }
-            return false;
-        } else if constexpr (std::is_same_v<T, LogicalAnd> ||
-                             std::is_same_v<T, LogicalOr>) {
-            for (const auto& child : node.children) {
-                if (analyzedPredicateReferencesIntLiteral(child, value))
-                    return true;
-            }
-            return false;
-        } else if constexpr (std::is_same_v<T, LogicalNot>) {
-            return analyzedPredicateReferencesIntLiteral(node.child, value);
-        }
-        return false;
-    }, pred->node);
-}
-
-bool analyzedFiltersReferenceScalarSentinel(const AnalyzedQuery& aq,
+bool analyzedFiltersReferenceScalarSubquery(const AnalyzedQuery& aq,
                                             int sqIdx) {
-    const int sentinel =
-        std::numeric_limits<int>::min() + static_cast<int>(sqIdx);
     for (const auto& filter : aq.filters) {
-        if (analyzedPredicateReferencesIntLiteral(filter, sentinel))
+        if (analyzedPredicateReferencesScalarSubquery(filter, sqIdx))
             return true;
     }
     return false;
@@ -502,7 +462,7 @@ parseFromSubqueryScalarExtremumForIr(const AnalyzedQuery& aq,
     for (size_t sqIdx = 0; sqIdx < aq.subqueries.size(); ++sqIdx) {
         const auto& sq = aq.subqueries[sqIdx];
         if (sq.type != AnalyzedQuery::Subquery::SCALAR_SUBQUERY) continue;
-        if (!analyzedFiltersReferenceScalarSentinel(
+        if (!analyzedFiltersReferenceScalarSubquery(
                 aq, static_cast<int>(sqIdx))) {
             continue;
         }

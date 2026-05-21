@@ -3,13 +3,14 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+source "$ROOT/scripts/bench_common.sh"
 cd "$ROOT"
 
 BIN="${BIN:-build/bin/GPUDBCodegen}"
 SCALES="${SCALES:-sf1 sf10 sf20}"
 WARMUP="${WARMUP:-1}"
 REPEAT="${REPEAT:-3}"
-OUT_DIR="${OUT_DIR:-build/generic_timing_$(date +%Y%m%d_%H%M%S)}"
+OUT_DIR="${OUT_DIR:-$(bench_default_output_dir generic_timing)}"
 DUCKDB="${DUCKDB:-duckdb}"
 GENERIC_GOLDEN_DIR="${GENERIC_GOLDEN_DIR:-$OUT_DIR/generic_goldens}"
 SKIP_GOLDEN_GEN="${SKIP_GOLDEN_GEN:-0}"
@@ -49,14 +50,14 @@ MARKER_SCAN="$OUT_DIR/marker_scan.txt"
     echo "# git_commit=$(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
     echo "# git_dirty_count=$(git status --porcelain 2>/dev/null | wc -l | tr -d ' ')"
     echo "# timestamp=$(date +%Y-%m-%dT%H:%M:%S%z)"
-    echo "scale_factor,query,status,timing_query,route,analyze_ms,plan_ms,codegen_ms,metal_compile_ms,pso_ms,compile_overhead_ms,load_source,load_bytes,load_mibps,ingest_ms,data_load_ms,io_ms,preprocess_ms,buffer_setup_ms,gpu_compute_ms,cpu_compute_ms,query_compute_ms,query_execution_ms,end_to_end_ms,execute_wall_ms,execute_overhead_ms,hook_cpu_ms,hook_gpu_ms,result_collect_ms,host_post_ms,validation_ms,gpu_trials_n,gpu_p10_ms,gpu_p50_ms,gpu_p90_ms,gpu_mad_ms,hot_execution_ms"
+    echo "scale_factor,query,status,timing_query,route,analyze_ms,plan_ms,codegen_ms,metal_compile_ms,pso_ms,compile_overhead_ms,load_source,load_bytes,load_mibps,ingest_ms,data_load_ms,io_ms,preprocess_ms,buffer_setup_ms,gpu_compute_ms,cpu_compute_ms,query_compute_ms,query_execution_ms,end_to_end_ms,execute_wall_ms,execute_residual_ms,hook_cpu_ms,hook_gpu_ms,result_collect_ms,host_post_ms,validation_ms,gpu_trials_n,gpu_p10_ms,gpu_p50_ms,gpu_p90_ms,gpu_mad_ms,hot_execution_ms"
 } > "$CSV"
 
 {
     echo "# command=$0"
     echo "# route=generic --sql-file"
     echo "# profile_phases=$PROFILE_PHASES"
-    echo "scale_factor,query,route,trial,phase,threadgroup,gpu_compute_ms,phase_wall_ms,phase_execute_overhead_ms,hook_cpu_ms,hook_gpu_ms"
+    echo "scale_factor,query,route,trial,phase,threadgroup,gpu_compute_ms,phase_wall_ms,phase_execute_residual_ms,hook_cpu_ms,hook_gpu_ms"
 } > "$PHASE_CSV"
 
 for q in $(seq 1 22); do
@@ -198,6 +199,7 @@ non_ok_rows = [r for r in rows if r["status"] != "OK"]
 summary_fields = [
     "scale_factor", "queries", "status_ok", "gpu_compute_total_ms", "query_execution_total_ms",
     "end_to_end_total_ms", "data_load_total_ms", "cpu_compute_total_ms",
+    "execute_residual_total_ms",
     "median_gpu_compute_ms", "max_gpu_query", "max_gpu_compute_ms",
 ]
 with summary_path.open("w", newline="") as fsum:
@@ -217,6 +219,7 @@ with summary_path.open("w", newline="") as fsum:
             "end_to_end_total_ms": fmt(sum(f(r, "end_to_end_ms") for r in rs)),
             "data_load_total_ms": fmt(sum(f(r, "data_load_ms") for r in rs)),
             "cpu_compute_total_ms": fmt(sum(f(r, "cpu_compute_ms") for r in rs)),
+            "execute_residual_total_ms": fmt(sum(f(r, "execute_residual_ms") for r in rs)),
             "median_gpu_compute_ms": fmt(statistics.median(gpu_vals)) if gpu_vals else "0.000",
             "max_gpu_query": max_row["query"] if max_row else "",
             "max_gpu_compute_ms": fmt(f(max_row, "gpu_compute_ms")) if max_row else "0.000",
@@ -238,8 +241,8 @@ lines.append(f"- Generic-only marker scan: `{'PASS' if marker_pass else 'FAIL'}`
 lines.append("")
 lines.append("## Scale Summary")
 lines.append("")
-lines.append("| Scale | OK/Total | GPU compute total ms | Query execution total ms | End-to-end total ms | Data load total ms | Median GPU compute ms | Slowest GPU query |")
-lines.append("|---|---:|---:|---:|---:|---:|---:|---|")
+lines.append("| Scale | OK/Total | GPU compute total ms | CPU compute total ms | Execute residual total ms | Query execution total ms | End-to-end total ms | Data load total ms | Median GPU compute ms | Slowest GPU query |")
+lines.append("|---|---:|---:|---:|---:|---:|---:|---:|---:|---|")
 for s in scales:
     rs = by_scale[s]
     ok = sum(1 for r in rs if r["status"] == "OK")
@@ -248,6 +251,8 @@ for s in scales:
     slowest = f"{max_row['query']} ({fmt(f(max_row, 'gpu_compute_ms'))} ms)" if max_row else ""
     lines.append(
         f"| {s} | {ok}/{len(rs)} | {fmt(sum(gpu_vals))} | "
+        f"{fmt(sum(f(r, 'cpu_compute_ms') for r in rs))} | "
+        f"{fmt(sum(f(r, 'execute_residual_ms') for r in rs))} | "
         f"{fmt(sum(f(r, 'query_execution_ms') for r in rs))} | "
         f"{fmt(sum(f(r, 'end_to_end_ms') for r in rs))} | "
         f"{fmt(sum(f(r, 'data_load_ms') for r in rs))} | "

@@ -10,8 +10,7 @@ extern "C" {
 
 #include <stdexcept>
 #include <algorithm>
-#include <climits>
-#include <iostream>
+#include <cstddef>
 #include <set>
 #include <unordered_map>
 
@@ -40,6 +39,19 @@ std::map<std::string, std::pair<json, std::vector<std::string>>> g_views;
 // Active schema/catalog used by AST walkers.
 static const SchemaProvider* g_analyzeSchema = nullptr;
 static const Catalog* g_analyzeCatalog = nullptr;
+
+std::string astSnippet(const json& node, std::size_t limit = 200) {
+    std::string dump = node.dump();
+    if (dump.size() > limit) {
+        dump.resize(limit);
+        dump += "...";
+    }
+    return dump;
+}
+
+[[noreturn]] void unsupportedSql(const std::string& context, const json& node) {
+    throw std::runtime_error("Unsupported SQL " + context + ": " + astSnippet(node));
+}
 
 // Resolve an unqualified column; unknown names may be SELECT aliases.
 std::pair<std::string, std::string> resolveColumn(const std::string& colName,
@@ -187,8 +199,7 @@ ExprPtr walkConst(const json& node) {
             return Expr::lits(sv["sval"].get<std::string>());
         return Expr::lits("");
     }
-    std::cerr << "WARN: unknown A_Const type: " << node.dump().substr(0, 200) << std::endl;
-    return Expr::lit(0);
+    unsupportedSql("constant", node);
 }
 
 ExprPtr walkTypeCast(const json& node, const std::vector<std::string>& tables) {
@@ -347,13 +358,12 @@ ExprPtr walkAExpr(const json& node, const std::vector<std::string>& tables) {
         else if (opName == "*") exOp = ExprOp::MUL;
         else if (opName == "/") exOp = ExprOp::DIV;
         else {
-            // Comparisons belong in walkPredicate; keep expression walking tolerant.
-            if (node.contains("lexpr"))
-                return walkExpr(node["lexpr"], tables);
-            return Expr::lit(0);
+            unsupportedSql("expression operator '" + opName + "'", node);
         }
         auto left = node.contains("lexpr") ? walkExpr(node["lexpr"], tables) : Expr::lit(0);
-        auto right = node.contains("rexpr") ? walkExpr(node["rexpr"], tables) : Expr::lit(0);
+        if (!node.contains("rexpr"))
+            unsupportedSql("expression missing right operand", node);
+        auto right = walkExpr(node["rexpr"], tables);
 
         // Fold DATE +/- INTERVAL when both sides are literals.
         if (exOp == ExprOp::ADD || exOp == ExprOp::SUB) {
@@ -375,10 +385,7 @@ ExprPtr walkAExpr(const json& node, const std::vector<std::string>& tables) {
 
         return Expr::binary(exOp, left, right);
     }
-    // Predicate-style expressions pass through their left expression here.
-    if (node.contains("lexpr"))
-        return walkExpr(node["lexpr"], tables);
-    return Expr::lit(0);
+    unsupportedSql("expression kind '" + kind + "'", node);
 }
 
 ExprPtr walkExpr(const json& node, const std::vector<std::string>& tables) {
@@ -406,12 +413,12 @@ ExprPtr walkExpr(const json& node, const std::vector<std::string>& tables) {
             ScalarSubqueryInfo sq;
             sq.sql = sl["subselect"].dump();
             g_scalarSubqueries.push_back(sq);
-            return Expr::lit(INT_MIN + idx); // Negative sentinel encodes subquery index.
+            return Expr::scalarSubquery(idx);
         }
-        return Expr::lit(0);
+        unsupportedSql("scalar subquery type '" + subType + "'", node);
     }
     if (node.contains("BoolExpr")) {
-        return Expr::lit(0);
+        unsupportedSql("boolean expression used as scalar expression", node);
     }
     if (node.contains("CaseExpr")) {
         auto& ce = node["CaseExpr"];
@@ -433,8 +440,7 @@ ExprPtr walkExpr(const json& node, const std::vector<std::string>& tables) {
         e->node = std::move(cw);
         return e;
     }
-    std::cerr << "WARN: unhandled expr node, returning lit(0): " << node.dump().substr(0, 200) << std::endl;
-    return Expr::lit(0);
+    unsupportedSql("expression node", node);
 }
 
 // --- Predicate Walking ---
@@ -502,10 +508,7 @@ PredPtr walkAExprPred(const json& node, const std::vector<std::string>& tables) 
         return Predicate::cmp(CmpOp::EQ, left, right);
     }
 
-    // Unknown predicate expression kinds are treated as equality.
-    auto left = node.contains("lexpr") ? walkExpr(node["lexpr"], tables) : Expr::lit(0);
-    auto right = node.contains("rexpr") ? walkExpr(node["rexpr"], tables) : Expr::lit(0);
-    return Predicate::cmp(CmpOp::EQ, left, right);
+    unsupportedSql("predicate expression kind '" + kind + "'", node);
 }
 
 PredPtr walkPredicate(const json& node, const std::vector<std::string>& tables) {
@@ -532,12 +535,7 @@ PredPtr walkPredicate(const json& node, const std::vector<std::string>& tables) 
         return walkAExprPred(node["A_Expr"], tables);
     }
     if (node.contains("NullTest")) {
-        auto& nt = node["NullTest"];
-        auto expr = walkExpr(nt["arg"], tables);
-        std::string kind = nt.value("nulltesttype", "IS_NULL");
-        if (kind == "IS_NOT_NULL")
-            return Predicate::cmp(CmpOp::NE, expr, Expr::lit(0)); // approximate
-        return Predicate::cmp(CmpOp::EQ, expr, Expr::lit(0)); // approximate
+        unsupportedSql("NULL predicate", node);
     }
     if (node.contains("SubLink")) {
         // Subquery predicates are expanded into joins after WHERE extraction.
@@ -545,10 +543,6 @@ PredPtr walkPredicate(const json& node, const std::vector<std::string>& tables) 
         std::string subType = sl.value("subLinkType", "EXISTS_SUBLINK");
         bool isExists = (subType == "EXISTS_SUBLINK");
         if (isExists || subType == "ALL_SUBLINK" || subType == "ANY_SUBLINK") {
-            std::string subSql;
-            if (sl.contains("subselect")) {
-                // The inliner reads the AST directly from this SubLink node.
-            }
             if (isExists) {
                 auto p = std::make_shared<Predicate>();
                 p->node = ExistsPred{false, -1};
@@ -559,11 +553,10 @@ PredPtr walkPredicate(const json& node, const std::vector<std::string>& tables) 
                     auto expr = walkExpr(sl["testexpr"], tables);
                     return Predicate::inList(expr, {}); // Marker for expanded ANY_SUBLINK.
                 }
+                unsupportedSql("subquery predicate missing test expression", node);
             }
         }
-        auto p = std::make_shared<Predicate>();
-        p->node = ExistsPred{false, -1};
-        return p;
+        unsupportedSql("subquery predicate type '" + subType + "'", node);
     }
     throw std::runtime_error("Unknown predicate node: " + node.dump().substr(0, 100));
 }

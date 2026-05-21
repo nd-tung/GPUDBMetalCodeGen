@@ -40,6 +40,7 @@ fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+source "$SCRIPT_DIR/bench_common.sh"
 cd "$REPO_ROOT"
 
 BIN="build/bin/GPUDBCodegen"
@@ -49,8 +50,8 @@ if [[ ! -x "$BIN" ]]; then
     exit 1
 fi
 
-TS="$(date +%Y%m%d_%H%M%S)"
-OUTPUT_DIR="${OUTPUT_DIR:-build/route_gap_${TS}}"
+TS="$(bench_timestamp)"
+OUTPUT_DIR="${OUTPUT_DIR:-$(bench_default_output_dir route_gap "$TS")}"
 if [[ "$RESUME" -eq 0 ]]; then
     rm -rf "$OUTPUT_DIR"
 fi
@@ -64,7 +65,7 @@ if [[ "$RESUME" -eq 0 || ! -f "$STATUS_CSV" ]]; then
     printf 'route,sf,query,status\n' > "$STATUS_CSV"
 fi
 if [[ "$RESUME" -eq 0 || ! -f "$TIMING_CSV" ]]; then
-    printf 'route,sf,query,gpu_compute_ms,end_to_end_ms,query_execution_ms\n' > "$TIMING_CSV"
+    printf 'route,sf,query,gpu_compute_ms,cpu_compute_ms,execute_residual_ms,end_to_end_ms,query_execution_ms\n' > "$TIMING_CSV"
 fi
 
 already_done() {
@@ -77,7 +78,7 @@ already_done() {
         END { exit ok ? 0 : 1 }
     ' "$STATUS_CSV" &&
     awk -F, -v route="$route" -v sf="$sf" -v q="$q" '
-        $1 == route && $2 == sf && $3 == q && $6 != "" { ok = 1 }
+        $1 == route && $2 == sf && $3 == q && $8 != "" { ok = 1 }
         END { exit ok ? 0 : 1 }
     ' "$TIMING_CSV"
 }
@@ -108,7 +109,7 @@ run_one() {
     printf '%s,%s,%s,%s\n' "$route" "$sf" "$q" "$stat" >> "$STATUS_CSV"
 
     local timing
-    timing="$(awk -F, '/^TIMING_CSV/ {gpu=$19; end_to_end=$23; query=$22} END {if (query != "") printf "%.3f,%.3f,%.3f", gpu, end_to_end, query}' "$log")"
+    timing="$(awk -F, '/^TIMING_CSV/ {gpu=$19; cpu=$20; residual=$25; end_to_end=$23; query=$22} END {if (query != "") printf "%.3f,%.3f,%.3f,%.3f,%.3f", gpu, cpu, residual, end_to_end, query}' "$log")"
     if [[ -n "$timing" ]]; then
         printf '%s,%s,%s,%s\n' "$route" "$sf" "$q" "$timing" >> "$TIMING_CSV"
     else
@@ -128,12 +129,14 @@ awk -F, '
 NR == 1 { next }
 {
     key = $2 "," $3
-    query_execution_ms[key "," $1] = $6
+    query_execution_ms[key "," $1] = $8
     gpu_compute_ms[key "," $1] = $4
-    end_to_end_ms[key "," $1] = $5
+    cpu_compute_ms[key "," $1] = $5
+    execute_residual_ms[key "," $1] = $6
+    end_to_end_ms[key "," $1] = $7
 }
 END {
-    print "sf,query,pre_query_execution_ms,generic_query_execution_ms,ratio,delta_ms,pre_gpu_compute_ms,generic_gpu_compute_ms,pre_end_to_end_ms,generic_end_to_end_ms"
+    print "sf,query,pre_query_execution_ms,generic_query_execution_ms,query_ratio,query_delta_ms,e2e_ratio,e2e_delta_ms,pre_gpu_compute_ms,generic_gpu_compute_ms,pre_cpu_compute_ms,generic_cpu_compute_ms,pre_execute_residual_ms,generic_execute_residual_ms,pre_end_to_end_ms,generic_end_to_end_ms"
     ns = split("'"${SCALE_FACTORS[*]}"'", sfs, " ")
     nq = split("'"${QUERIES[*]}"'", qs, " ")
     for (si = 1; si <= ns; ++si) {
@@ -145,12 +148,20 @@ END {
             g = query_execution_ms[key ",generic"] + 0
             ratio = p > 0 ? g / p : 0
             delta = g - p
-            printf "%s,%s,%.3f,%.3f,%.3f,%+.3f,%.3f,%.3f,%.3f,%.3f\n",
-                   sf, q, p, g, ratio, delta,
+            pe = end_to_end_ms[key ",predefined"] + 0
+            ge = end_to_end_ms[key ",generic"] + 0
+            e2eRatio = pe > 0 ? ge / pe : 0
+            e2eDelta = ge - pe
+            printf "%s,%s,%.3f,%.3f,%.3f,%+.3f,%.3f,%+.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f\n",
+                   sf, q, p, g, ratio, delta, e2eRatio, e2eDelta,
                    gpu_compute_ms[key ",predefined"] + 0,
                    gpu_compute_ms[key ",generic"] + 0,
-                   end_to_end_ms[key ",predefined"] + 0,
-                   end_to_end_ms[key ",generic"] + 0
+                   cpu_compute_ms[key ",predefined"] + 0,
+                   cpu_compute_ms[key ",generic"] + 0,
+                   execute_residual_ms[key ",predefined"] + 0,
+                   execute_residual_ms[key ",generic"] + 0,
+                   pe,
+                   ge
         }
     }
 }' "$TIMING_CSV" > "$GAP_CSV"

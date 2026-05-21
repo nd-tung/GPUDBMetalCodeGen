@@ -40,6 +40,19 @@ std::optional<MetalQueryPlan> fail(std::string* error, const std::string& msg) {
     return std::nullopt;
 }
 
+MetalTGReduce::ReduceOp scalarReduceOpToMetal(
+        ScalarReduceAccumulatorSpec::Op op) {
+    switch (op) {
+        case ScalarReduceAccumulatorSpec::Op::Min:
+            return MetalTGReduce::ReduceOp::MIN;
+        case ScalarReduceAccumulatorSpec::Op::Max:
+            return MetalTGReduce::ReduceOp::MAX;
+        case ScalarReduceAccumulatorSpec::Op::Sum:
+            return MetalTGReduce::ReduceOp::SUM;
+    }
+    return MetalTGReduce::ReduceOp::SUM;
+}
+
 void prependPlanPhases(MetalQueryPlan& target, MetalQueryPlan& prefix) {
     for (auto& helper : prefix.helpers) {
         if (std::find(target.helpers.begin(), target.helpers.end(), helper) ==
@@ -3217,70 +3230,11 @@ std::optional<MetalQueryPlan> lowerMultiTableGroupedAggregateIRToMetalImpl(
         return true;
     };
 
-    for (size_t i = 0; i < aggregate->groupBy.size(); ++i) {
-        const auto& group = aggregate->groupBy[i];
-        const std::string displayName = groupDisplayNameForAggregate(*aggregate, i);
-        groupSpec.keyColumns.push_back(displayName);
-        IrGroupKeyDesc key;
-        key.displayName = displayName;
-        groupKeys.push_back(std::move(key));
-        if (!addInputColumn(displayName, group ? group->type : TypeInfo{DataType::INT, 0},
-                            group, 0, "")) {
-            return std::nullopt;
-        }
+    if (!buildAggregateInputGroupSpec(
+            *aggregate, "IR multi-table grouped aggregate lowerer", groupSpec,
+            groupKeys, addInputColumn, error)) {
+        return std::nullopt;
     }
-
-    for (size_t i = 0; i < aggregate->aggregates.size(); ++i) {
-        const auto& projection = aggregate->aggregates[i];
-        auto* agg = projection.expr
-            ? std::get_if<GenericAggregateExpr>(&projection.expr->node)
-            : nullptr;
-        if (!agg)
-            return fail(error, "IR multi-table grouped aggregate lowerer: non-aggregate projection.");
-        const std::string displayName = projection.name.empty()
-            ? "agg_" + std::to_string(i)
-            : projection.name;
-
-        GenericExprPtr inputExpr;
-        TypeInfo inputType{DataType::FLOAT, 0};
-        int inputScaleDown = 0;
-        std::string distinctDomainSymbol;
-        std::string funcName = aggregateOutputFuncFor(*aggregate, i, agg->func);
-
-        if (agg->func == AggFunc::COUNT) {
-            GenericExpr lit;
-            lit.type = inputType;
-            lit.node = GenericLiteralExpr{1.0, inputType};
-            inputExpr = std::make_shared<GenericExpr>(std::move(lit));
-            funcName = "COUNT";
-        } else {
-            if (!agg->arg)
-                return fail(error, "IR multi-table grouped aggregate lowerer: aggregate '" +
-                                   aggFuncName(agg->func) + "' requires an argument.");
-            inputExpr = agg->arg;
-            if (agg->func == AggFunc::COUNT_DISTINCT) {
-                if (agg->arg->type.type == DataType::CHAR_FIXED)
-                    return fail(error, "IR multi-table grouped aggregate lowerer: COUNT(DISTINCT) over fixed strings is not supported yet.");
-                distinctDomainSymbol = distinctDomainSymbolForExpr(agg->arg);
-                inputType = agg->arg->type;
-                funcName = "COUNT_DISTINCT";
-            } else if (agg->func == AggFunc::SUM || agg->func == AggFunc::AVG) {
-                inputScaleDown = numericScaleForExpr(agg->arg);
-            } else if (agg->func != AggFunc::MIN && agg->func != AggFunc::MAX) {
-                return fail(error, "IR multi-table grouped aggregate lowerer: unsupported aggregate " +
-                                   aggFuncName(agg->func) + ".");
-            }
-        }
-
-        groupSpec.aggColumns.push_back(displayName);
-        groupSpec.aggFuncs.push_back(funcName);
-        if (!addInputColumn(displayName, inputType, inputExpr, inputScaleDown,
-                            distinctDomainSymbol)) {
-            return std::nullopt;
-        }
-    }
-
-    groupSpec.outputColumns = aggregate->outputOrder;
     if (!configureAggregateHaving(*aggregate, groupSpec, aq, &*shape, error))
         return std::nullopt;
 
@@ -5086,22 +5040,17 @@ std::optional<MetalQueryPlan> lowerMultiTableScalarAggregateIRToMetalImpl(
             continue;
         }
 
-        std::string outputType =
-            agg->arg->type.type == DataType::FLOAT ? "float" : "long";
-        MetalTGReduce::ReduceOp op = MetalTGReduce::ReduceOp::SUM;
-        if (agg->func == AggFunc::MIN) op = MetalTGReduce::ReduceOp::MIN;
-        else if (agg->func == AggFunc::MAX) op = MetalTGReduce::ReduceOp::MAX;
-        else if (agg->func != AggFunc::SUM) {
+        auto reduceSpec = buildScalarReduceAccumulatorSpec(
+            agg->func, agg->arg, valueExpr);
+        if (!reduceSpec) {
             return fail(error, "IR multi-table scalar aggregate lowerer: unsupported aggregate '" +
                                aggFuncName(agg->func) + "'.");
         }
-        if (op != MetalTGReduce::ReduceOp::SUM &&
-            agg->arg->type.type != DataType::FLOAT) {
-            outputType = "int";
-        }
-        int accIndex = reduce->addAccumulator(accName, valueExpr, outputType,
-                                              "", "", op);
-        reduce->setAccumulatorResultAlias(displayName, accIndex, 0, nullptr);
+        int accIndex = reduce->addAccumulator(
+            accName, reduceSpec->valueExpr, reduceSpec->metalType, "", "",
+            scalarReduceOpToMetal(reduceSpec->op));
+        reduce->setAccumulatorResultAlias(
+            displayName, accIndex, reduceSpec->outputScale, nullptr);
         consumed[i] = true;
     }
 

@@ -1,8 +1,10 @@
 #include "generic/lowering/generic_expression_metal.h"
 #include "metal_plan_common.h"
+#include "scalar_subquery_placeholder.h"
 
 #include <algorithm>
 #include <cctype>
+#include <stdexcept>
 #include <type_traits>
 
 namespace codegen {
@@ -175,6 +177,13 @@ std::string genericExprToMetalImpl(const GenericExprPtr& expr,
 std::string genericPredicateToMetalImpl(const GenericPredicatePtr& pred,
                                         const std::string& idxVar);
 
+[[noreturn]] void failUnsupportedGenericPredicateEmitter(
+        const std::string& detail) {
+    throw std::logic_error(
+        "genericPredicateToMetal: unsupported predicate " + detail +
+        "; call predicateSupported before emitting Metal.");
+}
+
 std::string inListValueToMetal(const GenericExprPtr& value,
                                const TypeInfo& exprType,
                                const std::string& idxVar) {
@@ -284,6 +293,8 @@ std::string genericExprToMetalImpl(const GenericExprPtr& expr,
             return functionExprToMetalImpl(node, idxVar);
         } else if constexpr (std::is_same_v<T, GenericAggregateExpr>) {
             return node.arg ? genericExprToMetalImpl(node.arg, idxVar) : "1";
+        } else if constexpr (std::is_same_v<T, GenericScalarSubqueryExpr>) {
+            return scalarSubqueryPlaceholderToken(node.index);
         } else if constexpr (std::is_same_v<T, GenericScalarLookupExpr>) {
             return node.outputName;
         }
@@ -401,7 +412,7 @@ std::string genericPredicateToMetalImpl(const GenericPredicatePtr& pred,
         } else if constexpr (std::is_same_v<T, GenericLikePred>) {
             if (auto like = fixedStringLikeMetal(node, idxVar))
                 return *like;
-            return node.negated ? "true" : "false";
+            failUnsupportedGenericPredicateEmitter("LIKE shape");
         } else if constexpr (std::is_same_v<T, GenericLogicalPred>) {
             if (node.op == GenericLogicalPred::Op::Not) {
                 return "!(" + (node.children.empty()
@@ -420,9 +431,10 @@ std::string genericPredicateToMetalImpl(const GenericPredicatePtr& pred,
             out += ")";
             return out;
         } else if constexpr (std::is_same_v<T, GenericExistsPred>) {
-            return node.negated ? "true" : "false";
+            failUnsupportedGenericPredicateEmitter(
+                node.negated ? "NOT EXISTS" : "EXISTS");
         }
-        return "true";
+        failUnsupportedGenericPredicateEmitter("variant");
     }, pred->node);
 }
 
@@ -457,6 +469,8 @@ bool materializeExprSupported(const GenericExprPtr& expr) {
                 }
             }
             return materializeExprSupported(node.elseResult);
+        } else if constexpr (std::is_same_v<T, GenericScalarSubqueryExpr>) {
+            return true;
         } else {
             return false;
         }

@@ -161,23 +161,6 @@ GROUP BY bucket
 ORDER BY bucket
 SQL
       ;;
-    10)
-      cat <<'SQL'
-SELECT
-    c_custkey,
-    SUM(l_extendedprice * (1 - l_discount)) AS revenue
-FROM customer, orders, lineitem, nation
-WHERE c_custkey = o_custkey
-  AND l_orderkey = o_orderkey
-  AND o_orderdate >= DATE '1993-10-01'
-  AND o_orderdate < DATE '1993-10-01' + INTERVAL '3' MONTH
-  AND l_returnflag = 'R'
-  AND c_nationkey = n_nationkey
-GROUP BY c_custkey
-ORDER BY revenue DESC
-LIMIT 20
-SQL
-      ;;
     15)
       cat <<'SQL'
 WITH revenue0 (supplier_no, total_revenue) AS (
@@ -192,28 +175,6 @@ FROM supplier, revenue0
 WHERE s_suppkey = supplier_no
   AND total_revenue = (SELECT MAX(total_revenue) FROM revenue0)
 ORDER BY s_suppkey
-SQL
-      ;;
-    18)
-      cat <<'SQL'
-SELECT
-    c_custkey,
-    o_orderkey,
-    o_orderdate,
-    o_totalprice,
-    SUM(l_quantity) AS "sum(l_quantity)"
-FROM customer, orders, lineitem
-WHERE o_orderkey IN (
-    SELECT l_orderkey
-    FROM lineitem
-    GROUP BY l_orderkey
-    HAVING SUM(l_quantity) > 300
-)
-  AND c_custkey = o_custkey
-  AND o_orderkey = l_orderkey
-GROUP BY c_name, c_custkey, o_orderkey, o_orderdate, o_totalprice
-ORDER BY o_totalprice DESC, o_orderdate
-LIMIT 100
 SQL
       ;;
     *)

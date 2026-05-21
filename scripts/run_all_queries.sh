@@ -86,7 +86,7 @@ GIT_COMMIT="$(git rev-parse --short HEAD 2>/dev/null || echo none)"
     echo "# check_dir=${CHECK_DIR:-none}"
     echo "# timestamp=$TS"
     # gpu fields come from the first SYSINFO_CSV line below.
-    echo "scale_factor,query,status,timing_query,route,analyze_ms,plan_ms,codegen_ms,metal_compile_ms,pso_ms,compile_overhead_ms,load_source,load_bytes,load_mibps,ingest_ms,data_load_ms,io_ms,preprocess_ms,buffer_setup_ms,gpu_compute_ms,cpu_compute_ms,query_compute_ms,query_execution_ms,end_to_end_ms,execute_wall_ms,execute_overhead_ms,hook_cpu_ms,hook_gpu_ms,result_collect_ms,host_post_ms,validation_ms,gpu_trials_n,gpu_p10_ms,gpu_p50_ms,gpu_p90_ms,gpu_mad_ms,hot_execution_ms,gpu_name,gpu_budget_bytes"
+    echo "scale_factor,query,status,timing_query,route,analyze_ms,plan_ms,codegen_ms,metal_compile_ms,pso_ms,compile_overhead_ms,load_source,load_bytes,load_mibps,ingest_ms,data_load_ms,io_ms,preprocess_ms,buffer_setup_ms,gpu_compute_ms,cpu_compute_ms,query_compute_ms,query_execution_ms,end_to_end_ms,execute_wall_ms,execute_residual_ms,hook_cpu_ms,hook_gpu_ms,result_collect_ms,host_post_ms,validation_ms,gpu_trials_n,gpu_p10_ms,gpu_p50_ms,gpu_p90_ms,gpu_mad_ms,hot_execution_ms,gpu_name,gpu_budget_bytes"
 } > "$OUTPUT"
 
 GPU_NAME=""
@@ -142,7 +142,7 @@ run_one() {
     #           compile_overhead,load_source,load_bytes,load_mibps,ingest,
     #           data_load,io,preprocess,buffer_setup,gpu_compute,cpu_compute,
     #           query_compute,query_execution,end_to_end,execute_wall,
-    #           execute_overhead,hook_cpu,hook_gpu,result_collect,host_post,
+    #           execute_residual,hook_cpu,hook_gpu,result_collect,host_post,
     #           validation,gpu_trials_n,gpu_p10,gpu_p50,gpu_p90,gpu_mad,
     #           hot_execution
     local body="${timing#TIMING_CSV,}"

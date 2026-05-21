@@ -11,18 +11,23 @@ std::optional<MetalQueryPlan> buildQ13Plan_byName() {
 
     // Match comments containing "special" before "requests".
     plan.helpers.push_back(R"(
+static bool q13_special_at(const device char* c, uint p) {
+    return c[p] == 's' && c[p + 1u] == 'p' && c[p + 2u] == 'e' &&
+           c[p + 3u] == 'c' && c[p + 4u] == 'i' &&
+           c[p + 5u] == 'a' && c[p + 6u] == 'l';
+}
+static bool q13_requests_at(const device char* c, uint p) {
+    return c[p] == 'r' && c[p + 1u] == 'e' && c[p + 2u] == 'q' &&
+           c[p + 3u] == 'u' && c[p + 4u] == 'e' &&
+           c[p + 5u] == 's' && c[p + 6u] == 't' &&
+           c[p + 7u] == 's';
+}
 static bool q13_comment_match(const device char* comment, uint idx) {
-    const device char* c = comment + idx * 79;
-    for (int p = 0; p <= 72 && c[p] != '\0'; p++) {
-        if (c[p]=='s' && c[p+1]=='p' && c[p+2]=='e' && c[p+3]=='c' &&
-            c[p+4]=='i' && c[p+5]=='a' && c[p+6]=='l') {
-            for (int q = p + 7; q <= 71 && c[q] != '\0'; q++) {
-                if (c[q]=='r' && c[q+1]=='e' && c[q+2]=='q' && c[q+3]=='u' &&
-                    c[q+4]=='e' && c[q+5]=='s' && c[q+6]=='t' && c[q+7]=='s') {
-                    return true;
-                }
-            }
-            break;
+    const device char* c = comment + (ulong)idx * 79ul;
+    for (uint s = 0u; s <= 72u; ++s) {
+        if (c[s] != 's' || !q13_special_at(c, s)) continue;
+        for (uint r = s + 7u; r <= 71u; ++r) {
+            if (c[r] == 'r' && q13_requests_at(c, r)) return true;
         }
     }
     return false;
@@ -104,8 +109,10 @@ static void q13_hist_emit(device atomic_uint* counter,
         std::string sortError;
         if (!appendGenericGpuSmallSort(plan, "q13_result", resultRows,
                                        256, columns, sortSpec, &sortError)) {
-            appendGenericGpuSort(plan, "q13_result", resultRows,
-                                 "256", columns, sortSpec, &sortError);
+            if (!appendGenericGpuSort(plan, "q13_result", resultRows,
+                                      "256", columns, sortSpec, &sortError)) {
+                return std::nullopt;
+            }
         }
     }
 

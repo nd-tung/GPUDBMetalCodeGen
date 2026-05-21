@@ -221,23 +221,14 @@ bool prepareQueryPreprocessing(const std::string& queryName,
                              kQ13HistBins * sizeof(uint32_t));
     }
 
-    // Q9 host work: size the GPU partsupp hash table.
+    // Q9 host work: size the GPU partsupp direct map.
     if (queryName == "Q9") {
-        size_t nPartSupp = 0;
-        if (!executor.tryGetSymbol("n_partsupp", nPartSupp) || nPartSupp == 0) {
-            std::cerr << "Q9 preprocessing: n_partsupp symbol unavailable\n";
+        size_t maxPartkey = 0;
+        if (!executor.tryGetSymbol("maxPartkey", maxPartkey) || maxPartkey == 0) {
+            std::cerr << "Q9 preprocessing: maxPartkey symbol unavailable\n";
             return false;
         }
-        size_t maxSk = 0;
-        if (!executor.tryGetSymbol("maxSuppkey", maxSk) || maxSk == 0) {
-            std::cerr << "Q9 preprocessing: maxSuppkey symbol unavailable\n";
-            return false;
-        }
-        size_t htSlots = 1;
-        while (htSlots < nPartSupp * 2) htSlots <<= 1;
-        executor.registerSymbol("q9HtSize", htSlots);
-        executor.registerScalarInt("d_ps_ht_mask", (int)(htSlots - 1));
-        executor.registerScalarInt("supp_mul", (int)maxSk);
+        executor.registerSymbol("q9_ps_slots", maxPartkey * 4);
         constexpr uint32_t kQ9ProfitBins = 25u * 8u;
         executor.registerSymbol("q9_profit_bins", kQ9ProfitBins);
         executor.registerScalarInt("q9_profit_bins", (int)kQ9ProfitBins);

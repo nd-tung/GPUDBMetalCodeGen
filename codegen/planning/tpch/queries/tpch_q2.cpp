@@ -298,9 +298,11 @@ static void q2_key_emit(device atomic_uint* counter,
         sortSpec.keys.push_back({"p_partkey", false});
         sortSpec.limit = 100;
         std::string orderError;
-        appendBestGenericGpuOrder(plan, "q2_result", resultRows,
-                                  "q2_compact_cap", columns, sortSpec,
-                                  &orderError);
+        if (!appendBestGenericGpuOrder(plan, "q2_result", resultRows,
+                                       "q2_compact_cap", columns, sortSpec,
+                                       &orderError)) {
+            return std::nullopt;
+        }
         if (plan.gpuSort) {
             struct Q2LateMaterializeTerminal : MetalOperator {
                 std::string sortedIndexBuffer_;

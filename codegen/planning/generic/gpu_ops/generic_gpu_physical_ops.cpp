@@ -1,5 +1,6 @@
 #include "generic_gpu_physical_ops.h"
 
+#include "generic/lowering/generic_expression_metal.h"
 #include "metal_generic_executor.h"
 #include "metal_plan_common.h"
 
@@ -17,16 +18,55 @@ struct GenericSortKeySpec {
     bool descending = false;
 };
 
-std::string sanitizeIdentifier(std::string name) {
-    if (name.empty()) name = "expr";
-    for (char& ch : name) {
-        unsigned char uch = static_cast<unsigned char>(ch);
-        if (!std::isalnum(uch) && ch != '_') ch = '_';
+std::string trimAscii(std::string value) {
+    auto notSpace = [](unsigned char c) { return !std::isspace(c); };
+    value.erase(value.begin(),
+                std::find_if(value.begin(), value.end(), notSpace));
+    value.erase(std::find_if(value.rbegin(), value.rend(), notSpace).base(),
+                value.end());
+    return value;
+}
+
+bool isDecimalInteger(const std::string& value) {
+    return !value.empty() &&
+           std::all_of(value.begin(), value.end(), [](unsigned char c) {
+               return std::isdigit(c);
+           });
+}
+
+int nextPow2Int(int value) {
+    int out = 1;
+    while (out < value) out <<= 1;
+    return out;
+}
+
+std::optional<int> constantRowBound(const std::string& expr) {
+    constexpr long long kLargeBound = 1 << 20;
+    auto parseBound = [=](const std::string& value) -> std::optional<int> {
+        try {
+            long long parsed = std::stoll(value);
+            if (parsed < 0) return std::nullopt;
+            if (parsed > kLargeBound) return static_cast<int>(kLargeBound);
+            return static_cast<int>(parsed);
+        } catch (...) {
+            return std::nullopt;
+        }
+    };
+
+    std::string e = trimAscii(expr);
+    if (isDecimalInteger(e)) return parseBound(e);
+
+    const std::string fn = "next_pow2(";
+    if (e.rfind(fn, 0) == 0 && e.size() > fn.size() && e.back() == ')') {
+        std::string inner = trimAscii(e.substr(fn.size(), e.size() - fn.size() - 1));
+        if (isDecimalInteger(inner)) {
+            auto parsed = parseBound(inner);
+            if (parsed && *parsed < kLargeBound)
+                return nextPow2Int(*parsed);
+            return parsed;
+        }
     }
-    if (std::isdigit(static_cast<unsigned char>(name.front()))) {
-        name = "c_" + name;
-    }
-    return name;
+    return std::nullopt;
 }
 
 const GenericMatColumnDesc* findMatColumn(
@@ -36,6 +76,85 @@ const GenericMatColumnDesc* findMatColumn(
         if (c.displayName == displayName) return &c;
     }
     return nullptr;
+}
+
+struct GenericHashGroupNames {
+    explicit GenericHashGroupNames(std::string tag)
+        : suffix(sanitizeIdentifier(std::move(tag))) {}
+
+    std::string prefix() const { return "d_gpu_gb_" + suffix; }
+    std::string state() const { return prefix() + "_state"; }
+    std::string hash() const { return prefix() + "_hash"; }
+    std::string hash2() const { return prefix() + "_hash2"; }
+    std::string repRow() const { return prefix() + "_rep_row"; }
+    std::string keyStore(const std::string& display) const {
+        return prefix() + "_key_" + sanitizeIdentifier(display);
+    }
+    std::string agg(size_t ai) const {
+        return prefix() + "_agg_" + std::to_string(ai);
+    }
+    std::string avgCount(size_t ai) const { return agg(ai) + "_count"; }
+    std::string distinctState(size_t ai) const {
+        return prefix() + "_distinct_state_" + std::to_string(ai);
+    }
+    std::string distinctGroup(size_t ai) const {
+        return prefix() + "_distinct_group_" + std::to_string(ai);
+    }
+    std::string distinctValue(size_t ai) const {
+        return prefix() + "_distinct_value_" + std::to_string(ai);
+    }
+    std::string total() const { return prefix() + "_having_total"; }
+
+    std::string suffix;
+};
+
+bool genericSortKeyTypeSupported(const GenericMatColumnDesc& col) {
+    return col.isLongPair || col.stringLen > 0 ||
+           col.metalType == "uint" || col.metalType == "int" ||
+           col.metalType == "float" || col.metalType == "char";
+}
+
+std::optional<GenericSortKeySpec> resolveGenericSortKeyColumn(
+        const std::vector<GenericMatColumnDesc>& columns,
+        const GenericSortSpec::SortKey& sortKey,
+        const std::string& context,
+        const std::string& role,
+        std::string* error) {
+    const auto* col = findMatColumn(columns, sortKey.column);
+    if (!col) {
+        if (error) {
+            *error = context + (role.empty() ? " key" : " " + role + " key") +
+                     " not present in materialized output: " + sortKey.column;
+        }
+        return std::nullopt;
+    }
+    return GenericSortKeySpec{*col, sortKey.descending};
+}
+
+std::optional<std::vector<GenericSortKeySpec>> resolveGenericSortKeys(
+        const std::vector<GenericMatColumnDesc>& columns,
+        const GenericSortSpec& sortSpec,
+        const std::string& context,
+        bool requireKeys,
+        std::string* error) {
+    if (requireKeys && sortSpec.keys.empty()) {
+        if (error) *error = context + " requires at least one ORDER BY key.";
+        return std::nullopt;
+    }
+
+    std::vector<GenericSortKeySpec> keys;
+    keys.reserve(sortSpec.keys.size());
+    for (const auto& sk : sortSpec.keys) {
+        auto key = resolveGenericSortKeyColumn(columns, sk, context, "", error);
+        if (!key) return std::nullopt;
+        if (!genericSortKeyTypeSupported(key->column)) {
+            if (error) *error = context +
+                                " currently supports int/uint/float/char, long-pair, and fixed string keys.";
+            return std::nullopt;
+        }
+        keys.push_back(std::move(*key));
+    }
+    return keys;
 }
 
 void addGenericGpuGroupHelpers(MetalQueryPlan& plan) {
@@ -177,30 +296,26 @@ public:
 private:
     GenericGpuGroupSpec spec_;
 
-    std::string suffix() const { return sanitizeIdentifier(spec_.tag); }
-    std::string stateName() const { return "d_gpu_gb_" + suffix() + "_state"; }
-    std::string hashName() const { return "d_gpu_gb_" + suffix() + "_hash"; }
-    std::string hash2Name() const { return "d_gpu_gb_" + suffix() + "_hash2"; }
-    std::string repRowName() const { return "d_gpu_gb_" + suffix() + "_rep_row"; }
+    GenericHashGroupNames names() const { return GenericHashGroupNames(spec_.tag); }
+    std::string stateName() const { return names().state(); }
+    std::string hashName() const { return names().hash(); }
+    std::string hash2Name() const { return names().hash2(); }
+    std::string repRowName() const { return names().repRow(); }
     std::string keyStoreName(const std::string& display) const {
-        return "d_gpu_gb_" + suffix() + "_key_" + sanitizeIdentifier(display);
+        return names().keyStore(display);
     }
-    std::string aggName(size_t ai) const {
-        return "d_gpu_gb_" + suffix() + "_agg_" + std::to_string(ai);
-    }
-    std::string avgCountName(size_t ai) const {
-        return "d_gpu_gb_" + suffix() + "_agg_" + std::to_string(ai) + "_count";
-    }
+    std::string aggName(size_t ai) const { return names().agg(ai); }
+    std::string avgCountName(size_t ai) const { return names().avgCount(ai); }
     std::string distinctStateName(size_t ai) const {
-        return "d_gpu_gb_" + suffix() + "_distinct_state_" + std::to_string(ai);
+        return names().distinctState(ai);
     }
     std::string distinctGroupName(size_t ai) const {
-        return "d_gpu_gb_" + suffix() + "_distinct_group_" + std::to_string(ai);
+        return names().distinctGroup(ai);
     }
     std::string distinctValueName(size_t ai) const {
-        return "d_gpu_gb_" + suffix() + "_distinct_value_" + std::to_string(ai);
+        return names().distinctValue(ai);
     }
-    std::string totalName() const { return "d_gpu_gb_" + suffix() + "_having_total"; }
+    std::string totalName() const { return names().total(); }
 
     bool hasStringGroupKey() const {
         for (const auto& key : spec_.groupBy.keyColumns) {
@@ -575,19 +690,15 @@ public:
 private:
     GenericGpuGroupSpec spec_;
 
-    std::string suffix() const { return sanitizeIdentifier(spec_.tag); }
-    std::string stateName() const { return "d_gpu_gb_" + suffix() + "_state"; }
-    std::string repRowName() const { return "d_gpu_gb_" + suffix() + "_rep_row"; }
+    GenericHashGroupNames names() const { return GenericHashGroupNames(spec_.tag); }
+    std::string stateName() const { return names().state(); }
+    std::string repRowName() const { return names().repRow(); }
     std::string keyStoreName(const std::string& display) const {
-        return "d_gpu_gb_" + suffix() + "_key_" + sanitizeIdentifier(display);
+        return names().keyStore(display);
     }
-    std::string aggName(size_t ai) const {
-        return "d_gpu_gb_" + suffix() + "_agg_" + std::to_string(ai);
-    }
-    std::string avgCountName(size_t ai) const {
-        return "d_gpu_gb_" + suffix() + "_agg_" + std::to_string(ai) + "_count";
-    }
-    std::string totalName() const { return "d_gpu_gb_" + suffix() + "_having_total"; }
+    std::string aggName(size_t ai) const { return names().agg(ai); }
+    std::string avgCountName(size_t ai) const { return names().avgCount(ai); }
+    std::string totalName() const { return names().total(); }
     std::string outputCapacityExpr() const {
         return spec_.maxOutputRowsExpr.empty()
             ? spec_.capacityExpr
@@ -1616,13 +1727,16 @@ PostDispatchHook makeGenericSortHook(
         const std::string& sortPhaseName,
         const std::string& sortIdxBufName,
         const std::string& nRowsSymbol,
-        const std::vector<GenericSortKeySpec>& keys) {
+        const std::vector<GenericSortKeySpec>& keys,
+        int smallSortCutoff = 0) {
     return [=](MetalGenericExecutor& executor) {
         auto* pso = executor.getPipelineState(sortPhaseName);
         auto* idxBuf = executor.getAllocatedBuffer(sortIdxBufName);
         if (!pso || !idxBuf) return 0.0;
         size_t nRows = 0;
         if (!executor.tryGetSymbol(nRowsSymbol, nRows) || nRows == 0) return 0.0;
+        if (smallSortCutoff > 0 && nRows <= static_cast<size_t>(smallSortCutoff))
+            return 0.0;
         unsigned int n = (unsigned int)nRows;
         unsigned int np2 = MetalInitSortKeys::nextPow2(n);
         auto* queue = executor.commandQueue();
@@ -1804,15 +1918,10 @@ bool appendGenericGpuSort(MetalQueryPlan& plan,
                           const std::vector<GenericMatColumnDesc>& columns,
                           const GenericSortSpec& sortSpec,
                           std::string* error) {
-    std::vector<GenericSortKeySpec> keys;
-    for (const auto& sk : sortSpec.keys) {
-        const auto* col = findMatColumn(columns, sk.column);
-        if (!col) {
-            if (error) *error = "GPU sort key not present in materialized output: " + sk.column;
-            return false;
-        }
-        keys.push_back({*col, sk.descending});
-    }
+    auto maybeKeys = resolveGenericSortKeys(columns, sortSpec, "GPU sort", false, error);
+    if (!maybeKeys) return false;
+    std::vector<GenericSortKeySpec> keys = std::move(*maybeKeys);
+
     const std::string suffix = sanitizeIdentifier(tag);
     const std::string idxBuf = "d_gpu_sort_idx_" + suffix;
     appendPhase(plan, "GENERIC_gpu_sort_init_" + suffix,
@@ -1839,27 +1948,10 @@ bool appendGenericGpuSmallSort(MetalQueryPlan& plan,
         if (error) *error = "GPU small sort requires a positive power-of-two maxRows.";
         return false;
     }
-    if (sortSpec.keys.empty()) {
-        if (error) *error = "GPU small sort requires at least one ORDER BY key.";
-        return false;
-    }
 
-    std::vector<GenericSortKeySpec> keys;
-    for (const auto& sk : sortSpec.keys) {
-        const auto* col = findMatColumn(columns, sk.column);
-        if (!col) {
-            if (error) *error = "GPU small sort key not present in materialized output: " +
-                                sk.column;
-            return false;
-        }
-        if (!col->isLongPair && col->stringLen <= 0 &&
-            col->metalType != "uint" && col->metalType != "int" &&
-            col->metalType != "float") {
-            if (error) *error = "GPU small sort currently supports int/uint/float, long-pair, and fixed string keys.";
-            return false;
-        }
-        keys.push_back({*col, sk.descending});
-    }
+    auto maybeKeys = resolveGenericSortKeys(columns, sortSpec, "GPU small sort", true, error);
+    if (!maybeKeys) return false;
+    std::vector<GenericSortKeySpec> keys = std::move(*maybeKeys);
 
     const std::string suffix = sanitizeIdentifier(tag);
     const std::string idxBuf = "d_gpu_smallsort_idx_" + suffix;
@@ -1891,22 +1983,10 @@ bool appendGenericGpuTopKSelection(MetalQueryPlan& plan,
         return false;
     }
 
-    std::vector<GenericSortKeySpec> keys;
-    for (const auto& sk : sortSpec.keys) {
-        const auto* col = findMatColumn(columns, sk.column);
-        if (!col) {
-            if (error) *error = "GPU selection top-k key not present in materialized output: " +
-                                sk.column;
-            return false;
-        }
-        if (!col->isLongPair && col->stringLen <= 0 &&
-            col->metalType != "uint" && col->metalType != "int" &&
-            col->metalType != "float") {
-            if (error) *error = "GPU selection top-k currently supports int/uint/float, long-pair, and fixed string keys.";
-            return false;
-        }
-        keys.push_back({*col, sk.descending});
-    }
+    auto maybeKeys = resolveGenericSortKeys(columns, sortSpec,
+                                            "GPU selection top-k", true, error);
+    if (!maybeKeys) return false;
+    std::vector<GenericSortKeySpec> keys = std::move(*maybeKeys);
 
     const std::string suffix = sanitizeIdentifier(tag);
     const std::string idxBuf = "d_gpu_topk_select_idx_" + suffix;
@@ -1934,32 +2014,25 @@ bool appendGenericGpuTopK(MetalQueryPlan& plan,
         return false;
     }
 
-    const auto* primaryCol = findMatColumn(columns, sortSpec.keys[0].column);
-    if (!primaryCol) {
-        if (error) *error = "GPU top-k primary key not present in materialized output: " +
-                            sortSpec.keys[0].column;
-        return false;
-    }
-    if (primaryCol->metalType != "float" || primaryCol->stringLen > 0 ||
-        primaryCol->isLongPair) {
+    auto primary = resolveGenericSortKeyColumn(
+        columns, sortSpec.keys[0], "GPU top-k", "primary", error);
+    if (!primary) return false;
+    if (primary->column.metalType != "float" || primary->column.stringLen > 0 ||
+        primary->column.isLongPair) {
         if (error) *error = "GPU top-k primary key must be a plain float column.";
         return false;
     }
 
     std::optional<GenericSortKeySpec> tie;
     if (sortSpec.keys.size() == 2) {
-        const auto* tieCol = findMatColumn(columns, sortSpec.keys[1].column);
-        if (!tieCol) {
-            if (error) *error = "GPU top-k tie key not present in materialized output: " +
-                                sortSpec.keys[1].column;
-            return false;
-        }
-        if ((tieCol->metalType != "int" && tieCol->metalType != "uint") ||
-            tieCol->stringLen > 0 || tieCol->isLongPair) {
+        tie = resolveGenericSortKeyColumn(
+            columns, sortSpec.keys[1], "GPU top-k", "tie", error);
+        if (!tie) return false;
+        if ((tie->column.metalType != "int" && tie->column.metalType != "uint") ||
+            tie->column.stringLen > 0 || tie->column.isLongPair) {
             if (error) *error = "GPU top-k tie key must be a plain integer column.";
             return false;
         }
-        tie = GenericSortKeySpec{*tieCol, sortSpec.keys[1].descending};
     }
 
     const std::string suffix = sanitizeIdentifier(tag);
@@ -1967,7 +2040,7 @@ bool appendGenericGpuTopK(MetalQueryPlan& plan,
     appendPhase(plan, "GENERIC_gpu_topk_" + suffix,
                 std::make_unique<MetalGenericTopKFloatInt>(
                     idxBuf,
-                    GenericSortKeySpec{*primaryCol, sortSpec.keys[0].descending},
+                    std::move(*primary),
                     std::move(tie), nRowsSymbol, capacityExpr, sortSpec.limit),
                 256);
     plan.gpuSort = MetalQueryPlan::GpuSort{idxBuf, nRowsSymbol, false, sortSpec.limit};
@@ -1982,18 +2055,59 @@ bool appendBestGenericGpuOrder(MetalQueryPlan& plan,
                                const GenericSortSpec& sortSpec,
                                std::string* error) {
     if (sortSpec.limit > 0 && !sortSpec.keys.empty()) {
-        std::string topKError;
-        if (appendGenericGpuTopK(plan, tag, nRowsSymbol, capacityExpr,
-                                 columns, sortSpec, &topKError)) {
-            return true;
+        if (sortSpec.keys.size() == 1) {
+            std::string topKError;
+            if (appendGenericGpuTopK(plan, tag, nRowsSymbol, capacityExpr,
+                                     columns, sortSpec, &topKError)) {
+                return true;
+            }
         }
         std::string selectError;
         if (appendGenericGpuTopKSelection(plan, tag, nRowsSymbol, capacityExpr,
                                           columns, sortSpec, &selectError)) {
             return true;
         }
-        if (error) *error = !selectError.empty() ? selectError : topKError;
     }
+
+    if (!sortSpec.keys.empty()) {
+        constexpr int kMaxGenericSmallSortRows = 4096;
+        if (auto bound = constantRowBound(capacityExpr);
+            bound && *bound > 0 && *bound <= kMaxGenericSmallSortRows) {
+            std::string smallSortError;
+            if (appendGenericGpuSmallSort(plan, tag, nRowsSymbol,
+                                          nextPow2Int(*bound), columns,
+                                          sortSpec, &smallSortError)) {
+                return true;
+            }
+        }
+
+        auto maybeKeys = resolveGenericSortKeys(columns, sortSpec,
+                                                "GPU adaptive sort", false,
+                                                error);
+        if (!maybeKeys) return false;
+
+        const std::string suffix = sanitizeIdentifier(tag);
+        const std::string idxBuf = "d_gpu_sort_idx_" + suffix;
+        appendPhase(plan, "GENERIC_gpu_sort_init_" + suffix,
+                    std::make_unique<MetalGenericSortInitIndices>(
+                        idxBuf, nRowsSymbol, capacityExpr));
+        appendPhase(plan, "GENERIC_gpu_smallsort_" + suffix,
+                    std::make_unique<MetalGenericSmallSort>(
+                        idxBuf, *maybeKeys, nRowsSymbol,
+                        kMaxGenericSmallSortRows),
+                    256);
+        const std::string phaseName = "GENERIC_gpu_sort_step_" + suffix;
+        auto& sortPhase = appendPhase(plan, phaseName,
+            std::make_unique<MetalGenericSortStep>(
+                idxBuf, *maybeKeys, capacityExpr));
+        sortPhase.postDispatchHook = makeGenericSortHook(
+            phaseName, idxBuf, nRowsSymbol, *maybeKeys,
+            kMaxGenericSmallSortRows);
+        plan.gpuSort = MetalQueryPlan::GpuSort{
+            idxBuf, nRowsSymbol, false, sortSpec.limit};
+        return true;
+    }
+
     return appendGenericGpuSort(plan, tag, nRowsSymbol, capacityExpr,
                                 columns, sortSpec, error);
 }

@@ -388,9 +388,11 @@ static void q16_emit_group_result(device atomic_uint* counter,
         sortSpec.keys.push_back({"p_type", false});
         sortSpec.keys.push_back({"p_size", false});
         std::string orderError;
-        appendBestGenericGpuOrder(plan, "q16_result", resultRows,
-                                  "q16_result_cap", columns, sortSpec,
-                                  &orderError);
+        if (!appendBestGenericGpuOrder(plan, "q16_result", resultRows,
+                                       "q16_result_cap", columns, sortSpec,
+                                       &orderError)) {
+            return std::nullopt;
+        }
     }
 
     return plan;

@@ -16,8 +16,10 @@
 #include <cmath>
 #include <cstring>
 #include <functional>
+#include <limits>
 #include <thread>
 #include <atomic>
+#include <cstdint>
 #include <sys/sysctl.h>
 
 // mmap support for binary loaders and large text files.
@@ -563,6 +565,110 @@ inline bool statFile(const std::string& p, size_t& sz, int64_t& mtimeNs) {
     return true;
 }
 
+inline bool validateHeader(const FileHeader& hdr,
+                           size_t fileSize,
+                           bool checkSource,
+                           size_t sourceSize = 0,
+                           int64_t sourceMtimeNs = 0) {
+    if (fileSize < sizeof(FileHeader)) return false;
+    if (memcmp(hdr.magic, MAGIC, sizeof(hdr.magic)) != 0) return false;
+    if (hdr.version != VERSION) return false;
+    if (checkSource &&
+        (hdr.source_size != sourceSize ||
+         hdr.source_mtime_ns != sourceMtimeNs)) {
+        return false;
+    }
+    const size_t maxDescCount = (fileSize - sizeof(FileHeader)) / sizeof(ColDesc);
+    return hdr.n_cols <= maxDescCount;
+}
+
+inline size_t elementBytes(const ColSpec& spec) {
+    switch (spec.type) {
+        case ColType::INT:
+        case ColType::DATE:
+            return sizeof(int32_t);
+        case ColType::FLOAT:
+            return sizeof(float);
+        case ColType::CHAR1:
+            return 1;
+        case ColType::CHAR_FIXED:
+            return spec.fixedWidth > 0 ? (size_t)spec.fixedWidth : 0;
+    }
+    return 0;
+}
+
+inline bool descriptorMatches(const ColDesc& desc,
+                              const ColSpec& spec,
+                              uint64_t nRows,
+                              size_t fileSize) {
+    const size_t elem = elementBytes(spec);
+    if (elem == 0) return false;
+    if (desc.columnIndex != spec.columnIndex) return false;
+    if (decodeType(desc.dtype) != spec.type) return false;
+    if (spec.type == ColType::CHAR_FIXED &&
+        desc.fixedWidth != spec.fixedWidth) {
+        return false;
+    }
+    if (desc.offset % ALIGN != 0) return false;
+    if (desc.offset > fileSize || desc.size_bytes > fileSize - desc.offset)
+        return false;
+    if (nRows > std::numeric_limits<uint64_t>::max() / elem) return false;
+    return desc.size_bytes == nRows * elem;
+}
+
+inline const ColDesc* findDescriptor(const ColDesc* descs,
+                                     uint32_t nCols,
+                                     int columnIndex) {
+    if (!descs) return nullptr;
+    for (uint32_t i = 0; i < nCols; ++i) {
+        if (descs[i].columnIndex == columnIndex) return &descs[i];
+    }
+    return nullptr;
+}
+
+inline bool descriptorsMatch(const ColDesc* descs,
+                             uint32_t nCols,
+                             const std::vector<ColSpec>& expectedSpecs,
+                             uint64_t nRows,
+                             size_t fileSize,
+                             bool requireExactColumnCount = false) {
+    if (requireExactColumnCount && nCols != expectedSpecs.size())
+        return false;
+    for (const ColSpec& spec : expectedSpecs) {
+        const ColDesc* desc = findDescriptor(descs, nCols, spec.columnIndex);
+        if (!desc || !descriptorMatches(*desc, spec, nRows, fileSize))
+            return false;
+    }
+    return true;
+}
+
+inline bool peekHeader(const std::string& colbinPath,
+                       FileHeader& outHeader,
+                       uint64_t* outFileSize = nullptr) {
+    struct stat st{};
+    if (::stat(colbinPath.c_str(), &st) != 0) return false;
+    const size_t fileSize = (size_t)st.st_size;
+    if (outFileSize) *outFileSize = (uint64_t)fileSize;
+
+    std::ifstream in(colbinPath, std::ios::binary);
+    if (!in) return false;
+    FileHeader hdr{};
+    in.read(reinterpret_cast<char*>(&hdr), sizeof(hdr));
+    if (!in) return false;
+    if (!validateHeader(hdr, fileSize, false)) return false;
+    outHeader = hdr;
+    return true;
+}
+
+inline bool peekRowCount(const std::string& colbinPath,
+                         uint64_t& outRows,
+                         uint64_t* outFileSize = nullptr) {
+    FileHeader hdr{};
+    if (!peekHeader(colbinPath, hdr, outFileSize)) return false;
+    outRows = hdr.n_rows;
+    return true;
+}
+
 inline bool loadColumnsFromBinary(const std::string& tblPath,
                                   const std::vector<ColSpec>& specs,
                                   LoadedColumns& out)
@@ -581,13 +687,8 @@ inline bool loadColumnsFromBinary(const std::string& tblPath,
     const char* base = (const char*)mf.data;
     FileHeader hdr;
     memcpy(&hdr, base, sizeof(hdr));
-    if (memcmp(hdr.magic, MAGIC, 8) != 0) return false;
-    if (hdr.version != VERSION) return false;
-    if (tblPresent) {
-        if (hdr.source_size != tblSize) return false;
-        if (hdr.source_mtime_ns != tblMtime) return false;
-    }
-    if (sizeof(FileHeader) + hdr.n_cols * sizeof(ColDesc) > mf.size) return false;
+    if (!validateHeader(hdr, mf.size, tblPresent, tblSize, tblMtime))
+        return false;
 
     const ColDesc* descs = (const ColDesc*)(base + sizeof(FileHeader));
     std::unordered_map<int, const ColDesc*> byIdx;
@@ -600,14 +701,11 @@ inline bool loadColumnsFromBinary(const std::string& tblPath,
         auto it = byIdx.find(s.columnIndex);
         if (it == byIdx.end()) return false;
         const ColDesc* d = it->second;
-        if (d->offset + d->size_bytes > mf.size) return false;
-        if (decodeType(d->dtype) != s.type) return false;
-        if (s.type == ColType::CHAR_FIXED && d->fixedWidth != s.fixedWidth) return false;
+        if (!descriptorMatches(*d, s, hdr.n_rows, mf.size)) return false;
         const char* src = base + d->offset;
         switch (s.type) {
             case ColType::INT:
             case ColType::DATE: {
-                if (d->size_bytes != n * sizeof(int32_t)) return false;
                 size_t idx = result.intCols.size();
                 result.intMap[s.columnIndex] = idx;
                 result.intCols.emplace_back(n);
@@ -615,7 +713,6 @@ inline bool loadColumnsFromBinary(const std::string& tblPath,
                 break;
             }
             case ColType::FLOAT: {
-                if (d->size_bytes != n * sizeof(float)) return false;
                 size_t idx = result.floatCols.size();
                 result.floatMap[s.columnIndex] = idx;
                 result.floatCols.emplace_back(n);
@@ -623,7 +720,6 @@ inline bool loadColumnsFromBinary(const std::string& tblPath,
                 break;
             }
             case ColType::CHAR1: {
-                if (d->size_bytes != n) return false;
                 size_t idx = result.charCols.size();
                 result.charMap[s.columnIndex] = idx;
                 result.charCols.emplace_back(n);
@@ -631,7 +727,6 @@ inline bool loadColumnsFromBinary(const std::string& tblPath,
                 break;
             }
             case ColType::CHAR_FIXED: {
-                if (d->size_bytes != n * (size_t)s.fixedWidth) return false;
                 size_t idx = result.charCols.size();
                 result.charMap[s.columnIndex] = idx;
                 result.charCols.emplace_back(d->size_bytes);
@@ -836,14 +931,7 @@ inline MappedColumns loadColumnsAsBuffers(MTL::Device* device,
 
         FileHeader hdr{};
         memcpy(&hdr, base, sizeof(hdr));
-        if (memcmp(hdr.magic, MAGIC, 8) != 0 ||
-            hdr.version != VERSION ||
-            (tblPresent && (hdr.source_size != tblSize ||
-                            hdr.source_mtime_ns != tblMtime))) {
-            ::munmap(base, fileSize);
-            return out;
-        }
-        if (sizeof(FileHeader) + hdr.n_cols * sizeof(ColDesc) > fileSize) {
+        if (!validateHeader(hdr, fileSize, tblPresent, tblSize, tblMtime)) {
             ::munmap(base, fileSize);
             return out;
         }
@@ -860,14 +948,7 @@ inline MappedColumns loadColumnsAsBuffers(MTL::Device* device,
             auto it = byIdx.find(s.columnIndex);
             if (it == byIdx.end())                 { ::munmap(base, fileSize); return MappedColumns{}; }
             const ColDesc* d = it->second;
-            if (decodeType(d->dtype) != s.type)    { ::munmap(base, fileSize); return MappedColumns{}; }
-            if (s.type == ColType::CHAR_FIXED && d->fixedWidth != s.fixedWidth) {
-                ::munmap(base, fileSize); return MappedColumns{};
-            }
-            if (d->offset % ALIGN != 0) {
-                ::munmap(base, fileSize); return MappedColumns{};
-            }
-            if (d->offset + d->size_bytes > fileSize) {
+            if (!descriptorMatches(*d, s, hdr.n_rows, fileSize)) {
                 ::munmap(base, fileSize); return MappedColumns{};
             }
             void* colPtr = (char*)base + d->offset;
@@ -890,14 +971,7 @@ inline MappedColumns loadColumnsAsBuffers(MTL::Device* device,
         ::close(fd);
         return out;
     }
-    if (memcmp(hdr.magic, MAGIC, 8) != 0 ||
-        hdr.version != VERSION ||
-        (tblPresent && (hdr.source_size != tblSize ||
-                        hdr.source_mtime_ns != tblMtime))) {
-        ::close(fd);
-        return out;
-    }
-    if (sizeof(FileHeader) + hdr.n_cols * sizeof(ColDesc) > fileSize) {
+    if (!validateHeader(hdr, fileSize, tblPresent, tblSize, tblMtime)) {
         ::close(fd);
         return out;
     }
@@ -917,17 +991,7 @@ inline MappedColumns loadColumnsAsBuffers(MTL::Device* device,
         auto it = byIdx.find(s.columnIndex);
         if (it == byIdx.end())                 { ::close(fd); return MappedColumns{}; }
         const ColDesc* d = it->second;
-        if (decodeType(d->dtype) != s.type)    { ::close(fd); return MappedColumns{}; }
-        if (s.type == ColType::CHAR_FIXED && d->fixedWidth != s.fixedWidth) {
-            ::close(fd); return MappedColumns{};
-        }
-        if (d->offset % ALIGN != 0) {
-            ::close(fd); return MappedColumns{};
-        }
-        if (d->offset + d->size_bytes > fileSize) {
-            ::close(fd); return MappedColumns{};
-        }
-        if (d->size_bytes == 0) {
+        if (!descriptorMatches(*d, s, hdr.n_rows, fileSize)) {
             ::close(fd); return MappedColumns{};
         }
         void* colPtr = ::mmap(nullptr, d->size_bytes, PROT_READ, MAP_PRIVATE,
@@ -1247,9 +1311,15 @@ inline void printDetailedTimingSummary(const DetailedTiming& t, bool quiet = fal
     //     CPU Preprocess = max-key scans, per-query preprocessing kernels
     //   Buffer Setup     = Metal buffer allocation (pointers only, no copy)
     //   GPU Compute      = GPU kernel execution time, including hook GPU work
-    //   CPU Compute      = host hook work + result collection + post-processing
-    //                      + measured execute overhead not visible in GPU stamps
-    //   Query Compute    = GPU Compute + CPU Compute
+    //   CPU Compute      = measured host hook work + result collection
+    //                      + post-processing. It intentionally excludes
+    //                      execute residual.
+    //   Execute Residual = execute wall time not explained by buffer setup,
+    //                      GPU timestamps, hook CPU, or result collection.
+    //                      This bucket may include zero-init, command-buffer
+    //                      wait overhead, unified-memory migration, and other
+    //                      synchronization effects.
+    //   Query Compute    = GPU Compute + CPU Compute + Execute Residual
     //   Hot Execution    = Buffer Setup + Query Compute
     //                      (repeatable hot-query work, excluding I/O, compile, and preprocess)
     //   Query Execution  = CPU Preprocess + Hot Execution
@@ -1264,8 +1334,9 @@ inline void printDetailedTimingSummary(const DetailedTiming& t, bool quiet = fal
         ? std::max(0.0, t.executeWallMs - executeAccountedMs)
         : 0.0;
     const double cpuComputeMs      = t.postMs + t.hookCpuMs +
-                                     t.resultCollectMs + executeOverheadMs;
-    const double queryComputeMs    = cpuComputeMs + gpuComputeMs;
+                                     t.resultCollectMs;
+    const double queryComputeMs    = gpuComputeMs + cpuComputeMs +
+                                     executeOverheadMs;
     // If split timings are unavailable, attribute dataLoadMs to I/O.
     const double ioMs              = (t.ioMs > 0.0 || t.preprocessMs > 0.0)
                                      ? t.ioMs : t.dataLoadMs;
@@ -1369,7 +1440,7 @@ inline void printDetailedTimingSummary(const DetailedTiming& t, bool quiet = fal
             rowMs("  Result Collect", t.resultCollectMs);
         }
         if (executeOverheadMs > 0.0) {
-            rowMs("  Execute Overhead", executeOverheadMs);
+            rowMs("  Execute Residual", executeOverheadMs);
         }
         rowMs("  Host Post", t.postMs);
         if (t.validationMs > 0.0) {
@@ -1378,7 +1449,7 @@ inline void printDetailedTimingSummary(const DetailedTiming& t, bool quiet = fal
         if (t.executeWallMs > 0.0) {
             rowMs("Execute Wall", t.executeWallMs);
         }
-        rowMs("CPU Compute",    cpuComputeMs);
+        rowMs("CPU Compute",       cpuComputeMs);
         rowMs("Query Compute",     queryComputeMs);
         rowMs("Hot Execution",     hotExecutionMs);
         rowMsHi("Query Execution",   queryExecutionMs);

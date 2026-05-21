@@ -9,39 +9,32 @@ std::optional<MetalQueryPlan> buildQ9Plan_byName() {
     std::string idx = "i";
     MetalQueryPlan plan;
 
-    // --- Hash Helpers ---
-    // Probe helper used by the final reduce phase.
+    // --- Partsupp Lookup Helpers ---
+    // TPC-H partsupp has four supplier rows per part.  Keep only green-part
+    // rows in a compact direct-address side table instead of a global hash.
     plan.helpers.push_back(R"(
-static float q9_ht_probe(const device uint* ht_keys, const device float* ht_vals,
-                          uint ht_mask, uint key) {
-    uint h = (key * 2654435769u) & ht_mask;
-    for (uint step = 0; step < 64; step++) {
-        uint slot = (h + step) & ht_mask;
-        uint k = ht_keys[slot];
-        if (k == key) return ht_vals[slot];
-        if (k == 0xFFFFFFFFu) break;
+static int q9_ps_lookup(const device uint* ps_counts,
+                        const device uint* ps_supps,
+                        const device uint* ps_costs,
+                        uint partkey,
+                        uint suppkey) {
+    uint n = ps_counts[partkey];
+    if (n > 4u) n = 4u;
+    ulong base = (ulong)partkey * 4ul;
+    for (uint j = 0u; j < n; ++j) {
+        ulong off = base + (ulong)j;
+        if (ps_supps[off] == suppkey) return (int)ps_costs[off];
     }
-    return -1.0f;
+    return -1;
 }
-)");
 
-    // Hash constants must match q9_ht_probe and host sizing.
-    plan.helpers.push_back(R"(
-static void q9_ht_insert(device atomic_uint* ht_keys, device float* ht_vals,
-                          uint ht_mask, uint key, float val) {
-    uint h = (key * 2654435769u) & ht_mask;
-    for (uint step = 0; step <= ht_mask; step++) {
-        uint slot = (h + step) & ht_mask;
-        uint expected = 0xFFFFFFFFu;
-        if (atomic_compare_exchange_weak_explicit(
-                &ht_keys[slot], &expected, key,
-                memory_order_relaxed, memory_order_relaxed)) {
-            ht_vals[slot] = val;
-            return;
-        }
-        // Duplicate (pk, sk) pairs should not occur, but exit defensively.
-        if (expected == key) return;
-    }
+static long q9_profit_scaled(float extendedprice, float discount,
+                             float quantity, int supplycost_cents) {
+    long extended_cents = (long)round(extendedprice * 100.0f);
+    long discount_basis = (long)round(discount * 100.0f);
+    long quantity_cents = (long)round(quantity * 100.0f);
+    return extended_cents * (100L - discount_basis) -
+           (long)supplycost_cents * quantity_cents;
 }
 )");
 
@@ -97,43 +90,47 @@ static void q9_ht_insert(device atomic_uint* ht_keys, device float* ht_vals,
         appendPhase(plan, "Q9_build_o_year", std::move(store));
     }
 
-    // --- Partsupp Hash Table ---
-    // Build (pk, sk) to supply-cost hash table.
+    // --- Partsupp Direct Map ---
+    // Build partkey -> up to four (suppkey, supply-cost-cents) pairs.
     {
         auto scan = makeAutoScan("partsupp", idx);
         auto gated = std::make_unique<MetalSelection>(std::move(scan),
             "bitmap_test_atomic(d_q9_part_bitmap, ps_partkey[" + idx + "])");
-        auto computeKey = std::make_unique<MetalComputeExpr>(
-            std::move(gated), "_psk", "uint",
-            "(uint)ps_partkey[" + idx + "] * supp_mul + (uint)ps_suppkey[" + idx + "]");
 
-        // Custom terminal emits q9_ht_insert after child bindings are registered.
-        struct HtInsertTerminal : MetalUnaryOperator {
+        struct PsStoreTerminal : MetalUnaryOperator {
             std::string idx_;
-            HtInsertTerminal(std::unique_ptr<MetalOperator> c, std::string i)
+            PsStoreTerminal(std::unique_ptr<MetalOperator> c, std::string i)
                 : MetalUnaryOperator(std::move(c)), idx_(std::move(i)) {}
             void iusUsed(std::vector<IU>& out) const override {
+                MetalOperator::appendIUsFromExpr("ps_partkey[" + idx_ + "]", out);
+                MetalOperator::appendIUsFromExpr("ps_suppkey[" + idx_ + "]", out);
                 MetalOperator::appendIUsFromExpr("ps_supplycost[" + idx_ + "]", out);
             }
             void produce(MetalCodegen& cg, ConsumerFn) override {
-                cg.addBufferParam("d_ps_ht_keys", "atomic_uint", "q9HtSize",
-                                  /*zeroInit=*/true, /*fillByte=*/0xFF);
-                cg.addBufferParam("d_ps_ht_vals", "float", "q9HtSize",
+                cg.addBufferParam("d_q9_ps_count", "atomic_uint", "maxPartkey",
                                   /*zeroInit=*/true, /*fillByte=*/0);
+                cg.addBufferParam("d_q9_ps_supp", "uint", "q9_ps_slots",
+                                  /*zeroInit=*/false, /*fillByte=*/0);
+                cg.addBufferParam("d_q9_ps_cost", "uint", "q9_ps_slots",
+                                  /*zeroInit=*/false, /*fillByte=*/0);
                 child_->produce(cg, [&]() {
-                    cg.addLine(
-                        "q9_ht_insert(d_ps_ht_keys, d_ps_ht_vals, d_ps_ht_mask, "
-                        "_psk, ps_supplycost[" + idx_ + "]);");
+                    cg.addLine("uint _q9_pk = (uint)ps_partkey[" + idx_ + "];");
+                    cg.addLine("uint _q9_slot = atomic_fetch_add_explicit("
+                               "&d_q9_ps_count[_q9_pk], 1u, memory_order_relaxed);");
+                    cg.addIf("_q9_slot < 4u", [&]() {
+                        cg.addLine("ulong _q9_off = (ulong)_q9_pk * 4ul + (ulong)_q9_slot;");
+                        cg.addLine("d_q9_ps_supp[_q9_off] = (uint)ps_suppkey[" + idx_ + "];");
+                        cg.addLine("d_q9_ps_cost[_q9_off] = "
+                                   "(uint)round(ps_supplycost[" + idx_ + "] * 100.0f);");
+                    });
                 });
             }
-            std::string describe() const override { return "Q9HtInsert"; }
+            std::string describe() const override { return "Q9PartsuppStore"; }
         };
-        auto term = std::make_unique<HtInsertTerminal>(std::move(computeKey), idx);
+        auto term = std::make_unique<PsStoreTerminal>(std::move(gated), idx);
 
-        auto& phase = appendPhase(plan, "Q9_build_ps_ht", std::move(term));
+        auto& phase = appendPhase(plan, "Q9_build_ps_map", std::move(term));
         phase.bitmapReads.push_back({"d_q9_part_bitmap", ""});
-        phase.scalarParams.push_back({"d_ps_ht_mask", "uint"});
-        phase.scalarParams.push_back({"supp_mul", "uint"});
     }
 
     // --- Profit Aggregate ---
@@ -152,34 +149,35 @@ static void q9_ht_insert(device atomic_uint* ht_keys, device float* ht_vals,
             std::move(natLookup), "d_q9_o_year",
             "l_orderkey[" + idx + "]", "_year", "int", 0);
 
-        std::string htProbeExpr =
-            "q9_ht_probe(d_ps_ht_keys, d_ps_ht_vals, d_ps_ht_mask, "
-            "(uint)l_partkey[" + idx + "] * supp_mul + (uint)l_suppkey[" + idx + "])";
+        std::string psProbeExpr =
+            "q9_ps_lookup(d_q9_ps_count, d_q9_ps_supp, d_q9_ps_cost, "
+            "(uint)l_partkey[" + idx + "], "
+            "(uint)l_suppkey[" + idx + "])";
         auto computeSC = std::make_unique<MetalComputeExpr>(
-            std::move(yearLookup), "_sc", "float", htProbeExpr);
+            std::move(yearLookup), "_sc", "int", psProbeExpr);
 
         auto scFilter = std::make_unique<MetalSelection>(
-            std::move(computeSC), "_sc >= 0.0f");
+            std::move(computeSC), "_sc >= 0");
 
         std::string profitExpr =
-            "l_extendedprice[" + idx + "] * (1.0f - l_discount[" + idx + "]) - _sc * l_quantity[" + idx + "]";
+            "q9_profit_scaled(l_extendedprice[" + idx + "], l_discount[" +
+            idx + "], l_quantity[" + idx + "], _sc)";
         auto computeProfit = std::make_unique<MetalComputeExpr>(
-            std::move(scFilter), "_profit", "float", profitExpr);
+            std::move(scFilter), "_profit", "long", profitExpr);
 
         // 200 bins cover 25 nations across eight order years.
         auto computeBin = std::make_unique<MetalComputeExpr>(
             std::move(computeProfit), "_bin", "int", "_nationkey * 8 + (_year - 1992)");
 
-        auto agg = std::make_unique<MetalAtomicAgg>(
-            std::move(computeBin), "d_q9_profit",
-            "_bin", "_profit", "200",
-            "atomic_float", "float");
+        auto agg = std::make_unique<MetalKeyedAgg>(
+            std::move(computeBin), "d_q9_profit", "_bin",
+            /*numBuckets=*/200, /*valuesPerBucket=*/2, "400");
+        agg->addAggregate("sum_profit", 0, "_profit", "add", true, 10000);
 
         auto& phase = appendPhase(plan, "Q9_profit_reduce", std::move(agg));
-        phase.extraBuffers.push_back({"d_ps_ht_keys", "uint", true});
-        phase.extraBuffers.push_back({"d_ps_ht_vals", "float", true});
-        phase.scalarParams.push_back({"d_ps_ht_mask", "uint"});
-        phase.scalarParams.push_back({"supp_mul", "uint"});
+        phase.extraBuffers.push_back({"d_q9_ps_count", "uint", true});
+        phase.extraBuffers.push_back({"d_q9_ps_supp",  "uint", true});
+        phase.extraBuffers.push_back({"d_q9_ps_cost",  "uint", true});
     }
 
     plan.helpers.push_back(R"(
@@ -187,15 +185,16 @@ static void q9_emit_profit_result(device atomic_uint* counter,
                                   device char* out_nation,
                                   device int* out_year,
                                   device float* out_profit,
-                                  const device float* profit_bins,
+                                  const device uint* profit_bins,
                                   const device int* nation_idx,
                                   const device char* n_name,
                                   uint cap, uint bin) {
     uint yr_off = bin & 7u;
     if (yr_off >= 7u) return;
     uint nk = bin >> 3u;
-    float profit = profit_bins[bin];
-    if (profit == 0.0f) return;
+    long profit_cents = load_long_pair(&profit_bins[bin * 2u], &profit_bins[bin * 2u + 1u]);
+    if (profit_cents == 0) return;
+    float profit = (float)profit_cents / 10000.0f;
     int nr = nation_idx[nk];
     if (nr < 0) return;
     uint slot = atomic_fetch_add_explicit(counter, 1u, memory_order_relaxed);
@@ -235,7 +234,7 @@ static void q9_emit_profit_result(device atomic_uint* counter,
         phase.extraBuffers.push_back({"d_q9_result_nation", "char",        false, true});
         phase.extraBuffers.push_back({"d_q9_result_year",   "int",         false, true});
         phase.extraBuffers.push_back({"d_q9_result_profit", "float",       false, true});
-        phase.extraBuffers.push_back({"d_q9_profit",        "float",       true,  false});
+        phase.extraBuffers.push_back({"d_q9_profit",        "uint",        true,  false});
         phase.extraBuffers.push_back({"d_q9_nation_idx",    "int",         true,  false});
         phase.scalarParams.push_back({"q9_result_cap", "uint"});
     }
@@ -252,8 +251,11 @@ static void q9_emit_profit_result(device atomic_uint* counter,
         std::string sortError;
         if (!appendGenericGpuSmallSort(plan, "q9_result", resultRows,
                                        256, columns, sortSpec, &sortError)) {
-            appendGenericGpuSort(plan, "q9_result", resultRows,
-                                 "q9_result_cap", columns, sortSpec, &sortError);
+            if (!appendGenericGpuSort(plan, "q9_result", resultRows,
+                                      "q9_result_cap", columns, sortSpec,
+                                      &sortError)) {
+                return std::nullopt;
+            }
         }
     }
 

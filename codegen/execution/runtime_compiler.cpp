@@ -3,6 +3,7 @@
 #include <iostream>
 #include <sstream>
 #include <functional>
+#include <utility>
 
 namespace codegen {
 
@@ -35,9 +36,11 @@ RuntimeCompiler::~RuntimeCompiler() {
 }
 
 void RuntimeCompiler::clearCache() {
-    for (auto& [name, pso] : pipelineCache_)
-        pso->release();
+    for (auto& [name, pso] : pipelineCache_) {
+        if (pso) pso->release();
+    }
     pipelineCache_.clear();
+    libraries_.clear();
 }
 
 MTL::Library* RuntimeCompiler::compile(const std::string& source) {
@@ -52,12 +55,16 @@ MTL::Library* RuntimeCompiler::compile(const std::string& source) {
 
     NS::Error* error = nullptr;
     auto* sourceStr = NS::String::string(source.c_str(), NS::UTF8StringEncoding);
-    auto* opts = MTL::CompileOptions::alloc()->init();
+    MetalOwnedObject<MTL::CompileOptions> opts(MTL::CompileOptions::alloc()->init());
+    if (!opts) {
+        std::cerr << "Metal compilation failed: could not allocate compile options" << std::endl;
+        return nullptr;
+    }
     opts->setFastMathEnabled(sFastMath_);
-    auto* library = device_->newLibrary(sourceStr, opts, &error);
-    opts->release();
+    MetalOwnedObject<MTL::Library> ownedLibrary(
+        device_->newLibrary(sourceStr, opts.get(), &error));
 
-    if (!library) {
+    if (!ownedLibrary) {
         std::cerr << "Metal compilation failed:" << std::endl;
         if (error)
             std::cerr << error->localizedDescription()->utf8String() << std::endl;
@@ -70,8 +77,13 @@ MTL::Library* RuntimeCompiler::compile(const std::string& source) {
         }
         return nullptr;
     }
-    if (sGlobalCacheEnabled_ && !currentLibraryCacheKey_.empty())
+    MTL::Library* library = ownedLibrary.get();
+    if (sGlobalCacheEnabled_ && !currentLibraryCacheKey_.empty()) {
         sLibraryCache_[currentLibraryCacheKey_] = library;
+        ownedLibrary.release();
+    } else {
+        libraries_.push_back(std::move(ownedLibrary));
+    }
     return library;
 }
 
@@ -83,24 +95,26 @@ MTL::ComputePipelineState* RuntimeCompiler::getPipeline(MTL::Library* lib, const
             return global->second;
 
         auto* funcName = NS::String::string(kernelName.c_str(), NS::UTF8StringEncoding);
-        auto* func = lib->newFunction(funcName);
+        MetalOwnedObject<MTL::Function> func(lib->newFunction(funcName));
         if (!func) {
             std::cerr << "Kernel function not found: " << kernelName << std::endl;
             return nullptr;
         }
 
         NS::Error* error = nullptr;
-        auto* pso = device_->newComputePipelineState(func, &error);
-        func->release();
+        MetalOwnedObject<MTL::ComputePipelineState> ownedPso(
+            device_->newComputePipelineState(func.get(), &error));
 
-        if (!pso) {
+        if (!ownedPso) {
             std::cerr << "Failed to create pipeline for " << kernelName << ": ";
             if (error) std::cerr << error->localizedDescription()->utf8String();
             std::cerr << std::endl;
             return nullptr;
         }
 
+        MTL::ComputePipelineState* pso = ownedPso.get();
         sGlobalPipelineCache_[key] = pso;
+        ownedPso.release();
         return pso;
     }
 
@@ -108,24 +122,26 @@ MTL::ComputePipelineState* RuntimeCompiler::getPipeline(MTL::Library* lib, const
     if (it != pipelineCache_.end()) return it->second;
 
     auto* funcName = NS::String::string(kernelName.c_str(), NS::UTF8StringEncoding);
-    auto* func = lib->newFunction(funcName);
+    MetalOwnedObject<MTL::Function> func(lib->newFunction(funcName));
     if (!func) {
         std::cerr << "Kernel function not found: " << kernelName << std::endl;
         return nullptr;
     }
 
     NS::Error* error = nullptr;
-    auto* pso = device_->newComputePipelineState(func, &error);
-    func->release();
+    MetalOwnedObject<MTL::ComputePipelineState> ownedPso(
+        device_->newComputePipelineState(func.get(), &error));
 
-    if (!pso) {
+    if (!ownedPso) {
         std::cerr << "Failed to create pipeline for " << kernelName << ": ";
         if (error) std::cerr << error->localizedDescription()->utf8String();
         std::cerr << std::endl;
         return nullptr;
     }
 
+    MTL::ComputePipelineState* pso = ownedPso.get();
     pipelineCache_[kernelName] = pso;
+    ownedPso.release();
     return pso;
 }
 

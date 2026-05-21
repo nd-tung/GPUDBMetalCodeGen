@@ -1,4 +1,6 @@
 #pragma once
+#include "core/metal_object_owner.h"
+
 #include <Metal/Metal.hpp>
 #include <string>
 #include <unordered_map>
@@ -43,6 +45,7 @@ public:
 private:
     MTL::Device* device_;
     std::unordered_map<std::string, MTL::ComputePipelineState*> pipelineCache_;
+    std::vector<MetalOwnedObject<MTL::Library>> libraries_;
     std::string currentLibraryCacheKey_;
     static bool sFastMath_;
     static bool sGlobalCacheEnabled_;

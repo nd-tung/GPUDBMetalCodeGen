@@ -64,7 +64,6 @@ struct GenericGroupSpec {
     std::vector<std::pair<int,int>> ratioPairs;
     int havingAggIdx = -1;
     double havingMultiplier = 0;
-    int havingSentinel = 0;
     std::string havingScalarCompareOp = ">";
     int havingCompareAggIdx = -1;
     std::string havingCompareOp;

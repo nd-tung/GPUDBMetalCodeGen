@@ -74,71 +74,11 @@ std::optional<MetalQueryPlan> lowerSingleTableHashGroupedAggregateIRToMetal(
         return true;
     };
 
-    for (size_t i = 0; i < aggregate.groupBy.size(); ++i) {
-        const auto& group = aggregate.groupBy[i];
-        const std::string displayName = groupDisplayNameForAggregate(aggregate, i);
-        groupSpec.keyColumns.push_back(displayName);
-        IrGroupKeyDesc key;
-        key.displayName = displayName;
-        groupKeys.push_back(std::move(key));
-        if (!addInputColumn(displayName,
-                            group ? group->type : TypeInfo{DataType::INT, 0},
-                            group, 0, "")) {
-            return std::nullopt;
-        }
+    if (!buildAggregateInputGroupSpec(
+            aggregate, "IR single-table hash group lowerer", groupSpec,
+            groupKeys, addInputColumn, error)) {
+        return std::nullopt;
     }
-
-    for (size_t i = 0; i < aggregate.aggregates.size(); ++i) {
-        const auto& projection = aggregate.aggregates[i];
-        auto* agg = projection.expr
-            ? std::get_if<GenericAggregateExpr>(&projection.expr->node)
-            : nullptr;
-        if (!agg)
-            return fail(error, "IR single-table hash group lowerer: non-aggregate projection.");
-        const std::string displayName = projection.name.empty()
-            ? "agg_" + std::to_string(i)
-            : projection.name;
-
-        GenericExprPtr inputExpr;
-        TypeInfo inputType{DataType::FLOAT, 0};
-        int inputScaleDown = 0;
-        std::string distinctDomainSymbol;
-        std::string funcName = aggregateOutputFuncFor(aggregate, i, agg->func);
-
-        if (agg->func == AggFunc::COUNT) {
-            GenericExpr lit;
-            lit.type = inputType;
-            lit.node = GenericLiteralExpr{1.0, inputType};
-            inputExpr = std::make_shared<GenericExpr>(std::move(lit));
-            funcName = "COUNT";
-        } else {
-            if (!agg->arg)
-                return fail(error, "IR single-table hash group lowerer: aggregate '" +
-                                   aggFuncName(agg->func) + "' requires an argument.");
-            inputExpr = agg->arg;
-            if (agg->func == AggFunc::COUNT_DISTINCT) {
-                if (agg->arg->type.type == DataType::CHAR_FIXED)
-                    return fail(error, "IR single-table hash group lowerer: COUNT(DISTINCT) over fixed strings is not supported yet.");
-                distinctDomainSymbol = distinctDomainSymbolForExpr(agg->arg);
-                inputType = agg->arg->type;
-                funcName = "COUNT_DISTINCT";
-            } else if (agg->func == AggFunc::SUM || agg->func == AggFunc::AVG) {
-                inputScaleDown = numericScaleForExpr(agg->arg);
-            } else if (agg->func != AggFunc::MIN && agg->func != AggFunc::MAX) {
-                return fail(error, "IR single-table hash group lowerer: unsupported aggregate " +
-                                   aggFuncName(agg->func) + ".");
-            }
-        }
-
-        groupSpec.aggColumns.push_back(displayName);
-        groupSpec.aggFuncs.push_back(funcName);
-        if (!addInputColumn(displayName, inputType, inputExpr, inputScaleDown,
-                            distinctDomainSymbol)) {
-            return std::nullopt;
-        }
-    }
-
-    groupSpec.outputColumns = aggregate.outputOrder;
     if (!configureAggregateHaving(aggregate, groupSpec, nullptr, nullptr, error))
         return std::nullopt;
 

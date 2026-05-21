@@ -127,6 +127,11 @@ struct GenericAggregateExpr {
     TypeInfo type;
 };
 
+struct GenericScalarSubqueryExpr {
+    int index = -1;
+    TypeInfo type;
+};
+
 struct GenericScalarLookupExpr {
     GenericNodeId source;
     std::string outputName;
@@ -143,6 +148,7 @@ struct GenericExpr {
                  GenericCaseExpr,
                  GenericFunctionExpr,
                  GenericAggregateExpr,
+                 GenericScalarSubqueryExpr,
                  GenericScalarLookupExpr> node;
 };
 

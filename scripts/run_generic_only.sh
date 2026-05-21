@@ -2,12 +2,13 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+source "$ROOT/scripts/bench_common.sh"
 cd "$ROOT"
 
 BIN="${BIN:-build/bin/GPUDBCodegen}"
 SF="${SF:-sf1}"
 CHECK_DIR="${CHECK_DIR:-tmp/duckdb_generic_sql}"
-OUT="${OUT:-tmp/generic_only_$(date +%Y%m%d_%H%M%S)}"
+OUT="${OUT:-$(bench_default_output_dir generic_only)}"
 MARKERS="${MARKERS:-ADHOC_|cpuSort|cpuGroupBy|cpuScalarAgg|buildQ[0-9]|predefined|Predefined}"
 
 if [ ! -x "$BIN" ]; then

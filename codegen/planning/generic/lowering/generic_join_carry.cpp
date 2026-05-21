@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <cctype>
 #include <optional>
+#include <stdexcept>
 #include <type_traits>
 
 namespace codegen {
@@ -18,6 +19,102 @@ const IrCarryColumn* findCarry(const IrCarryMap& carries,
     auto colIt = relIt->second.find(col.column);
     if (colIt == relIt->second.end()) return nullptr;
     return &colIt->second;
+}
+
+bool isCarriedStringColumn(const GenericColumnExpr& col,
+                           const IrCarryMap& carries) {
+    if (!findCarry(carries, col)) return false;
+    return col.type.type == DataType::CHAR_FIXED ||
+           col.type.type == DataType::CHAR1;
+}
+
+bool exprContainsCarriedString(const GenericExprPtr& expr,
+                               const IrCarryMap& carries,
+                               bool allowDirectColumn);
+
+bool predContainsCarriedString(const GenericPredicatePtr& pred,
+                               const IrCarryMap& carries);
+
+bool exprContainsCarriedString(const GenericExprPtr& expr,
+                               const IrCarryMap& carries,
+                               bool allowDirectColumn) {
+    if (!expr) return false;
+    return std::visit([&](const auto& node) -> bool {
+        using T = std::decay_t<decltype(node)>;
+        if constexpr (std::is_same_v<T, GenericColumnExpr>) {
+            return !allowDirectColumn && isCarriedStringColumn(node, carries);
+        } else if constexpr (std::is_same_v<T, GenericLiteralExpr>) {
+            return false;
+        } else if constexpr (std::is_same_v<T, GenericBinaryExpr>) {
+            return exprContainsCarriedString(node.left, carries, false) ||
+                   exprContainsCarriedString(node.right, carries, false);
+        } else if constexpr (std::is_same_v<T, GenericCaseExpr>) {
+            for (const auto& branch : node.branches) {
+                if (predContainsCarriedString(branch.condition, carries) ||
+                    exprContainsCarriedString(branch.result, carries, false)) {
+                    return true;
+                }
+            }
+            return exprContainsCarriedString(node.elseResult, carries, false);
+        } else if constexpr (std::is_same_v<T, GenericFunctionExpr>) {
+            for (const auto& arg : node.args) {
+                if (exprContainsCarriedString(arg, carries, false))
+                    return true;
+            }
+            return false;
+        } else if constexpr (std::is_same_v<T, GenericAggregateExpr>) {
+            return exprContainsCarriedString(node.arg, carries, false);
+        } else if constexpr (std::is_same_v<T, GenericScalarLookupExpr>) {
+            for (const auto& key : node.keys) {
+                if (exprContainsCarriedString(key, carries, false))
+                    return true;
+            }
+            return false;
+        } else {
+            return false;
+        }
+    }, expr->node);
+}
+
+bool predContainsCarriedString(const GenericPredicatePtr& pred,
+                               const IrCarryMap& carries) {
+    if (!pred) return false;
+    return std::visit([&](const auto& node) -> bool {
+        using T = std::decay_t<decltype(node)>;
+        if constexpr (std::is_same_v<T, GenericComparisonPred>) {
+            return exprContainsCarriedString(node.left, carries, false) ||
+                   exprContainsCarriedString(node.right, carries, false);
+        } else if constexpr (std::is_same_v<T, GenericBetweenPred>) {
+            return exprContainsCarriedString(node.expr, carries, false) ||
+                   exprContainsCarriedString(node.low, carries, false) ||
+                   exprContainsCarriedString(node.high, carries, false);
+        } else if constexpr (std::is_same_v<T, GenericInListPred>) {
+            if (exprContainsCarriedString(node.expr, carries, false))
+                return true;
+            for (const auto& value : node.values) {
+                if (exprContainsCarriedString(value, carries, false))
+                    return true;
+            }
+            return false;
+        } else if constexpr (std::is_same_v<T, GenericLikePred>) {
+            return exprContainsCarriedString(node.expr, carries, false);
+        } else if constexpr (std::is_same_v<T, GenericLogicalPred>) {
+            for (const auto& child : node.children) {
+                if (predContainsCarriedString(child, carries))
+                    return true;
+            }
+            return false;
+        } else {
+            return false;
+        }
+    }, pred->node);
+}
+
+[[noreturn]] void failUnsupportedCarryPredicateEmitter(
+        const std::string& detail) {
+    throw std::logic_error(
+        "genericPredicateToMetalWithCarryMap: unsupported predicate " +
+        detail + "; call predicateSupported before emitting Metal.");
 }
 
 std::optional<std::string> charStringComparisonToMetalWithCarryMap(
@@ -244,36 +341,19 @@ std::string genericPredicateToMetalWithCarryMap(const GenericPredicatePtr& pred,
         } else if constexpr (std::is_same_v<T, GenericLikePred>) {
             if (auto like = fixedStringLikeMetalWithCarryMap(node, idxVar, carries))
                 return *like;
-            return node.negated ? "true" : "false";
+            failUnsupportedCarryPredicateEmitter("LIKE shape");
+        } else if constexpr (std::is_same_v<T, GenericExistsPred>) {
+            failUnsupportedCarryPredicateEmitter(
+                node.negated ? "NOT EXISTS" : "EXISTS");
         } else {
-            return "true";
+            failUnsupportedCarryPredicateEmitter("variant");
         }
     }, pred->node);
 }
 
 bool exprNeedsCarriedString(const GenericExprPtr& expr,
                             const IrCarryMap& carries) {
-    (void)carries;
-    if (!expr) return false;
-    if (std::get_if<GenericColumnExpr>(&expr->node)) {
-        return false;
-    }
-    bool found = false;
-    std::visit([&](const auto& node) {
-        using T = std::decay_t<decltype(node)>;
-        if constexpr (std::is_same_v<T, GenericBinaryExpr>) {
-            found = exprNeedsCarriedString(node.left, carries) ||
-                    exprNeedsCarriedString(node.right, carries);
-        } else if constexpr (std::is_same_v<T, GenericFunctionExpr>) {
-            for (const auto& arg : node.args)
-                found = found || exprNeedsCarriedString(arg, carries);
-        } else if constexpr (std::is_same_v<T, GenericCaseExpr>) {
-            for (const auto& branch : node.branches)
-                found = found || exprNeedsCarriedString(branch.result, carries);
-            found = found || exprNeedsCarriedString(node.elseResult, carries);
-        }
-    }, expr->node);
-    return found;
+    return exprContainsCarriedString(expr, carries, true);
 }
 
 } // namespace codegen

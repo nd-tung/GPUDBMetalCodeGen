@@ -185,9 +185,11 @@ static void q3_compact_emit(device atomic_uint* counter,
         sortSpec.keys.push_back({"o_orderdate", false});
         sortSpec.limit = 10;
         std::string orderError;
-        appendBestGenericGpuOrder(plan, "q3_result", resultRows,
-                                  "maxOrderkey", columns, sortSpec,
-                                  &orderError);
+        if (!appendBestGenericGpuOrder(plan, "q3_result", resultRows,
+                                       "maxOrderkey", columns, sortSpec,
+                                       &orderError)) {
+            return std::nullopt;
+        }
     }
 
     return plan;

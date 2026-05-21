@@ -133,6 +133,9 @@ void validateExpr(const GenericRelPlan& plan,
         } else if constexpr (std::is_same_v<T, GenericAggregateExpr>) {
             if (!node.star)
                 validateExpr(plan, node.arg, result, path + ".arg");
+        } else if constexpr (std::is_same_v<T, GenericScalarSubqueryExpr>) {
+            if (node.index < 0)
+                addError(result, path + ": scalar subquery expression has no index");
         } else if constexpr (std::is_same_v<T, GenericScalarLookupExpr>) {
             if (node.source.valid() && !plan.findNode(node.source))
                 addError(result, path + ": scalar lookup references unknown source node");

@@ -1170,15 +1170,19 @@ std::unique_ptr<MetalOperator> appendScalarLookupLoads(
     return pipe;
 }
 
-std::string rewriteScalarLookupsInCondition(
+GenericScalarRewriteResult rewriteScalarLookupsInCondition(
         std::string condition,
         const std::vector<GenericScalarLookupInfo>* scalarLookups,
         const std::string& idxVar,
         const std::string& currentTable,
         const SchemaProvider* schema) {
-    if (!scalarLookups || scalarLookups->empty()) return condition;
-    return rewriteGenericScalarSentinels(condition, idxVar, *scalarLookups,
-                                         currentTable, schema);
+    if (!scalarLookups || scalarLookups->empty()) {
+        GenericScalarRewriteResult result;
+        result.text = std::move(condition);
+        return result;
+    }
+    return rewriteGenericScalarPlaceholdersWithDeps(
+        condition, idxVar, *scalarLookups, currentTable, schema);
 }
 
 std::string carryValueExpr(const IrCarryColumn& carry,
@@ -1982,12 +1986,10 @@ std::optional<MultiTableJoinLowering> buildMultiTableJoinLowering(
     auto predicateHasScalarLookup = [&](const GenericPredicatePtr& pred,
                                         const std::string& table) {
         if (!scalarLookups) return false;
-        std::string cond = genericPredicateToMetal(pred, idxVar);
-        if (referencesGenericScalarSentinel(cond, *scalarLookups)) return true;
-        cond = rewriteScalarLookupsInCondition(
-            std::move(cond), scalarLookups, idxVar, table,
+        auto rewrite = rewriteScalarLookupsInCondition(
+            genericPredicateToMetal(pred, idxVar), scalarLookups, idxVar, table,
             aq ? aq->schema : nullptr);
-        return referencesGenericScalarLookupBuffer(cond, *scalarLookups);
+        return rewrite.referencedScalarLookup || rewrite.needsScalarLookupBuffers;
     };
 
     auto applyPredicateFilters = [&](std::unique_ptr<MetalOperator> pipe,
@@ -1996,22 +1998,18 @@ std::optional<MultiTableJoinLowering> buildMultiTableJoinLowering(
                                      bool& scalarLookupsLoaded,
                                      bool& usesScalarLookupBuffer) {
         for (const auto& pred : filters) {
-            std::string cond = genericPredicateToMetal(pred, idxVar);
-            if (scalarLookups && referencesGenericScalarSentinel(cond, *scalarLookups) &&
-                !scalarLookupsLoaded) {
+            auto rewrite = rewriteScalarLookupsInCondition(
+                genericPredicateToMetal(pred, idxVar), scalarLookups, idxVar, table,
+                aq ? aq->schema : nullptr);
+            if (rewrite.needsScalarLookupLoads && !scalarLookupsLoaded) {
                 pipe = appendScalarLookupLoads(
                     std::move(pipe), scalarLookups, idxVar, table,
                     aq ? aq->schema : nullptr);
                 scalarLookupsLoaded = true;
             }
-            cond = rewriteScalarLookupsInCondition(
-                std::move(cond), scalarLookups, idxVar, table,
-                aq ? aq->schema : nullptr);
             usesScalarLookupBuffer =
-                usesScalarLookupBuffer ||
-                (scalarLookups &&
-                 referencesGenericScalarLookupBuffer(cond, *scalarLookups));
-            pipe = maybeSelect(std::move(pipe), cond);
+                usesScalarLookupBuffer || rewrite.needsScalarLookupBuffers;
+            pipe = maybeSelect(std::move(pipe), rewrite.text);
         }
         return pipe;
     };
@@ -2904,20 +2902,20 @@ std::optional<MultiTableJoinLowering> buildMultiTableJoinLowering(
         probeUsesScalarLookupBuffer);
 
     for (const auto& pred : crossFilters) {
-        std::string cond = genericPredicateToMetalWithCarryMap(pred, idxVar,
-                                                               lowering.carryMap);
-        if (scalarLookups && referencesGenericScalarSentinel(cond, *scalarLookups) &&
-            !probeScalarLookupsLoaded) {
+        auto rewrite = rewriteScalarLookupsInCondition(
+            genericPredicateToMetalWithCarryMap(pred, idxVar, lowering.carryMap),
+            scalarLookups, idxVar, probe->scan->table,
+            aq ? aq->schema : nullptr);
+        if (rewrite.needsScalarLookupLoads && !probeScalarLookupsLoaded) {
             lowering.probePipe = appendScalarLookupLoads(
                 std::move(lowering.probePipe), scalarLookups, idxVar,
                 probe->scan->table, aq ? aq->schema : nullptr);
             probeScalarLookupsLoaded = true;
         }
-        cond = rewriteScalarLookupsInCondition(
-            std::move(cond), scalarLookups, idxVar, probe->scan->table,
-            aq ? aq->schema : nullptr);
+        probeUsesScalarLookupBuffer =
+            probeUsesScalarLookupBuffer || rewrite.needsScalarLookupBuffers;
         lowering.probePipe = maybeSelect(
-            std::move(lowering.probePipe), cond);
+            std::move(lowering.probePipe), rewrite.text);
     }
 
     lowering.probeUsesScalarLookupBuffer = probeUsesScalarLookupBuffer;

@@ -136,9 +136,11 @@ static void q10_compact_emit(device atomic_uint* counter,
         sortSpec.keys.push_back({"c_custkey", false});
         sortSpec.limit = 20;
         std::string orderError;
-        appendBestGenericGpuOrder(plan, "q10_result", resultRows,
-                                  "maxCustkey", columns, sortSpec,
-                                  &orderError);
+        if (!appendBestGenericGpuOrder(plan, "q10_result", resultRows,
+                                       "maxCustkey", columns, sortSpec,
+                                       &orderError)) {
+            return std::nullopt;
+        }
         if (plan.gpuSort) {
             struct Q10LateMaterializeTerminal : MetalOperator {
                 std::string sortedIndexBuffer_;

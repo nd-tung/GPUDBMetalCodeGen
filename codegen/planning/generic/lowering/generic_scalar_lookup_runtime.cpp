@@ -1,6 +1,8 @@
 #include "generic/lowering/generic_scalar_lookup.h"
 
 #include "core/schema_provider.h"
+#include "generic/lowering/generic_scalar_hash_names.h"
+#include "scalar_subquery_placeholder.h"
 
 #include <sstream>
 
@@ -43,9 +45,10 @@ std::string scalarLookupKeyExpr(const ScalarLookupInfo& info,
 std::string scalarHashLookupRaw(const std::string& mapName,
                                 const std::string& key1,
                                 const std::string& key2) {
-    return "scalar_hash_lookup_raw64(" + mapName + "_states, " +
-           mapName + "_keys1, " + mapName + "_keys2, " +
-           mapName + "_values, n_" + mapName + ", " + key1 + ", " +
+    const auto names = scalarCompositeHashNames(mapName);
+    return "scalar_hash_lookup_raw64(" + names.states() + ", " +
+           names.keys1() + ", " + names.keys2() + ", " +
+           names.values() + ", " + names.capacity() + ", " + key1 + ", " +
            key2 + ")";
 }
 
@@ -90,9 +93,10 @@ std::string scalarLookupReplacement(const ScalarLookupInfo& info,
             return "(" + scalarFloatLiteral(info.multiplier) + " * (float)" +
                    info.countBuffer + "[" + key0 + "])";
         case ScalarLookupInfo::SumByCompositeHash: {
-            std::string val = "scalar_hash_lookup_float_or_nan64(" + info.hashMap + "_states, " +
-                              info.hashMap + "_keys1, " + info.hashMap + "_keys2, " +
-                              info.hashMap + "_values, n_" + info.hashMap + ", (uint)(" +
+            const auto names = scalarCompositeHashNames(info.hashMap);
+            std::string val = "scalar_hash_lookup_float_or_nan64(" + names.states() + ", " +
+                              names.keys1() + ", " + names.keys2() + ", " +
+                              names.values() + ", " + names.capacity() + ", (uint)(" +
                               key0 + "), (uint)(" + key1 + "))";
             return "(" + scalarFloatLiteral(info.multiplier) + " * " + val + ")";
         }
@@ -140,13 +144,44 @@ std::string scalarLookupReplacement(const ScalarLookupInfo& info,
     }
 }
 
-void replaceAll(std::string& str, const std::string& from, const std::string& to) {
-    if (from.empty()) return;
+bool replaceScalarLookupToken(std::string& str,
+                              const std::string& token,
+                              const std::string& replacement) {
+    if (token.empty()) return false;
+    bool replaced = false;
     size_t pos = 0;
-    while ((pos = str.find(from, pos)) != std::string::npos) {
-        str.replace(pos, from.size(), to);
-        pos += to.size();
+    while ((pos = str.find(token, pos)) != std::string::npos) {
+        str.replace(pos, token.size(), replacement);
+        pos += replacement.size();
+        replaced = true;
     }
+    return replaced;
+}
+
+std::string scalarLookupPlaceholderToken(const ScalarLookupInfo& info) {
+    if (info.scalarSubqueryIndex < 0) return "";
+    return scalarSubqueryPlaceholderToken(info.scalarSubqueryIndex);
+}
+
+bool scalarLookupNeedsPhaseBuffers(const ScalarLookupInfo& info) {
+    if (!info.scalarName.empty()) return true;
+    const bool global = info.kind == ScalarLookupInfo::GlobalSum ||
+                        info.kind == ScalarLookupInfo::GlobalAvg ||
+                        info.kind == ScalarLookupInfo::GlobalMin ||
+                        info.kind == ScalarLookupInfo::GlobalMax ||
+                        info.kind == ScalarLookupInfo::GlobalCount;
+    if (global) {
+        return !info.sumBuffer.empty() || !info.countBuffer.empty() ||
+               !info.minBuffer.empty() || !info.maxBuffer.empty() ||
+               !info.stateBuffer.empty();
+    }
+    if (info.kind == ScalarLookupInfo::AvgByKey)
+        return false;
+    return !info.sumBuffer.empty() || !info.countBuffer.empty() ||
+           !info.minBuffer.empty() || !info.maxBuffer.empty() ||
+           !info.stateBuffer.empty() || !info.hashMap.empty() ||
+           !info.countHashMap.empty() || !info.htFlags.empty() ||
+           !info.htKeys.empty() || !info.htVals.empty();
 }
 
 } // namespace
@@ -160,67 +195,38 @@ std::string genericScalarLookupKeyExpr(
     return scalarLookupKeyExpr(info, keyIndex, idxVar, probeTable, schema);
 }
 
-std::string rewriteGenericScalarSentinels(
+std::string rewriteGenericScalarPlaceholders(
         const std::string& cond,
         const std::string& idxVar,
         const std::vector<GenericScalarLookupInfo>& lookups,
         const std::string& probeTable,
         const SchemaProvider* schema) {
-    std::string result = cond;
+    return rewriteGenericScalarPlaceholdersWithDeps(
+        cond, idxVar, lookups, probeTable, schema).text;
+}
+
+GenericScalarRewriteResult rewriteGenericScalarPlaceholdersWithDeps(
+        const std::string& cond,
+        const std::string& idxVar,
+        const std::vector<GenericScalarLookupInfo>& lookups,
+        const std::string& probeTable,
+        const SchemaProvider* schema) {
+    GenericScalarRewriteResult result;
+    result.text = cond;
     for (const auto& info : lookups) {
-        replaceAll(result, std::to_string(info.sentinel),
-                   scalarLookupReplacement(info, idxVar, probeTable, schema));
+        if (replaceScalarLookupToken(
+                result.text, scalarLookupPlaceholderToken(info),
+                scalarLookupReplacement(info, idxVar, probeTable, schema))) {
+            result.referencedScalarLookup = true;
+            result.needsScalarLookupLoads =
+                result.needsScalarLookupLoads ||
+                info.kind == ScalarLookupInfo::AvgByKey;
+            result.needsScalarLookupBuffers =
+                result.needsScalarLookupBuffers ||
+                scalarLookupNeedsPhaseBuffers(info);
+        }
     }
     return result;
-}
-
-bool referencesGenericScalarSentinel(
-        const std::string& text,
-        const std::vector<GenericScalarLookupInfo>& lookups) {
-    for (const auto& info : lookups) {
-        if (text.find(std::to_string(info.sentinel)) != std::string::npos)
-            return true;
-    }
-    return false;
-}
-
-bool referencesGenericScalarLookupBuffer(
-        const std::string& text,
-        const std::vector<GenericScalarLookupInfo>& lookups) {
-    auto hasName = [&](const std::string& name) {
-        return !name.empty() && text.find(name) != std::string::npos;
-    };
-    for (const auto& info : lookups) {
-        if (hasName(info.sumBuffer) ||
-            hasName(info.countBuffer) ||
-            hasName(info.minBuffer) ||
-            hasName(info.maxBuffer) ||
-            hasName(info.stateBuffer) ||
-            hasName(info.htFlags) ||
-            hasName(info.htKeys) ||
-            hasName(info.htVals)) {
-            return true;
-        }
-        if (!info.hashMap.empty()) {
-            if (hasName(info.hashMap + "_states") ||
-                hasName(info.hashMap + "_keys1") ||
-                hasName(info.hashMap + "_keys2") ||
-                hasName(info.hashMap + "_values") ||
-                hasName("n_" + info.hashMap)) {
-                return true;
-            }
-        }
-        if (!info.countHashMap.empty()) {
-            if (hasName(info.countHashMap + "_states") ||
-                hasName(info.countHashMap + "_keys1") ||
-                hasName(info.countHashMap + "_keys2") ||
-                hasName(info.countHashMap + "_values") ||
-                hasName("n_" + info.countHashMap)) {
-                return true;
-            }
-        }
-    }
-    return false;
 }
 
 void attachGenericScalarLookupBuffers(
@@ -283,18 +289,20 @@ void attachGenericScalarLookupBuffers(
         if (!info.stateBuffer.empty())
             phase.extraBuffers.push_back({info.stateBuffer, "uint", true, false});
         if (!info.hashMap.empty()) {
-            phase.extraBuffers.push_back({info.hashMap + "_states", "uint", true, false});
-            phase.extraBuffers.push_back({info.hashMap + "_keys1", "uint", true, false});
-            phase.extraBuffers.push_back({info.hashMap + "_keys2", "uint", true, false});
-            phase.extraBuffers.push_back({info.hashMap + "_values", "uint", true, false});
-            addResolvedScalar("n_" + info.hashMap, "uint", info.hashCapacityExpr);
+            const auto names = scalarCompositeHashNames(info.hashMap);
+            phase.extraBuffers.push_back({names.states(), "uint", true, false});
+            phase.extraBuffers.push_back({names.keys1(), "uint", true, false});
+            phase.extraBuffers.push_back({names.keys2(), "uint", true, false});
+            phase.extraBuffers.push_back({names.values(), "uint", true, false});
+            addResolvedScalar(names.capacity(), "uint", info.hashCapacityExpr);
         }
         if (!info.countHashMap.empty()) {
-            phase.extraBuffers.push_back({info.countHashMap + "_states", "uint", true, false});
-            phase.extraBuffers.push_back({info.countHashMap + "_keys1", "uint", true, false});
-            phase.extraBuffers.push_back({info.countHashMap + "_keys2", "uint", true, false});
-            phase.extraBuffers.push_back({info.countHashMap + "_values", "uint", true, false});
-            addResolvedScalar("n_" + info.countHashMap, "uint", info.hashCapacityExpr);
+            const auto names = scalarCompositeHashNames(info.countHashMap);
+            phase.extraBuffers.push_back({names.states(), "uint", true, false});
+            phase.extraBuffers.push_back({names.keys1(), "uint", true, false});
+            phase.extraBuffers.push_back({names.keys2(), "uint", true, false});
+            phase.extraBuffers.push_back({names.values(), "uint", true, false});
+            addResolvedScalar(names.capacity(), "uint", info.hashCapacityExpr);
         }
         if (!info.htFlags.empty())
             phase.extraBuffers.push_back({info.htFlags, "uint", true, false});

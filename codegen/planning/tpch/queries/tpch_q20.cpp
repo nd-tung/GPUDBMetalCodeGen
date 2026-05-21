@@ -222,9 +222,11 @@ static void q20_result_emit(device atomic_uint* counter,
         GenericSortSpec sortSpec;
         sortSpec.keys.push_back({"s_name", false});
         std::string orderError;
-        appendBestGenericGpuOrder(plan, "q20_result", resultRows,
-                                  "n_supplier", columns, sortSpec,
-                                  &orderError);
+        if (!appendBestGenericGpuOrder(plan, "q20_result", resultRows,
+                                       "n_supplier", columns, sortSpec,
+                                       &orderError)) {
+            return std::nullopt;
+        }
     }
 
     return plan;

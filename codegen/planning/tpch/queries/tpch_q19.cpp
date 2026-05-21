@@ -9,33 +9,52 @@ std::optional<MetalQueryPlan> buildQ19Plan_byName() {
     MetalQueryPlan plan;
 
     // --- Helpers ---
-    // Fixed-width brand and container checks encode the three Q19 cases.
+    // Fixed-width brand and container checks encode the three Q19 part cases.
     plan.helpers.push_back(R"(
-static bool brand_eq(const device char* brand, uint idx, char d1, char d2) {
-    const device char* b = brand + idx * 10;
-    return b[0]=='B' && b[1]=='r' && b[2]=='a' && b[3]=='n' && b[4]=='d' && b[5]=='#' && b[6]==d1 && b[7]==d2;
+static bool q19_brand_eq(const device char* brand, uint idx, char d1, char d2) {
+    const device char* b = brand + (ulong)idx * 10ul;
+    return b[0] == 'B' && b[1] == 'r' && b[2] == 'a' &&
+           b[3] == 'n' && b[4] == 'd' && b[5] == '#' &&
+           b[6] == d1 && b[7] == d2 &&
+           (b[8] == '\0' || b[8] == ' ') &&
+           (b[9] == '\0' || b[9] == ' ');
 }
-static int container_match(const device char* cont, uint idx) {
-    const device char* c = cont + idx * 10;
-    // SM CASE/BOX/PACK/PKG -> 1
-    if (c[0]=='S' && c[1]=='M' && c[2]==' ') {
-        char c3=c[3],c4=c[4],c5=c[5];
-        if ((c3=='C'&&c4=='A'&&c5=='S') || (c3=='B'&&c4=='O') ||
-            (c3=='P'&&c4=='A'&&c5=='C') || (c3=='P'&&c4=='K')) return 1;
+static int q19_container_match(const device char* container, uint idx) {
+    const device char* c = container + (ulong)idx * 10ul;
+    if (c[0] == 'S' && c[1] == 'M' && c[2] == ' ') {
+        if ((c[3] == 'C' && c[4] == 'A' && c[5] == 'S' && c[6] == 'E') ||
+            (c[3] == 'B' && c[4] == 'O' && c[5] == 'X') ||
+            (c[3] == 'P' && c[4] == 'A' && c[5] == 'C' && c[6] == 'K') ||
+            (c[3] == 'P' && c[4] == 'K' && c[5] == 'G')) return 1;
     }
-    // MED BAG/BOX/PKG/PACK -> 2
-    if (c[0]=='M' && c[1]=='E' && c[2]=='D' && c[3]==' ') {
-        char c4=c[4],c5=c[5],c6=c[6];
-        if ((c4=='B'&&c5=='A'&&c6=='G') || (c4=='B'&&c5=='O') ||
-            (c4=='P'&&c5=='K') || (c4=='P'&&c5=='A'&&c6=='C')) return 2;
+    if (c[0] == 'M' && c[1] == 'E' && c[2] == 'D' && c[3] == ' ') {
+        if ((c[4] == 'B' && c[5] == 'A' && c[6] == 'G') ||
+            (c[4] == 'B' && c[5] == 'O' && c[6] == 'X') ||
+            (c[4] == 'P' && c[5] == 'K' && c[6] == 'G') ||
+            (c[4] == 'P' && c[5] == 'A' && c[6] == 'C' && c[7] == 'K')) return 2;
     }
-    // LG CASE/BOX/PACK/PKG -> 3
-    if (c[0]=='L' && c[1]=='G' && c[2]==' ') {
-        char c3=c[3],c4=c[4],c5=c[5];
-        if ((c3=='C'&&c4=='A'&&c5=='S') || (c3=='B'&&c4=='O') ||
-            (c3=='P'&&c4=='A'&&c5=='C') || (c3=='P'&&c4=='K')) return 3;
+    if (c[0] == 'L' && c[1] == 'G' && c[2] == ' ') {
+        if ((c[3] == 'C' && c[4] == 'A' && c[5] == 'S' && c[6] == 'E') ||
+            (c[3] == 'B' && c[4] == 'O' && c[5] == 'X') ||
+            (c[3] == 'P' && c[4] == 'A' && c[5] == 'C' && c[6] == 'K') ||
+            (c[3] == 'P' && c[4] == 'K' && c[5] == 'G')) return 3;
     }
     return 0;
+}
+static uchar q19_part_condition(const device char* brand,
+                                const device char* container,
+                                const device int* size,
+                                uint idx) {
+    int c = q19_container_match(container, idx);
+    int s = size[idx];
+    uchar mask = 0;
+    if (c == 1 && s >= 1 && s <= 5 &&
+        q19_brand_eq(brand, idx, '1', '2')) mask |= 1;
+    if (c == 2 && s >= 1 && s <= 10 &&
+        q19_brand_eq(brand, idx, '2', '3')) mask |= 2;
+    if (c == 3 && s >= 1 && s <= 15 &&
+        q19_brand_eq(brand, idx, '3', '4')) mask |= 4;
+    return mask;
 }
 )");
 
@@ -43,47 +62,62 @@ static int container_match(const device char* cont, uint idx) {
     // Bitmask values identify which Q19 quantity range applies.
     {
         auto scan = makeAutoScan("part", idx);
+        scan->addColumn("p_partkey", "int");
+        scan->addColumn("p_brand", "char");
+        scan->addColumn("p_container", "char");
+        scan->addColumn("p_size", "int");
+        std::string condExpr =
+            "q19_part_condition(p_brand, p_container, p_size, " + idx + ")";
 
         auto computeCond = std::make_unique<MetalComputeExpr>(
-            std::move(scan), "_cond", "int",
-            "(brand_eq(p_brand, " + idx + ", '1', '2') && container_match(p_container, " + idx + ") == 1 && "
-            "p_size[" + idx + "] >= 1 && p_size[" + idx + "] <= 5 ? 1 : 0) | "
-            "(brand_eq(p_brand, " + idx + ", '2', '3') && container_match(p_container, " + idx + ") == 2 && "
-            "p_size[" + idx + "] >= 1 && p_size[" + idx + "] <= 10 ? 2 : 0) | "
-            "(brand_eq(p_brand, " + idx + ", '3', '4') && container_match(p_container, " + idx + ") == 3 && "
-            "p_size[" + idx + "] >= 1 && p_size[" + idx + "] <= 15 ? 4 : 0)");
-
-        auto filtered = std::make_unique<MetalSelection>(std::move(computeCond), "_cond > 0");
-
+            std::move(scan), "_q19_part_cond", "uchar", condExpr);
+        auto filtered = std::make_unique<MetalSelection>(
+            std::move(computeCond), "_q19_part_cond > 0");
         auto store = std::make_unique<MetalArrayStore>(
-            std::move(filtered), "d_part_cond",
-            "p_partkey[" + idx + "]", "_cond", "int", "maxPartkey");
-
+            std::move(filtered), "d_q19_part_cond",
+            "p_partkey[" + idx + "]", "_q19_part_cond", "uchar",
+            "maxPartkey", /*fillByte=*/0);
         appendPhase(plan, "Q19_build_part_cond", std::move(store), 256);
     }
 
     // --- Revenue Reduction ---
-    // Probe part conditions, check quantity ranges, then reduce revenue.
+    // Probe candidate branch masks, re-check quantity, then reduce revenue.
     {
         auto scan = makeAutoScan("lineitem", idx);
+        scan->addColumn("l_shipmode", "char");
+        scan->addColumn("l_shipinstruct", "char");
+        scan->addColumn("l_quantity", "float");
+        scan->addColumn("l_partkey", "int");
+        scan->addColumn("l_extendedprice", "float");
+        scan->addColumn("l_discount", "float");
+        std::string shipModeCond =
+            "((l_shipmode[(ulong)" + idx + " * 2ul] == 'A' && l_shipmode[(ulong)" + idx + " * 2ul + 1ul] == 'I') || "
+            "(l_shipmode[(ulong)" + idx + " * 2ul] == 'R' && l_shipmode[(ulong)" + idx + " * 2ul + 1ul] == 'E'))";
+        std::string instructCond =
+            "l_shipinstruct[(ulong)" + idx + " * 25ul] == 'D'";
+        std::string qtyCond =
+            "((l_quantity[" + idx + "] >= 1.0f && l_quantity[" + idx + "] <= 11.0f) || "
+            "(l_quantity[" + idx + "] >= 10.0f && l_quantity[" + idx + "] <= 20.0f) || "
+            "(l_quantity[" + idx + "] >= 20.0f && l_quantity[" + idx + "] <= 30.0f))";
+        auto lineFiltered = std::make_unique<MetalSelection>(
+            std::move(scan), shipModeCond + " && " + instructCond + " && " + qtyCond);
 
-        // AIR/REG AIR and DELIVER IN PERSON are identified by fixed prefixes.
-        auto filtered = std::make_unique<MetalSelection>(std::move(scan),
-            "(l_shipmode[" + idx + " * 2] == 'A' || (l_shipmode[" + idx + " * 2] == 'R' && l_shipmode[" + idx + " * 2 + 1] == 'E')) && l_shipinstruct[" + idx + " * 25] == 'D'");
+        auto condLookup = std::make_unique<MetalArrayLookup>(
+            std::move(lineFiltered), "d_q19_part_cond",
+            "l_partkey[" + idx + "]", "_q19_part_cond", "uchar", 0);
 
-        auto lookup = std::make_unique<MetalArrayLookup>(
-            std::move(filtered), "d_part_cond",
-            "l_partkey[" + idx + "]", "_cond", "int", -1);
+        std::string branchQtyCond =
+            "(((_q19_part_cond & 1) != 0 && l_quantity[" + idx + "] >= 1.0f && l_quantity[" + idx + "] <= 11.0f) || "
+            "((_q19_part_cond & 2) != 0 && l_quantity[" + idx + "] >= 10.0f && l_quantity[" + idx + "] <= 20.0f) || "
+            "((_q19_part_cond & 4) != 0 && l_quantity[" + idx + "] >= 20.0f && l_quantity[" + idx + "] <= 30.0f))";
+        auto branchFiltered = std::make_unique<MetalSelection>(
+            std::move(condLookup), branchQtyCond);
 
-        std::string qtyCheck =
-            "((_cond & 1) && l_quantity[" + idx + "] >= 1.0f && l_quantity[" + idx + "] <= 11.0f) || "
-            "((_cond & 2) && l_quantity[" + idx + "] >= 10.0f && l_quantity[" + idx + "] <= 20.0f) || "
-            "((_cond & 4) && l_quantity[" + idx + "] >= 20.0f && l_quantity[" + idx + "] <= 30.0f)";
-        auto qtyFiltered = std::make_unique<MetalSelection>(std::move(lookup), qtyCheck);
-
-        std::string revenue = "(long)(l_extendedprice[" + idx + "] * (1.0f - l_discount[" + idx + "]) * 100.0f)";
-        auto reduce = std::make_unique<MetalTGReduce>(std::move(qtyFiltered), "d_q19");
-        reduce->addAccumulator("revenue", revenue, "long");
+        std::string revenueExpr =
+            "(long)round(l_extendedprice[" + idx + "] * (1.0f - l_discount[" +
+            idx + "]) * 100.0f)";
+        auto reduce = std::make_unique<MetalTGReduce>(std::move(branchFiltered), "d_q19");
+        reduce->addAccumulator("revenue", revenueExpr, "long");
         reduce->setResultAlias("revenue", 100);
 
         appendPhase(plan, "Q19_reduce", std::move(reduce));

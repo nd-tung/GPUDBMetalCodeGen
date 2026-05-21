@@ -13,33 +13,8 @@ namespace codegen {
 
 namespace {
 
-size_t elementBytes(const ColSpec& spec) {
-    switch (spec.type) {
-        case ColType::INT:
-        case ColType::DATE:
-            return sizeof(int32_t);
-        case ColType::FLOAT:
-            return sizeof(float);
-        case ColType::CHAR1:
-            return 1;
-        case ColType::CHAR_FIXED:
-            return (size_t)std::max(spec.fixedWidth, 1);
-    }
-    return 1;
-}
-
 std::string errnoMessage(const std::string& path) {
     return path + ": " + std::strerror(errno);
-}
-
-bool descriptorMatches(const colbin::ColDesc& desc, const ColSpec& spec,
-                       size_t rows, size_t fileSize) {
-    const size_t elem = elementBytes(spec);
-    if (desc.columnIndex != spec.columnIndex) return false;
-    if (colbin::decodeType(desc.dtype) != spec.type) return false;
-    if (spec.type == ColType::CHAR_FIXED && desc.fixedWidth != spec.fixedWidth) return false;
-    if (desc.offset + desc.size_bytes > fileSize) return false;
-    return desc.size_bytes == rows * elem;
 }
 
 } // namespace
@@ -105,11 +80,7 @@ bool ChunkedColbinTable::open(MTL::Device* device,
 
     colbin::FileHeader header{};
     std::memcpy(&header, base, sizeof(header));
-    if (std::memcmp(header.magic, colbin::MAGIC, 8) != 0 ||
-        header.version != colbin::VERSION ||
-        (tblPresent && (header.source_size != tblSize ||
-                        header.source_mtime_ns != tblMtime)) ||
-        sizeof(colbin::FileHeader) + header.n_cols * sizeof(colbin::ColDesc) > fileSize) {
+    if (!colbin::validateHeader(header, fileSize, tblPresent, tblSize, tblMtime)) {
         ::munmap(base, fileSize);
         error = "stale or invalid .colbin for " + tblPath + " (run make colbin-sfN)";
         return false;
@@ -127,12 +98,13 @@ bool ChunkedColbinTable::open(MTL::Device* device,
     columns.reserve(specs.size());
     for (const auto& spec : specs) {
         auto it = byIndex.find(spec.columnIndex);
-        if (it == byIndex.end() || !descriptorMatches(*it->second, spec, header.n_rows, fileSize)) {
+        if (it == byIndex.end() ||
+            !colbin::descriptorMatches(*it->second, spec, header.n_rows, fileSize)) {
             ::munmap(base, fileSize);
             error = "column descriptor mismatch in " + colbinPath + " (run make colbin-sfN)";
             return false;
         }
-        columns.push_back(ColumnInfo{spec, *it->second, elementBytes(spec)});
+        columns.push_back(ColumnInfo{spec, *it->second, colbin::elementBytes(spec)});
     }
 
     std::vector<Slot> slots((size_t)slotCount);

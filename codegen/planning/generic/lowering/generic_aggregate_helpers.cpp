@@ -4,15 +4,17 @@
 #include "generic/gpu_ops/generic_gpu_physical_ops.h"
 #include "generic/lowering/generic_expression_metal.h"
 #include "generic/lowering/generic_plan_shapes.h"
-#include "generic/lowering/generic_scalar_sentinel.h"
+#include "generic/lowering/generic_scalar_placeholder.h"
 #include "query_analyzer.h"
 
 #include <algorithm>
 #include <cctype>
 #include <iomanip>
 #include <map>
+#include <memory>
 #include <sstream>
 #include <type_traits>
+#include <utility>
 
 namespace codegen {
 
@@ -97,6 +99,40 @@ std::optional<double> numericLiteralValue(const GenericExprPtr& expr) {
         else
             return std::nullopt;
     }, lit->value);
+}
+
+bool scaleNeutralFactor(const GenericExprPtr& expr) {
+    if (!expr) return false;
+    if (numericLiteralValue(expr)) return true;
+    return expr->type.type == DataType::INT;
+}
+
+int scalarSumFixedPointScaleForExpr(const GenericExprPtr& expr) {
+    const int directScale = numericScaleForExpr(expr);
+    if (directScale > 0) return directScale;
+    if (!expr) return 0;
+    auto* bin = std::get_if<GenericBinaryExpr>(&expr->node);
+    if (!bin) return 0;
+
+    const int leftScale = scalarSumFixedPointScaleForExpr(bin->left);
+    const int rightScale = scalarSumFixedPointScaleForExpr(bin->right);
+    switch (bin->op) {
+        case ExprOp::ADD:
+        case ExprOp::SUB:
+            if (leftScale > 0 && leftScale == rightScale) return leftScale;
+            if (leftScale > 0 && numericLiteralValue(bin->right)) return leftScale;
+            if (rightScale > 0 && numericLiteralValue(bin->left)) return rightScale;
+            return 0;
+        case ExprOp::MUL:
+            if (leftScale > 0 && rightScale > 0)
+                return std::max(leftScale, rightScale);
+            if (leftScale > 0 && scaleNeutralFactor(bin->right)) return leftScale;
+            if (rightScale > 0 && scaleNeutralFactor(bin->left)) return rightScale;
+            return 0;
+        case ExprOp::DIV:
+            return 0;
+    }
+    return 0;
 }
 
 CmpOp reverseCmpOp(CmpOp op) {
@@ -288,6 +324,8 @@ std::optional<std::string> genericExprSignatureForIr(const GenericExprPtr& expr)
             auto arg = genericExprSignatureForIr(node.arg);
             if (!arg) return std::nullopt;
             return "agg:" + aggFuncSignatureName(node.func) + "(" + *arg + ")";
+        } else if constexpr (std::is_same_v<T, GenericScalarSubqueryExpr>) {
+            return "scalar_subquery:" + std::to_string(node.index);
         } else {
             return std::nullopt;
         }
@@ -688,7 +726,6 @@ bool configureAggregateScalarHaving(const GenericAggregateDetail& aggregate,
                                     int aggIdx,
                                     CmpOp op,
                                     int sqIdx,
-                                    int sentinel,
                                     const AnalyzedQuery* aq,
                                     const MultiTableGroupedAggShape* shape,
                                     GenericGroupSpec& groupSpec,
@@ -747,7 +784,6 @@ bool configureAggregateScalarHaving(const GenericAggregateDetail& aggregate,
 
     groupSpec.havingAggIdx = aggIdx;
     groupSpec.havingMultiplier = summary->aggregate.multiplier;
-    groupSpec.havingSentinel = sentinel;
     groupSpec.havingScalarCompareOp = cmpOpToMetal(op);
     return true;
 }
@@ -770,28 +806,17 @@ bool configureAggregateHaving(const GenericAggregateDetail& aggregate,
 
     auto aggIdx = aggregateIndexForHavingExpr(cmp->left, aggregate);
     CmpOp op = cmp->op;
-    auto sqIdx = scalarSubqueryIndexFromSentinelLiteral(cmp->right);
-    int sentinel = 0;
-    if (sqIdx) {
-        auto* lit = std::get_if<GenericLiteralExpr>(&cmp->right->node);
-        auto* value = lit ? std::get_if<int64_t>(&lit->value) : nullptr;
-        sentinel = value ? static_cast<int>(*value) : 0;
-    }
+    auto sqIdx = scalarSubqueryIndexFromExpr(cmp->right);
 
     if (!aggIdx || !sqIdx) {
         aggIdx = aggregateIndexForHavingExpr(cmp->right, aggregate);
         op = reverseCmpOp(cmp->op);
-        sqIdx = scalarSubqueryIndexFromSentinelLiteral(cmp->left);
-        if (sqIdx) {
-            auto* lit = std::get_if<GenericLiteralExpr>(&cmp->left->node);
-            auto* value = lit ? std::get_if<int64_t>(&lit->value) : nullptr;
-            sentinel = value ? static_cast<int>(*value) : 0;
-        }
+        sqIdx = scalarSubqueryIndexFromExpr(cmp->left);
     }
 
     if (aggIdx && sqIdx) {
         return configureAggregateScalarHaving(aggregate, *aggIdx, op, *sqIdx,
-                                              sentinel, aq, shape, groupSpec, error);
+                                              aq, shape, groupSpec, error);
     }
 
     aggIdx = aggregateIndexForHavingExpr(cmp->left, aggregate);
@@ -804,8 +829,8 @@ bool configureAggregateHaving(const GenericAggregateDetail& aggregate,
         op = reverseCmpOp(cmp->op);
     }
 
-    if ((literal && isScalarSubquerySentinelLiteral(cmp->left)) ||
-        (literal && isScalarSubquerySentinelLiteral(cmp->right))) {
+    if ((literal && isScalarSubqueryPlaceholderExpr(cmp->left)) ||
+        (literal && isScalarSubqueryPlaceholderExpr(cmp->right))) {
         if (error)
             *error = "IR grouped aggregate lowerer: scalar-subquery HAVING requires decorrelation.";
         return false;
@@ -868,6 +893,8 @@ bool genericExprEquivalent(const GenericExprPtr& left, const GenericExprPtr& rig
                    lnode.star == rnode->star &&
                    lnode.distinct == rnode->distinct &&
                    genericExprEquivalent(lnode.arg, rnode->arg);
+        } else if constexpr (std::is_same_v<L, GenericScalarSubqueryExpr>) {
+            return lnode.index == rnode->index;
         } else if constexpr (std::is_same_v<L, GenericScalarLookupExpr>) {
             if (lnode.source.value != rnode->source.value ||
                 lnode.outputName != rnode->outputName ||
@@ -963,6 +990,39 @@ int numericScaleForExpr(const GenericExprPtr& expr) {
     return 0;
 }
 
+std::optional<ScalarReduceAccumulatorSpec> buildScalarReduceAccumulatorSpec(
+        AggFunc func,
+        const GenericExprPtr& arg,
+        std::string valueExpr) {
+    if (!arg) return std::nullopt;
+
+    ScalarReduceAccumulatorSpec spec;
+    spec.valueExpr = std::move(valueExpr);
+    spec.metalType = arg->type.type == DataType::FLOAT ? "float" : "long";
+
+    if (func == AggFunc::MIN) {
+        spec.op = ScalarReduceAccumulatorSpec::Op::Min;
+    } else if (func == AggFunc::MAX) {
+        spec.op = ScalarReduceAccumulatorSpec::Op::Max;
+    } else if (func != AggFunc::SUM) {
+        return std::nullopt;
+    }
+
+    if (spec.op == ScalarReduceAccumulatorSpec::Op::Sum &&
+        arg->type.type == DataType::FLOAT) {
+        spec.outputScale = scalarSumFixedPointScaleForExpr(arg);
+        if (spec.outputScale > 0) {
+            spec.valueExpr = scaledLongExpr(spec.valueExpr, spec.outputScale);
+            spec.metalType = "long";
+        }
+    } else if (spec.op != ScalarReduceAccumulatorSpec::Op::Sum &&
+               arg->type.type != DataType::FLOAT) {
+        spec.metalType = "int";
+    }
+
+    return spec;
+}
+
 std::string distinctDomainSymbolForExpr(const GenericExprPtr& expr) {
     if (!expr) return "";
     if (auto* col = std::get_if<GenericColumnExpr>(&expr->node))
@@ -994,6 +1054,95 @@ std::string aggregateOutputFuncFor(const GenericAggregateDetail& aggregate,
         return aggregate.aggregateOutputFuncs[index];
     }
     return aggFuncName(fallback);
+}
+
+bool buildAggregateInputGroupSpec(
+        const GenericAggregateDetail& aggregate,
+        const std::string& errorContext,
+        GenericGroupSpec& groupSpec,
+        std::vector<IrGroupKeyDesc>& groupKeys,
+        const AggregateInputColumnBuilder& addInputColumn,
+        std::string* error) {
+    for (size_t i = 0; i < aggregate.groupBy.size(); ++i) {
+        const auto& group = aggregate.groupBy[i];
+        const std::string displayName = groupDisplayNameForAggregate(aggregate, i);
+        groupSpec.keyColumns.push_back(displayName);
+        IrGroupKeyDesc key;
+        key.displayName = displayName;
+        groupKeys.push_back(std::move(key));
+        if (!addInputColumn(displayName,
+                            group ? group->type : TypeInfo{DataType::INT, 0},
+                            group, 0, "")) {
+            return false;
+        }
+    }
+
+    for (size_t i = 0; i < aggregate.aggregates.size(); ++i) {
+        const auto& projection = aggregate.aggregates[i];
+        auto* agg = projection.expr
+            ? std::get_if<GenericAggregateExpr>(&projection.expr->node)
+            : nullptr;
+        if (!agg) {
+            if (error) *error = errorContext + ": non-aggregate projection.";
+            return false;
+        }
+        const std::string displayName = projection.name.empty()
+            ? "agg_" + std::to_string(i)
+            : projection.name;
+
+        GenericExprPtr inputExpr;
+        TypeInfo inputType{DataType::FLOAT, 0};
+        int inputScaleDown = 0;
+        std::string distinctDomainSymbol;
+        std::string funcName = aggregateOutputFuncFor(aggregate, i, agg->func);
+
+        if (agg->func == AggFunc::COUNT) {
+            GenericExpr lit;
+            lit.type = inputType;
+            lit.node = GenericLiteralExpr{1.0, inputType};
+            inputExpr = std::make_shared<GenericExpr>(std::move(lit));
+            funcName = "COUNT";
+        } else {
+            if (!agg->arg) {
+                if (error) {
+                    *error = errorContext + ": aggregate '" +
+                             aggFuncName(agg->func) + "' requires an argument.";
+                }
+                return false;
+            }
+            inputExpr = agg->arg;
+            if (agg->func == AggFunc::COUNT_DISTINCT) {
+                if (agg->arg->type.type == DataType::CHAR_FIXED) {
+                    if (error) {
+                        *error = errorContext +
+                                 ": COUNT(DISTINCT) over fixed strings is not supported yet.";
+                    }
+                    return false;
+                }
+                distinctDomainSymbol = distinctDomainSymbolForExpr(agg->arg);
+                inputType = agg->arg->type;
+                funcName = "COUNT_DISTINCT";
+            } else if (agg->func == AggFunc::SUM || agg->func == AggFunc::AVG) {
+                inputScaleDown = numericScaleForExpr(agg->arg);
+            } else if (agg->func != AggFunc::MIN && agg->func != AggFunc::MAX) {
+                if (error) {
+                    *error = errorContext + ": unsupported aggregate " +
+                             aggFuncName(agg->func) + ".";
+                }
+                return false;
+            }
+        }
+
+        groupSpec.aggColumns.push_back(displayName);
+        groupSpec.aggFuncs.push_back(funcName);
+        if (!addInputColumn(displayName, inputType, inputExpr, inputScaleDown,
+                            distinctDomainSymbol)) {
+            return false;
+        }
+    }
+
+    groupSpec.outputColumns = aggregate.outputOrder;
+    return true;
 }
 
 bool aggregateNeedsHashGroupOutput(const GenericAggregateDetail& aggregate) {

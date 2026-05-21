@@ -2,6 +2,7 @@
 
 #include "generic/ir/generic_relational_ir.h"
 
+#include <functional>
 #include <optional>
 #include <string>
 #include <vector>
@@ -40,6 +41,15 @@ struct IrPendingAgg {
     std::string innerColumn;
 };
 
+struct ScalarReduceAccumulatorSpec {
+    enum class Op { Sum, Min, Max };
+
+    std::string valueExpr;
+    std::string metalType = "float";
+    int outputScale = 0;
+    Op op = Op::Sum;
+};
+
 bool genericExprEquivalent(const GenericExprPtr& left,
                            const GenericExprPtr& right);
 
@@ -52,6 +62,10 @@ std::string char1BucketExpr(const GenericColumnExpr& col,
                             const std::string& idxVar);
 std::string scaledLongExpr(const std::string& rawExpr, int scale);
 int numericScaleForExpr(const GenericExprPtr& expr);
+std::optional<ScalarReduceAccumulatorSpec> buildScalarReduceAccumulatorSpec(
+    AggFunc func,
+    const GenericExprPtr& arg,
+    std::string valueExpr);
 std::string distinctDomainSymbolForExpr(const GenericExprPtr& expr);
 std::string innerColumnName(const GenericExprPtr& expr);
 
@@ -63,6 +77,21 @@ std::string aggregateOutputFuncFor(
     const GenericAggregateDetail& aggregate,
     size_t index,
     AggFunc fallback);
+
+using AggregateInputColumnBuilder = std::function<bool(
+    const std::string& displayName,
+    const TypeInfo& type,
+    const GenericExprPtr& expr,
+    int scaleDown,
+    const std::string& distinctDomainSymbol)>;
+
+bool buildAggregateInputGroupSpec(
+    const GenericAggregateDetail& aggregate,
+    const std::string& errorContext,
+    GenericGroupSpec& groupSpec,
+    std::vector<IrGroupKeyDesc>& groupKeys,
+    const AggregateInputColumnBuilder& addInputColumn,
+    std::string* error);
 
 bool aggregateNeedsHashGroupOutput(const GenericAggregateDetail& aggregate);
 bool canUseKeyedSingleTableGroup(const GenericAggregateDetail& aggregate);

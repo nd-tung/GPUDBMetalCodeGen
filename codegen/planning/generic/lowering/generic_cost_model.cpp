@@ -5,7 +5,6 @@
 #include <cctype>
 #include <cmath>
 #include <cstdlib>
-#include <cstring>
 #include <fstream>
 #include <iomanip>
 #include <limits>
@@ -219,16 +218,9 @@ std::optional<int> currentTpchScaleFactor() {
 
 std::optional<size_t> readColbinRowCount(const std::string& table) {
     const std::string path = ::g_dataset_path + table + ".colbin";
-    std::ifstream in(path, std::ios::binary);
-    if (!in) return std::nullopt;
-    colbin::FileHeader hdr{};
-    in.read(reinterpret_cast<char*>(&hdr), sizeof(hdr));
-    if (!in) return std::nullopt;
-    if (std::memcmp(hdr.magic, colbin::MAGIC, sizeof(hdr.magic)) != 0 ||
-        hdr.version != colbin::VERSION) {
-        return std::nullopt;
-    }
-    return static_cast<size_t>(hdr.n_rows);
+    uint64_t rows = 0;
+    if (!colbin::peekRowCount(path, rows)) return std::nullopt;
+    return static_cast<size_t>(rows);
 }
 
 std::optional<size_t> fallbackTpchRowCount(const std::string& table) {

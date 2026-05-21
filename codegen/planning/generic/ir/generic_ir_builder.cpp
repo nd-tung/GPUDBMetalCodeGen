@@ -84,6 +84,8 @@ TypeInfo typeFromExpr(const ExprPtr& expr) {
             std::transform(name.begin(), name.end(), name.begin(), ::tolower);
             if (name == "avg") return floatType();
             return intType();
+        } else if constexpr (std::is_same_v<T, ScalarSubqueryRef>) {
+            return floatType();
         }
         return intType();
     }, expr->node);
@@ -173,6 +175,8 @@ bool analyzedExprEquivalent(const ExprPtr& left, const ExprPtr& right) {
             return true;
         } else if constexpr (std::is_same_v<L, CaseWhen>) {
             return false;
+        } else if constexpr (std::is_same_v<L, ScalarSubqueryRef>) {
+            return lnode.index == rnode->index;
         }
         return false;
     }, left->node);
@@ -449,6 +453,14 @@ public:
                 GenericExpr out;
                 out.type = fn.type;
                 out.node = std::move(fn);
+                return makeExpr(std::move(out));
+            } else if constexpr (std::is_same_v<T, ScalarSubqueryRef>) {
+                GenericScalarSubqueryExpr scalar;
+                scalar.index = node.index;
+                scalar.type = typeFromExpr(expr);
+                GenericExpr out;
+                out.type = scalar.type;
+                out.node = std::move(scalar);
                 return makeExpr(std::move(out));
             }
             return nullptr;

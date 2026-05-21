@@ -163,8 +163,11 @@ static void q5_emit_nation_result(device atomic_uint* counter,
         std::string sortError;
         if (!appendGenericGpuSmallSort(plan, "q5_result", resultRows,
                                        32, columns, sortSpec, &sortError)) {
-            appendGenericGpuSort(plan, "q5_result", resultRows,
-                                 "q5_result_cap", columns, sortSpec, &sortError);
+            if (!appendGenericGpuSort(plan, "q5_result", resultRows,
+                                      "q5_result_cap", columns, sortSpec,
+                                      &sortError)) {
+                return std::nullopt;
+            }
         }
     }
 
