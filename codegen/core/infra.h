@@ -547,10 +547,29 @@ inline ColType decodeType(uint8_t b) {
     }
 }
 
-inline std::string binaryPath(const std::string& tblPath) {
-    auto pos = tblPath.rfind('.');
-    std::string base = (pos == std::string::npos) ? tblPath : tblPath.substr(0, pos);
+inline bool hasSuffix(const std::string& text, const std::string& suffix) {
+    return text.size() >= suffix.size() &&
+           text.compare(text.size() - suffix.size(), suffix.size(), suffix) == 0;
+}
+
+inline std::string pathBase(const std::string& dataPath) {
+    auto pos = dataPath.rfind('.');
+    return (pos == std::string::npos) ? dataPath : dataPath.substr(0, pos);
+}
+
+inline bool isBinaryPath(const std::string& dataPath) {
+    return hasSuffix(dataPath, ".colbin");
+}
+
+inline std::string binaryPath(const std::string& dataPath) {
+    if (isBinaryPath(dataPath)) return dataPath;
+    std::string base = pathBase(dataPath);
     return base + ".colbin";
+}
+
+inline std::string textPath(const std::string& dataPath) {
+    if (hasSuffix(dataPath, ".tbl")) return dataPath;
+    return pathBase(dataPath) + ".tbl";
 }
 
 inline bool statFile(const std::string& p, size_t& sz, int64_t& mtimeNs) {
@@ -669,13 +688,14 @@ inline bool peekRowCount(const std::string& colbinPath,
     return true;
 }
 
-inline bool loadColumnsFromBinary(const std::string& tblPath,
+inline bool loadColumnsFromBinary(const std::string& dataPath,
                                   const std::vector<ColSpec>& specs,
                                   LoadedColumns& out)
 {
-    const std::string cp = binaryPath(tblPath);
+    const std::string cp = binaryPath(dataPath);
     size_t tblSize = 0; int64_t tblMtime = 0;
-    const bool tblPresent = statFile(tblPath, tblSize, tblMtime);
+    const bool checkSource = !isBinaryPath(dataPath);
+    const bool tblPresent = checkSource && statFile(textPath(dataPath), tblSize, tblMtime);
     // .tbl is optional: if missing, trust the .colbin's internal header and
     // skip source-size/mtime cross-check (tbl files may be deleted to save
     // disk once .colbin has been generated).
@@ -905,14 +925,15 @@ struct MappedColumns {
 namespace colbin {
 
 inline MappedColumns loadColumnsAsBuffers(MTL::Device* device,
-                                           const std::string& tblPath,
+                                           const std::string& dataPath,
                                            const std::vector<ColSpec>& specs) {
     MappedColumns out;
     if (!device) return out;
 
-    const std::string cp = binaryPath(tblPath);
+    const std::string cp = binaryPath(dataPath);
     size_t tblSize = 0; int64_t tblMtime = 0;
-    const bool tblPresent = statFile(tblPath, tblSize, tblMtime);
+    const bool checkSource = !isBinaryPath(dataPath);
+    const bool tblPresent = checkSource && statFile(textPath(dataPath), tblSize, tblMtime);
     // .tbl is optional once .colbin has been generated.
 
     int fd = ::open(cp.c_str(), O_RDONLY);
@@ -1154,14 +1175,16 @@ inline void QueryColumns::_adoptCopied(MTL::Device* dev, LoadedColumns&& lc, con
 }
 
 inline bool QueryColumns::_adoptCopiedColbin(MTL::Device* dev,
-                                             const std::string& tblPath,
+                                             const std::string& dataPath,
                                              const std::vector<ColSpec>& specs) {
     if (!dev || specs.empty()) return false;
 
-    const std::string cp = colbin::binaryPath(tblPath);
+    const std::string cp = colbin::binaryPath(dataPath);
     size_t tblSize = 0;
     int64_t tblMtime = 0;
-    const bool tblPresent = colbin::statFile(tblPath, tblSize, tblMtime);
+    const bool checkSource = !colbin::isBinaryPath(dataPath);
+    const bool tblPresent = checkSource &&
+        colbin::statFile(colbin::textPath(dataPath), tblSize, tblMtime);
 
     int fd = ::open(cp.c_str(), O_RDONLY);
     if (fd < 0) return false;
@@ -1252,11 +1275,11 @@ inline bool QueryColumns::_adoptCopiedColbin(MTL::Device* dev,
 }
 
 inline QueryColumns loadQueryColumns(MTL::Device* device,
-                                      const std::string& tblPath,
+                                      const std::string& dataPath,
                                       const std::vector<ColSpec>& specs) {
     QueryColumns qc;
     if (zeroCopyEnabled() && binaryEnabled()) {
-        MappedColumns mc = colbin::loadColumnsAsBuffers(device, tblPath, specs);
+        MappedColumns mc = colbin::loadColumnsAsBuffers(device, dataPath, specs);
         if (mc.valid()) {
             size_t bytes = 0;
             for (auto& [k, b] : mc.buffers) if (b) bytes += b->length();
@@ -1266,10 +1289,10 @@ inline QueryColumns loadQueryColumns(MTL::Device* device,
         }
     }
     if (!zeroCopyEnabled() && binaryEnabled() &&
-        qc._adoptCopiedColbin(device, tblPath, specs)) {
+        qc._adoptCopiedColbin(device, dataPath, specs)) {
         return qc;
     }
-    LoadedColumns lc = loadColumnsMultiAuto(tblPath, specs);
+    LoadedColumns lc = loadColumnsMultiAuto(dataPath, specs);
     qc._adoptCopied(device, std::move(lc), specs);
     return qc;
 }
@@ -1294,10 +1317,11 @@ inline LoadedColumns loadColumnsMultiAuto(const std::string& filePath,
                       << " — using .tbl parser (run `make colbin-sfN` to accelerate).\n";
         }
     }
+    const std::string textInput = colbin::textPath(filePath);
     struct stat st{};
-    if (::stat(filePath.c_str(), &st) != 0) {
+    if (::stat(textInput.c_str(), &st) != 0) {
         loadStats().recordText(0);
-        return loadColumnsMulti(filePath, specs);
+        return loadColumnsMulti(textInput, specs);
     }
     loadStats().recordText((size_t)st.st_size);
     constexpr off_t THRESHOLD = 1LL * 1024 * 1024 * 1024; // 1 GiB
@@ -1305,12 +1329,12 @@ inline LoadedColumns loadColumnsMultiAuto(const std::string& filePath,
     // loadStats so callers can subtract it from end-to-end timing.
     auto _ingest0 = std::chrono::high_resolution_clock::now();
     LoadedColumns _out = (st.st_size >= THRESHOLD)
-        ? loadColumnsMultiMmap(filePath, specs)
-        : loadColumnsMulti(filePath, specs);
+        ? loadColumnsMultiMmap(textInput, specs)
+        : loadColumnsMulti(textInput, specs);
     auto _ingest1 = std::chrono::high_resolution_clock::now();
     double _ingestMs = std::chrono::duration<double, std::milli>(_ingest1 - _ingest0).count();
     loadStats().recordExcluded(_ingestMs);
-    std::cerr << "[tbl-ingest] " << filePath << ": "
+    std::cerr << "[tbl-ingest] " << textInput << ": "
               << std::fixed << std::setprecision(1) << _ingestMs
               << " ms (one-time, excluded from end-to-end timing)\n";
     return _out;

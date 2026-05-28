@@ -56,10 +56,12 @@ std::optional<MetalQueryPlan> lowerSingleTableGroupedAggregateIRToMetal(
         return fail(error, "IR grouped aggregate lowerer: malformed scan/aggregate detail.");
     if (aggregate->groupBy.empty())
         return std::nullopt;
-    if (aggregate->having)
-        return fail(error, "IR grouped aggregate lowerer: HAVING is not supported yet.");
     if (aggregate->aggregates.empty())
         return fail(error, "IR grouped aggregate lowerer: no aggregate outputs.");
+
+    GenericGroupSpec groupSpec;
+    if (!configureAggregateHaving(*aggregate, groupSpec, nullptr, nullptr, error))
+        return std::nullopt;
 
     if (aggregateNeedsHashGroupOutput(*aggregate) ||
         !canUseKeyedSingleTableGroup(*aggregate)) {
@@ -117,6 +119,7 @@ std::optional<MetalQueryPlan> lowerSingleTableGroupedAggregateIRToMetal(
     std::vector<IrPendingAgg> pending;
     std::vector<IrPendingAgg> physicalAggs;
     std::unordered_map<std::string, IrPendingAgg> physicalSlots;
+    std::vector<int> aggregatePendingIndex(aggregate->aggregates.size(), -1);
     int valuesPerBucket = 0;
     auto registerPhysicalSlot = [&](const std::string& key,
                                     IrPendingAgg slot,
@@ -152,6 +155,7 @@ std::optional<MetalQueryPlan> lowerSingleTableGroupedAggregateIRToMetal(
             ? "agg_" + std::to_string(i)
             : projection.name;
         if (agg->func == AggFunc::COUNT) {
+            aggregatePendingIndex[i] = static_cast<int>(pending.size());
             pending.push_back(countSlot(displayName, false));
             continue;
         }
@@ -192,6 +196,7 @@ std::optional<MetalQueryPlan> lowerSingleTableGroupedAggregateIRToMetal(
             sumView.displayName = displayName;
             sumView.funcName = "AVG";
             sumView.scaleDown = sum.scaleDown;
+            aggregatePendingIndex[i] = static_cast<int>(pending.size());
             pending.push_back(std::move(sumView));
 
             pending.push_back(countSlot(displayName + "_cnt", true));
@@ -232,10 +237,46 @@ std::optional<MetalQueryPlan> lowerSingleTableGroupedAggregateIRToMetal(
         view.displayName = displayName;
         view.funcName = aggFuncName(agg->func);
         view.scaleDown = out.scaleDown;
+        aggregatePendingIndex[i] = static_cast<int>(pending.size());
         pending.push_back(std::move(view));
     }
     if (pending.empty())
         return fail(error, "IR grouped aggregate lowerer: no aggregate slots.");
+
+    KeyedCompactHavingSpec havingSpec;
+    auto configureHavingSlot = [&](int aggIdx) -> bool {
+        if (aggIdx < 0 ||
+            aggIdx >= static_cast<int>(aggregatePendingIndex.size())) {
+            return false;
+        }
+        const int pendingIdx = aggregatePendingIndex[(size_t)aggIdx];
+        if (pendingIdx < 0 || pendingIdx >= static_cast<int>(pending.size())) {
+            return false;
+        }
+        const auto& p = pending[(size_t)pendingIdx];
+        if (p.funcName == "AVG") {
+            if (error)
+                *error = "IR grouped aggregate lowerer: HAVING over AVG is not supported yet.";
+            return false;
+        }
+        havingSpec.compareAggOffset = p.offset;
+        havingSpec.compareAggIsLongPair = p.isLongPair;
+        havingSpec.compareAggIsFloatSum = p.isFloatSum;
+        havingSpec.compareAggScaleDown = p.scaleDown;
+        havingSpec.compareOp = groupSpec.havingCompareOp;
+        havingSpec.compareValue = groupSpec.havingCompareValue;
+        return true;
+    };
+    if (aggregate->having) {
+        if (groupSpec.havingAggIdx >= 0) {
+            return fail(error, "IR grouped aggregate lowerer: scalar-subquery HAVING is not supported in single-table grouped plans yet.");
+        }
+        if (groupSpec.havingCompareAggIdx < 0 || groupSpec.havingCompareOp.empty()) {
+            return fail(error, "IR grouped aggregate lowerer: HAVING comparison was not configured.");
+        }
+        if (!configureHavingSlot(groupSpec.havingCompareAggIdx))
+            return std::nullopt;
+    }
 
     std::unique_ptr<MetalOperator> pipe = makeAutoScan(scan->table, idxVar);
     if (auto* filter = filterDetail(shape->filter)) {
@@ -343,7 +384,8 @@ std::optional<MetalQueryPlan> lowerSingleTableGroupedAggregateIRToMetal(
     auto& compactPhase = appendPhase(plan, "GENERIC_ir_single_table_group_compact",
         makeKeyedAggCompactOperator(
             "d_ir_group_aggs", compactCounter, totalBuckets, valuesPerBucket,
-            compactKeys, compactAggs, compactCols));
+            compactKeys, compactAggs, compactCols,
+            {}, {}, havingSpec));
 
     if (!sortSpec.keys.empty() || sortSpec.limit >= 0) {
         const std::string sortRowsSym = "n_gpu_sort_ir_single_keyed_rows";

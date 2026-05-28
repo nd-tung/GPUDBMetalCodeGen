@@ -19,7 +19,7 @@ public:
     ChunkedColbinTable& operator=(const ChunkedColbinTable&) = delete;
 
     bool open(MTL::Device* device,
-              const std::string& tblPath,
+              const std::string& dataPath,
               const std::vector<ColSpec>& specs,
               size_t chunkRows,
               int slotCount,

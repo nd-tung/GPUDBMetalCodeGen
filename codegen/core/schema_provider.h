@@ -5,6 +5,7 @@
 
 #include "../planning/query_plan.h"
 #include <cstddef>
+#include <limits>
 #include <optional>
 #include <string>
 #include <vector>
@@ -26,8 +27,12 @@ public:
                                 const std::string& col) const = 0;
     virtual int columnFixedWidth(const std::string& table,
                                  const std::string& col) const = 0;
+    virtual int columnIndex(const std::string& table,
+                            const std::string& col) const = 0;
     virtual bool hasColumn(const std::string& table,
                            const std::string& col) const = 0;
+    virtual std::vector<std::string> columnNames(
+        const std::string& table) const = 0;
 
     // Table metadata for codegen.
     virtual std::string maxKeySymbol(const std::string& table) const = 0;
@@ -50,7 +55,11 @@ public:
         const std::string& table, const std::string& col) const = 0;
 
     // Multi-table join planning.
-    virtual int tableProbePriority(const std::string& table) const = 0;
+    virtual int tableProbePriority(const std::string& table) const {
+        const size_t rows = tableRowCount(table);
+        const size_t cap = static_cast<size_t>(std::numeric_limits<int>::max());
+        return static_cast<int>(rows > cap ? cap : rows);
+    }
     virtual std::optional<std::pair<std::string, std::string>> pkInfo(
         const std::string& table) const = 0;
 
@@ -63,6 +72,10 @@ public:
     }
 
     // Runtime sizing.
+    virtual std::string tableDataPath(const std::string& table) const {
+        (void)table;
+        return "";
+    }
     virtual size_t tableRowCount(const std::string& table) const = 0;
 };
 

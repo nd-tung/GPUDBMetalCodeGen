@@ -191,6 +191,13 @@ struct KeysetPropagationCostChoice {
 };
 
 bool genericCostTraceEnabled();
+class GenericCostSymbolScope {
+public:
+    explicit GenericCostSymbolScope(const GenericRelPlan& ir);
+    ~GenericCostSymbolScope();
+    GenericCostSymbolScope(const GenericCostSymbolScope&) = delete;
+    GenericCostSymbolScope& operator=(const GenericCostSymbolScope&) = delete;
+};
 size_t genericCostTypeByteWidth(const TypeInfo& type);
 std::optional<double> parseGenericCostPositiveNumber(const std::string& expr);
 std::optional<double> resolveGenericCostExpression(const std::string& expr);

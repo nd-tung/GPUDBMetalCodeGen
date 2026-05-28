@@ -1,7 +1,7 @@
 #pragma once
 // --- Catalog ---
 // Generic table/column registry used by the analyzer and planner.
-// Schema-specific metadata stays behind SchemaProvider.
+// Schema-specific metadata is supplied by SchemaProvider.
 
 #include "../core/schema_provider.h"
 #include <string>
@@ -47,7 +47,7 @@ public:
         ref = std::move(t);
     }
 
-    // Build a minimal Catalog view from a SchemaProvider.
+    // Build a complete Catalog view from a SchemaProvider.
     static Catalog fromSchemaProvider(const SchemaProvider& sp) {
         Catalog cat;
         for (const auto& tn : sp.tableNames()) {
@@ -57,7 +57,19 @@ public:
             if (pk) ct.primaryKey = pk->first;
             ct.maxKeySymbol = sp.maxKeySymbol(tn);
 
-            // Columns are discovered lazily during query analysis.
+            for (const auto& colName : sp.columnNames(tn)) {
+                CatColumn cc;
+                cc.name = colName;
+                cc.type = sp.columnType(tn, colName);
+                cc.fixedWidth = sp.columnFixedWidth(tn, colName);
+                if (auto domain = sp.groupDomain(tn, colName)) {
+                    cc.domainMin = domain->minValue;
+                    cc.domainMax = domain->maxValue;
+                }
+                cc.charDomain = sp.charDomain(tn, colName);
+                cc.isKey = pk && pk->first == colName;
+                ct.columns.push_back(std::move(cc));
+            }
             cat.addTable(std::move(ct));
         }
         return cat;

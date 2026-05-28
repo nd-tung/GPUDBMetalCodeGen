@@ -1,4 +1,5 @@
 #include "generic/ir/generic_ir_builder.h"
+#include "generic/ir/analyzed_query.h"
 #include "generic/ir/generic_scalar_subquery_analysis.h"
 #include "core/schema_provider.h"
 
@@ -10,8 +11,6 @@
 #include <set>
 #include <sstream>
 #include <unordered_map>
-
-#include "generic/ir/analyzed_query.inc"
 
 namespace codegen {
 
@@ -1430,7 +1429,7 @@ static std::optional<GenericRelPlan> buildGenericRelPlanFromAnalyzedQuery(
 
 std::optional<GenericRelPlan> buildGenericRelationalIRFromSQL(
         const std::string& sql,
-        const SchemaProvider* schema,
+        const SchemaProvider& schema,
         std::string* error) {
     try {
         auto analyzed = collectAnalyzedQuery(sql, schema);

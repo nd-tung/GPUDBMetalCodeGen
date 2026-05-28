@@ -3,6 +3,7 @@
 #include "generic/lowering/generic_cost_model.h"
 #include "generic/lowering/generic_expression_metal.h"
 #include "generic/lowering/generic_plan_shapes.h"
+#include "core/schema_provider.h"
 #include "metal_plan_common.h"
 
 #include <algorithm>
@@ -36,13 +37,30 @@ std::optional<std::pair<std::string, TypeInfo>> scanAnchorColumn(
         }
         return std::nullopt;
     };
+    auto columnFromSchema = [&](const std::string& name)
+            -> std::optional<std::pair<std::string, TypeInfo>> {
+        if (!ir.schema || name.empty() || !ir.schema->hasColumn(scan.table, name))
+            return std::nullopt;
+        return std::make_pair(
+            name,
+            TypeInfo{ir.schema->columnType(scan.table, name),
+                     ir.schema->columnFixedWidth(scan.table, name)});
+    };
 
     if (const auto* inst = ir.findRelationInstance(scan.relationInstance)) {
         if (const auto* rel = ir.findRelation(inst->relation)) {
             if (!rel->primaryKeyColumn.empty()) {
                 if (auto anchor = columnFromScanOutput(rel->primaryKeyColumn))
                     return anchor;
+                if (auto anchor = columnFromSchema(rel->primaryKeyColumn))
+                    return anchor;
             }
+        }
+    }
+    if (ir.schema) {
+        for (const auto& name : ir.schema->columnNames(scan.table)) {
+            if (auto anchor = columnFromSchema(name))
+                return anchor;
         }
     }
     return columnFromScanOutput("");

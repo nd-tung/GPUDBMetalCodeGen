@@ -1,5 +1,6 @@
 #include "metal_adhoc_plan_api.h"
 #include "generic/ir/generic_relational_ir.h"
+#include "generic/lowering/generic_cost_model.h"
 #include "generic/lowering/generic_ir_physical_planner.h"
 #include "generic/ir/generic_ir_validator.h"
 
@@ -101,6 +102,7 @@ std::optional<MetalQueryPlan> buildAdhocGenericPlan(const GenericRelPlan& ir,
 
     std::string lowerErrors;
     auto dispatch = [&]() -> std::optional<MetalQueryPlan> {
+        GenericCostSymbolScope costSymbols(ir);
         if (singleTableIr) {
             std::string irLowerError;
             if (auto p = lowerSingleTableGroupedAggregateIRToMetal(*singleTableIr, &irLowerError)) {

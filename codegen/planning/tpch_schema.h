@@ -6,6 +6,9 @@
 #include <unordered_map>
 #include <stdexcept>
 #include <utility>
+#include <cstdint>
+#include <cstring>
+#include <fstream>
 
 namespace codegen {
 
@@ -197,20 +200,38 @@ private:
 
 class TPCHSchemaProvider : public SchemaProvider {
 public:
+    explicit TPCHSchemaProvider(std::string dataDir = {})
+        : dataDir_(std::move(dataDir)) {}
+
+    void setDataDir(std::string dataDir) { dataDir_ = std::move(dataDir); }
+
     DataType columnType(const std::string& table, const std::string& col) const override {
         auto it = TPCHSchema::instance().tables.find(table);
-        if (it == TPCHSchema::instance().tables.end()) return DataType::INT;
+        if (it == TPCHSchema::instance().tables.end())
+            throw std::runtime_error("Unknown table: " + table);
         auto jt = it->second.nameToIdx.find(col);
-        if (jt == it->second.nameToIdx.end()) return DataType::INT;
+        if (jt == it->second.nameToIdx.end())
+            throw std::runtime_error("Unknown column: " + table + "." + col);
         return it->second.columns[jt->second].type;
     }
     int columnFixedWidth(const std::string& table, const std::string& col) const override {
         return TPCHSchema::instance().table(table).col(col).fixedWidth;
     }
+    int columnIndex(const std::string& table, const std::string& col) const override {
+        return TPCHSchema::instance().table(table).col(col).index;
+    }
     bool hasColumn(const std::string& table, const std::string& col) const override {
         auto it = TPCHSchema::instance().tables.find(table);
         if (it == TPCHSchema::instance().tables.end()) return false;
         return it->second.nameToIdx.count(col) > 0;
+    }
+    std::vector<std::string> columnNames(const std::string& table) const override {
+        std::vector<std::string> names;
+        auto it = TPCHSchema::instance().tables.find(table);
+        if (it == TPCHSchema::instance().tables.end()) return names;
+        names.reserve(it->second.columns.size());
+        for (const auto& col : it->second.columns) names.push_back(col.name);
+        return names;
     }
     std::string maxKeySymbol(const std::string& table) const override {
         return TPCHSchema::instance().table(table).maxKeySymbol;
@@ -253,18 +274,6 @@ public:
                                  const std::string& col) const override {
         return TPCHSchema::instance().table(table).col(col).charDomain;
     }
-    int tableProbePriority(const std::string& table) const override {
-        // Larger tables probe first.
-        if (table == "lineitem") return 100;
-        if (table == "orders")   return 80;
-        if (table == "partsupp") return 70;
-        if (table == "customer") return 50;
-        if (table == "part")     return 40;
-        if (table == "supplier") return 30;
-        if (table == "nation")   return 10;
-        if (table == "region")   return 5;
-        return 0;
-    }
     std::optional<std::pair<std::string, std::string>> pkInfo(const std::string& table) const override {
         if (table == "customer") return std::make_pair("c_custkey",   "maxCustkey");
         if (table == "orders")   return std::make_pair("o_orderkey",  "maxOrderkey");
@@ -283,7 +292,40 @@ public:
         if (jt == it->second.nameToIdx.end()) return 0;
         return it->second.columns[jt->second].type == DataType::FLOAT ? 100 : 0;
     }
-    size_t tableRowCount(const std::string& /*table*/) const override { return 0; }
+    std::string tableDataPath(const std::string& table) const override {
+        if (dataDir_.empty()) return "";
+        const bool needsSlash = dataDir_.back() != '/';
+        return dataDir_ + (needsSlash ? "/" : "") + table + ".colbin";
+    }
+    size_t tableRowCount(const std::string& table) const override {
+        const std::string path = tableDataPath(table);
+        if (path.empty()) return 0;
+
+        struct Header {
+            char magic[8];
+            uint32_t version;
+            uint32_t nCols;
+            uint64_t nRows;
+            uint64_t sourceSize;
+            int64_t sourceMtimeNs;
+            uint64_t pad;
+        };
+        static_assert(sizeof(Header) == 48, "colbin header size drift");
+
+        std::ifstream in(path, std::ios::binary);
+        if (!in) return 0;
+        Header header{};
+        in.read(reinterpret_cast<char*>(&header), sizeof(header));
+        static constexpr char kMagic[8] = {'T','P','C','H','C','B','0','1'};
+        if (!in || std::memcmp(header.magic, kMagic, sizeof(kMagic)) != 0 ||
+            header.version != 2) {
+            return 0;
+        }
+        return static_cast<size_t>(header.nRows);
+    }
+
+private:
+    std::string dataDir_;
 };
 
 inline std::string tblPath(const std::string& dataDir, const std::string& tableName) {

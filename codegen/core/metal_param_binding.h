@@ -25,6 +25,10 @@ enum class MetalParamKind {
 // Shared names used by codegen and executor.
 inline std::string tableDataName(const std::string& table) { return "d_" + table; }
 inline std::string tableSizeName(const std::string& table) { return "n_" + table; }
+inline std::string tableColumnDataName(const std::string& table,
+                                       const std::string& column) {
+    return table + "." + column;
+}
 
 struct MetalParamBinding {
     std::string name;

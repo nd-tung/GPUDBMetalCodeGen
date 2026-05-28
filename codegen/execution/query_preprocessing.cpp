@@ -1,5 +1,4 @@
 #include "query_preprocessing.h"
-#include "tpch_schema.h"
 
 #include <algorithm>
 #include <cstring>
@@ -11,9 +10,10 @@
 namespace codegen {
 
 QueryColumns loadPreprocessColumns(MTL::Device* device,
+                                   const SchemaProvider& schema,
                                    const std::string& tableName,
                                    const std::vector<ColSpec>& specs) {
-    return loadQueryColumns(device, g_dataset_path + tableName + ".tbl", specs);
+    return loadQueryColumns(device, schema.tableDataPath(tableName), specs);
 }
 
 std::vector<int> copyIntColumn(const QueryColumns& columns, int columnIndex) {
@@ -70,6 +70,7 @@ struct PreprocessColumns {
 };
 
 PreprocessColumns resolvePreprocessColumns(MTL::Device* device,
+                                           const SchemaProvider& schema,
                                            const std::string& tableName,
                                            const std::vector<ColSpec>& specs,
                                            const std::vector<LoadedQueryTable>& loadedTables) {
@@ -78,7 +79,7 @@ PreprocessColumns resolvePreprocessColumns(MTL::Device* device,
         result.borrowed = loaded;
         return result;
     }
-    result.owned = loadPreprocessColumns(device, tableName, specs);
+    result.owned = loadPreprocessColumns(device, schema, tableName, specs);
     return result;
 }
 
@@ -96,11 +97,12 @@ int findFixedNameKey(const QueryColumns& columns, int keyColumn, int nameColumn,
 // Resolve a fixed-width name key and register it as a scalar.
 bool registerNameKey(MTL::Device* device,
                      MetalGenericExecutor& executor,
+                     const SchemaProvider& schema,
                      const std::vector<LoadedQueryTable>& loadedTables,
                      const std::string& tableName,
                      const std::string& target,
                      const std::string& paramName) {
-    auto view = resolvePreprocessColumns(device, tableName,
+    auto view = resolvePreprocessColumns(device, schema, tableName,
         {{0, ColType::INT}, {1, ColType::CHAR_FIXED, 25}}, loadedTables);
     int key = findFixedNameKey(view.get(), 0, 1, 25, target);
     if (key == -1) {
@@ -174,16 +176,17 @@ void resetQueryPreprocessingState() {
 bool prepareQueryPreprocessing(const std::string& queryName,
                                MTL::Device* device,
                                MetalGenericExecutor& executor,
+                               const SchemaProvider& schema,
                                const std::vector<LoadedQueryTable>& loadedTables) {
     resetQueryPreprocessingState();
 
     if (queryName == "Q7") {
-        if (!registerNameKey(device, executor, loadedTables, "nation", "FRANCE",  "france_nk"))  return false;
-        if (!registerNameKey(device, executor, loadedTables, "nation", "GERMANY", "germany_nk")) return false;
+        if (!registerNameKey(device, executor, schema, loadedTables, "nation", "FRANCE",  "france_nk"))  return false;
+        if (!registerNameKey(device, executor, schema, loadedTables, "nation", "GERMANY", "germany_nk")) return false;
     }
 
     if (queryName == "Q5") {
-        if (!registerNameKey(device, executor, loadedTables, "region", "ASIA", "asia_rk")) return false;
+        if (!registerNameKey(device, executor, schema, loadedTables, "region", "ASIA", "asia_rk")) return false;
         constexpr uint32_t kQ5ResultCap = 25;
         executor.registerScalarInt("q5_result_cap", (int)kQ5ResultCap);
         executor.registerSymbol("q5_result_cap", kQ5ResultCap);
@@ -196,14 +199,14 @@ bool prepareQueryPreprocessing(const std::string& queryName,
     }
 
     if (queryName == "Q8") {
-        if (!registerNameKey(device, executor, loadedTables, "region", "AMERICA", "america_rk")) return false;
-        if (!registerNameKey(device, executor, loadedTables, "nation", "BRAZIL",  "brazil_nk"))  return false;
+        if (!registerNameKey(device, executor, schema, loadedTables, "region", "AMERICA", "america_rk")) return false;
+        if (!registerNameKey(device, executor, schema, loadedTables, "nation", "BRAZIL",  "brazil_nk"))  return false;
     }
 
     // Q22 avg_bal is registered by the GPU phase hook.
 
     if (queryName == "Q11") {
-        if (!registerNameKey(device, executor, loadedTables, "nation", "GERMANY", "germany_nk")) return false;
+        if (!registerNameKey(device, executor, schema, loadedTables, "nation", "GERMANY", "germany_nk")) return false;
     }
 
     // Q17 preprocessing runs in GPU phases.
@@ -267,7 +270,7 @@ bool prepareQueryPreprocessing(const std::string& queryName,
         executor.registerScalarInt("d_q20_ht_mask", (int)(htSlots - 1));
         executor.registerScalarInt("supp_mul", (int)maxSk);
 
-        if (!registerNameKey(device, executor, loadedTables, "nation",
+        if (!registerNameKey(device, executor, schema, loadedTables, "nation",
                              "CANADA", "canada_nk")) {
             return false;
         }
@@ -483,12 +486,12 @@ bool prepareQueryPreprocessing(const std::string& queryName,
 
     // Q21 setup: SAUDI nation key, scratch buffers, and compact result buffers.
     if (queryName == "Q21") {
-        if (!registerNameKey(device, executor, loadedTables, "nation",
+        if (!registerNameKey(device, executor, schema, loadedTables, "nation",
                              "SAUDI ARABIA", "sa_nk")) {
             return false;
         }
 
-        auto sView = resolvePreprocessColumns(device, "supplier",
+        auto sView = resolvePreprocessColumns(device, schema, "supplier",
             {{0, ColType::INT}}, loadedTables);
         const QueryColumns& sCols = sView.get();
         const size_t nSupplier = sCols.rows();

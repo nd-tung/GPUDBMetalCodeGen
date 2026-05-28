@@ -35,6 +35,14 @@ void checkCommandBufferStatus(MTL::CommandBuffer* cmdBuf,
     }
 }
 
+std::string phaseBufferKey(const MetalParamBinding& binding) {
+    if (binding.kind == MetalParamKind::TableData &&
+        !binding.tableName.empty()) {
+        return tableColumnDataName(binding.tableName, binding.name);
+    }
+    return binding.name;
+}
+
 } // namespace
 
 MetalGenericExecutor::MetalGenericExecutor(MTL::Device* device, MTL::CommandQueue* cmdQueue)
@@ -55,6 +63,25 @@ void MetalGenericExecutor::registerTableBuffer(const std::string& name,
     tables_[name] = {buffer, rowCount, false};
     sizeResolver_.registerSymbol(tableSizeName(name), rowCount);
     sizeResolver_.registerSymbol("num" + name, rowCount);
+}
+
+void MetalGenericExecutor::registerTableBuffer(const std::string& tableName,
+                                                const std::string& columnName,
+                                                MTL::Buffer* buffer,
+                                                size_t rowCount) {
+    TableInfo info{buffer, rowCount, false};
+    tables_[tableColumnDataName(tableName, columnName)] = info;
+
+    auto ownerIt = tableBufferShortOwners_.find(columnName);
+    if (ownerIt == tableBufferShortOwners_.end() || ownerIt->second == tableName) {
+        tableBufferShortOwners_[columnName] = tableName;
+        if (!ambiguousTableBufferNames_.count(columnName))
+            tables_[columnName] = info;
+        return;
+    }
+
+    ambiguousTableBufferNames_.insert(columnName);
+    tables_.erase(columnName);
 }
 
 void MetalGenericExecutor::registerAllocatedBuffer(const std::string& name, MTL::Buffer* buffer) {
@@ -113,11 +140,15 @@ BufferMap MetalGenericExecutor::allocatePhaseBuffers(
     for (const auto& b : phase.bindings) {
         switch (b.kind) {
             case MetalParamKind::TableData: {
-                // Prefer column binding, then table binding.
-                auto tIt = tables_.find(b.name);
+                // Qualified bindings must win when present; short names are only
+                // a compatibility fast path for globally unambiguous columns.
+                auto tIt = tables_.end();
+                if (!b.tableName.empty())
+                    tIt = tables_.find(tableColumnDataName(b.tableName, b.name));
+                if (tIt == tables_.end()) tIt = tables_.find(b.name);
                 if (tIt == tables_.end()) tIt = tables_.find(b.tableName);
                 if (tIt != tables_.end()) {
-                    buffers[b.name] = tIt->second.buffer;
+                    buffers[phaseBufferKey(b)] = tIt->second.buffer;
                 } else {
                     throw std::runtime_error(
                         "MetalGenericExecutor: required table/column '" + b.name +
@@ -298,7 +329,8 @@ void MetalGenericExecutor::bindPhaseBuffers(MTL::ComputeCommandEncoder* encoder,
         switch (b.kind) {
             case MetalParamKind::TableData:
             case MetalParamKind::DeviceBuffer: {
-                auto it = buffers.find(b.name);
+                auto key = phaseBufferKey(b);
+                auto it = buffers.find(key);
                 if (it != buffers.end() && it->second) {
                     encoder->setBuffer(it->second, 0, b.bufferIndex);
                 } else {
@@ -666,6 +698,8 @@ void MetalGenericExecutor::releaseAllocatedBuffers() {
             info.buffer->release();
     }
     tables_.clear();
+    tableBufferShortOwners_.clear();
+    ambiguousTableBufferNames_.clear();
 }
 
 void MetalGenericExecutor::releasePhaseAllocatedBuffers() {

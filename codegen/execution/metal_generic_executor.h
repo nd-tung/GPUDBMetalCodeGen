@@ -52,6 +52,10 @@ public:
     // Table buffers are borrowed; their row counts seed size symbols.
     void registerTableBuffer(const std::string& name, MTL::Buffer* buffer,
                              size_t rowCount);
+    void registerTableBuffer(const std::string& tableName,
+                             const std::string& columnName,
+                             MTL::Buffer* buffer,
+                             size_t rowCount);
 
     // Register row count for n_tableName resolution.
     void registerTableRowCount(const std::string& tableName, size_t rowCount);
@@ -136,6 +140,8 @@ private:
         bool ownsBuffer = false;
     };
     std::unordered_map<std::string, TableInfo> tables_;
+    std::unordered_map<std::string, std::string> tableBufferShortOwners_;
+    std::unordered_set<std::string> ambiguousTableBufferNames_;
 
     // Scratch/output buffers owned for the lifetime of this executor.
     std::unordered_map<std::string, MTL::Buffer*> allocatedBuffers_;

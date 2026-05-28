@@ -12,7 +12,7 @@ class SchemaProvider;
 // Parses SQL and builds the GPU-neutral relational IR used by generic lowering routes.
 std::optional<GenericRelPlan> buildGenericRelationalIRFromSQL(
     const std::string& sql,
-    const SchemaProvider* schema = nullptr,
+    const SchemaProvider& schema,
     std::string* error = nullptr);
 
 } // namespace codegen

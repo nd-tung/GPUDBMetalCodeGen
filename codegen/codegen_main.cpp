@@ -268,6 +268,13 @@ static bool parseRowCountWithSuffix(const std::string& text, size_t& out) {
 }
 
 // Read .colbin row count and file size without mapping the payload.
+static std::string tableColbinPath(const codegen::SchemaProvider& schema,
+                                   const std::string& tableName) {
+    std::string path = schema.tableDataPath(tableName);
+    if (!path.empty()) return path;
+    return g_dataset_path + tableName + ".colbin";
+}
+
 static bool peekColbinHeader(const std::string& path,
                               uint64_t& out_n_rows, uint64_t& out_file_size) {
     return colbin::peekRowCount(path, out_n_rows, &out_file_size);
@@ -275,12 +282,13 @@ static bool peekColbinHeader(const std::string& path,
 
 // Use the largest referenced .colbin as the streaming table.
 static std::string autoDetectStreamTable(
+        const codegen::SchemaProvider& schema,
         const std::map<std::string, std::set<std::string>>& tableCols) {
     std::string best;
     uint64_t bestSize = 0;
     for (const auto& [tName, _cols] : tableCols) {
         uint64_t nr = 0, fsz = 0;
-        if (peekColbinHeader(g_dataset_path + tName + ".colbin", nr, fsz) &&
+        if (peekColbinHeader(tableColbinPath(schema, tName), nr, fsz) &&
                 fsz > bestSize) {
             bestSize = fsz;
             best = tName;
@@ -379,13 +387,14 @@ static bool runCodegenQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
 
         // Build Generic IR only for the ad-hoc route.
         std::optional<codegen::GenericRelPlan> genericIr;
-        static codegen::TPCHSchemaProvider defaultSchema;
-        const codegen::SchemaProvider* activeSchema = &defaultSchema;
+        codegen::TPCHSchemaProvider tpchSchema(g_dataset_path);
+        const codegen::SchemaProvider* activeSchema =
+            static_cast<const codegen::SchemaProvider*>(&tpchSchema);
         if (apiKind == QueryApiKind::AdhocSQL) {
             auto tAnalyze0 = clk::now();
             std::string irError;
             genericIr = codegen::buildGenericRelationalIRFromSQL(
-                sql, nullptr, &irError);
+                sql, *activeSchema, &irError);
             if (!genericIr) {
                 std::cerr << "Codegen: generic relational IR build failed for "
                           << queryName << std::endl;
@@ -517,7 +526,6 @@ static bool runCodegenQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
         }
         timing.psoMs = elapsedMs(tPso0, clk::now());
 
-        const auto& schema = codegen::TPCHSchema::instance();
         // Collect columns referenced by all phases.
         std::map<std::string, std::set<std::string>> tableCols;
         for (const auto& phase : cg.getPhases()) {
@@ -533,7 +541,7 @@ static bool runCodegenQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
         // Chunk sizing uses projected bytes, not full file size. Physmem is
         // the trigger on UMA because reclaimable-page accounting is too tight.
         if (plan.chunkable && (g_autoChunk || g_chunkRows > 0)) {
-            const std::string autoStreamTable = autoDetectStreamTable(tableCols);
+            const std::string autoStreamTable = autoDetectStreamTable(*activeSchema, tableCols);
             if (!autoStreamTable.empty()) {
                 uint64_t physMemBytes = 0;
                 {
@@ -559,21 +567,23 @@ static bool runCodegenQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
                 // availMemBytes is diagnostic only.
                 uint64_t totalBudget = std::min(physMemBytes, gpuBudgetBytes);
 
-                auto elemBytes = [&](const codegen::ColumnDef& c) -> uint64_t {
-                    switch (c.type) {
+                auto elemBytes = [&](codegen::DataType type, int fixedWidth) -> uint64_t {
+                    switch (type) {
                         case codegen::DataType::INT:
                         case codegen::DataType::DATE:
                         case codegen::DataType::FLOAT:      return 4;
                         case codegen::DataType::CHAR1:      return 1;
-                        case codegen::DataType::CHAR_FIXED: return (uint64_t)c.fixedWidth;
+                        case codegen::DataType::CHAR_FIXED: return (uint64_t)fixedWidth;
                     }
                     return 0;
                 };
                 auto projectedBytesPerRow = [&](const std::string& tName,
                                                  const std::set<std::string>& cols) {
                     uint64_t bpr = 0;
-                    const auto& tdef = schema.table(tName);
-                    for (const auto& cn : cols) bpr += elemBytes(tdef.col(cn));
+                    for (const auto& cn : cols) {
+                        bpr += elemBytes(activeSchema->columnType(tName, cn),
+                                         activeSchema->columnFixedWidth(tName, cn));
+                    }
                     return bpr;
                 };
 
@@ -582,7 +592,7 @@ static bool runCodegenQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
                 std::map<std::string, uint64_t> fullTableRows;
                 for (const auto& [tName, _cols] : tableCols) {
                     uint64_t nr = 0, fsz = 0;
-                    if (peekColbinHeader(g_dataset_path + tName + ".colbin", nr, fsz)) {
+                    if (peekColbinHeader(tableColbinPath(*activeSchema, tName), nr, fsz)) {
                         totalDataBytes += fsz;
                         fullTableRows[tName] = nr;
                     }
@@ -592,7 +602,7 @@ static bool runCodegenQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
                 for (const auto& [tName, cols] : tableCols) {
                     if (tName == autoStreamTable) continue;
                     uint64_t nr = 0, fsz = 0;
-                    if (!peekColbinHeader(g_dataset_path + tName + ".colbin", nr, fsz))
+                    if (!peekColbinHeader(tableColbinPath(*activeSchema, tName), nr, fsz))
                         continue;
                     residentBytes += nr * projectedBytesPerRow(tName, cols);
                 }
@@ -600,7 +610,7 @@ static bool runCodegenQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
                 uint64_t streamProjectedBytes = 0;
                 {
                     uint64_t nr = 0, fsz = 0;
-                    if (peekColbinHeader(g_dataset_path + autoStreamTable + ".colbin",
+                    if (peekColbinHeader(tableColbinPath(*activeSchema, autoStreamTable),
                                          nr, fsz)) {
                         streamProjectedBytes =
                             nr * projectedBytesPerRow(autoStreamTable,
@@ -651,7 +661,7 @@ static bool runCodegenQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
 
                 if (g_chunkRows == 0 && g_autoChunk && !fitsInBudget) {
                     uint64_t streamRows = 0, streamFsz = 0;
-                    if (peekColbinHeader(g_dataset_path + autoStreamTable + ".colbin",
+                    if (peekColbinHeader(tableColbinPath(*activeSchema, autoStreamTable),
                                         streamRows, streamFsz) && streamRows > 0) {
                         const std::set<std::string>& streamCols = tableCols.at(autoStreamTable);
                         uint64_t streamBytesPerRow =
@@ -734,7 +744,7 @@ static bool runCodegenQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
         executor.setDetailedPhaseTiming(g_profilePhases || g_autotuneTgPerPhase);
 
         const std::string streamTable = (g_chunkRows > 0)
-            ? autoDetectStreamTable(tableCols) : std::string{};
+            ? autoDetectStreamTable(*activeSchema, tableCols) : std::string{};
         bool didChunk = false;
 
         // Stream table columns are loaded per chunk below.
@@ -743,19 +753,18 @@ static bool runCodegenQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
         std::vector<std::pair<std::string, QueryColumns>> loadedTables;
         for (auto& [tableName, colNames] : tableCols) {
             if (!streamTable.empty() && tableName == streamTable) continue;
-            const auto& tdef = schema.table(tableName);
             std::vector<ColSpec> specs;
             for (const auto& colName : colNames)
-                specs.push_back(codegen::colSpecFor(tdef.col(colName)));
+                specs.push_back(codegen::colSpecFor(*activeSchema, tableName, colName));
             auto _ioStart = clk::now();
-            auto cols = loadQueryColumns(device, g_dataset_path + tableName + ".tbl", specs);
+            auto cols = loadQueryColumns(device, tableColbinPath(*activeSchema, tableName), specs);
             ioMs += elapsedMs(_ioStart, clk::now());
             size_t rowCount = cols.rows();
             for (const auto& colName : colNames) {
-                auto& cdef = tdef.col(colName);
-                MTL::Buffer* buf = cols.buffer(cdef.index);
+                const int columnIndex = activeSchema->columnIndex(tableName, colName);
+                MTL::Buffer* buf = cols.buffer(columnIndex);
                 if (!buf) continue;
-                executor.registerTableBuffer(colName, buf, rowCount);
+                executor.registerTableBuffer(tableName, colName, buf, rowCount);
             }
             executor.registerTableRowCount(tableName, rowCount);
             loadedTables.emplace_back(tableName, std::move(cols));
@@ -763,18 +772,19 @@ static bool runCodegenQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
 
         {
             auto _ppStart = clk::now();
-            codegen::registerMaxKeySymbols(executor, loadedTables, tableCols, schema);
+            codegen::registerMaxKeySymbols(executor, loadedTables, tableCols, *activeSchema);
             if (!streamTable.empty() && tableCols.count(streamTable)) {
                 codegen::extendMaxKeysFromStreamColbin(
                     executor,
-                    g_dataset_path + streamTable + ".tbl",
+                    tableColbinPath(*activeSchema, streamTable),
                     tableCols.at(streamTable),
-                    schema,
+                    *activeSchema,
                     streamTable);
             }
             codegen::resetQueryPreprocessingState();
             if (isPredefinedTpchRoute &&
-                !codegen::prepareQueryPreprocessing(plan.name, device, executor, loadedTables)) {
+                !codegen::prepareQueryPreprocessing(plan.name, device, executor,
+                                                    *activeSchema, loadedTables)) {
                 return false;
             }
             preprocessMs += elapsedMs(_ppStart, clk::now());
@@ -786,19 +796,18 @@ static bool runCodegenQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
         if (!streamTable.empty()) {
             std::vector<ColSpec> streamSpecs;
             for (const auto& colName : tableCols.at(streamTable))
-                streamSpecs.push_back(codegen::colSpecFor(schema.table(streamTable).col(colName)));
+                streamSpecs.push_back(codegen::colSpecFor(*activeSchema, streamTable, colName));
             const int streamSlots = g_chunkDoubleBuffer ? 2 : 1;
             codegen::ChunkedColbinTable stream;
             std::string streamError;
             auto streamOpenStart = clk::now();
-            if (!stream.open(device, g_dataset_path + streamTable + ".tbl",
+            if (!stream.open(device, tableColbinPath(*activeSchema, streamTable),
                              streamSpecs, g_chunkRows, streamSlots, streamError)) {
                 std::cerr << "Codegen: chunk open failed for " << streamTable
                           << ": " << streamError << std::endl;
                 return false;
             }
             double streamOpenMs = elapsedMs(streamOpenStart, clk::now());
-            const auto& streamTdef = schema.table(streamTable);
             const size_t totalRows = stream.rows(), chunkRows = stream.chunkRows();
             size_t chunkCount = 0;
             double chunkCopyMs = 0.0, gpuMs = 0.0, bufAllocMs = 0.0;
@@ -849,14 +858,14 @@ static bool runCodegenQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
                 }
                 chunkCopyMs += elapsedMs(chunkLoadStart, clk::now());
                 for (const auto& colName : tableCols.at(streamTable)) {
-                    const auto& cdef = streamTdef.col(colName);
-                    MTL::Buffer* buf = stream.buffer(slot, cdef.index);
+                    const int columnIndex = activeSchema->columnIndex(streamTable, colName);
+                    MTL::Buffer* buf = stream.buffer(slot, columnIndex);
                     if (!buf) {
                         std::cerr << "Codegen: missing chunk buffer for "
                                   << streamTable << "." << colName << std::endl;
                         return false;
                     }
-                    executor.registerTableBuffer(colName, buf, rowsThisChunk);
+                    executor.registerTableBuffer(streamTable, colName, buf, rowsThisChunk);
                 }
                 executor.registerTableRowCount(streamTable, rowsThisChunk);
                 if (chunkCount == 1) executor.setSkipZeroInit(true);

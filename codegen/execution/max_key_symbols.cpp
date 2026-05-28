@@ -1,6 +1,7 @@
 #include "max_key_symbols.h"
 
 #include <algorithm>
+#include <cctype>
 #include <cstdlib>
 #include <fstream>
 #include <future>
@@ -11,19 +12,37 @@
 
 namespace codegen {
 
-ColSpec colSpecFor(const ColumnDef& cdef) {
+ColSpec colSpecFor(int columnIndex, DataType dataType, int fixedWidth) {
     ColType type = ColType::INT;
-    switch (cdef.type) {
+    switch (dataType) {
         case DataType::INT:        type = ColType::INT; break;
         case DataType::FLOAT:      type = ColType::FLOAT; break;
         case DataType::DATE:       type = ColType::DATE; break;
         case DataType::CHAR1:      type = ColType::CHAR1; break;
         case DataType::CHAR_FIXED: type = ColType::CHAR_FIXED; break;
     }
-    return ColSpec(cdef.index, type, cdef.fixedWidth);
+    return ColSpec(columnIndex, type, fixedWidth);
+}
+
+ColSpec colSpecFor(const ColumnDef& cdef) {
+    return colSpecFor(cdef.index, cdef.type, cdef.fixedWidth);
+}
+
+ColSpec colSpecFor(const SchemaProvider& schema,
+                   const std::string& table,
+                   const std::string& column) {
+    return colSpecFor(schema.columnIndex(table, column),
+                      schema.columnType(table, column),
+                      schema.columnFixedWidth(table, column));
 }
 
 namespace {
+
+std::string tableDataPath(const SchemaProvider& schema, const std::string& table) {
+    std::string path = schema.tableDataPath(table);
+    if (!path.empty()) return path;
+    return g_dataset_path + table + ".colbin";
+}
 
 enum class MaxKeyMode { Serial, Parallel, Cache };
 
@@ -77,13 +96,29 @@ struct MaxKeyCacheEntry {
     int maxValue;
 };
 
-std::string maxKeyCachePath() {
+std::string cachePathForDataPath(const std::string& dataPath) {
+    if (dataPath.empty()) return g_dataset_path + ".maxkeys.json";
+    const std::string colbinPath = colbin::binaryPath(dataPath);
+    const size_t slash = colbinPath.find_last_of('/');
+    if (slash == std::string::npos) return ".maxkeys.json";
+    if (slash == 0) return "/.maxkeys.json";
+    return colbinPath.substr(0, slash + 1) + ".maxkeys.json";
+}
+
+std::string cachePathForSchema(
+    const SchemaProvider& schema,
+    const std::map<std::string, std::set<std::string>>& tableCols) {
+    for (const auto& [table, _] : tableCols) {
+        const std::string path = tableDataPath(schema, table);
+        if (!path.empty()) return cachePathForDataPath(path);
+    }
     return g_dataset_path + ".maxkeys.json";
 }
 
-bool loadMaxKeyCache(std::vector<MaxKeyCacheEntry>& out) {
+bool loadMaxKeyCache(const std::string& cachePath,
+                     std::vector<MaxKeyCacheEntry>& out) {
     out.clear();
-    std::ifstream file(maxKeyCachePath());
+    std::ifstream file(cachePath);
     if (!file) return false;
     try {
         nlohmann::json json;
@@ -104,7 +139,8 @@ bool loadMaxKeyCache(std::vector<MaxKeyCacheEntry>& out) {
     }
 }
 
-void saveMaxKeyCache(const std::vector<MaxKeyCacheEntry>& entries) {
+void saveMaxKeyCache(const std::string& cachePath,
+                     const std::vector<MaxKeyCacheEntry>& entries) {
     nlohmann::json json = nlohmann::json::array();
     for (const auto& entry : entries) {
         json.push_back({
@@ -115,7 +151,7 @@ void saveMaxKeyCache(const std::vector<MaxKeyCacheEntry>& entries) {
             {"max", entry.maxValue},
         });
     }
-    std::ofstream file(maxKeyCachePath());
+    std::ofstream file(cachePath);
     if (!file) return;
     file << json.dump(2);
 }
@@ -136,11 +172,11 @@ bool cacheLookup(const std::vector<MaxKeyCacheEntry>& cache,
     return false;
 }
 
-bool isMaxKeyColumn(const std::string& colName) {
-    return colName == "c_custkey" || colName == "o_custkey" ||
-           colName == "s_suppkey" || colName == "l_suppkey" || colName == "ps_suppkey" ||
-           colName == "o_orderkey" || colName == "l_orderkey" ||
-           colName == "p_partkey" || colName == "l_partkey" || colName == "ps_partkey";
+bool isNumericLiteral(const std::string& value) {
+    return !value.empty() &&
+           std::all_of(value.begin(), value.end(), [](unsigned char ch) {
+               return std::isdigit(ch) != 0;
+           });
 }
 
 int computeColMax(const int* data,
@@ -177,10 +213,11 @@ int computeColMax(const int* data,
 
 void mergeCacheWrites(std::vector<MaxKeyCacheEntry>& cacheRead,
                       std::vector<MaxKeyCacheEntry>& cacheWrite,
-                      bool cacheDirty) {
+                      bool cacheDirty,
+                      const std::string& cachePath) {
     if (!cacheDirty) return;
     for (auto& entry : cacheWrite) cacheRead.push_back(std::move(entry));
-    saveMaxKeyCache(cacheRead);
+    saveMaxKeyCache(cachePath, cacheRead);
 }
 
 } // namespace
@@ -189,65 +226,57 @@ void registerMaxKeySymbols(
     MetalGenericExecutor& executor,
     const std::vector<std::pair<std::string, QueryColumns>>& loadedTables,
     const std::map<std::string, std::set<std::string>>& tableCols,
-    const TPCHSchema& schema) {
-    int maxCustkey = 0;
-    int maxSuppkey = 0;
-    int maxOrderkey = 0;
-    int maxPartkey = 0;
+    const SchemaProvider& schema) {
+    std::map<std::string, int> maxBySymbol;
     std::vector<MaxKeyCacheEntry> cacheRead, cacheWrite;
     bool cacheDirty = false;
-    if (currentMaxKeyMode() == MaxKeyMode::Cache) loadMaxKeyCache(cacheRead);
+    const std::string cachePath = cachePathForSchema(schema, tableCols);
+    if (currentMaxKeyMode() == MaxKeyMode::Cache)
+        loadMaxKeyCache(cachePath, cacheRead);
 
     for (const auto& [tblName, columns] : loadedTables) {
         const auto tableIt = tableCols.find(tblName);
         if (tableIt == tableCols.end()) continue;
-        const auto& tableDef = schema.table(tblName);
         size_t rowCount = columns.rows();
         for (const auto& colName : tableIt->second) {
-            const auto& columnDef = tableDef.col(colName);
-            if (columnDef.type != DataType::INT && columnDef.type != DataType::DATE) continue;
-            const int* data = columns.ints(columnDef.index);
+            const std::string symbol = schema.keyDomainSymbol(tblName, colName);
+            if (symbol.empty() || isNumericLiteral(symbol)) continue;
+
+            const DataType type = schema.columnType(tblName, colName);
+            if (type != DataType::INT && type != DataType::DATE) continue;
+
+            const int columnIndex = schema.columnIndex(tblName, colName);
+            const int* data = columns.ints(columnIndex);
             if (!data) continue;
 
-            const std::string tblPath = g_dataset_path + tblName + ".tbl";
-            int colMax = 0;
-            if (isMaxKeyColumn(colName)) {
-                colMax = computeColMax(data, rowCount, tblPath, columnDef.index,
-                                       cacheRead, cacheWrite, cacheDirty);
-            }
-
-            if (colName == "c_custkey" || colName == "o_custkey")
-                maxCustkey = std::max(maxCustkey, colMax);
-            else if (colName == "s_suppkey" || colName == "l_suppkey" || colName == "ps_suppkey")
-                maxSuppkey = std::max(maxSuppkey, colMax);
-            else if (colName == "o_orderkey" || colName == "l_orderkey")
-                maxOrderkey = std::max(maxOrderkey, colMax);
-            else if (colName == "p_partkey" || colName == "l_partkey" || colName == "ps_partkey")
-                maxPartkey = std::max(maxPartkey, colMax);
+            const std::string colbinPath = tableDataPath(schema, tblName);
+            const int colMax = computeColMax(data, rowCount, colbinPath, columnIndex,
+                                             cacheRead, cacheWrite, cacheDirty);
+            maxBySymbol[symbol] = std::max(maxBySymbol[symbol], colMax);
         }
     }
 
-    mergeCacheWrites(cacheRead, cacheWrite, cacheDirty);
-    executor.registerSymbol("maxCustkey", maxCustkey + 1);
-    executor.registerSymbol("maxSuppkey", maxSuppkey + 1);
-    executor.registerSymbol("maxOrderkey", maxOrderkey + 1);
-    executor.registerSymbol("maxPartkey", maxPartkey + 1);
+    mergeCacheWrites(cacheRead, cacheWrite, cacheDirty, cachePath);
+    for (const auto& [symbol, maxValue] : maxBySymbol)
+        executor.registerSymbol(symbol, (size_t)maxValue + 1);
 }
 
 void extendMaxKeysFromStreamColbin(
     MetalGenericExecutor& executor,
     const std::string& streamTblPath,
     const std::set<std::string>& streamCols,
-    const TPCHSchema& schema,
+    const SchemaProvider& schema,
     const std::string& streamTable) {
     if (streamTable.empty()) return;
-    const auto& tableDef = schema.table(streamTable);
     std::vector<std::pair<std::string, ColSpec>> intSpecs;
     for (const auto& colName : streamCols) {
-        const auto& columnDef = tableDef.col(colName);
-        if (columnDef.type != DataType::INT && columnDef.type != DataType::DATE) continue;
-        if (!isMaxKeyColumn(colName)) continue;
-        intSpecs.emplace_back(colName, colSpecFor(columnDef));
+        const std::string symbol = schema.keyDomainSymbol(streamTable, colName);
+        if (symbol.empty() || isNumericLiteral(symbol)) continue;
+
+        const DataType type = schema.columnType(streamTable, colName);
+        if (type != DataType::INT && type != DataType::DATE) continue;
+
+        intSpecs.emplace_back(symbol, colSpecFor(schema, streamTable, colName));
     }
     if (intSpecs.empty()) return;
 
@@ -263,30 +292,22 @@ void extendMaxKeysFromStreamColbin(
         return;
     }
 
-    int maxCustkey = 0;
-    int maxSuppkey = 0;
-    int maxOrderkey = 0;
-    int maxPartkey = 0;
+    std::map<std::string, int> maxBySymbol;
     std::vector<MaxKeyCacheEntry> cacheRead, cacheWrite;
     bool cacheDirty = false;
-    if (currentMaxKeyMode() == MaxKeyMode::Cache) loadMaxKeyCache(cacheRead);
+    const std::string cachePath = cachePathForDataPath(streamTblPath);
+    if (currentMaxKeyMode() == MaxKeyMode::Cache)
+        loadMaxKeyCache(cachePath, cacheRead);
 
-    for (const auto& [colName, spec] : intSpecs) {
+    for (const auto& [symbol, spec] : intSpecs) {
         const auto& values = parsed.ints(spec.columnIndex);
         if (values.empty()) continue;
         int colMax = computeColMax(values.data(), values.size(), streamTblPath, spec.columnIndex,
                                    cacheRead, cacheWrite, cacheDirty);
-        if (colName == "c_custkey" || colName == "o_custkey")
-            maxCustkey = std::max(maxCustkey, colMax);
-        else if (colName == "s_suppkey" || colName == "l_suppkey" || colName == "ps_suppkey")
-            maxSuppkey = std::max(maxSuppkey, colMax);
-        else if (colName == "o_orderkey" || colName == "l_orderkey")
-            maxOrderkey = std::max(maxOrderkey, colMax);
-        else if (colName == "p_partkey" || colName == "l_partkey" || colName == "ps_partkey")
-            maxPartkey = std::max(maxPartkey, colMax);
+        maxBySymbol[symbol] = std::max(maxBySymbol[symbol], colMax);
     }
 
-    mergeCacheWrites(cacheRead, cacheWrite, cacheDirty);
+    mergeCacheWrites(cacheRead, cacheWrite, cacheDirty, cachePath);
 
     auto bump = [&](const char* name, int streamMax) {
         if (streamMax <= 0) return;
@@ -297,10 +318,8 @@ void extendMaxKeysFromStreamColbin(
             executor.registerSymbol(name, (size_t)streamMax + 1);
         }
     };
-    bump("maxCustkey", maxCustkey);
-    bump("maxSuppkey", maxSuppkey);
-    bump("maxOrderkey", maxOrderkey);
-    bump("maxPartkey", maxPartkey);
+    for (const auto& [symbol, maxValue] : maxBySymbol)
+        bump(symbol.c_str(), maxValue);
 }
 
 } // namespace codegen

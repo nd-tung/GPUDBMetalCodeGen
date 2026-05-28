@@ -24,7 +24,7 @@ ChunkedColbinTable::~ChunkedColbinTable() {
 }
 
 bool ChunkedColbinTable::open(MTL::Device* device,
-                              const std::string& tblPath,
+                              const std::string& dataPath,
                               const std::vector<ColSpec>& specs,
                               size_t chunkRows,
                               int slotCount,
@@ -46,11 +46,13 @@ bool ChunkedColbinTable::open(MTL::Device* device,
 
     size_t tblSize = 0;
     int64_t tblMtime = 0;
-    const bool tblPresent = colbin::statFile(tblPath, tblSize, tblMtime);
+    const bool checkSource = !colbin::isBinaryPath(dataPath);
+    const bool tblPresent = checkSource &&
+        colbin::statFile(colbin::textPath(dataPath), tblSize, tblMtime);
     // .tbl is optional once .colbin has been generated; if absent we skip
     // the source-size/mtime cross-check and trust the .colbin header.
 
-    const std::string colbinPath = colbin::binaryPath(tblPath);
+    const std::string colbinPath = colbin::binaryPath(dataPath);
     int fd = ::open(colbinPath.c_str(), O_RDONLY);
     if (fd < 0) {
         error = "missing .colbin for chunked execution: " + errnoMessage(colbinPath);
@@ -82,7 +84,7 @@ bool ChunkedColbinTable::open(MTL::Device* device,
     std::memcpy(&header, base, sizeof(header));
     if (!colbin::validateHeader(header, fileSize, tblPresent, tblSize, tblMtime)) {
         ::munmap(base, fileSize);
-        error = "stale or invalid .colbin for " + tblPath + " (run make colbin-sfN)";
+        error = "stale or invalid .colbin for " + dataPath + " (run make colbin-sfN)";
         return false;
     }
 
@@ -118,7 +120,7 @@ bool ChunkedColbinTable::open(MTL::Device* device,
                     for (auto& [_, owned] : cleanupSlot.buffers) if (owned) owned->release();
                 }
                 ::munmap(base, fileSize);
-                error = "Metal buffer allocation failed for chunked table " + tblPath;
+                error = "Metal buffer allocation failed for chunked table " + dataPath;
                 return false;
             }
             slot.buffers[col.spec.columnIndex] = buffer;

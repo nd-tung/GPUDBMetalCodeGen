@@ -1,5 +1,6 @@
 #include "generic/lowering/generic_cost_model.h"
 #include "core/infra.h"
+#include "core/schema_provider.h"
 
 #include <algorithm>
 #include <cctype>
@@ -199,48 +200,45 @@ std::string trimCostExpression(const std::string& expr) {
     return expr.substr(first, last - first);
 }
 
-std::optional<int> currentTpchScaleFactor() {
-    const std::string& path = ::g_dataset_path;
-    auto pos = path.find("SF-");
-    if (pos == std::string::npos) return std::nullopt;
-    pos += 3;
-    int value = 0;
-    bool any = false;
-    while (pos < path.size() &&
-           std::isdigit(static_cast<unsigned char>(path[pos]))) {
-        any = true;
-        value = value * 10 + (path[pos] - '0');
-        ++pos;
+std::string pathDirectory(const std::string& path) {
+    const size_t slash = path.find_last_of('/');
+    if (slash == std::string::npos) return "";
+    return path.substr(0, slash + 1);
+}
+
+std::string pathFileName(const std::string& path) {
+    const size_t slash = path.find_last_of('/');
+    return slash == std::string::npos ? path : path.substr(slash + 1);
+}
+
+bool isNumericSymbol(const std::string& value) {
+    return !value.empty() &&
+           std::all_of(value.begin(), value.end(), [](unsigned char ch) {
+               return std::isdigit(ch) != 0;
+           });
+}
+
+std::string schemaTableDataPath(const SchemaProvider& schema,
+                                const std::string& table) {
+    try {
+        return schema.tableDataPath(table);
+    } catch (...) {
+        return "";
     }
-    if (!any || value <= 0) return std::nullopt;
-    return value;
 }
 
-std::optional<size_t> readColbinRowCount(const std::string& table) {
-    const std::string path = ::g_dataset_path + table + ".colbin";
+std::optional<size_t> schemaTableRowCount(const SchemaProvider& schema,
+                                          const std::string& table) {
+    try {
+        if (size_t rows = schema.tableRowCount(table))
+            return rows;
+    } catch (...) {
+    }
+    const std::string path = schemaTableDataPath(schema, table);
+    if (path.empty()) return std::nullopt;
     uint64_t rows = 0;
-    if (!colbin::peekRowCount(path, rows)) return std::nullopt;
+    if (!colbin::peekRowCount(colbin::binaryPath(path), rows)) return std::nullopt;
     return static_cast<size_t>(rows);
-}
-
-std::optional<size_t> fallbackTpchRowCount(const std::string& table) {
-    auto sf = currentTpchScaleFactor();
-    if (!sf) return std::nullopt;
-    const size_t scale = static_cast<size_t>(*sf);
-    if (table == "region") return 5;
-    if (table == "nation") return 25;
-    if (table == "supplier") return 10000 * scale;
-    if (table == "part") return 200000 * scale;
-    if (table == "partsupp") return 800000 * scale;
-    if (table == "customer") return 150000 * scale;
-    if (table == "orders") return 1500000 * scale;
-    if (table == "lineitem") return 6000000 * scale;
-    return std::nullopt;
-}
-
-std::optional<size_t> costTableRowCount(const std::string& table) {
-    if (auto rows = readColbinRowCount(table)) return rows;
-    return fallbackTpchRowCount(table);
 }
 
 std::optional<std::string> extractJsonStringField(const std::string& object,
@@ -280,9 +278,11 @@ std::optional<size_t> extractJsonSizeField(const std::string& object,
     return value;
 }
 
-std::map<std::pair<std::string, int>, size_t> loadMaxKeyCacheValues() {
+std::map<std::pair<std::string, int>, size_t> loadMaxKeyCacheValues(
+        const std::string& cachePath) {
     std::map<std::pair<std::string, int>, size_t> values;
-    std::ifstream in(::g_dataset_path + ".maxkeys.json");
+    if (cachePath.empty()) return values;
+    std::ifstream in(cachePath);
     if (!in) return values;
     std::string text((std::istreambuf_iterator<char>(in)),
                      std::istreambuf_iterator<char>());
@@ -307,85 +307,140 @@ std::map<std::pair<std::string, int>, size_t> loadMaxKeyCacheValues() {
 
 std::optional<size_t> maxKeyFromCache(
         const std::map<std::pair<std::string, int>, size_t>& cache,
-        const std::vector<std::pair<std::string, int>>& columns) {
-    std::optional<size_t> out;
-    for (const auto& column : columns) {
-        auto it = cache.find(column);
-        if (it == cache.end()) continue;
-        out = out ? std::max(*out, it->second) : it->second;
+        const SchemaProvider& schema,
+        const std::string& table,
+        const std::string& column) {
+    if (table.empty() || column.empty()) return std::nullopt;
+    std::string path = schemaTableDataPath(schema, table);
+    if (path.empty()) return std::nullopt;
+    int columnIndex = -1;
+    try {
+        columnIndex = schema.columnIndex(table, column);
+    } catch (...) {
+        return std::nullopt;
     }
-    return out;
+    if (columnIndex < 0) return std::nullopt;
+    auto it = cache.find({pathFileName(colbin::binaryPath(path)), columnIndex});
+    if (it == cache.end()) return std::nullopt;
+    return it->second;
 }
 
-void registerCostSymbolIfMissing(
+void registerCostSymbolMax(
         std::unordered_map<std::string, size_t>& symbols,
         const std::string& name,
         size_t value) {
-    symbols.emplace(name, value);
+    if (name.empty() || isNumericSymbol(name) || value == 0) return;
+    auto it = symbols.find(name);
+    if (it == symbols.end() || value > it->second) symbols[name] = value;
 }
 
-std::unordered_map<std::string, size_t> buildScaleAwareCostSymbols() {
+std::string cachePathForPlan(const GenericRelPlan& ir) {
+    if (ir.schema) {
+        for (const auto& rel : ir.relations) {
+            if (rel.virtualRelation) continue;
+            const std::string path = schemaTableDataPath(*ir.schema, rel.name);
+            if (!path.empty())
+                return pathDirectory(colbin::binaryPath(path)) + ".maxkeys.json";
+        }
+    }
+    return "";
+}
+
+std::unordered_map<std::string, size_t> buildGenericCostSymbols(
+        const GenericRelPlan& ir) {
     std::unordered_map<std::string, size_t> symbols;
-    const std::vector<std::string> tables = {
-        "region", "nation", "supplier", "part", "partsupp",
-        "customer", "orders", "lineitem"
-    };
+    if (!ir.schema) return symbols;
+
+    const SchemaProvider& schema = *ir.schema;
+    const auto cache = loadMaxKeyCacheValues(cachePathForPlan(ir));
     std::unordered_map<std::string, size_t> rowsByTable;
-    for (const auto& table : tables) {
-        if (auto rows = costTableRowCount(table)) {
-            rowsByTable[table] = *rows;
-            registerCostSymbolIfMissing(symbols, tableSizeName(table), *rows);
-            registerCostSymbolIfMissing(symbols, "num" + table, *rows);
+
+    for (const auto& rel : ir.relations) {
+        if (rel.virtualRelation || rel.name.empty()) continue;
+        if (auto rows = schemaTableRowCount(schema, rel.name)) {
+            rowsByTable[rel.name] = *rows;
+            registerCostSymbolMax(symbols, tableSizeName(rel.name), *rows);
+            registerCostSymbolMax(symbols, "num" + rel.name, *rows);
         }
     }
 
-    const auto cache = loadMaxKeyCacheValues();
-    auto registerMaxKey = [&](const std::string& symbol,
-                              const std::vector<std::pair<std::string, int>>& columns,
-                              std::optional<size_t> fallbackMax) {
-        std::optional<size_t> maxValue = maxKeyFromCache(cache, columns);
-        if (!maxValue) maxValue = fallbackMax;
-        if (maxValue) registerCostSymbolIfMissing(symbols, symbol, *maxValue + 1);
-    };
-
-    auto rowMax = [&](const std::string& table) -> std::optional<size_t> {
+    auto tableRows = [&](const std::string& table) -> std::optional<size_t> {
         auto it = rowsByTable.find(table);
         if (it == rowsByTable.end() || it->second == 0) return std::nullopt;
         return it->second;
     };
 
-    registerMaxKey("maxCustkey",
-                   {{"customer.colbin", 0}, {"orders.colbin", 1}},
-                   rowMax("customer"));
-    registerMaxKey("maxSuppkey",
-                   {{"supplier.colbin", 0}, {"partsupp.colbin", 1},
-                    {"lineitem.colbin", 2}},
-                   rowMax("supplier"));
-    registerMaxKey("maxPartkey",
-                   {{"part.colbin", 0}, {"partsupp.colbin", 0},
-                    {"lineitem.colbin", 1}},
-                   rowMax("part"));
-    std::optional<size_t> fallbackOrderMax;
-    if (auto orderRows = rowMax("orders"))
-        fallbackOrderMax = *orderRows * 4;
-    registerMaxKey("maxOrderkey",
-                   {{"orders.colbin", 0}, {"lineitem.colbin", 0}},
-                   fallbackOrderMax);
+    auto registerColumnDomain = [&](const std::string& table,
+                                    const std::string& column,
+                                    const std::string& symbol) {
+        if (symbol.empty() || isNumericSymbol(symbol)) return;
+        if (auto maxValue = maxKeyFromCache(cache, schema, table, column)) {
+            registerCostSymbolMax(symbols, symbol, *maxValue + 1);
+            return;
+        }
+        try {
+            if (auto domain = schema.groupDomain(table, column)) {
+                if (domain->maxValue >= 0 && domain->maxValue >= domain->minValue)
+                    registerCostSymbolMax(symbols, symbol,
+                                          static_cast<size_t>(domain->maxValue) + 1);
+                return;
+            }
+        } catch (...) {
+        }
+        try {
+            if (auto pk = schema.pkInfo(table); pk && pk->first == column) {
+                if (auto rows = tableRows(table))
+                    registerCostSymbolMax(symbols, symbol, *rows + 1);
+            }
+        } catch (...) {
+        }
+    };
+
+    for (const auto& rel : ir.relations) {
+        if (rel.virtualRelation || rel.name.empty()) continue;
+        try {
+            if (auto pk = schema.pkInfo(rel.name)) {
+                registerColumnDomain(rel.name, pk->first, pk->second);
+                registerColumnDomain(rel.name, pk->first, rel.primaryKeyDomainSymbol);
+                registerColumnDomain(rel.name, pk->first, rel.maxKeySymbol);
+            }
+        } catch (...) {
+        }
+    }
+
+    std::vector<GenericColumnExpr> sourceColumns;
+    for (const auto& node : ir.nodes)
+        collectCostColumnsFromNode(node, sourceColumns);
+
+    std::set<std::pair<std::string, std::string>> seenColumns;
+    for (const auto& col : sourceColumns) {
+        std::string table = col.table;
+        if (table.empty() && col.relationInstance.valid()) {
+            if (const auto* inst = ir.findRelationInstance(col.relationInstance))
+                table = inst->baseName;
+        }
+        if (table.empty() || col.column.empty()) continue;
+        if (!seenColumns.insert({table, col.column}).second) continue;
+
+        registerColumnDomain(table, col.column, col.keyDomainSymbol);
+        registerColumnDomain(table, col.column, col.distinctDomainSymbol);
+        try {
+            registerColumnDomain(table, col.column,
+                                 schema.keyDomainSymbol(table, col.column));
+            registerColumnDomain(table, col.column,
+                                 schema.distinctDomainSymbol(table, col.column));
+        } catch (...) {
+        }
+    }
     return symbols;
 }
 
-const std::unordered_map<std::string, size_t>& scaleAwareCostSymbols() {
-    static std::string cachedDatasetPath;
-    static std::unordered_map<std::string, size_t> cachedSymbols;
-    if (cachedDatasetPath != ::g_dataset_path || cachedSymbols.empty()) {
-        cachedDatasetPath = ::g_dataset_path;
-        cachedSymbols = buildScaleAwareCostSymbols();
-    }
-    return cachedSymbols;
-}
+thread_local std::vector<std::unordered_map<std::string, size_t>>
+    genericCostSymbolStack;
 
-void populateScaleAwareCostSymbols(MetalSizeResolver& resolver) {
-    for (const auto& [name, value] : scaleAwareCostSymbols()) {
+void populateActiveCostSymbols(MetalSizeResolver& resolver) {
+    if (genericCostSymbolStack.empty()) return;
+    for (const auto& [name, value] : genericCostSymbolStack.back()) {
         if (!resolver.hasSymbol(name)) resolver.registerSymbol(name, value);
     }
 }
@@ -538,6 +593,14 @@ bool genericCostTraceEnabled() {
     return value && value[0] != '\0' && value[0] != '0';
 }
 
+GenericCostSymbolScope::GenericCostSymbolScope(const GenericRelPlan& ir) {
+    genericCostSymbolStack.push_back(buildGenericCostSymbols(ir));
+}
+
+GenericCostSymbolScope::~GenericCostSymbolScope() {
+    if (!genericCostSymbolStack.empty()) genericCostSymbolStack.pop_back();
+}
+
 size_t genericCostTypeByteWidth(const TypeInfo& type) {
     switch (type.type) {
         case DataType::INT:
@@ -573,7 +636,7 @@ std::optional<double> resolveGenericCostExpression(const std::string& expr) {
     if (auto parsed = parseGenericCostPositiveNumber(trimmed)) return parsed;
 
     MetalSizeResolver resolver;
-    populateScaleAwareCostSymbols(resolver);
+    populateActiveCostSymbols(resolver);
     try {
         return static_cast<double>(resolver.resolve(trimmed));
     } catch (...) {
