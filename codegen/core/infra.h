@@ -1448,11 +1448,14 @@ inline void printDetailedTimingSummary(const DetailedTiming& t, bool quiet = fal
     //                      wait overhead, unified-memory migration, and other
     //                      synchronization effects.
     //   Query Compute    = GPU Compute + CPU Compute + Execute Residual
-    //   Hot Execution    = Buffer Setup + Query Compute
-    //                      (repeatable hot-query work, excluding I/O, compile, and preprocess)
+    //                      (diagnostic breakdown; may not be used for totals
+    //                      when wall time is available)
+    //   Hot Execution    = Execute Wall + Host Post
+    //                      (repeatable hot-query wall time, excluding I/O,
+    //                      compile, and preprocess)
     //   Query Execution  = CPU Preprocess + Hot Execution
     //                      (everything actually executing the query, EXCLUDING pure I/O)
-    //   End-to-End       = Compile Overhead + Data Load + Buffer Setup + Query Compute
+    //   End-to-End       = Compile Overhead + Data Load + Hot Execution
     const double compileOverheadMs = t.analyzeMs + t.planMs + t.codegenMs +
                                      t.compileMs + t.psoMs;
     const double gpuComputeMs      = t.gpuTotalMs;
@@ -1470,10 +1473,12 @@ inline void printDetailedTimingSummary(const DetailedTiming& t, bool quiet = fal
                                      ? t.ioMs : t.dataLoadMs;
     const double preprocessMs      = (t.ioMs > 0.0 || t.preprocessMs > 0.0)
                                      ? t.preprocessMs : 0.0;
-    const double hotExecutionMs    = t.bufferAllocMs + queryComputeMs;
+    const double hotExecutionMs    = (t.executeWallMs > 0.0)
+                                     ? (t.executeWallMs + t.postMs)
+                                     : (t.bufferAllocMs + queryComputeMs);
     const double queryExecutionMs  = preprocessMs + hotExecutionMs;
     const double endToEndMs        = compileOverheadMs + t.dataLoadMs +
-                                     t.bufferAllocMs + queryComputeMs;
+                                     hotExecutionMs;
 
     if (!quiet) {
         auto bar = []() {

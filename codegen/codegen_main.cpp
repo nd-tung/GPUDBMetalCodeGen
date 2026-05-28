@@ -1046,6 +1046,7 @@ static bool runCodegenQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
         // host-side hook/result work, and optionally JIT compile time.
         std::vector<double> gpuTrials;     gpuTrials.reserve(g_repeat);
         std::vector<double> compileTrials; compileTrials.reserve(g_repeat);
+        std::vector<double> psoTrials;     psoTrials.reserve(g_repeat);
         std::vector<double> executeWallTrials; executeWallTrials.reserve(g_repeat);
         std::vector<double> bufferAllocTrials; bufferAllocTrials.reserve(g_repeat);
         std::vector<double> hookCpuTrials; hookCpuTrials.reserve(g_repeat);
@@ -1065,16 +1066,19 @@ static bool runCodegenQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
             codegen::RuntimeCompiler::CompiledQuery compiledTrial = compiled;
             std::unique_ptr<codegen::RuntimeCompiler> compilerR;
             double trialCompileMs = 0.0;
+            double trialPsoMs = 0.0;
             if (g_noPipelineCache) {
-                auto tcr0 = clk::now();
                 compilerR = std::make_unique<codegen::RuntimeCompiler>(device);
+                auto tcr0 = clk::now();
                 auto* libR = compilerR->compile(metalSource);
+                trialCompileMs = elapsedMs(tcr0, clk::now());
                 if (!libR) {
                     std::cerr << "Codegen: Metal recompile failed in --no-pipeline-cache trial\n";
                     return false;
                 }
                 codegen::RuntimeCompiler::CompiledQuery cR;
                 cR.library = libR;
+                auto tPsoR0 = clk::now();
                 for (const auto& phase : cg.getPhases()) {
                     auto* pso = compilerR->getPipeline(libR, phase.name);
                     if (!pso) {
@@ -1084,8 +1088,8 @@ static bool runCodegenQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
                     cR.pipelines.push_back(pso);
                     cR.kernelNames.push_back(phase.name);
                 }
+                trialPsoMs = elapsedMs(tPsoR0, clk::now());
                 compiledTrial = cR;
-                trialCompileMs = elapsedMs(tcr0, clk::now());
             }
 
             auto tr0 = clk::now();
@@ -1094,6 +1098,7 @@ static bool runCodegenQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
 
             gpuTrials.push_back((double)result.totalKernelTimeMs);
             compileTrials.push_back(trialCompileMs);
+            psoTrials.push_back(trialPsoMs);
             executeWallTrials.push_back(executeWallTrialMs);
             bufferAllocTrials.push_back((double)result.bufferAllocTimeMs);
             hookCpuTrials.push_back((double)result.hookCpuTimeMs);
@@ -1184,9 +1189,11 @@ static bool runCodegenQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
         timing.gpuMsP90      = percentileValue(gpuTrials, 0.90);
         timing.gpuMsMad      = medianAbsoluteDeviation(gpuTrials);
         if (g_noPipelineCache) {
-            // Override the single-shot compile time with the per-trial median
-            // so the headline number reflects the cost we're studying.
+            // Override one-shot compile/PSO timings with per-trial medians so
+            // the headline numbers reflect the cost we're studying without
+            // folding PSO creation into Metal Compile.
             timing.compileMs = medianValue(compileTrials);
+            timing.psoMs = medianValue(psoTrials);
         }
         timing.phaseKernelMs.clear();
         for (size_t i = 0; i < phaseTrialSamples.size(); i++) {
