@@ -4,6 +4,8 @@
 #include <variant>
 #include <memory>
 #include <cstdint>
+#include <map>
+#include <optional>
 
 namespace codegen {
 
@@ -125,7 +127,7 @@ struct LogicalNot { PredPtr child; };
 
 struct ExistsPred {
     bool negated = false;
-    // Child query index in AnalyzedQuery::subqueries.
+    // Child query index in the source subquery list.
     int subqueryIdx = -1;
 
     ExistsPred() = default;
@@ -172,6 +174,46 @@ struct Predicate {
         p->node = LogicalNot{ch};
         return p;
     }
+};
+
+// --- Query fragments shared by SQL analysis and Generic IR source metadata ---
+
+struct JoinClause {
+    std::string leftTable, rightTable;
+    std::string leftCol, rightCol;
+    bool anti = false;       // NOT EXISTS anti-semi join.
+    bool leftOuter = false;  // LEFT OUTER JOIN.
+    bool semi = false;       // EXISTS semi join.
+    std::string innerTable;  // EXISTS/NOT EXISTS inner table.
+};
+
+struct AggTarget {
+    AggFunc func;
+    ExprPtr innerExpr;  // Aggregate input expression.
+    std::string alias;
+    bool isStar = false; // COUNT(*)
+};
+
+struct SelectTarget {
+    ExprPtr expr;
+    std::string alias;
+    bool isAgg = false;
+    std::optional<AggTarget> agg;
+};
+
+struct FromSubqueryAggInfo {
+    std::string alias;  // FROM-subquery alias.
+    std::vector<std::string> tables;
+    std::vector<std::string> tableAliases;
+    std::vector<JoinClause> joins;
+    std::vector<PredPtr> filters;
+    std::vector<SelectTarget> targets;
+    std::vector<ExprPtr> groupBy;
+};
+
+struct OrderByItem {
+    ExprPtr expr;
+    bool descending = false;
 };
 
 // --- Aggregation Spec ---

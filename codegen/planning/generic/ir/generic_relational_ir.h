@@ -4,6 +4,7 @@
 #include "../../../../third_party/nlohmann/json.hpp"
 
 #include <cstdint>
+#include <map>
 #include <memory>
 #include <optional>
 #include <string>
@@ -12,6 +13,8 @@
 #include <vector>
 
 namespace codegen {
+
+class SchemaProvider;
 
 struct GenericRelationId {
     int value = -1;
@@ -266,6 +269,112 @@ struct GenericMaterializeDetail {
     std::string outputName;
 };
 
+struct GenericInSubqueryHaving {
+    CmpOp op = CmpOp::GT;
+    double literal = 0.0;
+};
+
+struct GenericScalarSubqueryAggTarget {
+    AggFunc func = AggFunc::SUM;
+    bool star = false;
+    double multiplier = 1.0;
+    std::string argSignature;
+};
+
+struct GenericScalarHavingSubquerySummary {
+    GenericScalarSubqueryAggTarget aggregate;
+    std::vector<std::string> tables;
+    std::vector<std::string> predicateSignatures;
+};
+
+struct GenericFromSubqueryScalarExtremum {
+    std::string sourceAlias;
+    AggFunc func = AggFunc::MAX;
+    std::string argAlias;
+};
+
+struct DecorrCol {
+    std::string table;
+    std::string column;
+    std::string qualifier;
+    bool inner = false;
+};
+
+struct DecorrJoin {
+    DecorrCol left;
+    DecorrCol right;
+};
+
+struct DecorrCorrelation {
+    DecorrCol inner;
+    DecorrCol outer;
+};
+
+struct DecorrelatedScalarSubquery {
+    int sqIdx = 0;
+    AggFunc func = AggFunc::SUM;
+    bool countStar = false;
+    float multiplier = 1.0f;
+    std::string valueTable;
+    std::string valueCol;
+    std::vector<std::string> tables;
+    std::map<std::string, std::string> aliases;
+    std::vector<DecorrJoin> joins;
+    std::vector<DecorrCorrelation> correlations;
+    std::map<std::string, std::vector<GenericPredicatePtr>> filtersByTable;
+};
+
+struct GenericSourceSubquery {
+    enum Type { IN_SUBQUERY, EXISTS_SUBQUERY, NOT_EXISTS_SUBQUERY, SCALAR_SUBQUERY };
+    Type type = SCALAR_SUBQUERY;
+    std::optional<GenericScalarHavingSubquerySummary> scalarHavingSummary;
+    std::vector<GenericFromSubqueryScalarExtremum> fromSubqueryScalarExtrema;
+    std::optional<DecorrelatedScalarSubquery> decorrelatedScalar;
+};
+
+struct GenericInSubqueryAggInfo {
+    std::string alias;        // Duplicate table alias.
+    std::string baseTable;    // Base table name.
+    int tableIndex = -1;      // Source table index from SQL analysis.
+    std::string groupCol;     // GROUP BY column.
+    std::string aggFunc;      // SUM, COUNT, AVG, MIN, or MAX.
+    std::string aggExpr;      // Aggregate input column.
+    bool hasHavingPred = false;
+    std::optional<GenericInSubqueryHaving> having;
+};
+
+struct GenericFromSubqueryJoin {
+    std::string leftTable;
+    std::string rightTable;
+    std::string leftCol;
+    std::string rightCol;
+    bool leftOuter = false;
+};
+
+struct GenericFromSubqueryAggTarget {
+    std::string name;
+    AggFunc func = AggFunc::COUNT;
+    GenericExprPtr arg;
+    bool star = false;
+    TypeInfo type;
+};
+
+struct GenericFromSubqueryAggInfo {
+    std::string alias;
+    std::vector<std::string> tables;
+    std::vector<std::string> tableAliases;
+    std::vector<GenericFromSubqueryJoin> joins;
+    std::vector<GenericPredicatePtr> filters;
+    std::vector<GenericFromSubqueryAggTarget> aggregates;
+    std::vector<GenericExprPtr> groupBy;
+};
+
+struct GenericSourceQueryInfo {
+    std::vector<GenericInSubqueryAggInfo> inSubAggs;
+    std::vector<GenericFromSubqueryAggInfo> fromSubqueryAggs;
+    std::vector<GenericSourceSubquery> subqueries;
+};
+
 struct GenericRelNode {
     GenericNodeId id;
     GenericRelOp op = GenericRelOp::Scan;
@@ -286,6 +395,8 @@ struct GenericRelPlan {
     std::vector<GenericRelationInstance> relationInstances;
     std::vector<GenericRelNode> nodes;
     GenericNodeId root;
+    const SchemaProvider* schema = nullptr;
+    GenericSourceQueryInfo source;
 
     const GenericRelation* findRelation(GenericRelationId id) const;
     const GenericRelationInstance* findRelationInstance(GenericRelationInstanceId id) const;
@@ -315,6 +426,8 @@ public:
                                        GenericSortDetail,
                                        GenericLimitDetail,
                                        GenericMaterializeDetail> detail);
+    void setSchema(const SchemaProvider* schema);
+    void setSourceQuery(GenericSourceQueryInfo source);
     GenericExprId nextExprId();
     GenericColumnId nextColumnId();
     GenericRelPlan finish(GenericNodeId root);

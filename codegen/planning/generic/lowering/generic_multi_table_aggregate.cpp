@@ -2912,9 +2912,9 @@ std::optional<MetalQueryPlan> lowerSharedDimensionCount(
         const GenericRelPlan& ir,
         const MultiTableGroupedAggShape& shape,
         const GenericAggregateDetail& aggregate,
-        const AnalyzedQuery* aq,
         std::string* error) {
-    if (!aq || !aq->schema) return std::nullopt;
+    const auto* schema = ir.schema;
+    if (!schema) return std::nullopt;
     if (shape.scans.size() != 3) return std::nullopt;
 
     if (aggregate.groupBy.size() != 1 || aggregate.aggregates.size() != 1)
@@ -2965,7 +2965,7 @@ std::optional<MetalQueryPlan> lowerSharedDimensionCount(
     ColumnEquivalence eq = buildJoinColumnEquivalence(shape.joins, shape.filter);
     GenericColumnExpr dimensionPk =
         relationColumn(*dimensionScan, dimensionRel->primaryKeyColumn,
-                       *aq->schema);
+                       *schema);
     auto equivalentCols = eq.columnsEquivalentTo(dimensionPk);
 
     struct CountInput {
@@ -3008,7 +3008,7 @@ std::optional<MetalQueryPlan> lowerSharedDimensionCount(
     for (const auto& input : countInputs) {
         auto scan = makeScanForCols(input.scan->table, idxVar,
                                     {input.keyCol.column},
-                                    aq->schema);
+                                    schema);
         auto count = std::make_unique<MetalAtomicCount>(
             std::move(scan), input.countBuffer,
             input.keyCol.column + "[" + idxVar + "]",
@@ -3022,8 +3022,8 @@ std::optional<MetalQueryPlan> lowerSharedDimensionCount(
     if (groupCol->type.type == DataType::CHAR_FIXED) {
         groupStringWidth = groupCol->type.fixedWidth > 0
             ? groupCol->type.fixedWidth
-            : aq->schema->columnFixedWidth(dimensionScan->table,
-                                           groupCol->column);
+            : schema->columnFixedWidth(dimensionScan->table,
+                                       groupCol->column);
         if (groupStringWidth <= 0) return std::nullopt;
     }
 
@@ -3031,7 +3031,7 @@ std::optional<MetalQueryPlan> lowerSharedDimensionCount(
         dimensionRel->primaryKeyColumn, groupCol->column};
     std::unique_ptr<MetalOperator> dimensionPipe =
         makeScanForCols(dimensionScan->table, idxVar, dimensionCols,
-                        aq->schema);
+                        schema);
     if (auto* filter = filterDetail(shape.filter)) {
         dimensionPipe = maybeSelect(
             std::move(dimensionPipe),
@@ -3125,7 +3125,6 @@ std::optional<MetalQueryPlan> lowerSharedDimensionCount(
 
 std::optional<MetalQueryPlan> lowerMultiTableGroupedAggregateIRToMetalImpl(
         const GenericRelPlan& ir,
-        const AnalyzedQuery* aq,
         std::string* error) {
     auto shape = parseMultiTableGroupedAggShape(ir, error);
     if (!shape) return std::nullopt;
@@ -3138,7 +3137,7 @@ std::optional<MetalQueryPlan> lowerMultiTableGroupedAggregateIRToMetalImpl(
     if (aggregate->aggregates.empty())
         return fail(error, "IR multi-table grouped aggregate lowerer: no aggregate outputs.");
 
-    if (auto p = lowerSharedDimensionCount(ir, *shape, *aggregate, aq, error))
+    if (auto p = lowerSharedDimensionCount(ir, *shape, *aggregate, error))
         return p;
 
     std::vector<GenericExprPtr> neededExprs;
@@ -3156,9 +3155,9 @@ std::optional<MetalQueryPlan> lowerMultiTableGroupedAggregateIRToMetalImpl(
 
     MetalQueryPlan scalarPreAggPlan;
     std::vector<GenericScalarLookupInfo> scalarLookups;
-    if (hasScalarSubqueries(aq) && groupedAggregateNeedsScalarPreAgg(*shape)) {
+    if (hasScalarSubqueries(ir) && groupedAggregateNeedsScalarPreAgg(*shape)) {
         scalarPreAggPlan.name = "GENERIC_IR_MULTI_TABLE_GROUP_PREAGG";
-        scalarLookups = buildGenericScalarPreAggs(*aq, scalarPreAggPlan);
+        scalarLookups = buildGenericScalarPreAggs(ir, scalarPreAggPlan);
         if (scalarLookups.empty()) {
             return fail(error, "IR multi-table grouped aggregate lowerer: scalar subquery decorrelation is not supported.");
         }
@@ -3166,7 +3165,7 @@ std::optional<MetalQueryPlan> lowerMultiTableGroupedAggregateIRToMetalImpl(
 
     auto lowering = buildMultiTableJoinLowering(
         ir, shape->scans, shape->joins, shape->filter, neededExprs,
-        "GENERIC_IR_MULTI_TABLE_GROUP", aq,
+        "GENERIC_IR_MULTI_TABLE_GROUP",
         scalarLookups.empty() ? nullptr : &scalarLookups, error);
     if (!lowering) return std::nullopt;
     prependPlanPhases(lowering->plan, scalarPreAggPlan);
@@ -3189,12 +3188,6 @@ std::optional<MetalQueryPlan> lowerMultiTableGroupedAggregateIRToMetalImpl(
             if (error)
                 *error = "IR multi-table grouped aggregate lowerer: input expression '" +
                          displayName + "' is not supported.";
-            return false;
-        }
-        if (exprNeedsCarriedString(expr, lowering->carryMap)) {
-            if (error)
-                *error = "IR multi-table grouped aggregate lowerer: carried string input '" +
-                         displayName + "' is not supported yet.";
             return false;
         }
         const IrCarryColumn* carriedFixedString = nullptr;
@@ -3235,7 +3228,7 @@ std::optional<MetalQueryPlan> lowerMultiTableGroupedAggregateIRToMetalImpl(
             groupKeys, addInputColumn, error)) {
         return std::nullopt;
     }
-    if (!configureAggregateHaving(*aggregate, groupSpec, aq, &*shape, error))
+    if (!configureAggregateHaving(*aggregate, groupSpec, &ir, &*shape, error))
         return std::nullopt;
 
     std::optional<size_t> materializePhaseIndex;
@@ -4874,22 +4867,12 @@ std::optional<MetalQueryPlan> lowerMultiTableGroupedAggregateIRToMetal(
         const GenericRelPlan& ir,
         std::string* error) {
     return attachGenericCostTrace(
-        lowerMultiTableGroupedAggregateIRToMetalImpl(ir, nullptr, error),
-        ir, "multi_table_grouped_aggregate");
-}
-
-std::optional<MetalQueryPlan> lowerMultiTableGroupedAggregateIRToMetal(
-        const GenericRelPlan& ir,
-        const AnalyzedQuery& aq,
-        std::string* error) {
-    return attachGenericCostTrace(
-        lowerMultiTableGroupedAggregateIRToMetalImpl(ir, &aq, error),
+        lowerMultiTableGroupedAggregateIRToMetalImpl(ir, error),
         ir, "multi_table_grouped_aggregate");
 }
 
 std::optional<MetalQueryPlan> lowerMultiTableScalarAggregateIRToMetalImpl(
         const GenericRelPlan& ir,
-        const AnalyzedQuery* aq,
         std::string* error) {
     auto shape = parseMultiTableScalarAggShape(ir, error);
     if (!shape) return std::nullopt;
@@ -4917,9 +4900,9 @@ std::optional<MetalQueryPlan> lowerMultiTableScalarAggregateIRToMetalImpl(
 
     MetalQueryPlan scalarPreAggPlan;
     std::vector<GenericScalarLookupInfo> scalarLookups;
-    if (hasScalarSubqueries(aq)) {
+    if (hasScalarSubqueries(ir)) {
         scalarPreAggPlan.name = "GENERIC_IR_MULTI_TABLE_SCALAR_PREAGG";
-        scalarLookups = buildGenericScalarPreAggs(*aq, scalarPreAggPlan);
+        scalarLookups = buildGenericScalarPreAggs(ir, scalarPreAggPlan);
         if (scalarLookups.empty()) {
             return fail(error, "IR multi-table scalar aggregate lowerer: scalar subquery decorrelation is not supported.");
         }
@@ -4927,7 +4910,7 @@ std::optional<MetalQueryPlan> lowerMultiTableScalarAggregateIRToMetalImpl(
 
     auto lowering = buildMultiTableJoinLowering(
         ir, shape->scans, shape->joins, shape->filter, neededExprs,
-        "GENERIC_IR_MULTI_TABLE_SCALAR", aq,
+        "GENERIC_IR_MULTI_TABLE_SCALAR",
         scalarLookups.empty() ? nullptr : &scalarLookups, error);
     if (!lowering) return std::nullopt;
     prependPlanPhases(lowering->plan, scalarPreAggPlan);
@@ -4944,12 +4927,6 @@ std::optional<MetalQueryPlan> lowerMultiTableScalarAggregateIRToMetalImpl(
             if (error)
                 *error = "IR multi-table scalar aggregate lowerer: aggregate '" +
                          displayName + "' argument is not supported.";
-            return false;
-        }
-        if (exprNeedsCarriedString(expr, lowering->carryMap)) {
-            if (error)
-                *error = "IR multi-table scalar aggregate lowerer: carried string aggregate input '" +
-                         displayName + "' is not supported yet.";
             return false;
         }
         if (expr->type.type != DataType::INT &&
@@ -5067,16 +5044,7 @@ std::optional<MetalQueryPlan> lowerMultiTableScalarAggregateIRToMetal(
         const GenericRelPlan& ir,
         std::string* error) {
     return attachGenericCostTrace(
-        lowerMultiTableScalarAggregateIRToMetalImpl(ir, nullptr, error),
-        ir, "multi_table_scalar_aggregate");
-}
-
-std::optional<MetalQueryPlan> lowerMultiTableScalarAggregateIRToMetal(
-        const GenericRelPlan& ir,
-        const AnalyzedQuery& aq,
-        std::string* error) {
-    return attachGenericCostTrace(
-        lowerMultiTableScalarAggregateIRToMetalImpl(ir, &aq, error),
+        lowerMultiTableScalarAggregateIRToMetalImpl(ir, error),
         ir, "multi_table_scalar_aggregate");
 }
 

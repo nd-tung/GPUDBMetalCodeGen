@@ -2,18 +2,17 @@
 
 #include "core/schema_provider.h"
 #include "generic/gpu_ops/generic_gpu_physical_ops.h"
+#include "generic/lowering/generic_aggregate_helpers.h"
 #include "generic/lowering/generic_expression_metal.h"
+#include "generic/lowering/generic_plan_shapes.h"
 #include "metal_plan_common.h"
-#include "query_analyzer.h"
 #include "scalar_subquery_placeholder.h"
 
 #include <algorithm>
 #include <cctype>
-#include <map>
 #include <memory>
 #include <optional>
 #include <set>
-#include <sstream>
 #include <type_traits>
 #include <vector>
 
@@ -26,147 +25,396 @@ std::optional<MetalQueryPlan> fail(std::string* error, const std::string& msg) {
     return std::nullopt;
 }
 
-std::string lowerAscii(std::string value) {
-    std::transform(value.begin(), value.end(), value.begin(),
-                   [](unsigned char c) { return (char)std::tolower(c); });
-    return value;
-}
+bool genericExprReferencesScalarSubquery(const GenericExprPtr& expr,
+                                         int scalarSubqueryIndex);
 
-std::optional<std::string> jsonStringValueForIr(const nlohmann::json& node) {
-    if (node.is_string()) return node.get<std::string>();
-    if (node.is_object() && node.contains("String") && node["String"].contains("sval"))
-        return node["String"]["sval"].get<std::string>();
-    return std::nullopt;
-}
-
-std::string jsonFuncNameForIr(const nlohmann::json& fc) {
-    if (!fc.contains("funcname") || !fc["funcname"].is_array() || fc["funcname"].empty())
-        return {};
-    auto s = jsonStringValueForIr(fc["funcname"].back());
-    return s ? lowerAscii(*s) : "";
-}
-
-std::string analyzedColumnNameForExpr(const ExprPtr& expr) {
-    if (auto* col = expr ? std::get_if<ColRef>(&expr->node) : nullptr)
-        return col->column;
-    return "";
-}
-
-std::string analyzedDisplayNameForExpr(const ExprPtr& expr) {
-    if (!expr) return "expr";
-    return std::visit([&](const auto& node) -> std::string {
+bool genericPredicateReferencesScalarSubquery(const GenericPredicatePtr& pred,
+                                              int scalarSubqueryIndex) {
+    if (!pred) return false;
+    return std::visit([&](const auto& node) -> bool {
         using T = std::decay_t<decltype(node)>;
-        if constexpr (std::is_same_v<T, ColRef>) {
-            return node.column;
-        } else if constexpr (std::is_same_v<T, Literal>) {
-            if (auto* i = std::get_if<int>(&node.value))
-                return std::to_string(*i);
-            if (auto* f = std::get_if<float>(&node.value)) {
-                std::ostringstream oss;
-                oss << *f;
-                return oss.str();
+        if constexpr (std::is_same_v<T, GenericComparisonPred>) {
+            return genericExprReferencesScalarSubquery(node.left, scalarSubqueryIndex) ||
+                   genericExprReferencesScalarSubquery(node.right, scalarSubqueryIndex);
+        } else if constexpr (std::is_same_v<T, GenericBetweenPred>) {
+            return genericExprReferencesScalarSubquery(node.expr, scalarSubqueryIndex) ||
+                   genericExprReferencesScalarSubquery(node.low, scalarSubqueryIndex) ||
+                   genericExprReferencesScalarSubquery(node.high, scalarSubqueryIndex);
+        } else if constexpr (std::is_same_v<T, GenericInListPred>) {
+            if (genericExprReferencesScalarSubquery(node.expr, scalarSubqueryIndex))
+                return true;
+            for (const auto& value : node.values) {
+                if (genericExprReferencesScalarSubquery(value, scalarSubqueryIndex))
+                    return true;
             }
-            if (auto* s = std::get_if<std::string>(&node.value))
-                return "'" + *s + "'";
-            return "literal";
-        } else if constexpr (std::is_same_v<T, FuncCall>) {
-            std::string out = node.name + "(";
-            for (size_t i = 0; i < node.args.size(); ++i) {
-                if (i) out += ",";
-                out += analyzedDisplayNameForExpr(node.args[i]);
+            return false;
+        } else if constexpr (std::is_same_v<T, GenericLikePred>) {
+            return genericExprReferencesScalarSubquery(node.expr, scalarSubqueryIndex);
+        } else if constexpr (std::is_same_v<T, GenericLogicalPred>) {
+            for (const auto& child : node.children) {
+                if (genericPredicateReferencesScalarSubquery(child,
+                                                             scalarSubqueryIndex)) {
+                    return true;
+                }
             }
-            out += ")";
-            return out;
+            return false;
+        } else {
+            return false;
         }
-        return "expr";
+    }, pred->node);
+}
+
+bool genericExprReferencesScalarSubquery(const GenericExprPtr& expr,
+                                         int scalarSubqueryIndex) {
+    if (!expr) return false;
+    return std::visit([&](const auto& node) -> bool {
+        using T = std::decay_t<decltype(node)>;
+        if constexpr (std::is_same_v<T, GenericScalarSubqueryExpr>) {
+            return node.index == scalarSubqueryIndex;
+        } else if constexpr (std::is_same_v<T, GenericBinaryExpr>) {
+            return genericExprReferencesScalarSubquery(node.left,
+                                                       scalarSubqueryIndex) ||
+                   genericExprReferencesScalarSubquery(node.right,
+                                                       scalarSubqueryIndex);
+        } else if constexpr (std::is_same_v<T, GenericCaseExpr>) {
+            for (const auto& branch : node.branches) {
+                if (genericPredicateReferencesScalarSubquery(
+                        branch.condition, scalarSubqueryIndex) ||
+                    genericExprReferencesScalarSubquery(branch.result,
+                                                        scalarSubqueryIndex)) {
+                    return true;
+                }
+            }
+            return genericExprReferencesScalarSubquery(node.elseResult,
+                                                       scalarSubqueryIndex);
+        } else if constexpr (std::is_same_v<T, GenericFunctionExpr>) {
+            for (const auto& arg : node.args) {
+                if (genericExprReferencesScalarSubquery(arg,
+                                                        scalarSubqueryIndex)) {
+                    return true;
+                }
+            }
+            return false;
+        } else if constexpr (std::is_same_v<T, GenericAggregateExpr>) {
+            return genericExprReferencesScalarSubquery(node.arg,
+                                                       scalarSubqueryIndex);
+        } else if constexpr (std::is_same_v<T, GenericScalarLookupExpr>) {
+            for (const auto& key : node.keys) {
+                if (genericExprReferencesScalarSubquery(key,
+                                                        scalarSubqueryIndex)) {
+                    return true;
+                }
+            }
+            return false;
+        } else {
+            return false;
+        }
     }, expr->node);
 }
 
-std::string analyzedDisplayNameForTarget(const SelectTarget& target,
-                                         size_t targetIndex) {
-    if (!target.alias.empty()) return target.alias;
-    if (target.isAgg && target.agg) {
-        std::string base = target.agg->isStar ? "*"
-            : analyzedDisplayNameForExpr(target.agg->innerExpr);
-        return aggFuncName(target.agg->func) + "(" + base + ")";
+bool genericFiltersReferenceScalarSubquery(const GenericRelPlan& ir,
+                                           int scalarSubqueryIndex) {
+    for (const auto& node : ir.nodes) {
+        if (node.op != GenericRelOp::Filter) continue;
+        auto* filter = std::get_if<GenericFilterDetail>(&node.detail);
+        if (!filter) continue;
+        if (genericPredicateReferencesScalarSubquery(filter->predicate,
+                                                     scalarSubqueryIndex)) {
+            return true;
+        }
     }
-    if (target.expr && std::holds_alternative<ColRef>(target.expr->node))
-        return analyzedColumnNameForExpr(target.expr);
-    return "expr_" + std::to_string(targetIndex);
+    return false;
 }
 
-std::optional<std::string> analyzedOrderColumnForExpr(
-        const ExprPtr& expr,
-        const std::vector<SelectTarget>& targets) {
-    if (!expr) return std::nullopt;
-    if (auto* lit = std::get_if<Literal>(&expr->node)) {
-        if (auto* ordinal = std::get_if<int>(&lit->value)) {
-            if (*ordinal >= 1 &&
-                static_cast<size_t>(*ordinal) <= targets.size()) {
-                return analyzedDisplayNameForTarget(
-                    targets[*ordinal - 1],
-                    static_cast<size_t>(*ordinal - 1));
-            }
+void collectGenericJoinEqualities(
+        const GenericPredicatePtr& pred,
+        std::vector<std::pair<GenericColumnExpr, GenericColumnExpr>>& out) {
+    if (!pred) return;
+    std::visit([&](const auto& node) {
+        using T = std::decay_t<decltype(node)>;
+        if constexpr (std::is_same_v<T, GenericComparisonPred>) {
+            if (node.op != CmpOp::EQ || !node.left || !node.right) return;
+            auto* left = std::get_if<GenericColumnExpr>(&node.left->node);
+            auto* right = std::get_if<GenericColumnExpr>(&node.right->node);
+            if (left && right) out.push_back({*left, *right});
+        } else if constexpr (std::is_same_v<T, GenericLogicalPred>) {
+            if (node.op != GenericLogicalPred::Op::And) return;
+            for (const auto& child : node.children)
+                collectGenericJoinEqualities(child, out);
         }
+    }, pred->node);
+}
+
+std::vector<std::pair<GenericColumnExpr, GenericColumnExpr>>
+genericOuterJoinEqualities(const GenericRelPlan& ir) {
+    std::vector<std::pair<GenericColumnExpr, GenericColumnExpr>> out;
+    for (const auto& node : ir.nodes) {
+        if (node.op != GenericRelOp::Join &&
+            node.op != GenericRelOp::SemiJoin &&
+            node.op != GenericRelOp::AntiJoin) {
+            continue;
+        }
+        auto* join = std::get_if<GenericJoinDetail>(&node.detail);
+        if (!join) continue;
+        collectGenericJoinEqualities(join->predicate, out);
+    }
+    return out;
+}
+
+std::string genericColumnQualifierForFromMatch(const GenericColumnExpr& col) {
+    if (!col.alias.empty()) return col.alias;
+    return col.table;
+}
+
+struct FromSubqueryProjectShape {
+    const GenericProjectDetail* project = nullptr;
+    const GenericRelNode* sort = nullptr;
+    const GenericRelNode* limit = nullptr;
+};
+
+struct FromSubqueryAggregateShape {
+    const GenericAggregateDetail* aggregate = nullptr;
+    const GenericRelNode* sort = nullptr;
+    const GenericRelNode* limit = nullptr;
+};
+
+std::optional<FromSubqueryProjectShape> parseFromSubqueryProjectShape(
+        const GenericRelPlan& ir) {
+    FromSubqueryProjectShape shape;
+    const GenericRelNode* node = ir.findNode(ir.root);
+    if (!node) return std::nullopt;
+
+    if (node->op == GenericRelOp::Limit) {
+        shape.limit = node;
+        node = node->inputs.empty() ? nullptr : ir.findNode(node->inputs.front());
+    }
+    if (node && node->op == GenericRelOp::Sort) {
+        shape.sort = sortDetail(node) ? node : nullptr;
+        node = node->inputs.empty() ? nullptr : ir.findNode(node->inputs.front());
+    }
+    if (!node || node->op != GenericRelOp::Project)
         return std::nullopt;
-    }
-    auto* orderCol = std::get_if<ColRef>(&expr->node);
-    if (!orderCol) return std::nullopt;
-
-    std::optional<std::string> unqualifiedMatch;
-    const bool orderQualified =
-        !orderCol->table.empty() || !orderCol->tableAlias.empty();
-    for (size_t i = 0; i < targets.size(); ++i) {
-        const auto& target = targets[i];
-        std::string displayName = analyzedDisplayNameForTarget(target, i);
-        if (displayName == orderCol->column) return displayName;
-        auto* targetCol = target.expr
-            ? std::get_if<ColRef>(&target.expr->node)
-            : nullptr;
-        if (!targetCol || targetCol->column != orderCol->column) continue;
-        bool tableMatches = true;
-        if (!orderCol->table.empty() && targetCol->table != orderCol->table)
-            tableMatches = false;
-        if (!orderCol->tableAlias.empty() &&
-            targetCol->tableAlias != orderCol->tableAlias) {
-            tableMatches = false;
-        }
-        if (orderQualified) {
-            if (tableMatches) return displayName;
-        } else if (!unqualifiedMatch) {
-            unqualifiedMatch = displayName;
-        }
-    }
-    return unqualifiedMatch;
+    shape.project = projectDetail(node);
+    if (!shape.project) return std::nullopt;
+    return shape;
 }
 
-std::optional<std::string> analyzedResolveOrderColumn(
-        const ExprPtr& expr,
-        int orderIdx,
-        const std::vector<SelectTarget>& targets) {
-    auto col = analyzedOrderColumnForExpr(expr, targets);
-    if (col) return col;
-    if (expr) {
-        const std::string orderExprName = analyzedDisplayNameForExpr(expr);
-        for (size_t i = 0; i < targets.size(); ++i) {
-            if (targets[i].expr &&
-                analyzedDisplayNameForExpr(targets[i].expr) == orderExprName) {
-                return analyzedDisplayNameForTarget(targets[i], i);
+std::optional<FromSubqueryAggregateShape> parseFromSubqueryAggregateShape(
+        const GenericRelPlan& ir) {
+    FromSubqueryAggregateShape shape;
+    const GenericRelNode* node = ir.findNode(ir.root);
+    if (!node) return std::nullopt;
+
+    if (node->op == GenericRelOp::Limit) {
+        shape.limit = node;
+        node = node->inputs.empty() ? nullptr : ir.findNode(node->inputs.front());
+    }
+    if (node && node->op == GenericRelOp::Sort) {
+        shape.sort = sortDetail(node) ? node : nullptr;
+        node = node->inputs.empty() ? nullptr : ir.findNode(node->inputs.front());
+    }
+    if (!node || node->op != GenericRelOp::Aggregate)
+        return std::nullopt;
+    shape.aggregate = aggregateDetail(node);
+    if (!shape.aggregate) return std::nullopt;
+    return shape;
+}
+
+bool genericColumnMatchesTable(const GenericColumnExpr& col,
+                               const std::string& table) {
+    return col.table == table || col.alias == table;
+}
+
+void collectGenericColumnsForTable(const GenericExprPtr& expr,
+                                   const std::string& table,
+                                   std::set<std::string>& out);
+
+void collectGenericPredicateColumnsForTable(const GenericPredicatePtr& pred,
+                                            const std::string& table,
+                                            std::set<std::string>& out) {
+    if (!pred) return;
+    std::visit([&](const auto& node) {
+        using T = std::decay_t<decltype(node)>;
+        if constexpr (std::is_same_v<T, GenericComparisonPred>) {
+            collectGenericColumnsForTable(node.left, table, out);
+            collectGenericColumnsForTable(node.right, table, out);
+        } else if constexpr (std::is_same_v<T, GenericBetweenPred>) {
+            collectGenericColumnsForTable(node.expr, table, out);
+            collectGenericColumnsForTable(node.low, table, out);
+            collectGenericColumnsForTable(node.high, table, out);
+        } else if constexpr (std::is_same_v<T, GenericInListPred>) {
+            collectGenericColumnsForTable(node.expr, table, out);
+            for (const auto& value : node.values)
+                collectGenericColumnsForTable(value, table, out);
+        } else if constexpr (std::is_same_v<T, GenericLikePred>) {
+            collectGenericColumnsForTable(node.expr, table, out);
+        } else if constexpr (std::is_same_v<T, GenericLogicalPred>) {
+            for (const auto& child : node.children)
+                collectGenericPredicateColumnsForTable(child, table, out);
+        }
+    }, pred->node);
+}
+
+void collectGenericColumnsForTable(const GenericExprPtr& expr,
+                                   const std::string& table,
+                                   std::set<std::string>& out) {
+    if (!expr) return;
+    std::visit([&](const auto& node) {
+        using T = std::decay_t<decltype(node)>;
+        if constexpr (std::is_same_v<T, GenericColumnExpr>) {
+            if (genericColumnMatchesTable(node, table))
+                out.insert(node.column);
+        } else if constexpr (std::is_same_v<T, GenericBinaryExpr>) {
+            collectGenericColumnsForTable(node.left, table, out);
+            collectGenericColumnsForTable(node.right, table, out);
+        } else if constexpr (std::is_same_v<T, GenericCaseExpr>) {
+            for (const auto& branch : node.branches) {
+                collectGenericPredicateColumnsForTable(
+                    branch.condition, table, out);
+                collectGenericColumnsForTable(branch.result, table, out);
             }
+            collectGenericColumnsForTable(node.elseResult, table, out);
+        } else if constexpr (std::is_same_v<T, GenericFunctionExpr>) {
+            for (const auto& arg : node.args)
+                collectGenericColumnsForTable(arg, table, out);
+        } else if constexpr (std::is_same_v<T, GenericAggregateExpr>) {
+            collectGenericColumnsForTable(node.arg, table, out);
+        } else if constexpr (std::is_same_v<T, GenericScalarLookupExpr>) {
+            for (const auto& key : node.keys)
+                collectGenericColumnsForTable(key, table, out);
         }
-    }
-    if (orderIdx >= 0 && orderIdx < static_cast<int>(targets.size()))
-        return analyzedDisplayNameForTarget(targets[orderIdx], orderIdx);
-    return std::nullopt;
+    }, expr->node);
 }
 
-void collectAnalyzedPredTables(const PredPtr& pred,
-                               std::set<std::string>& tables) {
-    std::map<std::string, std::string> colToTable;
-    collectColumnTables(pred, colToTable);
-    for (const auto& [_, table] : colToTable) {
-        if (!table.empty()) tables.insert(table);
+void collectGenericColumns(const GenericExprPtr& expr,
+                           std::set<std::string>& out);
+
+void collectGenericPredicateColumns(const GenericPredicatePtr& pred,
+                                    std::set<std::string>& out) {
+    if (!pred) return;
+    std::visit([&](const auto& node) {
+        using T = std::decay_t<decltype(node)>;
+        if constexpr (std::is_same_v<T, GenericComparisonPred>) {
+            collectGenericColumns(node.left, out);
+            collectGenericColumns(node.right, out);
+        } else if constexpr (std::is_same_v<T, GenericBetweenPred>) {
+            collectGenericColumns(node.expr, out);
+            collectGenericColumns(node.low, out);
+            collectGenericColumns(node.high, out);
+        } else if constexpr (std::is_same_v<T, GenericInListPred>) {
+            collectGenericColumns(node.expr, out);
+            for (const auto& value : node.values)
+                collectGenericColumns(value, out);
+        } else if constexpr (std::is_same_v<T, GenericLikePred>) {
+            collectGenericColumns(node.expr, out);
+        } else if constexpr (std::is_same_v<T, GenericLogicalPred>) {
+            for (const auto& child : node.children)
+                collectGenericPredicateColumns(child, out);
+        }
+    }, pred->node);
+}
+
+void collectGenericColumns(const GenericExprPtr& expr,
+                           std::set<std::string>& out) {
+    if (!expr) return;
+    std::visit([&](const auto& node) {
+        using T = std::decay_t<decltype(node)>;
+        if constexpr (std::is_same_v<T, GenericColumnExpr>) {
+            out.insert(node.column);
+        } else if constexpr (std::is_same_v<T, GenericBinaryExpr>) {
+            collectGenericColumns(node.left, out);
+            collectGenericColumns(node.right, out);
+        } else if constexpr (std::is_same_v<T, GenericCaseExpr>) {
+            for (const auto& branch : node.branches) {
+                collectGenericPredicateColumns(branch.condition, out);
+                collectGenericColumns(branch.result, out);
+            }
+            collectGenericColumns(node.elseResult, out);
+        } else if constexpr (std::is_same_v<T, GenericFunctionExpr>) {
+            for (const auto& arg : node.args)
+                collectGenericColumns(arg, out);
+        } else if constexpr (std::is_same_v<T, GenericAggregateExpr>) {
+            collectGenericColumns(node.arg, out);
+        } else if constexpr (std::is_same_v<T, GenericScalarLookupExpr>) {
+            for (const auto& key : node.keys)
+                collectGenericColumns(key, out);
+        }
+    }, expr->node);
+}
+
+void collectGenericExprTables(const GenericExprPtr& expr,
+                              std::set<std::string>& tables);
+
+void collectGenericPredicateTables(const GenericPredicatePtr& pred,
+                                   std::set<std::string>& tables) {
+    if (!pred) return;
+    std::visit([&](const auto& node) {
+        using T = std::decay_t<decltype(node)>;
+        if constexpr (std::is_same_v<T, GenericComparisonPred>) {
+            collectGenericExprTables(node.left, tables);
+            collectGenericExprTables(node.right, tables);
+        } else if constexpr (std::is_same_v<T, GenericBetweenPred>) {
+            collectGenericExprTables(node.expr, tables);
+            collectGenericExprTables(node.low, tables);
+            collectGenericExprTables(node.high, tables);
+        } else if constexpr (std::is_same_v<T, GenericInListPred>) {
+            collectGenericExprTables(node.expr, tables);
+            for (const auto& value : node.values)
+                collectGenericExprTables(value, tables);
+        } else if constexpr (std::is_same_v<T, GenericLikePred>) {
+            collectGenericExprTables(node.expr, tables);
+        } else if constexpr (std::is_same_v<T, GenericLogicalPred>) {
+            for (const auto& child : node.children)
+                collectGenericPredicateTables(child, tables);
+        }
+    }, pred->node);
+}
+
+void collectGenericExprTables(const GenericExprPtr& expr,
+                              std::set<std::string>& tables) {
+    if (!expr) return;
+    std::visit([&](const auto& node) {
+        using T = std::decay_t<decltype(node)>;
+        if constexpr (std::is_same_v<T, GenericColumnExpr>) {
+            std::string table = node.table.empty() ? node.alias : node.table;
+            if (!table.empty()) tables.insert(std::move(table));
+        } else if constexpr (std::is_same_v<T, GenericBinaryExpr>) {
+            collectGenericExprTables(node.left, tables);
+            collectGenericExprTables(node.right, tables);
+        } else if constexpr (std::is_same_v<T, GenericCaseExpr>) {
+            for (const auto& branch : node.branches) {
+                collectGenericPredicateTables(branch.condition, tables);
+                collectGenericExprTables(branch.result, tables);
+            }
+            collectGenericExprTables(node.elseResult, tables);
+        } else if constexpr (std::is_same_v<T, GenericFunctionExpr>) {
+            for (const auto& arg : node.args)
+                collectGenericExprTables(arg, tables);
+        } else if constexpr (std::is_same_v<T, GenericAggregateExpr>) {
+            collectGenericExprTables(node.arg, tables);
+        } else if constexpr (std::is_same_v<T, GenericScalarLookupExpr>) {
+            for (const auto& key : node.keys)
+                collectGenericExprTables(key, tables);
+        }
+    }, expr->node);
+}
+
+std::string combineGenericFilters(
+        const std::vector<GenericPredicatePtr>& filters,
+        const std::string& idxVar) {
+    std::string cond;
+    for (const auto& filter : filters) {
+        if (!filter) continue;
+        if (!cond.empty()) cond += " && ";
+        cond += "(" + genericPredicateToMetal(filter, idxVar) + ")";
     }
+    return cond;
+}
+
+const GenericAggregateExpr* genericAggregateForProjection(
+        const GenericProjection& projection) {
+    if (!projection.expr) return nullptr;
+    return std::get_if<GenericAggregateExpr>(&projection.expr->node);
 }
 
 std::string keyDomainSymbolForAnalyzedColumn(const std::string& table,
@@ -182,7 +430,7 @@ std::string keyDomainSymbolForAnalyzedColumn(const std::string& table,
     return schema->maxKeySymbol(table);
 }
 
-std::string fromSubqueryBaseForKey(const FromSubqueryAggInfo& info,
+std::string fromSubqueryBaseForKey(const GenericFromSubqueryAggInfo& info,
                                    const std::string& tableKey) {
     for (size_t i = 0; i < info.tables.size(); ++i) {
         if (info.tables[i] == tableKey) return info.tables[i];
@@ -192,251 +440,14 @@ std::string fromSubqueryBaseForKey(const FromSubqueryAggInfo& info,
     return tableKey;
 }
 
-bool fromSubqueryColMatches(const FromSubqueryAggInfo& info,
-                            const ColRef& col,
+bool fromSubqueryColMatches(const GenericFromSubqueryAggInfo& info,
+                            const GenericColumnExpr& col,
                             const std::string& tableKey,
                             const std::string& column) {
     if (col.column != column) return false;
     if (col.table == tableKey) return true;
-    if (!col.tableAlias.empty() && col.tableAlias == tableKey) return true;
+    if (!col.alias.empty() && col.alias == tableKey) return true;
     return fromSubqueryBaseForKey(info, tableKey) == col.table;
-}
-
-TypeInfo analyzedTypeInfoForExpr(const ExprPtr& expr,
-                                 const SchemaProvider* schema) {
-    if (!expr) return {DataType::INT, 0};
-    return std::visit([&](const auto& node) -> TypeInfo {
-        using T = std::decay_t<decltype(node)>;
-        if constexpr (std::is_same_v<T, ColRef>) {
-            int width = node.fixedWidth;
-            if (node.dataType == DataType::CHAR_FIXED && width <= 0 && schema) {
-                try { width = schema->columnFixedWidth(node.table, node.column); }
-                catch (...) { width = 0; }
-            }
-            return {node.dataType, width};
-        } else if constexpr (std::is_same_v<T, Literal>) {
-            if (std::holds_alternative<float>(node.value))
-                return {DataType::FLOAT, 0};
-            if (auto* s = std::get_if<std::string>(&node.value))
-                return {DataType::CHAR_FIXED, static_cast<int>(s->size())};
-            return {DataType::INT, 0};
-        } else if constexpr (std::is_same_v<T, BinaryExpr>) {
-            TypeInfo left = analyzedTypeInfoForExpr(node.left, schema);
-            TypeInfo right = analyzedTypeInfoForExpr(node.right, schema);
-            if (node.op == ExprOp::DIV ||
-                left.type == DataType::FLOAT ||
-                right.type == DataType::FLOAT) {
-                return {DataType::FLOAT, 0};
-            }
-            return {DataType::INT, 0};
-        } else if constexpr (std::is_same_v<T, CaseWhen>) {
-            if (!node.branches.empty())
-                return analyzedTypeInfoForExpr(node.branches.front().result, schema);
-            return analyzedTypeInfoForExpr(node.elseResult, schema);
-        } else if constexpr (std::is_same_v<T, FuncCall>) {
-            return {DataType::INT, 0};
-        }
-        return {DataType::INT, 0};
-    }, expr->node);
-}
-
-bool analyzedTypeIsNumericLike(DataType type) {
-    return type == DataType::INT || type == DataType::FLOAT ||
-           type == DataType::DATE;
-}
-
-bool analyzedMaterializeExprSupported(const ExprPtr& expr);
-bool analyzedPredicateSupportedForMaterialize(const PredPtr& pred);
-
-bool analyzedMaterializeExprSupported(const ExprPtr& expr) {
-    if (!expr) return false;
-    return std::visit([&](const auto& node) -> bool {
-        using T = std::decay_t<decltype(node)>;
-        if constexpr (std::is_same_v<T, ColRef>) {
-            return node.dataType == DataType::INT ||
-                   node.dataType == DataType::FLOAT ||
-                   node.dataType == DataType::DATE ||
-                   node.dataType == DataType::CHAR1 ||
-                   node.dataType == DataType::CHAR_FIXED;
-        } else if constexpr (std::is_same_v<T, Literal>) {
-            return !std::holds_alternative<std::string>(node.value);
-        } else if constexpr (std::is_same_v<T, BinaryExpr>) {
-            return analyzedMaterializeExprSupported(node.left) &&
-                   analyzedMaterializeExprSupported(node.right) &&
-                   analyzedTypeIsNumericLike(
-                       analyzedTypeInfoForExpr(node.left, nullptr).type) &&
-                   analyzedTypeIsNumericLike(
-                       analyzedTypeInfoForExpr(node.right, nullptr).type);
-        } else if constexpr (std::is_same_v<T, CaseWhen>) {
-            for (const auto& branch : node.branches) {
-                TypeInfo branchType =
-                    analyzedTypeInfoForExpr(branch.result, nullptr);
-                if (!analyzedTypeIsNumericLike(branchType.type) ||
-                    !analyzedPredicateSupportedForMaterialize(branch.condition) ||
-                    !analyzedMaterializeExprSupported(branch.result)) {
-                    return false;
-                }
-            }
-            if (!node.elseResult) return true;
-            TypeInfo elseType = analyzedTypeInfoForExpr(node.elseResult, nullptr);
-            return analyzedTypeIsNumericLike(elseType.type) &&
-                   analyzedMaterializeExprSupported(node.elseResult);
-        } else if constexpr (std::is_same_v<T, FuncCall>) {
-            const std::string name = lowerAscii(node.name);
-            return name == "date_part" || name == "extract" ||
-                   name == "substring" || name == "sum" ||
-                   name == "count" || name == "avg" ||
-                   name == "min" || name == "max";
-        }
-        return false;
-    }, expr->node);
-}
-
-bool analyzedPredicateSupportedForMaterialize(const PredPtr& pred) {
-    if (!pred) return true;
-    return std::visit([&](const auto& node) -> bool {
-        using T = std::decay_t<decltype(node)>;
-        if constexpr (std::is_same_v<T, Comparison>) {
-            return analyzedMaterializeExprSupported(node.left) &&
-                   analyzedMaterializeExprSupported(node.right);
-        } else if constexpr (std::is_same_v<T, Between>) {
-            return analyzedMaterializeExprSupported(node.expr) &&
-                   analyzedMaterializeExprSupported(node.low) &&
-                   analyzedMaterializeExprSupported(node.high);
-        } else if constexpr (std::is_same_v<T, InList>) {
-            if (!analyzedMaterializeExprSupported(node.expr)) return false;
-            for (const auto& value : node.values) {
-                if (!analyzedMaterializeExprSupported(value)) return false;
-            }
-            return true;
-        } else if constexpr (std::is_same_v<T, Like>) {
-            return analyzedMaterializeExprSupported(node.expr);
-        } else if constexpr (std::is_same_v<T, LogicalAnd> ||
-                             std::is_same_v<T, LogicalOr>) {
-            for (const auto& child : node.children) {
-                if (!analyzedPredicateSupportedForMaterialize(child)) return false;
-            }
-            return true;
-        } else if constexpr (std::is_same_v<T, LogicalNot>) {
-            return analyzedPredicateSupportedForMaterialize(node.child);
-        }
-        return false;
-    }, pred->node);
-}
-
-int analyzedFixedStringLenForExpr(const ExprPtr& expr,
-                                  const SchemaProvider* schema) {
-    if (!expr) return 0;
-    auto* col = std::get_if<ColRef>(&expr->node);
-    if (!col) return 0;
-    if (col->dataType == DataType::CHAR1) return 1;
-    if (col->dataType != DataType::CHAR_FIXED) return 0;
-    if (col->fixedWidth > 0) return col->fixedWidth;
-    if (!schema) return 0;
-    try { return schema->columnFixedWidth(col->table, col->column); }
-    catch (...) { return 0; }
-}
-
-std::string analyzedMaterializeValueExpr(const ExprPtr& expr,
-                                         const std::string& idxVar,
-                                         const SchemaProvider* schema) {
-    if (auto* col = expr ? std::get_if<ColRef>(&expr->node) : nullptr) {
-        if (col->dataType == DataType::CHAR1)
-            return col->column + " + " + idxVar;
-        if (col->dataType == DataType::CHAR_FIXED) {
-            int len = analyzedFixedStringLenForExpr(expr, schema);
-            if (len <= 0) len = 1;
-            std::string aliasPrefix;
-            if (!col->tableAlias.empty())
-                aliasPrefix = "/*" + col->tableAlias + "*/";
-            return aliasPrefix + col->column + " + " + idxVar +
-                   " * " + std::to_string(len) + "ul";
-        }
-    }
-    return exprToMetal(expr, idxVar, schema);
-}
-
-void analyzedCollectColumnsForTable(const ExprPtr& expr,
-                                    const std::string& table,
-                                    std::set<std::string>& cols);
-
-void analyzedCollectPredicateColumnsForTable(const PredPtr& pred,
-                                             const std::string& table,
-                                             std::set<std::string>& cols) {
-    if (!pred) return;
-    std::visit([&](const auto& node) {
-        using T = std::decay_t<decltype(node)>;
-        if constexpr (std::is_same_v<T, Comparison>) {
-            analyzedCollectColumnsForTable(node.left, table, cols);
-            analyzedCollectColumnsForTable(node.right, table, cols);
-        } else if constexpr (std::is_same_v<T, Between>) {
-            analyzedCollectColumnsForTable(node.expr, table, cols);
-            analyzedCollectColumnsForTable(node.low, table, cols);
-            analyzedCollectColumnsForTable(node.high, table, cols);
-        } else if constexpr (std::is_same_v<T, InList>) {
-            analyzedCollectColumnsForTable(node.expr, table, cols);
-            for (const auto& value : node.values)
-                analyzedCollectColumnsForTable(value, table, cols);
-        } else if constexpr (std::is_same_v<T, Like>) {
-            analyzedCollectColumnsForTable(node.expr, table, cols);
-        } else if constexpr (std::is_same_v<T, LogicalAnd> ||
-                             std::is_same_v<T, LogicalOr>) {
-            for (const auto& child : node.children)
-                analyzedCollectPredicateColumnsForTable(child, table, cols);
-        } else if constexpr (std::is_same_v<T, LogicalNot>) {
-            analyzedCollectPredicateColumnsForTable(node.child, table, cols);
-        }
-    }, pred->node);
-}
-
-void analyzedCollectColumnsForTable(const ExprPtr& expr,
-                                    const std::string& table,
-                                    std::set<std::string>& cols) {
-    if (!expr) return;
-    std::visit([&](const auto& node) {
-        using T = std::decay_t<decltype(node)>;
-        if constexpr (std::is_same_v<T, ColRef>) {
-            if (node.table == table || node.tableAlias == table)
-                cols.insert(node.column);
-        } else if constexpr (std::is_same_v<T, BinaryExpr>) {
-            analyzedCollectColumnsForTable(node.left, table, cols);
-            analyzedCollectColumnsForTable(node.right, table, cols);
-        } else if constexpr (std::is_same_v<T, FuncCall>) {
-            for (const auto& arg : node.args)
-                analyzedCollectColumnsForTable(arg, table, cols);
-        } else if constexpr (std::is_same_v<T, CaseWhen>) {
-            for (const auto& branch : node.branches) {
-                analyzedCollectPredicateColumnsForTable(
-                    branch.condition, table, cols);
-                analyzedCollectColumnsForTable(branch.result, table, cols);
-            }
-            analyzedCollectColumnsForTable(node.elseResult, table, cols);
-        }
-    }, expr->node);
-}
-
-struct JsonColumnRefForIr {
-    std::string qualifier;
-    std::string column;
-};
-
-std::optional<JsonColumnRefForIr> jsonRawColumnRefForIr(
-        const nlohmann::json& node) {
-    const nlohmann::json* cr = nullptr;
-    if (node.is_object() && node.contains("ColumnRef")) cr = &node["ColumnRef"];
-    else if (node.is_object() && node.contains("fields")) cr = &node;
-    if (!cr || !cr->contains("fields") || !(*cr)["fields"].is_array())
-        return std::nullopt;
-
-    std::vector<std::string> fields;
-    for (const auto& field : (*cr)["fields"]) {
-        if (auto s = jsonStringValueForIr(field)) fields.push_back(*s);
-    }
-    if (fields.empty()) return std::nullopt;
-    JsonColumnRefForIr out;
-    out.column = fields.back();
-    if (fields.size() >= 2) out.qualifier = fields[fields.size() - 2];
-    return out;
 }
 
 struct FromSubqueryScalarExtremumForIr {
@@ -445,68 +456,27 @@ struct FromSubqueryScalarExtremumForIr {
     std::string argAlias;
 };
 
-bool analyzedFiltersReferenceScalarSubquery(const AnalyzedQuery& aq,
-                                            int sqIdx) {
-    for (const auto& filter : aq.filters) {
-        if (analyzedPredicateReferencesScalarSubquery(filter, sqIdx))
-            return true;
-    }
-    return false;
-}
-
 std::optional<FromSubqueryScalarExtremumForIr>
-parseFromSubqueryScalarExtremumForIr(const AnalyzedQuery& aq,
-                                     const FromSubqueryAggInfo& fsq,
+parseFromSubqueryScalarExtremumForIr(const GenericRelPlan& ir,
+                                     const GenericSourceQueryInfo& aq,
+                                     const GenericFromSubqueryAggInfo& fsq,
                                      const std::string& aggregateAlias) {
     if (fsq.alias.empty() || aggregateAlias.empty()) return std::nullopt;
     for (size_t sqIdx = 0; sqIdx < aq.subqueries.size(); ++sqIdx) {
         const auto& sq = aq.subqueries[sqIdx];
-        if (sq.type != AnalyzedQuery::Subquery::SCALAR_SUBQUERY) continue;
-        if (!analyzedFiltersReferenceScalarSubquery(
-                aq, static_cast<int>(sqIdx))) {
+        if (sq.type != GenericSourceSubquery::SCALAR_SUBQUERY) continue;
+        if (!genericFiltersReferenceScalarSubquery(
+                ir, static_cast<int>(sqIdx))) {
             continue;
         }
-
-        nlohmann::json root;
-        try { root = nlohmann::json::parse(sq.sql); }
-        catch (...) { continue; }
-        if (!root.contains("SelectStmt")) continue;
-        const auto& ss = root["SelectStmt"];
-        if (!ss.contains("fromClause") || !ss["fromClause"].is_array())
-            continue;
-
-        bool scansView = false;
-        for (const auto& from : ss["fromClause"]) {
-            if (!from.contains("RangeVar")) continue;
-            const auto& rv = from["RangeVar"];
-            if (rv.value("relname", "") == fsq.alias) {
-                scansView = true;
-                break;
-            }
-        }
-        if (!scansView) continue;
-        if (!ss.contains("targetList") || !ss["targetList"].is_array() ||
-            ss["targetList"].empty()) {
-            continue;
-        }
-
-        for (const auto& target : ss["targetList"]) {
-            if (!target.contains("ResTarget")) continue;
-            const auto& rt = target["ResTarget"];
-            if (!rt.contains("val") || !rt["val"].contains("FuncCall"))
-                continue;
-            const auto& fc = rt["val"]["FuncCall"];
-            const std::string func = jsonFuncNameForIr(fc);
-            if (func != "max" && func != "min") continue;
-            if (!fc.contains("args") || !fc["args"].is_array() ||
-                fc["args"].empty()) {
+        for (const auto& extremum : sq.fromSubqueryScalarExtrema) {
+            if (extremum.sourceAlias != fsq.alias ||
+                extremum.argAlias != aggregateAlias) {
                 continue;
             }
-            auto arg = jsonRawColumnRefForIr(fc["args"][0]);
-            if (!arg || arg->column != aggregateAlias) continue;
             FromSubqueryScalarExtremumForIr out;
             out.sqIdx = static_cast<int>(sqIdx);
-            out.func = (func == "max") ? AggFunc::MAX : AggFunc::MIN;
+            out.func = extremum.func;
             out.argAlias = aggregateAlias;
             return out;
         }
@@ -720,71 +690,74 @@ private:
 };
 
 std::optional<MetalQueryPlan> lowerFromSubqueryTopScalarIRToMetal(
-        const AnalyzedQuery& aq,
+        const GenericRelPlan& ir,
         std::string* error) {
-    if (aq.fromSubqueryAggs.size() != 1) return std::nullopt;
-    if (aq.hasAggregation() || aq.hasGroupBy()) return std::nullopt;
+    const auto& source = ir.source;
+    const auto* schema = ir.schema;
+    if (source.fromSubqueryAggs.size() != 1) return std::nullopt;
+    auto shape = parseFromSubqueryProjectShape(ir);
+    if (!shape || !shape->project) return std::nullopt;
+    const auto& project = *shape->project;
 
-    const auto& fsq = aq.fromSubqueryAggs[0];
+    const auto& fsq = source.fromSubqueryAggs[0];
     if (fsq.tables.size() != 1 || fsq.groupBy.size() != 1)
         return std::nullopt;
     auto* groupCol = fsq.groupBy[0]
-        ? std::get_if<ColRef>(&fsq.groupBy[0]->node)
+        ? std::get_if<GenericColumnExpr>(&fsq.groupBy[0]->node)
         : nullptr;
     if (!groupCol) return std::nullopt;
 
-    const SelectTarget* innerAgg = nullptr;
-    size_t innerAggIndex = 0;
+    const GenericFromSubqueryAggTarget* innerAgg = nullptr;
     FromSubqueryScalarExtremumForIr scalarExtremum;
-    for (size_t ti = 0; ti < fsq.targets.size(); ++ti) {
-        const auto& target = fsq.targets[ti];
-        if (!target.isAgg || !target.agg) continue;
-        const std::string alias = analyzedDisplayNameForTarget(target, ti);
-        auto parsed = parseFromSubqueryScalarExtremumForIr(aq, fsq, alias);
+    for (const auto& target : fsq.aggregates) {
+        auto parsed = parseFromSubqueryScalarExtremumForIr(
+            ir, source, fsq, target.name);
         if (!parsed) continue;
         innerAgg = &target;
-        innerAggIndex = ti;
         scalarExtremum = *parsed;
         break;
     }
-    if (!innerAgg || !innerAgg->agg) return std::nullopt;
+    if (!innerAgg) return std::nullopt;
     if (scalarExtremum.func != AggFunc::MAX) {
         return fail(error,
             "IR grouped FROM-view scalar lowerer currently supports scalar MAX.");
     }
-    if (innerAgg->agg->func != AggFunc::SUM) {
+    if (innerAgg->func != AggFunc::SUM) {
         return fail(error,
             "IR grouped FROM-view scalar lowerer currently supports SUM aggregate values.");
     }
-    TypeInfo aggValueType =
-        analyzedTypeInfoForExpr(innerAgg->agg->innerExpr, aq.schema);
-    if (!innerAgg->agg->innerExpr ||
-        !analyzedTypeIsNumericLike(aggValueType.type)) {
+    TypeInfo aggValueType = innerAgg->arg ? innerAgg->arg->type : innerAgg->type;
+    if (!innerAgg->arg ||
+        (aggValueType.type != DataType::INT &&
+         aggValueType.type != DataType::FLOAT &&
+         aggValueType.type != DataType::DATE)) {
         return fail(error,
             "IR grouped FROM-view scalar lowerer requires a numeric aggregate expression.");
     }
 
     std::string viewBase = fromSubqueryBaseForKey(
-        fsq, groupCol->tableAlias.empty()
+        fsq, groupCol->alias.empty()
                  ? groupCol->table
-                 : groupCol->tableAlias);
+                 : groupCol->alias);
     if (viewBase.empty()) viewBase = groupCol->table;
     if (viewBase.empty()) return std::nullopt;
 
     bool foundOuterJoin = false;
     std::string outerTable;
     std::string outerKeyCol;
-    for (const auto& jc : aq.joins) {
+    for (const auto& [leftCol, rightCol] : genericOuterJoinEqualities(ir)) {
+        const std::string leftKey = genericColumnQualifierForFromMatch(leftCol);
+        const std::string rightKey = genericColumnQualifierForFromMatch(rightCol);
         const bool leftIsViewKey =
-            fromSubqueryColMatches(fsq, *groupCol, jc.leftTable, jc.leftCol);
+            fromSubqueryColMatches(fsq, *groupCol, leftKey, leftCol.column);
         const bool rightIsViewKey =
-            fromSubqueryColMatches(fsq, *groupCol, jc.rightTable, jc.rightCol);
+            fromSubqueryColMatches(fsq, *groupCol, rightKey, rightCol.column);
         if (leftIsViewKey == rightIsViewKey) continue;
         const std::string candidateTable = leftIsViewKey
-            ? fromSubqueryBaseForKey(fsq, jc.rightTable)
-            : fromSubqueryBaseForKey(fsq, jc.leftTable);
+            ? fromSubqueryBaseForKey(fsq, rightKey)
+            : fromSubqueryBaseForKey(fsq, leftKey);
         const std::string candidateKey =
-            leftIsViewKey ? jc.rightCol : jc.leftCol;
+            leftIsViewKey ? rightCol.column : leftCol.column;
         if (std::find(fsq.tables.begin(), fsq.tables.end(),
                       candidateTable) != fsq.tables.end()) {
             continue;
@@ -798,7 +771,7 @@ std::optional<MetalQueryPlan> lowerFromSubqueryTopScalarIRToMetal(
         return std::nullopt;
 
     const std::string sizeSymbol = keyDomainSymbolForAnalyzedColumn(
-        viewBase, groupCol->column, aq.schema);
+        viewBase, groupCol->column, schema);
     if (sizeSymbol.empty()) {
         return fail(error,
             "IR grouped FROM-view scalar lowerer: group key has no schema domain.");
@@ -809,8 +782,7 @@ std::optional<MetalQueryPlan> lowerFromSubqueryTopScalarIRToMetal(
     const std::string idxVar = "i";
     const std::string tag = sanitizeIdentifier(
         fsq.alias.empty() ? "from_subquery" : fsq.alias);
-    const std::string aggAlias =
-        analyzedDisplayNameForTarget(*innerAgg, innerAggIndex);
+    const std::string aggAlias = innerAgg->name;
     const std::string aggBuffer = "d_ir_from_subquery_" + tag + "_" +
         sanitizeIdentifier(aggAlias);
     const std::string aggSeenBuffer = aggBuffer + "_seen_keys";
@@ -820,14 +792,14 @@ std::optional<MetalQueryPlan> lowerFromSubqueryTopScalarIRToMetal(
 
     {
         std::set<std::string> scanCols{groupCol->column};
-        collectColumns(innerAgg->agg->innerExpr, scanCols);
+        collectGenericColumns(innerAgg->arg, scanCols);
         for (const auto& filter : fsq.filters)
-            collectColumns(filter, scanCols);
-        auto scan = makeScanForCols(viewBase, idxVar, scanCols, aq.schema);
+            collectGenericPredicateColumns(filter, scanCols);
+        auto scan = makeScanForCols(viewBase, idxVar, scanCols, schema);
         auto filtered = maybeSelect(
-            std::move(scan), combineFilters(fsq.filters, idxVar, aq.schema));
+            std::move(scan), combineGenericFilters(fsq.filters, idxVar));
         const std::string valueExpr =
-            exprToMetal(innerAgg->agg->innerExpr, idxVar, aq.schema);
+            genericExprToMetal(innerAgg->arg, idxVar);
         auto agg = std::make_unique<MetalIrAtomicFloatSumWithSeen>(
             std::move(filtered), aggBuffer, aggSeenBuffer,
             groupCol->column + "[" + idxVar + "]", valueExpr, sizeSymbol);
@@ -846,13 +818,12 @@ std::optional<MetalQueryPlan> lowerFromSubqueryTopScalarIRToMetal(
 
     {
         std::set<std::string> scanCols{outerKeyCol};
-        for (size_t ti = 0; ti < aq.targets.size(); ++ti) {
-            if (analyzedDisplayNameForTarget(aq.targets[ti], ti) == aggAlias)
+        for (const auto& projection : project.projections) {
+            if (projection.name == aggAlias)
                 continue;
-            analyzedCollectColumnsForTable(
-                aq.targets[ti].expr, outerTable, scanCols);
+            collectGenericColumnsForTable(projection.expr, outerTable, scanCols);
         }
-        auto scan = makeScanForCols(outerTable, idxVar, scanCols, aq.schema);
+        auto scan = makeScanForCols(outerTable, idxVar, scanCols, schema);
         const std::string outerKeyExpr = outerKeyCol + "[" + idxVar + "]";
         const std::string aggValueExpr = "atomic_load_explicit(&" +
             aggBuffer + "[" + outerKeyExpr + "], memory_order_relaxed)";
@@ -872,10 +843,9 @@ std::optional<MetalQueryPlan> lowerFromSubqueryTopScalarIRToMetal(
         const std::string outputSize = tableSizeName(outerTable);
         std::vector<GenericMatColumnDesc> materializedCols;
 
-        for (size_t ti = 0; ti < aq.targets.size(); ++ti) {
-            const auto& target = aq.targets[ti];
-            const std::string displayName =
-                analyzedDisplayNameForTarget(target, ti);
+        for (size_t ti = 0; ti < project.projections.size(); ++ti) {
+            const auto& projection = project.projections[ti];
+            const std::string displayName = projection.name;
             const std::string bufferName = "d_ir_from_subquery_" + tag +
                 "_" + std::to_string(ti) + "_" +
                 sanitizeIdentifier(displayName);
@@ -886,20 +856,19 @@ std::optional<MetalQueryPlan> lowerFromSubqueryTopScalarIRToMetal(
                     {displayName, bufferName, "float", 0, 0, false});
                 continue;
             }
-            if (!target.expr ||
-                !analyzedMaterializeExprSupported(target.expr)) {
+            if (!projection.expr ||
+                !materializeExprSupported(projection.expr)) {
                 return fail(error,
                     "IR grouped FROM-view scalar lowerer target expression is not supported.");
             }
-            TypeInfo type = analyzedTypeInfoForExpr(target.expr, aq.schema);
-            const int stringLen =
-                analyzedFixedStringLenForExpr(target.expr, aq.schema);
+            TypeInfo type = projection.type;
+            const int stringLen = fixedStringLenForExpr(projection.expr);
             std::string sizeExpr = outputSize;
             if (stringLen > 0)
                 sizeExpr += " * " + std::to_string(stringLen);
             const std::string outType = metalTypeForType(type);
-            const std::string valueExpr = analyzedMaterializeValueExpr(
-                target.expr, idxVar, aq.schema);
+            const std::string valueExpr =
+                materializeExprToMetal(projection.expr, idxVar);
             materialize->addColumn(bufferName, outType, valueExpr,
                                    displayName, sizeExpr, stringLen);
             materializedCols.push_back(
@@ -917,15 +886,16 @@ std::optional<MetalQueryPlan> lowerFromSubqueryTopScalarIRToMetal(
             {extremumState, "atomic_uint", true, false});
 
         GenericSortSpec sortSpec;
-        sortSpec.limit = aq.limit;
-        for (int oi = 0; oi < static_cast<int>(aq.orderBy.size()); ++oi) {
-            auto column = analyzedResolveOrderColumn(
-                aq.orderBy[oi].expr, oi, aq.targets);
-            if (!column) {
-                return fail(error,
-                    "IR grouped FROM-view scalar lowerer: ORDER BY key is not projected.");
+        sortSpec.limit = limitValue(shape->limit);
+        if (auto* sort = sortDetail(shape->sort)) {
+            for (const auto& key : sort->keys) {
+                auto column = sortKeyDisplayName(key, project);
+                if (!column) {
+                    return fail(error,
+                        "IR grouped FROM-view scalar lowerer: ORDER BY key is not projected.");
+                }
+                sortSpec.keys.push_back({*column, key.descending});
             }
-            sortSpec.keys.push_back({*column, aq.orderBy[oi].descending});
         }
         if (!sortSpec.keys.empty() || sortSpec.limit >= 0) {
             const std::string sortRowsSym =
@@ -945,62 +915,63 @@ std::optional<MetalQueryPlan> lowerFromSubqueryTopScalarIRToMetal(
 }
 
 std::optional<MetalQueryPlan> lowerFromSubqueryHistogramIRToMetal(
-        const AnalyzedQuery& aq,
+        const GenericRelPlan& ir,
         std::string* error) {
-    if (aq.fromSubqueryAggs.size() != 1) return std::nullopt;
-    if (aq.groupBy.size() != 1) return std::nullopt;
+    const auto& source = ir.source;
+    const auto* schema = ir.schema;
+    if (source.fromSubqueryAggs.size() != 1) return std::nullopt;
+    auto shape = parseFromSubqueryAggregateShape(ir);
+    if (!shape || !shape->aggregate) return std::nullopt;
+    const auto& outerAggregate = *shape->aggregate;
+    if (outerAggregate.groupBy.size() != 1) return std::nullopt;
 
-    const auto& fsq = aq.fromSubqueryAggs[0];
-    auto* outerGroupCol = aq.groupBy[0]
-        ? std::get_if<ColRef>(&aq.groupBy[0]->node)
+    const auto& fsq = source.fromSubqueryAggs[0];
+    auto* outerGroupCol = outerAggregate.groupBy[0]
+        ? std::get_if<GenericColumnExpr>(&outerAggregate.groupBy[0]->node)
         : nullptr;
-    std::string innerAggAlias = outerGroupCol ? outerGroupCol->column : "";
-    if (innerAggAlias.empty()) {
-        for (size_t ti = 0; ti < aq.targets.size(); ++ti) {
-            if (!aq.targets[ti].isAgg) {
-                if (!innerAggAlias.empty()) return std::nullopt;
-                innerAggAlias = analyzedDisplayNameForTarget(aq.targets[ti], ti);
-            }
-        }
-    }
+    std::string innerAggAlias = !outerAggregate.groupNames.empty()
+        ? outerAggregate.groupNames.front()
+        : (outerGroupCol ? outerGroupCol->column : "");
     if (innerAggAlias.empty()) return std::nullopt;
 
-    const SelectTarget* outerCount = nullptr;
-    size_t outerCountIndex = 0;
-    bool hasOuterGroupProjection = false;
-    for (size_t ti = 0; ti < aq.targets.size(); ++ti) {
-        const auto& target = aq.targets[ti];
-        const std::string display = analyzedDisplayNameForTarget(target, ti);
-        if (!target.isAgg && display == innerAggAlias) {
-            hasOuterGroupProjection = true;
-        } else if (target.isAgg && target.agg &&
-                   target.agg->func == AggFunc::COUNT) {
-            outerCount = &target;
-            outerCountIndex = ti;
+    bool hasOuterGroupProjection =
+        std::find(outerAggregate.outputOrder.begin(),
+                  outerAggregate.outputOrder.end(),
+                  innerAggAlias) != outerAggregate.outputOrder.end();
+    if (outerAggregate.outputOrder.empty()) {
+        hasOuterGroupProjection =
+            std::find(outerAggregate.groupNames.begin(),
+                      outerAggregate.groupNames.end(),
+                      innerAggAlias) != outerAggregate.groupNames.end();
+    }
+
+    const GenericProjection* outerCount = nullptr;
+    for (const auto& projection : outerAggregate.aggregates) {
+        auto* agg = genericAggregateForProjection(projection);
+        if (agg && agg->func == AggFunc::COUNT) {
+            outerCount = &projection;
+            break;
         }
     }
     if (!hasOuterGroupProjection || !outerCount) return std::nullopt;
 
-    const SelectTarget* innerAgg = nullptr;
-    for (size_t ti = 0; ti < fsq.targets.size(); ++ti) {
-        const auto& target = fsq.targets[ti];
-        if (target.isAgg && target.agg &&
-            analyzedDisplayNameForTarget(target, ti) == innerAggAlias) {
+    const GenericFromSubqueryAggTarget* innerAgg = nullptr;
+    for (const auto& target : fsq.aggregates) {
+        if (target.name == innerAggAlias) {
             innerAgg = &target;
             break;
         }
     }
-    if (!innerAgg || !innerAgg->agg ||
-        innerAgg->agg->func != AggFunc::COUNT) {
+    if (!innerAgg || innerAgg->func != AggFunc::COUNT) {
         return std::nullopt;
     }
     if (fsq.groupBy.size() != 1) return std::nullopt;
     auto* innerGroupCol = fsq.groupBy[0]
-        ? std::get_if<ColRef>(&fsq.groupBy[0]->node)
+        ? std::get_if<GenericColumnExpr>(&fsq.groupBy[0]->node)
         : nullptr;
     if (!innerGroupCol) return std::nullopt;
 
-    const JoinClause* leftOuterJoin = nullptr;
+    const GenericFromSubqueryJoin* leftOuterJoin = nullptr;
     for (const auto& jc : fsq.joins) {
         if (!jc.leftOuter) continue;
         if (fromSubqueryColMatches(fsq, *innerGroupCol,
@@ -1022,10 +993,10 @@ std::optional<MetalQueryPlan> lowerFromSubqueryHistogramIRToMetal(
         return std::nullopt;
     }
 
-    std::vector<PredPtr> aggFilters;
+    std::vector<GenericPredicatePtr> aggFilters;
     for (const auto& filter : fsq.filters) {
         std::set<std::string> filterTables;
-        collectAnalyzedPredTables(filter, filterTables);
+        collectGenericPredicateTables(filter, filterTables);
         bool appliesToAgg = filterTables.empty();
         if (!filterTables.empty()) {
             appliesToAgg = std::all_of(
@@ -1037,7 +1008,7 @@ std::optional<MetalQueryPlan> lowerFromSubqueryHistogramIRToMetal(
     }
 
     std::string countSize =
-        keyDomainSymbolForAnalyzedColumn(groupBase, groupJoinCol, aq.schema);
+        keyDomainSymbolForAnalyzedColumn(groupBase, groupJoinCol, schema);
     if (countSize.empty()) {
         return fail(error, "IR FROM-subquery histogram lowerer: group key has no schema domain.");
     }
@@ -1052,10 +1023,11 @@ std::optional<MetalQueryPlan> lowerFromSubqueryHistogramIRToMetal(
 
     {
         std::set<std::string> scanCols{aggJoinCol};
-        for (const auto& filter : aggFilters) collectColumns(filter, scanCols);
-        auto scan = makeScanForCols(aggBase, idxVar, scanCols, aq.schema);
+        for (const auto& filter : aggFilters)
+            collectGenericPredicateColumns(filter, scanCols);
+        auto scan = makeScanForCols(aggBase, idxVar, scanCols, schema);
         auto filtered = maybeSelect(
-            std::move(scan), combineFilters(aggFilters, idxVar, aq.schema));
+            std::move(scan), combineGenericFilters(aggFilters, idxVar));
         auto count = std::make_unique<MetalAtomicCount>(
             std::move(filtered), countBuffer, aggJoinCol + "[" + idxVar + "]",
             countSize);
@@ -1065,10 +1037,9 @@ std::optional<MetalQueryPlan> lowerFromSubqueryHistogramIRToMetal(
 
     {
         std::set<std::string> scanCols{groupJoinCol};
-        auto scan = makeScanForCols(groupBase, idxVar, scanCols, aq.schema);
+        auto scan = makeScanForCols(groupBase, idxVar, scanCols, schema);
         const std::string groupKeyExpr = groupJoinCol + "[" + idxVar + "]";
-        const std::string outerCountName =
-            analyzedDisplayNameForTarget(*outerCount, outerCountIndex);
+        const std::string outerCountName = outerCount->name;
         constexpr int kHistogramBucketCap = 65536;
         constexpr int kLocalHistogramBucketCap = 256;
         const std::string groupTag = "ir_from_subquery_hist_" + tag;
@@ -1109,14 +1080,19 @@ std::optional<MetalQueryPlan> lowerFromSubqueryHistogramIRToMetal(
         attachMaterializedCountHook(compactPhase, compactCounter, sortRowsSym);
 
         GenericSortSpec sortSpec;
-        sortSpec.limit = aq.limit;
-        for (int oi = 0; oi < static_cast<int>(aq.orderBy.size()); ++oi) {
-            auto column = analyzedResolveOrderColumn(
-                aq.orderBy[oi].expr, oi, aq.targets);
-            if (!column) {
-                return fail(error, "IR FROM-subquery histogram lowerer: ORDER BY key is not projected.");
+        sortSpec.limit = limitValue(shape->limit);
+        if (auto* sort = sortDetail(shape->sort)) {
+            IrGroupKeyDesc groupKey;
+            groupKey.displayName = innerAggAlias;
+            std::vector<IrGroupKeyDesc> groupKeys{groupKey};
+            for (const auto& key : sort->keys) {
+                auto column = sortKeyDisplayNameForGroupedAgg(
+                    key, outerAggregate, groupKeys);
+                if (!column) {
+                    return fail(error, "IR FROM-subquery histogram lowerer: ORDER BY key is not projected.");
+                }
+                sortSpec.keys.push_back({*column, key.descending});
             }
-            sortSpec.keys.push_back({*column, aq.orderBy[oi].descending});
         }
         if (!sortSpec.keys.empty() || sortSpec.limit >= 0) {
             if (!appendBestGenericGpuOrder(plan, "group_" + groupTag,
@@ -1137,11 +1113,11 @@ std::optional<MetalQueryPlan> lowerFromSubqueryHistogramIRToMetal(
 } // namespace
 
 std::optional<MetalQueryPlan> lowerFromSubqueryAggregateIRToMetal(
-        const AnalyzedQuery& aq,
+        const GenericRelPlan& ir,
         std::string* error) {
-    if (auto p = lowerFromSubqueryHistogramIRToMetal(aq, error))
+    if (auto p = lowerFromSubqueryHistogramIRToMetal(ir, error))
         return p;
-    return lowerFromSubqueryTopScalarIRToMetal(aq, error);
+    return lowerFromSubqueryTopScalarIRToMetal(ir, error);
 }
 
 } // namespace codegen

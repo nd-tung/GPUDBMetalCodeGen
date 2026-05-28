@@ -12,7 +12,8 @@ std::optional<MetalQueryPlan> buildQ22Plan_byName() {
     MetalQueryPlan plan;
 
     // --- Average Balance ---
-    // Compute avg_bal, then register it for the final aggregate phase.
+    // Compute count and sum in separate kernels. Keeping the global float sum
+    // alone avoids mixing it with threadgroup count atomics in the hot pass.
     {
         auto scan = makeAutoScan("customer", idx);
 
@@ -29,12 +30,27 @@ std::optional<MetalQueryPlan> buildQ22Plan_byName() {
         auto countOp = std::make_unique<MetalAtomicCount>(
             std::move(filtered), "d_q22_avgbal_count", "0", "1");
 
+        appendPhase(plan, "Q22_compute_avg_bal_count", std::move(countOp), 256);
+    }
+    {
+        auto scan = makeAutoScan("customer", idx);
+
+        auto computePrefix = std::make_unique<MetalComputeExpr>(
+            std::move(scan), "_prefix", "int",
+            "(c_phone[" + idx + " * 15] - '0') * 10 + (c_phone[" + idx + " * 15 + 1] - '0')");
+
+        std::string validPrefixCond =
+            "(_prefix == 13 || _prefix == 17 || _prefix == 18 || "
+            "_prefix == 23 || _prefix == 29 || _prefix == 30 || _prefix == 31) && "
+            "c_acctbal[" + idx + "] > 0.0f";
+        auto filtered = std::make_unique<MetalSelection>(std::move(computePrefix), validPrefixCond);
+
         auto sumOp = std::make_unique<MetalAtomicAgg>(
-            std::move(countOp), "d_q22_avgbal_sum",
+            std::move(filtered), "d_q22_avgbal_sum",
             "0", "c_acctbal[" + idx + "]", "1",
             "atomic_float", "float");
 
-        auto& phase = appendPhase(plan, "Q22_compute_avg_bal", std::move(sumOp), 256);
+        auto& phase = appendPhase(plan, "Q22_compute_avg_bal_sum", std::move(sumOp), 256);
         phase.postDispatchHook = [](MetalGenericExecutor& ex) {
             auto* sumBuf   = ex.getAllocatedBuffer("d_q22_avgbal_sum");
             auto* countBuf = ex.getAllocatedBuffer("d_q22_avgbal_count");
@@ -85,16 +101,18 @@ std::optional<MetalQueryPlan> buildQ22Plan_byName() {
             "(_prefix == 13 ? 0 : _prefix == 17 ? 1 : _prefix == 18 ? 2 : "
             "_prefix == 23 ? 3 : _prefix == 29 ? 4 : _prefix == 30 ? 5 : 6)");
 
-        // Seven bins correspond to the accepted country-code prefixes.
-        auto count = std::make_unique<MetalAtomicCount>(
-            std::move(computeBin), "d_q22_count", "_bin", "7");
+        // Seven bins correspond to the accepted country-code prefixes. Use a
+        // keyed aggregate so both count and balance sum are reduced within
+        // each threadgroup before the global atomics.
+        auto agg = std::make_unique<MetalKeyedAgg>(
+            std::move(computeBin), "d_q22_aggs", "_bin",
+            /*numBuckets=*/7, /*valuesPerBucket=*/2, "14");
+        agg->addAggregate("numcust", 0, "1u", "add", false, 0);
+        agg->addAggregateWithMeta("totacctbal", 1, "c_acctbal[" + idx + "]",
+                                  "add", false, 0,
+                                  true, false);
 
-        auto sum = std::make_unique<MetalAtomicAgg>(
-            std::move(count), "d_q22_sum",
-            "_bin", "c_acctbal[" + idx + "]", "7",
-            "atomic_float", "float");
-
-        auto& phase = appendPhase(plan, "Q22_final_aggregate", std::move(sum), 256);
+        auto& phase = appendPhase(plan, "Q22_final_aggregate", std::move(agg), 256);
         phase.scalarParams = {{"avg_bal", "float"}};
     }
 

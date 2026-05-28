@@ -1,4 +1,4 @@
-#include "query_analyzer.h"
+#include "query_plan.h"
 #include "tpch_schema.h"
 #include "catalog.hpp"
 #include "metal_plan_common.h"
@@ -6,7 +6,7 @@
 extern "C" {
 #include "pg_query.h"
 }
-#include "../../third_party/nlohmann/json.hpp"
+#include "../../../../third_party/nlohmann/json.hpp"
 
 #include <stdexcept>
 #include <algorithm>
@@ -18,14 +18,43 @@ using json = nlohmann::json;
 
 namespace codegen {
 
+struct AnalyzedQuery {
+    std::vector<std::string> tables;
+    std::vector<std::string> tableAliases;
+    std::vector<JoinClause> joins;
+    std::vector<PredPtr> filters;
+    std::map<std::string, std::vector<PredPtr>> instanceFilters;
+
+    struct InSubqueryAggInfo {
+        std::string alias;
+        std::string baseTable;
+        int tableIndex = -1;
+        std::string groupCol;
+        std::string aggFunc;
+        std::string aggExpr;
+        PredPtr havingPred;
+    };
+    std::vector<InSubqueryAggInfo> inSubAggs;
+    std::vector<FromSubqueryAggInfo> fromSubqueryAggs;
+    std::vector<SelectTarget> targets;
+    std::vector<ExprPtr> groupBy;
+    PredPtr having;
+    std::vector<OrderByItem> orderBy;
+    int limit = -1;
+    std::vector<std::string> scalarSubquerySql;
+
+    const SchemaProvider* schema = nullptr;
+    std::unordered_map<std::string, std::string> aliasMap;
+};
+
 // --- Internal Helpers ---
 
 namespace {
 
-// Alias -> base table name for the active analysis.
+// Alias -> base table name for the active SQL parse.
 std::unordered_map<std::string, std::string> g_aliasMap;
 
-// Default schema provider for ad-hoc analysis.
+// Default schema provider for ad-hoc SQL parsing.
 static TPCHSchemaProvider g_defaultSchema;
 
 // FROM-subquery column aliases -> source columns.
@@ -33,7 +62,7 @@ std::unordered_map<std::string, ColRef> g_subqueryAliasMap;
 // FROM-subquery column aliases -> source expressions.
 std::unordered_map<std::string, ExprPtr> g_subqueryExprMap;
 
-// View definitions available for inlining during analysis.
+// View definitions available for inlining during SQL parsing.
 std::map<std::string, std::pair<json, std::vector<std::string>>> g_views;
 
 // Active schema/catalog used by AST walkers.
@@ -94,16 +123,11 @@ bool isInlinedSubqueryPlaceholder(const PredPtr& pred) {
 
 } // anonymous namespace
 
-// Scalar subqueries collected by walkExpr and transferred to AnalyzedQuery.
+// Scalar subqueries collected by walkExpr and transferred to Generic source metadata.
 struct ScalarSubqueryInfo {
     std::string sql; // Serialized subselect AST.
 };
 static std::vector<ScalarSubqueryInfo> g_scalarSubqueries;
-
-SchemaProvider& defaultSchemaProvider() {
-    static TPCHSchemaProvider s;
-    return s;
-}
 
 // Parse YYYY-MM-DD into YYYYMMDD.
 int parseDateLiteral(const std::string& s) {
@@ -1019,9 +1043,9 @@ void collectReferencedViews(const json& fromItem, std::set<std::string>& views) 
     }
 }
 
-// --- Public Analysis Entry Point ---
+// --- SQL Build-State Collection ---
 
-AnalyzedQuery analyzeSQL(const std::string& sql, const SchemaProvider* schema) {
+static AnalyzedQuery collectAnalyzedQuery(const std::string& sql, const SchemaProvider* schema) {
     PgQueryParseResult result = pg_query_parse(sql.c_str());
     if (result.error) {
         std::string msg = result.error->message;
@@ -1049,8 +1073,7 @@ AnalyzedQuery analyzeSQL(const std::string& sql, const SchemaProvider* schema) {
         s_catalog = Catalog::fromSchemaProvider(*aq.schema);
         s_catFor = aq.schema;
     }
-    aq.catalog = &s_catalog;
-    g_analyzeCatalog = aq.catalog;
+    g_analyzeCatalog = &s_catalog;
 
     g_aliasMap.clear();
     g_subqueryAliasMap.clear();
@@ -1549,9 +1572,8 @@ AnalyzedQuery analyzeSQL(const std::string& sql, const SchemaProvider* schema) {
             aq.limit = lc["A_Const"]["ival"]["ival"].get<int>();
     }
 
-    // Move alias maps into the analyzed query for builder access.
-    aq.subqueryColMap = std::move(g_subqueryAliasMap);
-    aq.subqueryExprMap = std::move(g_subqueryExprMap);
+    auto subqueryColMap = std::move(g_subqueryAliasMap);
+    auto subqueryExprMap = std::move(g_subqueryExprMap);
     g_subqueryAliasMap.clear();
     g_subqueryExprMap.clear();
 
@@ -1560,15 +1582,15 @@ AnalyzedQuery analyzeSQL(const std::string& sql, const SchemaProvider* schema) {
         if (!expr) return;
         if (auto* cr = std::get_if<ColRef>(&expr->node)) {
             if (cr->table.empty()) {
-                auto it = aq.subqueryColMap.find(cr->column);
-                if (it != aq.subqueryColMap.end()) {
+                auto it = subqueryColMap.find(cr->column);
+                if (it != subqueryColMap.end()) {
                     expr = Expr::col(it->second.table, it->second.column,
                                      it->second.colIndex, it->second.dataType,
                                      it->second.fixedWidth, it->second.tableAlias);
                     return;
                 }
-                auto eit = aq.subqueryExprMap.find(cr->column);
-                if (eit != aq.subqueryExprMap.end()) {
+                auto eit = subqueryExprMap.find(cr->column);
+                if (eit != subqueryExprMap.end()) {
                     expr = eit->second;
                     return;
                 }
@@ -1602,12 +1624,9 @@ AnalyzedQuery analyzeSQL(const std::string& sql, const SchemaProvider* schema) {
     }
     // GROUP BY/ORDER BY keep display aliases; targets use resolved expressions.
 
-    // Transfer scalar subqueries into the analyzed query.
+    // Transfer scalar subqueries into Generic source metadata input.
     for (auto& sq : g_scalarSubqueries) {
-        AnalyzedQuery::Subquery aqSq;
-        aqSq.type = AnalyzedQuery::Subquery::SCALAR_SUBQUERY;
-        aqSq.sql = sq.sql;
-        aq.subqueries.push_back(aqSq);
+        aq.scalarSubquerySql.push_back(sq.sql);
     }
     g_scalarSubqueries.clear();
 

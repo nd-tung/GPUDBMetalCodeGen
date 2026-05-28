@@ -46,18 +46,6 @@ bool domainKeyListExistsEnabled() {
     return value && value[0] != '\0' && value[0] != '0';
 }
 
-CmpOp reverseCmpOp(CmpOp op) {
-    switch (op) {
-        case CmpOp::LT: return CmpOp::GT;
-        case CmpOp::LE: return CmpOp::GE;
-        case CmpOp::GT: return CmpOp::LT;
-        case CmpOp::GE: return CmpOp::LE;
-        case CmpOp::EQ: return CmpOp::EQ;
-        case CmpOp::NE: return CmpOp::NE;
-    }
-    return op;
-}
-
 struct IrJoinColumns {
     GenericColumnExpr left;
     GenericColumnExpr right;
@@ -1237,11 +1225,10 @@ std::unique_ptr<MetalOperator> appendCarryStore(
         keyExpr, valueExpr, metalTypeForType(carry.column.type), keyDomain);
 }
 
-const AnalyzedQuery::InSubqueryAggInfo* inSubAggForBuild(
-        const AnalyzedQuery* aq,
+const GenericInSubqueryAggInfo* inSubAggForBuild(
+        const GenericRelPlan& ir,
         const IrBuildSide& build) {
-    if (!aq) return nullptr;
-    for (const auto& info : aq->inSubAggs) {
+    for (const auto& info : ir.source.inSubAggs) {
         if (info.tableIndex >= 0 && info.tableIndex == build.relationInstance)
             return &info;
         if (!info.alias.empty() && build.scan && build.scan->alias == info.alias)
@@ -1255,51 +1242,13 @@ const AnalyzedQuery::InSubqueryAggInfo* inSubAggForBuild(
     return nullptr;
 }
 
-std::optional<std::string> analyzedLiteralToFloatMetal(const Literal& lit) {
-    return std::visit([](const auto& value) -> std::optional<std::string> {
-        using T = std::decay_t<decltype(value)>;
-        if constexpr (std::is_same_v<T, int>) {
-            return std::to_string(value) + ".0f";
-        } else if constexpr (std::is_same_v<T, float>) {
-            return std::to_string(value) + "f";
-        } else {
-            return std::nullopt;
-        }
-    }, lit.value);
-}
-
-bool analyzedExprIsInSubAggCall(const ExprPtr& expr,
-                                const AnalyzedQuery::InSubqueryAggInfo& info) {
-    if (!expr) return false;
-    auto* call = std::get_if<FuncCall>(&expr->node);
-    if (!call || lowerAscii(call->name) != lowerAscii(info.aggFunc))
-        return false;
-    if (lowerAscii(info.aggFunc) == "count")
-        return true;
-    if (call->args.empty() || !call->args.front())
-        return info.aggExpr.empty();
-    auto* col = std::get_if<ColRef>(&call->args.front()->node);
-    return col && col->column == info.aggExpr;
-}
-
 std::optional<std::string> inSubAggHavingCondition(
-        const AnalyzedQuery::InSubqueryAggInfo& info,
+        const GenericInSubqueryAggInfo& info,
         const std::string& aggRef) {
-    auto* cmp = info.havingPred ? std::get_if<Comparison>(&info.havingPred->node) : nullptr;
-    if (!cmp) return aggRef + " > 0.0f";
-
-    CmpOp op = cmp->op;
-    const Literal* literal = nullptr;
-    if (analyzedExprIsInSubAggCall(cmp->left, info)) {
-        literal = cmp->right ? std::get_if<Literal>(&cmp->right->node) : nullptr;
-    } else if (analyzedExprIsInSubAggCall(cmp->right, info)) {
-        literal = cmp->left ? std::get_if<Literal>(&cmp->left->node) : nullptr;
-        op = reverseCmpOp(cmp->op);
-    }
-    if (!literal) return std::nullopt;
-    auto rhs = analyzedLiteralToFloatMetal(*literal);
-    if (!rhs) return std::nullopt;
-    return aggRef + " " + cmpOpToMetal(op) + " " + *rhs;
+    if (!info.hasHavingPred) return aggRef + " > 0.0f";
+    if (!info.having) return std::nullopt;
+    return aggRef + " " + cmpOpToMetal(info.having->op) + " " +
+           std::to_string(info.having->literal) + "f";
 }
 
 GenericPredicatePtr makeLogicalPredicate(
@@ -1466,15 +1415,16 @@ bool carryLookupHasReliableSentinel(const IrCarryColumn& carry) {
 }
 
 bool canElideBitmapWithCarrySentinel(const IrBuildSide& build,
-                                     const AnalyzedQuery* aq) {
+                                     const GenericRelPlan& ir) {
+    const auto& source = ir.source;
     if (build.useHashJoin || build.semiJoinFilter || build.antiJoinFilter ||
         build.existsDistinct || build.emitKeyList ||
-        build.subtreeCarries.empty() || !build.scan || !aq || !aq->schema) {
+        build.subtreeCarries.empty() || !build.scan || !ir.schema) {
         return false;
     }
-    if (!aq->inSubAggs.empty())
+    if (!source.inSubAggs.empty())
         return false;
-    auto pk = aq->schema->pkInfo(build.scan->table);
+    auto pk = ir.schema->pkInfo(build.scan->table);
     if (!pk || pk->first != build.joinCol.column)
         return false;
     for (const auto& carry : build.subtreeCarries) {
@@ -1680,7 +1630,6 @@ std::optional<MultiTableJoinLowering> buildMultiTableJoinLowering(
         const GenericRelNode* filterNode,
         const std::vector<GenericExprPtr>& neededExprs,
         const std::string& planName,
-        const AnalyzedQuery* aq,
         const std::vector<GenericScalarLookupInfo>* scalarLookups,
         std::string* error) {
     std::vector<IrScanSide> sides;
@@ -1936,7 +1885,7 @@ std::optional<MultiTableJoinLowering> buildMultiTableJoinLowering(
             continue;
         }
         build.elideBitmapWithCarrySentinel =
-            canElideBitmapWithCarrySentinel(build, aq);
+            canElideBitmapWithCarrySentinel(build, ir);
     }
 
     for (const auto& [rel, build] : buildByRel) {
@@ -1988,7 +1937,7 @@ std::optional<MultiTableJoinLowering> buildMultiTableJoinLowering(
         if (!scalarLookups) return false;
         auto rewrite = rewriteScalarLookupsInCondition(
             genericPredicateToMetal(pred, idxVar), scalarLookups, idxVar, table,
-            aq ? aq->schema : nullptr);
+            ir.schema);
         return rewrite.referencedScalarLookup || rewrite.needsScalarLookupBuffers;
     };
 
@@ -2000,11 +1949,11 @@ std::optional<MultiTableJoinLowering> buildMultiTableJoinLowering(
         for (const auto& pred : filters) {
             auto rewrite = rewriteScalarLookupsInCondition(
                 genericPredicateToMetal(pred, idxVar), scalarLookups, idxVar, table,
-                aq ? aq->schema : nullptr);
+                ir.schema);
             if (rewrite.needsScalarLookupLoads && !scalarLookupsLoaded) {
                 pipe = appendScalarLookupLoads(
                     std::move(pipe), scalarLookups, idxVar, table,
-                    aq ? aq->schema : nullptr);
+                    ir.schema);
                 scalarLookupsLoaded = true;
             }
             usesScalarLookupBuffer =
@@ -2208,7 +2157,7 @@ std::optional<MultiTableJoinLowering> buildMultiTableJoinLowering(
                 spec.sourceProbeColumn + "[" + idxVar + "]");
         }
         const std::string domainExpr =
-            keyDomainExprForColumn(spec.outputColumn, aq ? aq->schema : nullptr);
+            keyDomainExprForColumn(spec.outputColumn, ir.schema);
         auto build = std::make_unique<MetalBitmapBuild>(
             std::move(pipe), spec.bitmapName,
             spec.outputColumn.column + "[" + idxVar + "]",
@@ -2233,7 +2182,7 @@ std::optional<MultiTableJoinLowering> buildMultiTableJoinLowering(
             auto filters = relationImmediateFilters(rel);
             if (filters.empty()) continue;
             for (const auto& [_, col] : columns) {
-                if (!columnHasSmallFiniteKeyDomain(col, aq ? aq->schema : nullptr))
+                if (!columnHasSmallFiniteKeyDomain(col, ir.schema))
                     continue;
                 auto pipe = makeRelationKeysetScan(rel, filters);
                 if (!pipe) continue;
@@ -2246,7 +2195,7 @@ std::optional<MultiTableJoinLowering> buildMultiTableJoinLowering(
                 spec.bitmapName = bitmapName;
                 spec.reason = "seed";
                 spec.estimatedActiveKeyFraction =
-                    estimateFilterSelectivity(filters, aq ? aq->schema : nullptr);
+                    estimateFilterSelectivity(filters, ir.schema);
                 const int specIndex = static_cast<int>(keysetSpecs.size());
                 keysetSpecs.push_back(std::move(spec));
                 addKeysetState(col, bitmapName, false, specIndex,
@@ -2272,7 +2221,7 @@ std::optional<MultiTableJoinLowering> buildMultiTableJoinLowering(
                     if (outCol.column == state.column.column ||
                         hasKeysetState(outCol) ||
                         !columnHasSmallFiniteKeyDomain(
-                            outCol, aq ? aq->schema : nullptr)) {
+                            outCol, ir.schema)) {
                         continue;
                     }
                     auto filters = relationImmediateFilters(rel);
@@ -2318,7 +2267,7 @@ std::optional<MultiTableJoinLowering> buildMultiTableJoinLowering(
                 }
                 if (!dst || hasKeysetState(*dst) ||
                     !columnHasSmallFiniteKeyDomain(
-                        *dst, aq ? aq->schema : nullptr)) {
+                        *dst, ir.schema)) {
                     continue;
                 }
 
@@ -2422,7 +2371,7 @@ std::optional<MultiTableJoinLowering> buildMultiTableJoinLowering(
         }
         input.targetRowsExpr = relationRowsExpr(targetRel);
         input.keyDomainExpr =
-            keyDomainExprForColumn(state.column, aq ? aq->schema : nullptr);
+            keyDomainExprForColumn(state.column, ir.schema);
         input.keyByteWidth = genericCostTypeByteWidth(state.column.type);
         input.targetRowByteWidth = relationFilterWidth(targetRel, state.column);
         auto choice = chooseKeysetPropagation(input);
@@ -2698,7 +2647,7 @@ std::optional<MultiTableJoinLowering> buildMultiTableJoinLowering(
             continue;
         }
 
-        if (const auto* subAgg = inSubAggForBuild(aq, build)) {
+        if (const auto* subAgg = inSubAggForBuild(ir, build)) {
             const std::string aggFunc = lowerAscii(subAgg->aggFunc);
             if (aggFunc != "sum" && aggFunc != "count") {
                 return shapeFail<MultiTableJoinLowering>(
@@ -2905,11 +2854,11 @@ std::optional<MultiTableJoinLowering> buildMultiTableJoinLowering(
         auto rewrite = rewriteScalarLookupsInCondition(
             genericPredicateToMetalWithCarryMap(pred, idxVar, lowering.carryMap),
             scalarLookups, idxVar, probe->scan->table,
-            aq ? aq->schema : nullptr);
+            ir.schema);
         if (rewrite.needsScalarLookupLoads && !probeScalarLookupsLoaded) {
             lowering.probePipe = appendScalarLookupLoads(
                 std::move(lowering.probePipe), scalarLookups, idxVar,
-                probe->scan->table, aq ? aq->schema : nullptr);
+                probe->scan->table, ir.schema);
             probeScalarLookupsLoaded = true;
         }
         probeUsesScalarLookupBuffer =

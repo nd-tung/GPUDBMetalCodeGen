@@ -1,5 +1,6 @@
 #pragma once
 
+#include "generic/ir/generic_relational_ir.h"
 #include "generic/lowering/generic_scalar_lookup.h"
 #include "metal_plan_builder.h"
 
@@ -8,7 +9,7 @@
 namespace codegen {
 
 std::vector<GenericScalarLookupInfo> buildGenericScalarPreAggs(
-    const AnalyzedQuery& aq,
+    const GenericRelPlan& ir,
     MetalQueryPlan& plan);
 
 } // namespace codegen

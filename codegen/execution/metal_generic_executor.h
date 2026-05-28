@@ -30,8 +30,8 @@ struct MetalExecutionResult {
     std::vector<float> phaseOverheadTimesMs; // wall - GPU - hook CPU
 
     // CPU-side sub-phases are filled by the caller.
-    float analyzeTimeMs    = 0.0f;  // SQL to AnalyzedQuery
-    float planTimeMs       = 0.0f;  // AnalyzedQuery to MetalQueryPlan
+    float analyzeTimeMs    = 0.0f;  // SQL analysis
+    float planTimeMs       = 0.0f;  // IR build plus GenericRelPlan to MetalQueryPlan
     float codegenTimeMs    = 0.0f;  // Plan to Metal source
     float compileTimeMs    = 0.0f;  // Metal source to MTLLibrary
     float psoTimeMs        = 0.0f;  // MTLLibrary to pipeline states
@@ -153,8 +153,10 @@ private:
                           const MetalCodegen::PhaseInfo& phase,
                           const BufferMap& buffers);
 
-    void zeroInitBuffers(const MetalCodegen::PhaseInfo& phase,
-                         const BufferMap& buffers);
+    void zeroInitBuffersForRange(const std::vector<MetalCodegen::PhaseInfo>& phases,
+                                 int firstPhase,
+                                 int lastPhase,
+                                 const BufferMap& buffers);
 
     MTL::ComputePipelineState* findPSO(const RuntimeCompiler::CompiledQuery& cq,
                                         const std::string& name);

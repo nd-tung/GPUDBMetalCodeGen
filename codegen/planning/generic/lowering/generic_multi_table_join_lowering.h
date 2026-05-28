@@ -51,7 +51,6 @@ std::optional<MultiTableJoinLowering> buildMultiTableJoinLowering(
     const GenericRelNode* filterNode,
     const std::vector<GenericExprPtr>& neededExprs,
     const std::string& planName,
-    const AnalyzedQuery* aq,
     const std::vector<GenericScalarLookupInfo>* scalarLookups,
     std::string* error);
 

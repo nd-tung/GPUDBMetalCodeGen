@@ -7,7 +7,7 @@
 #include <stdexcept>
 #include <cstddef>
 #include <cstdint>
-#include "query_analyzer.h"
+#include "query_plan.h"
 
 namespace codegen {
 

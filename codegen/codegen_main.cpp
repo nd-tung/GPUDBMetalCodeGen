@@ -1,11 +1,11 @@
 // Standalone SQL-to-Metal entry point.
 
 #include "core/infra.h"
-#include "query_analyzer.h"
 #include "runtime_compiler.h"
 #include "metal_plan_builder.h"
 #include "api/metal_adhoc_plan_api.h"
 #include "api/metal_tpch_plan_api.h"
+#include "generic/ir/generic_ir_builder.h"
 #include "metal_generic_executor.h"
 #include "max_key_symbols.h"
 #include "query_preprocessing.h"
@@ -377,19 +377,24 @@ static bool runCodegenQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
             }
         }
 
-        // Analyze SQL only for the ad-hoc route.
-        codegen::AnalyzedQuery analyzed;
-        bool analyzedOk = false;
+        // Build Generic IR only for the ad-hoc route.
+        std::optional<codegen::GenericRelPlan> genericIr;
+        static codegen::TPCHSchemaProvider defaultSchema;
+        const codegen::SchemaProvider* activeSchema = &defaultSchema;
         if (apiKind == QueryApiKind::AdhocSQL) {
             auto tAnalyze0 = clk::now();
-            try {
-                analyzed = codegen::analyzeSQL(sql);
-                analyzedOk = true;
-            } catch (const std::exception& e) {
-                std::cerr << "Codegen: SQL analysis failed for " << queryName
-                          << ": " << e.what() << std::endl;
+            std::string irError;
+            genericIr = codegen::buildGenericRelationalIRFromSQL(
+                sql, nullptr, &irError);
+            if (!genericIr) {
+                std::cerr << "Codegen: generic relational IR build failed for "
+                          << queryName << std::endl;
+                if (!irError.empty()) {
+                    std::cerr << "  Reason: " << irError << std::endl;
+                }
                 return false;
             }
+            if (genericIr->schema) activeSchema = genericIr->schema;
             timing.analyzeMs = elapsedMs(tAnalyze0, clk::now());
         }
 
@@ -404,13 +409,13 @@ static bool runCodegenQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
                 return false;
             }
         } else {
-            if (!analyzedOk) {
-                std::cerr << "Codegen: ad-hoc SQL requires successful analysis for "
+            if (!genericIr) {
+                std::cerr << "Codegen: ad-hoc SQL requires successful Generic IR build for "
                           << queryName << std::endl;
                 return false;
             }
             std::string planError;
-            maybePlan = codegen::buildAdhocSQLPlan(analyzed, queryName, &planError);
+            maybePlan = codegen::buildAdhocGenericPlan(*genericIr, queryName, &planError);
             if (!maybePlan) {
                 std::cerr << "Codegen: ad-hoc SQL pattern not supported for "
                           << queryName << std::endl;
@@ -469,7 +474,7 @@ static bool runCodegenQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
         // Generate Metal source.
         auto tCodegen0 = clk::now();
         // Predefined TPC-H plans need the default schema for auto-projection.
-        auto cg = codegen::generateFromPlan(plan, analyzed.schema ? analyzed.schema : &codegen::defaultSchemaProvider());
+        auto cg = codegen::generateFromPlan(plan, activeSchema);
         std::string metalSource = cg.print();
         timing.codegenMs = elapsedMs(tCodegen0, clk::now());
 
@@ -1299,7 +1304,7 @@ int main(int argc, const char* argv[]) {
             printf("  mb1..mb7      - Run microbenchmark SQL through the analyzer route\n");
             printf("  mball         - Run all microbenchmarks\n");
             printf("Loader flags:\n");
-            printf("  --no-zerocopy        Disable zero-copy mmap path (force buffer copies)\n");
+            printf("  --no-zerocopy        Disable zero-copy mmap path (copy into shared buffers)\n");
             printf("  --no-binary          Disable .colbin binary loader (force .tbl parser)\n");
             printf("  --chunk N[K|M|G]     Stream certified chunkable plans from .colbin\n");
             printf("  --auto-chunk         Auto-enable chunking for certified chunkable plans (default)\n");

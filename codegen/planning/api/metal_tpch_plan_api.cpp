@@ -285,9 +285,9 @@ void applyTPCHMetadata(MetalQueryPlan& plan, const std::string& queryName) {
         for (int i = 0; i < 7; ++i) {
             s.staticRows.push_back(staticRow({
                 intCell(prefixes[i]),
-                bufUInt("d_q22_count", i),
-                bufFloat("d_q22_sum", i),
-            }, bufUInt("d_q22_count", i)));
+                bufUInt("d_q22_aggs", i * 2),
+                bufFloat("d_q22_aggs", i * 2 + 1),
+            }, bufUInt("d_q22_aggs", i * 2)));
         }
         plan.hostResult = std::move(s);
     }

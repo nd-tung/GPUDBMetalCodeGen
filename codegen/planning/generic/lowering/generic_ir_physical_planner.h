@@ -8,8 +8,6 @@
 
 namespace codegen {
 
-struct AnalyzedQuery;
-
 // Lower supported single-table materialize/order/limit IR shapes to Metal.
 // Returns nullopt when this route does not handle the shape.
 std::optional<MetalQueryPlan> lowerSingleTableMaterializeIRToMetal(
@@ -28,31 +26,16 @@ std::optional<MetalQueryPlan> lowerMultiTableMaterializeIRToMetal(
     const GenericRelPlan& ir,
     std::string* error = nullptr);
 
-std::optional<MetalQueryPlan> lowerMultiTableMaterializeIRToMetal(
-    const GenericRelPlan& ir,
-    const AnalyzedQuery& aq,
-    std::string* error = nullptr);
-
 std::optional<MetalQueryPlan> lowerMultiTableGroupedAggregateIRToMetal(
-    const GenericRelPlan& ir,
-    std::string* error = nullptr);
-
-std::optional<MetalQueryPlan> lowerMultiTableGroupedAggregateIRToMetal(
-    const GenericRelPlan& ir,
-    const AnalyzedQuery& aq,
-    std::string* error = nullptr);
-
-std::optional<MetalQueryPlan> lowerMultiTableScalarAggregateIRToMetal(
     const GenericRelPlan& ir,
     std::string* error = nullptr);
 
 std::optional<MetalQueryPlan> lowerMultiTableScalarAggregateIRToMetal(
     const GenericRelPlan& ir,
-    const AnalyzedQuery& aq,
     std::string* error = nullptr);
 
 std::optional<MetalQueryPlan> lowerFromSubqueryAggregateIRToMetal(
-    const AnalyzedQuery& aq,
+    const GenericRelPlan& ir,
     std::string* error = nullptr);
 
 } // namespace codegen

@@ -1,7 +1,6 @@
 #include "generic/lowering/generic_multi_table_checks.h"
 
 #include "generic/lowering/generic_scalar_placeholder.h"
-#include "query_analyzer.h"
 
 #include <type_traits>
 
@@ -31,10 +30,9 @@ const GenericJoinDetail* joinDetail(const GenericRelNode* node) {
 
 } // namespace
 
-bool hasScalarSubqueries(const AnalyzedQuery* aq) {
-    if (!aq) return false;
-    for (const auto& sq : aq->subqueries) {
-        if (sq.type == AnalyzedQuery::Subquery::SCALAR_SUBQUERY)
+bool hasScalarSubqueries(const GenericRelPlan& ir) {
+    for (const auto& sq : ir.source.subqueries) {
+        if (sq.type == GenericSourceSubquery::SCALAR_SUBQUERY)
             return true;
     }
     return false;

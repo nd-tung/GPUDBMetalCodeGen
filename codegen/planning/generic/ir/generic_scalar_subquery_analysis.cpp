@@ -1,7 +1,6 @@
-#include "generic/lowering/generic_scalar_subquery_analysis.h"
+#include "generic/ir/generic_scalar_subquery_analysis.h"
 
 #include "core/schema_provider.h"
-#include "metal_plan_common.h"
 
 #include <algorithm>
 #include <cctype>
@@ -9,6 +8,7 @@
 #include <optional>
 #include <set>
 #include <string>
+#include <type_traits>
 #include <variant>
 #include <vector>
 
@@ -149,106 +149,242 @@ static DecorrCol resolveDecorrCol(DecorrCol col,
     return col;
 }
 
-static ExprPtr jsonExprToExpr(const nlohmann::json& node,
-                              const DecorrelatedScalarSubquery& dsq,
-                              const SchemaProvider* schema);
+static TypeInfo intType() {
+    return TypeInfo{DataType::INT, 0};
+}
 
-static ExprPtr jsonConstToExpr(const nlohmann::json& ac) {
+static TypeInfo floatType() {
+    return TypeInfo{DataType::FLOAT, 0};
+}
+
+static TypeInfo stringType(size_t len) {
+    return TypeInfo{DataType::CHAR_FIXED, static_cast<int>(len)};
+}
+
+template <typename Node>
+static GenericExprPtr makeGenericExpr(TypeInfo type, Node node) {
+    auto out = std::make_shared<GenericExpr>();
+    out->type = type;
+    out->node = std::move(node);
+    return out;
+}
+
+template <typename Node>
+static GenericPredicatePtr makeGenericPredicate(Node node) {
+    auto out = std::make_shared<GenericPredicate>();
+    out->node = std::move(node);
+    return out;
+}
+
+static GenericExprPtr genericIntLiteral(int64_t value) {
+    TypeInfo type = intType();
+    return makeGenericExpr(type, GenericLiteralExpr{value, type});
+}
+
+static GenericExprPtr genericDateLiteral(int64_t value) {
+    TypeInfo type{DataType::DATE, 0};
+    return makeGenericExpr(type, GenericLiteralExpr{value, type});
+}
+
+static GenericExprPtr genericFloatLiteral(double value) {
+    TypeInfo type = floatType();
+    return makeGenericExpr(type, GenericLiteralExpr{value, type});
+}
+
+static GenericExprPtr genericStringLiteral(std::string value) {
+    TypeInfo type = stringType(value.size());
+    return makeGenericExpr(type, GenericLiteralExpr{std::move(value), type});
+}
+
+static std::optional<std::string> genericStringLiteralValue(
+        const GenericExprPtr& expr) {
+    if (!expr) return std::nullopt;
+    auto* lit = std::get_if<GenericLiteralExpr>(&expr->node);
+    if (!lit) return std::nullopt;
+    auto* value = std::get_if<std::string>(&lit->value);
+    if (!value) return std::nullopt;
+    return *value;
+}
+
+static std::optional<int64_t> genericIntLiteralValue(const GenericExprPtr& expr) {
+    if (!expr) return std::nullopt;
+    auto* lit = std::get_if<GenericLiteralExpr>(&expr->node);
+    if (!lit) return std::nullopt;
+    auto* value = std::get_if<int64_t>(&lit->value);
+    if (!value) return std::nullopt;
+    return *value;
+}
+
+static TypeInfo typeForDecorrCol(const DecorrCol& col,
+                                 const SchemaProvider* schema) {
+    if (col.inner && schema && schema->hasColumn(col.table, col.column)) {
+        DataType dt = schema->columnType(col.table, col.column);
+        int fixedWidth = dt == DataType::CHAR_FIXED
+            ? schema->columnFixedWidth(col.table, col.column)
+            : 0;
+        return TypeInfo{dt, fixedWidth};
+    }
+    return intType();
+}
+
+static GenericExprPtr genericColExpr(const DecorrCol& col,
+                                     const SchemaProvider* schema) {
+    GenericColumnExpr out;
+    out.table = col.inner ? col.table : "";
+    out.alias = col.qualifier;
+    out.column = col.column;
+    out.type = typeForDecorrCol(col, schema);
+    if (col.inner && schema && schema->hasColumn(col.table, col.column)) {
+        if (auto gd = schema->groupDomain(col.table, col.column)) {
+            out.hasGroupDomain = true;
+            out.domainMin = gd->minValue;
+            out.domainMax = gd->maxValue;
+        }
+        out.charDomain = schema->charDomain(col.table, col.column);
+        out.numericScale = schema->numericScale(col.table, col.column);
+        out.keyDomainSymbol = schema->keyDomainSymbol(col.table, col.column);
+        out.distinctDomainSymbol =
+            schema->distinctDomainSymbol(col.table, col.column);
+    }
+    return makeGenericExpr(out.type, std::move(out));
+}
+
+static GenericExprPtr jsonExprToGenericExpr(
+    const nlohmann::json& node,
+    const DecorrelatedScalarSubquery& dsq,
+    const SchemaProvider* schema);
+
+static GenericExprPtr jsonConstToGenericExpr(const nlohmann::json& ac) {
     if (ac.contains("ival")) {
         const auto& iv = ac["ival"];
-        if (iv.is_object() && iv.contains("ival")) return Expr::lit(iv["ival"].get<int>());
-        return Expr::lit(0);
+        if (iv.is_object() && iv.contains("ival"))
+            return genericIntLiteral(iv["ival"].get<int64_t>());
+        if (iv.is_number_integer()) return genericIntLiteral(iv.get<int64_t>());
+        return genericIntLiteral(0);
     }
     if (ac.contains("fval")) {
         const auto& fv = ac["fval"];
         if (fv.is_object() && fv.contains("fval"))
-            return Expr::litf(std::stof(fv["fval"].get<std::string>()));
-        return Expr::litf(0.0f);
+            return genericFloatLiteral(std::stod(fv["fval"].get<std::string>()));
+        if (fv.is_number()) return genericFloatLiteral(fv.get<double>());
+        return genericFloatLiteral(0.0);
     }
     if (ac.contains("sval")) {
         const auto& sv = ac["sval"];
         if (sv.is_object() && sv.contains("sval"))
-            return Expr::lits(sv["sval"].get<std::string>());
+            return genericStringLiteral(sv["sval"].get<std::string>());
+        if (sv.is_string()) return genericStringLiteral(sv.get<std::string>());
     }
-    return Expr::lit(0);
+    if (ac.contains("val")) {
+        const auto& val = ac["val"];
+        if (val.contains("Integer")) {
+            const auto& iv = val["Integer"].at("ival");
+            if (iv.is_number_integer()) return genericIntLiteral(iv.get<int64_t>());
+            if (iv.is_string()) return genericIntLiteral(std::stoll(iv.get<std::string>()));
+        }
+        if (val.contains("Float")) {
+            const auto& fv = val["Float"].at("fval");
+            if (fv.is_number()) return genericFloatLiteral(fv.get<double>());
+            if (fv.is_string()) return genericFloatLiteral(std::stod(fv.get<std::string>()));
+        }
+        if (val.contains("String")) {
+            return genericStringLiteral(val["String"].at("sval").get<std::string>());
+        }
+    }
+    return genericIntLiteral(0);
 }
 
-static ExprPtr jsonTypeCastToExpr(const nlohmann::json& tc,
-                                  const DecorrelatedScalarSubquery& dsq,
-                                  const SchemaProvider* schema) {
+static GenericExprPtr jsonTypeCastToGenericExpr(
+        const nlohmann::json& tc,
+        const DecorrelatedScalarSubquery& dsq,
+        const SchemaProvider* schema) {
     std::string typ;
     if (tc.contains("typeName") && tc["typeName"].contains("names")) {
         for (const auto& n : tc["typeName"]["names"]) {
             if (auto s = jsonStringValue(n)) typ = *s;
         }
     }
-    auto arg = jsonExprToExpr(tc.value("arg", nlohmann::json{}), dsq, schema);
+    auto arg = jsonExprToGenericExpr(tc.value("arg", nlohmann::json{}),
+                                     dsq, schema);
     if (typ == "date") {
-        if (auto* lit = std::get_if<Literal>(&arg->node)) {
-            if (auto* sv = std::get_if<std::string>(&lit->value))
-                return Expr::lit(parseDateLiteralLocal(*sv));
-        }
+        if (auto sv = genericStringLiteralValue(arg))
+            return genericDateLiteral(parseDateLiteralLocal(*sv));
     }
     if (typ == "interval") {
-        if (auto* lit = std::get_if<Literal>(&arg->node)) {
-            if (auto* sv = std::get_if<std::string>(&lit->value)) return Expr::lit(std::stoi(*sv));
-            if (auto* iv = std::get_if<int>(&lit->value)) return Expr::lit(*iv);
-        }
+        if (auto sv = genericStringLiteralValue(arg))
+            return genericIntLiteral(std::stoi(*sv));
+        if (auto iv = genericIntLiteralValue(arg)) return genericIntLiteral(*iv);
     }
     return arg;
 }
 
-static ExprPtr jsonExprToExpr(const nlohmann::json& node,
-                              const DecorrelatedScalarSubquery& dsq,
-                              const SchemaProvider* schema) {
+static TypeInfo binaryExprType(ExprOp op,
+                               const GenericExprPtr& left,
+                               const GenericExprPtr& right) {
+    TypeInfo leftType = left ? left->type : intType();
+    TypeInfo rightType = right ? right->type : intType();
+    if (op == ExprOp::ADD || op == ExprOp::SUB) {
+        if (leftType.type == DataType::DATE || rightType.type == DataType::DATE)
+            return TypeInfo{DataType::DATE, 0};
+    }
+    if (leftType.type == DataType::FLOAT || rightType.type == DataType::FLOAT)
+        return floatType();
+    return leftType;
+}
+
+static GenericExprPtr jsonExprToGenericExpr(
+        const nlohmann::json& node,
+        const DecorrelatedScalarSubquery& dsq,
+        const SchemaProvider* schema) {
     if (node.contains("ColumnRef")) {
         auto raw = jsonRawColumnRef(node);
-        if (!raw) return Expr::lit(0);
+        if (!raw) return genericIntLiteral(0);
         auto col = resolveDecorrCol(*raw, dsq, schema);
-        DataType dt = (col.inner && schema) ? schema->columnType(col.table, col.column) : DataType::INT;
-        int fw = (dt == DataType::CHAR_FIXED && schema) ? schema->columnFixedWidth(col.table, col.column) : 0;
-        return Expr::col(col.inner ? col.table : "", col.column, -1, dt, fw, col.qualifier);
+        return genericColExpr(col, schema);
     }
-    if (node.contains("A_Const")) return jsonConstToExpr(node["A_Const"]);
-    if (node.contains("TypeCast")) return jsonTypeCastToExpr(node["TypeCast"], dsq, schema);
+    if (node.contains("A_Const"))
+        return jsonConstToGenericExpr(node["A_Const"]);
+    if (node.contains("TypeCast"))
+        return jsonTypeCastToGenericExpr(node["TypeCast"], dsq, schema);
     if (node.contains("FuncCall")) {
-        FuncCall fc;
+        GenericFunctionExpr fc;
         fc.name = jsonFuncName(node["FuncCall"]);
         if (node["FuncCall"].contains("args")) {
             for (const auto& arg : node["FuncCall"]["args"])
-                fc.args.push_back(jsonExprToExpr(arg, dsq, schema));
+                fc.args.push_back(jsonExprToGenericExpr(arg, dsq, schema));
         }
-        auto out = std::make_shared<Expr>();
-        out->node = std::move(fc);
-        return out;
+        fc.type = intType();
+        return makeGenericExpr(fc.type, std::move(fc));
     }
     if (node.contains("A_Expr")) {
         const auto& ae = node["A_Expr"];
         std::string op = jsonAExprOp(ae);
         if (op == "+" || op == "-" || op == "*" || op == "/") {
-            auto left = jsonExprToExpr(ae.value("lexpr", nlohmann::json{}), dsq, schema);
-            auto right = jsonExprToExpr(ae.value("rexpr", nlohmann::json{}), dsq, schema);
+            auto left = jsonExprToGenericExpr(
+                ae.value("lexpr", nlohmann::json{}), dsq, schema);
+            auto right = jsonExprToGenericExpr(
+                ae.value("rexpr", nlohmann::json{}), dsq, schema);
             ExprOp eop = ExprOp::ADD;
             if (op == "-") eop = ExprOp::SUB;
             else if (op == "*") eop = ExprOp::MUL;
             else if (op == "/") eop = ExprOp::DIV;
             if ((eop == ExprOp::ADD || eop == ExprOp::SUB)) {
-                auto* l = std::get_if<Literal>(&left->node);
-                auto* r = std::get_if<Literal>(&right->node);
-                if (l && r) {
-                    auto* dateVal = std::get_if<int>(&l->value);
-                    auto* intervalVal = std::get_if<int>(&r->value);
-                    if (dateVal && intervalVal && *dateVal > 19000101 && *dateVal < 21001231) {
-                        int years = *intervalVal;
-                        if (eop == ExprOp::SUB) years = -years;
-                        return Expr::lit(dateAddYearsLocal(*dateVal, years));
-                    }
+                auto dateVal = genericIntLiteralValue(left);
+                auto intervalVal = genericIntLiteralValue(right);
+                if (dateVal && intervalVal &&
+                    *dateVal > 19000101 && *dateVal < 21001231) {
+                    int years = static_cast<int>(*intervalVal);
+                    if (eop == ExprOp::SUB) years = -years;
+                    return genericDateLiteral(dateAddYearsLocal(
+                        static_cast<int>(*dateVal), years));
                 }
             }
-            return Expr::binary(eop, left, right);
+            TypeInfo type = binaryExprType(eop, left, right);
+            return makeGenericExpr(
+                type, GenericBinaryExpr{eop, std::move(left), std::move(right), type});
         }
     }
-    return Expr::lit(0);
+    return genericIntLiteral(0);
 }
 
 static CmpOp cmpOpFromJson(const std::string& op) {
@@ -261,50 +397,66 @@ static CmpOp cmpOpFromJson(const std::string& op) {
     return CmpOp::EQ;
 }
 
-static PredPtr jsonPredToPred(const nlohmann::json& node,
-                              const DecorrelatedScalarSubquery& dsq,
-                              const SchemaProvider* schema) {
+static GenericPredicatePtr jsonPredToGenericPred(
+        const nlohmann::json& node,
+        const DecorrelatedScalarSubquery& dsq,
+        const SchemaProvider* schema) {
     if (node.contains("BoolExpr")) {
         const auto& be = node["BoolExpr"];
         std::string op = be.value("boolop", "AND_EXPR");
-        std::vector<PredPtr> children;
+        std::vector<GenericPredicatePtr> children;
         if (be.contains("args")) {
             for (const auto& arg : be["args"])
-                children.push_back(jsonPredToPred(arg, dsq, schema));
+                children.push_back(jsonPredToGenericPred(arg, dsq, schema));
         }
-        if (op == "OR_EXPR") return Predicate::logOr(std::move(children));
-        if (op == "NOT_EXPR" && !children.empty()) return Predicate::logNot(children.front());
-        return Predicate::logAnd(std::move(children));
+        GenericLogicalPred pred;
+        if (op == "OR_EXPR") pred.op = GenericLogicalPred::Op::Or;
+        else if (op == "NOT_EXPR") pred.op = GenericLogicalPred::Op::Not;
+        else pred.op = GenericLogicalPred::Op::And;
+        pred.children = std::move(children);
+        return makeGenericPredicate(std::move(pred));
     }
     if (node.contains("A_Expr")) {
         const auto& ae = node["A_Expr"];
         std::string kind = ae.value("kind", "AEXPR_OP");
         std::string op = jsonAExprOp(ae);
         if (kind == "AEXPR_IN") {
-            auto expr = jsonExprToExpr(ae.value("lexpr", nlohmann::json{}), dsq, schema);
-            std::vector<ExprPtr> values;
+            auto expr = jsonExprToGenericExpr(
+                ae.value("lexpr", nlohmann::json{}), dsq, schema);
+            std::vector<GenericExprPtr> values;
             if (ae.contains("rexpr") && ae["rexpr"].contains("List") &&
                 ae["rexpr"]["List"].contains("items")) {
                 for (const auto& item : ae["rexpr"]["List"]["items"])
-                    values.push_back(jsonExprToExpr(item, dsq, schema));
+                    values.push_back(jsonExprToGenericExpr(item, dsq, schema));
             }
-            auto pred = Predicate::inList(expr, std::move(values));
-            if (op == "<>" || op == "!=") return Predicate::logNot(pred);
+            auto pred = makeGenericPredicate(
+                GenericInListPred{std::move(expr), std::move(values)});
+            if (op == "<>" || op == "!=") {
+                GenericLogicalPred notPred;
+                notPred.op = GenericLogicalPred::Op::Not;
+                notPred.children.push_back(pred);
+                return makeGenericPredicate(std::move(notPred));
+            }
             return pred;
         }
         if (kind == "AEXPR_LIKE" || kind == "AEXPR_ILIKE") {
-            auto expr = jsonExprToExpr(ae.value("lexpr", nlohmann::json{}), dsq, schema);
-            auto patExpr = jsonExprToExpr(ae.value("rexpr", nlohmann::json{}), dsq, schema);
-            std::string pat;
-            if (auto* lit = std::get_if<Literal>(&patExpr->node))
-                if (auto* sv = std::get_if<std::string>(&lit->value)) pat = *sv;
-            return Predicate::like(expr, pat, op == "!~~" || op == "!~~*");
+            auto expr = jsonExprToGenericExpr(
+                ae.value("lexpr", nlohmann::json{}), dsq, schema);
+            auto patExpr = jsonExprToGenericExpr(
+                ae.value("rexpr", nlohmann::json{}), dsq, schema);
+            std::string pat = genericStringLiteralValue(patExpr).value_or("");
+            return makeGenericPredicate(
+                GenericLikePred{std::move(expr), pat, op == "!~~" || op == "!~~*"});
         }
-        auto left = jsonExprToExpr(ae.value("lexpr", nlohmann::json{}), dsq, schema);
-        auto right = jsonExprToExpr(ae.value("rexpr", nlohmann::json{}), dsq, schema);
-        return Predicate::cmp(cmpOpFromJson(op), left, right);
+        auto left = jsonExprToGenericExpr(
+            ae.value("lexpr", nlohmann::json{}), dsq, schema);
+        auto right = jsonExprToGenericExpr(
+            ae.value("rexpr", nlohmann::json{}), dsq, schema);
+        return makeGenericPredicate(
+            GenericComparisonPred{cmpOpFromJson(op), std::move(left), std::move(right)});
     }
-    return Predicate::cmp(CmpOp::EQ, Expr::lit(1), Expr::lit(1));
+    return makeGenericPredicate(
+        GenericComparisonPred{CmpOp::EQ, genericIntLiteral(1), genericIntLiteral(1)});
 }
 
 static void collectJsonConjuncts(const nlohmann::json& node,
@@ -316,12 +468,60 @@ static void collectJsonConjuncts(const nlohmann::json& node,
     out.push_back(node);
 }
 
-static void collectPredTables(const PredPtr& pred, std::set<std::string>& tables) {
-    std::map<std::string, std::string> colToTable;
-    collectColumnTables(pred, colToTable);
-    for (const auto& [_, table] : colToTable) {
-        if (!table.empty()) tables.insert(table);
-    }
+static void collectGenericExprTables(const GenericExprPtr& expr,
+                                     std::set<std::string>& tables);
+
+static void collectGenericPredTables(const GenericPredicatePtr& pred,
+                                     std::set<std::string>& tables) {
+    if (!pred) return;
+    std::visit([&](const auto& node) {
+        using T = std::decay_t<decltype(node)>;
+        if constexpr (std::is_same_v<T, GenericComparisonPred>) {
+            collectGenericExprTables(node.left, tables);
+            collectGenericExprTables(node.right, tables);
+        } else if constexpr (std::is_same_v<T, GenericBetweenPred>) {
+            collectGenericExprTables(node.expr, tables);
+            collectGenericExprTables(node.low, tables);
+            collectGenericExprTables(node.high, tables);
+        } else if constexpr (std::is_same_v<T, GenericInListPred>) {
+            collectGenericExprTables(node.expr, tables);
+            for (const auto& value : node.values)
+                collectGenericExprTables(value, tables);
+        } else if constexpr (std::is_same_v<T, GenericLikePred>) {
+            collectGenericExprTables(node.expr, tables);
+        } else if constexpr (std::is_same_v<T, GenericLogicalPred>) {
+            for (const auto& child : node.children)
+                collectGenericPredTables(child, tables);
+        }
+    }, pred->node);
+}
+
+static void collectGenericExprTables(const GenericExprPtr& expr,
+                                     std::set<std::string>& tables) {
+    if (!expr) return;
+    std::visit([&](const auto& node) {
+        using T = std::decay_t<decltype(node)>;
+        if constexpr (std::is_same_v<T, GenericColumnExpr>) {
+            if (!node.table.empty()) tables.insert(node.table);
+        } else if constexpr (std::is_same_v<T, GenericBinaryExpr>) {
+            collectGenericExprTables(node.left, tables);
+            collectGenericExprTables(node.right, tables);
+        } else if constexpr (std::is_same_v<T, GenericCaseExpr>) {
+            for (const auto& branch : node.branches) {
+                collectGenericPredTables(branch.condition, tables);
+                collectGenericExprTables(branch.result, tables);
+            }
+            collectGenericExprTables(node.elseResult, tables);
+        } else if constexpr (std::is_same_v<T, GenericFunctionExpr>) {
+            for (const auto& arg : node.args)
+                collectGenericExprTables(arg, tables);
+        } else if constexpr (std::is_same_v<T, GenericAggregateExpr>) {
+            collectGenericExprTables(node.arg, tables);
+        } else if constexpr (std::is_same_v<T, GenericScalarLookupExpr>) {
+            for (const auto& key : node.keys)
+                collectGenericExprTables(key, tables);
+        }
+    }, expr->node);
 }
 
 
@@ -380,7 +580,7 @@ static bool extractDecorrelatedAggTarget(const nlohmann::json& node,
 
 std::optional<DecorrelatedScalarSubquery> parseDecorrelatedScalarSubquery(
         const std::string& sqlJson,
-        const AnalyzedQuery& aq,
+        const SchemaProvider* schema,
         int sqIdx) {
     nlohmann::json root;
     try { root = nlohmann::json::parse(sqlJson); } catch (...) { return std::nullopt; }
@@ -411,7 +611,7 @@ std::optional<DecorrelatedScalarSubquery> parseDecorrelatedScalarSubquery(
     bool foundAgg = false;
     for (const auto& target : ss["targetList"]) {
         if (!target.contains("ResTarget") || !target["ResTarget"].contains("val")) continue;
-        if (extractDecorrelatedAggTarget(target["ResTarget"]["val"], dsq, aq.schema)) {
+        if (extractDecorrelatedAggTarget(target["ResTarget"]["val"], dsq, schema)) {
             foundAgg = true;
             break;
         }
@@ -426,8 +626,8 @@ std::optional<DecorrelatedScalarSubquery> parseDecorrelatedScalarSubquery(
             auto leftRaw = jsonRawColumnRef(predJson["A_Expr"].value("lexpr", nlohmann::json{}));
             auto rightRaw = jsonRawColumnRef(predJson["A_Expr"].value("rexpr", nlohmann::json{}));
             if (leftRaw && rightRaw) {
-                auto left = resolveDecorrCol(*leftRaw, dsq, aq.schema);
-                auto right = resolveDecorrCol(*rightRaw, dsq, aq.schema);
+                auto left = resolveDecorrCol(*leftRaw, dsq, schema);
+                auto right = resolveDecorrCol(*rightRaw, dsq, schema);
                 if (left.inner && right.inner) {
                     if (left.table != right.table || left.column != right.column)
                         dsq.joins.push_back({left, right});
@@ -442,9 +642,9 @@ std::optional<DecorrelatedScalarSubquery> parseDecorrelatedScalarSubquery(
         }
         if (classified) continue;
 
-        auto pred = jsonPredToPred(predJson, dsq, aq.schema);
+        auto pred = jsonPredToGenericPred(predJson, dsq, schema);
         std::set<std::string> predTables;
-        collectPredTables(pred, predTables);
+        collectGenericPredTables(pred, predTables);
         if (predTables.size() != 1) return std::nullopt;
         dsq.filtersByTable[*predTables.begin()].push_back(pred);
     }

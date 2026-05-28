@@ -383,7 +383,6 @@ std::vector<LateProjection> makeLateProjections(
 
 std::optional<MetalQueryPlan> lowerMultiTableMaterializeIRToMetalImpl(
         const GenericRelPlan& ir,
-        const AnalyzedQuery* aq,
         std::string* error) {
     auto shape = parseMultiTableMaterializeShape(ir, error);
     if (!shape) return std::nullopt;
@@ -396,9 +395,9 @@ std::optional<MetalQueryPlan> lowerMultiTableMaterializeIRToMetalImpl(
 
     MetalQueryPlan scalarPreAggPlan;
     std::vector<GenericScalarLookupInfo> scalarLookups;
-    if (hasScalarSubqueries(aq) && materializeNeedsScalarPreAgg(*shape)) {
+    if (hasScalarSubqueries(ir) && materializeNeedsScalarPreAgg(*shape)) {
         scalarPreAggPlan.name = "GENERIC_IR_MULTI_TABLE_MATERIALIZE_PREAGG";
-        scalarLookups = buildGenericScalarPreAggs(*aq, scalarPreAggPlan);
+        scalarLookups = buildGenericScalarPreAggs(ir, scalarPreAggPlan);
         if (scalarLookups.empty()) {
             return fail(error, "IR multi-table materialize lowerer: scalar subquery decorrelation is not supported.");
         }
@@ -415,7 +414,7 @@ std::optional<MetalQueryPlan> lowerMultiTableMaterializeIRToMetalImpl(
     std::string sharedLowerError;
     auto lowering = buildMultiTableJoinLowering(
         ir, shape->scans, shape->joins, shape->filter, neededExprs,
-        "GENERIC_IR_MULTI_TABLE_MATERIALIZE", aq,
+        "GENERIC_IR_MULTI_TABLE_MATERIALIZE",
         scalarLookups.empty() ? nullptr : &scalarLookups, &sharedLowerError);
     if (!lowering) {
         return fail(error, sharedLowerError.empty()
@@ -577,16 +576,7 @@ std::optional<MetalQueryPlan> lowerMultiTableMaterializeIRToMetal(
         const GenericRelPlan& ir,
         std::string* error) {
     return attachGenericCostTrace(
-        lowerMultiTableMaterializeIRToMetalImpl(ir, nullptr, error),
-        ir, "multi_table_materialize");
-}
-
-std::optional<MetalQueryPlan> lowerMultiTableMaterializeIRToMetal(
-        const GenericRelPlan& ir,
-        const AnalyzedQuery& aq,
-        std::string* error) {
-    return attachGenericCostTrace(
-        lowerMultiTableMaterializeIRToMetalImpl(ir, &aq, error),
+        lowerMultiTableMaterializeIRToMetalImpl(ir, error),
         ir, "multi_table_materialize");
 }
 

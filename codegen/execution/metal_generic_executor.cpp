@@ -207,17 +207,81 @@ BufferMap MetalGenericExecutor::allocatePhaseBuffers(
     return buffers;
 }
 
-void MetalGenericExecutor::zeroInitBuffers(const MetalCodegen::PhaseInfo& phase,
-                                            const BufferMap& buffers) {
+void MetalGenericExecutor::zeroInitBuffersForRange(
+    const std::vector<MetalCodegen::PhaseInfo>& phases,
+    int firstPhase,
+    int lastPhase,
+    const BufferMap& buffers) {
     if (skipZeroInit_) return;
-    for (const auto& b : phase.bindings) {
-        if (b.zeroInit && b.kind == MetalParamKind::DeviceBuffer) {
+
+    struct ZeroTask {
+        MTL::Buffer* buffer = nullptr;
+        size_t length = 0;
+        int fillByte = 0;
+    };
+
+    std::vector<ZeroTask> tasks;
+    std::unordered_set<std::string> seen;
+    size_t totalBytes = 0;
+
+    for (int pi = firstPhase; pi < lastPhase; pi++) {
+        const auto& phase = phases[(size_t)pi];
+        for (const auto& b : phase.bindings) {
+            if (!b.zeroInit || b.kind != MetalParamKind::DeviceBuffer)
+                continue;
+            if (!seen.insert(b.name).second)
+                continue;
             auto it = buffers.find(b.name);
-            if (it != buffers.end() && it->second) {
-                memset(it->second->contents(), b.fillByte, it->second->length());
-                it->second->didModifyRange(NS::Range::Make(0, it->second->length()));
-            }
+            if (it == buffers.end() || !it->second)
+                continue;
+            const size_t length = it->second->length();
+            if (length == 0)
+                continue;
+            tasks.push_back({it->second, length, b.fillByte});
+            totalBytes += length;
         }
+    }
+
+    if (tasks.empty())
+        return;
+
+    constexpr size_t kGpuZeroInitThresholdBytes = 1u << 20;
+    if (totalBytes < kGpuZeroInitThresholdBytes) {
+        for (const auto& task : tasks) {
+            memset(task.buffer->contents(), task.fillByte, task.length);
+            task.buffer->didModifyRange(NS::Range::Make(0, task.length));
+        }
+        return;
+    }
+
+    auto* cmdBuf = cmdQueue_->commandBuffer();
+    auto* blit = cmdBuf->blitCommandEncoder();
+    bool encodedFill = false;
+
+    for (const auto& task : tasks) {
+        const uint8_t fill = static_cast<uint8_t>(task.fillByte & 0xFF);
+        const size_t alignedLength = task.length & ~size_t(3);
+        if (alignedLength > 0) {
+            blit->fillBuffer(task.buffer,
+                             NS::Range::Make(0, (NS::UInteger)alignedLength),
+                             fill);
+            encodedFill = true;
+        }
+        if (alignedLength < task.length) {
+            char* base = static_cast<char*>(task.buffer->contents());
+            memset(base + alignedLength, fill, task.length - alignedLength);
+            task.buffer->didModifyRange(
+                NS::Range::Make((NS::UInteger)alignedLength,
+                                (NS::UInteger)(task.length - alignedLength)));
+        }
+    }
+
+    blit->endEncoding();
+
+    if (encodedFill) {
+        cmdBuf->commit();
+        cmdBuf->waitUntilCompleted();
+        checkCommandBufferStatus(cmdBuf, "zero-init");
     }
 }
 
@@ -381,11 +445,9 @@ MetalExecutionResult MetalGenericExecutor::execute(
     int totalRuns = warmupRuns + measuredRuns;
 
     for (int iter = 0; iter < totalRuns; iter++) {
-        // Zero-init output buffers each iteration.
-        for (int _pi = firstPhase; _pi < lastPhase; _pi++) {
-            const auto& phase = allPhases[_pi];
-            zeroInitBuffers(phase, allBuffers);
-        }
+        // Zero-init output buffers each iteration. Large clears use a single
+        // Metal blit pass; small clears stay on CPU to avoid command overhead.
+        zeroInitBuffersForRange(allPhases, firstPhase, lastPhase, allBuffers);
 
         const bool isMeasured = (iter == totalRuns - 1);
 

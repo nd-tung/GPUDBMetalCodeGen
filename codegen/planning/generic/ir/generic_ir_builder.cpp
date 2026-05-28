@@ -1,12 +1,17 @@
 #include "generic/ir/generic_ir_builder.h"
+#include "generic/ir/generic_scalar_subquery_analysis.h"
 #include "core/schema_provider.h"
 
 #include <algorithm>
 #include <cctype>
+#include <iomanip>
 #include <map>
 #include <memory>
 #include <set>
+#include <sstream>
 #include <unordered_map>
+
+#include "generic/ir/analyzed_query.inc"
 
 namespace codegen {
 
@@ -139,7 +144,7 @@ std::string lowerAscii(std::string value) {
     return value;
 }
 
-bool analyzedExprEquivalent(const ExprPtr& left, const ExprPtr& right) {
+bool sqlExprEquivalent(const ExprPtr& left, const ExprPtr& right) {
     if (!left || !right) return !left && !right;
     return std::visit([&](const auto& lnode) -> bool {
         using L = std::decay_t<decltype(lnode)>;
@@ -161,15 +166,15 @@ bool analyzedExprEquivalent(const ExprPtr& left, const ExprPtr& right) {
             return lnode.value == rnode->value;
         } else if constexpr (std::is_same_v<L, BinaryExpr>) {
             return lnode.op == rnode->op &&
-                   analyzedExprEquivalent(lnode.left, rnode->left) &&
-                   analyzedExprEquivalent(lnode.right, rnode->right);
+                   sqlExprEquivalent(lnode.left, rnode->left) &&
+                   sqlExprEquivalent(lnode.right, rnode->right);
         } else if constexpr (std::is_same_v<L, FuncCall>) {
             if (lowerAscii(lnode.name) != lowerAscii(rnode->name) ||
                 lnode.args.size() != rnode->args.size()) {
                 return false;
             }
             for (size_t i = 0; i < lnode.args.size(); ++i) {
-                if (!analyzedExprEquivalent(lnode.args[i], rnode->args[i]))
+                if (!sqlExprEquivalent(lnode.args[i], rnode->args[i]))
                     return false;
             }
             return true;
@@ -188,7 +193,7 @@ std::string groupOutputNameForExpr(const AnalyzedQuery& aq,
     for (size_t i = 0; i < aq.targets.size(); ++i) {
         const auto& target = aq.targets[i];
         if (target.isAgg) continue;
-        if (analyzedExprEquivalent(target.expr, expr))
+        if (sqlExprEquivalent(target.expr, expr))
             return targetName(target, i);
     }
     return groupName(expr, groupIndex);
@@ -217,6 +222,555 @@ bool aggregateFuncName(std::string name, AggFunc& out) {
         return true;
     }
     return false;
+}
+
+std::string formatSignatureDouble(double value) {
+    std::ostringstream oss;
+    oss << std::setprecision(17) << value;
+    return oss.str();
+}
+
+std::optional<std::string> jsonStringValueForGenericSource(
+        const nlohmann::json& node) {
+    if (node.is_string()) return node.get<std::string>();
+    if (node.is_object() && node.contains("String") &&
+        node["String"].contains("sval")) {
+        return node["String"]["sval"].get<std::string>();
+    }
+    return std::nullopt;
+}
+
+std::string jsonAExprOpForGenericSource(const nlohmann::json& ae) {
+    if (!ae.contains("name") || !ae["name"].is_array() || ae["name"].empty())
+        return {};
+    if (auto s = jsonStringValueForGenericSource(ae["name"][0])) return *s;
+    return {};
+}
+
+std::string jsonFuncNameForGenericSource(const nlohmann::json& fc) {
+    if (!fc.contains("funcname") || !fc["funcname"].is_array() ||
+        fc["funcname"].empty()) {
+        return {};
+    }
+    auto s = jsonStringValueForGenericSource(fc["funcname"].back());
+    return s ? lowerAscii(*s) : "";
+}
+
+std::optional<double> jsonNumericConstForGenericSource(
+        const nlohmann::json& node) {
+    const nlohmann::json* ac = nullptr;
+    if (node.is_object() && node.contains("A_Const")) ac = &node["A_Const"];
+    else if (node.is_object()) ac = &node;
+    if (!ac) return std::nullopt;
+
+    auto readNum = [](const nlohmann::json& v) -> std::optional<double> {
+        try {
+            if (v.is_number()) return v.get<double>();
+            if (v.is_string()) return std::stod(v.get<std::string>());
+        } catch (...) {
+            return std::nullopt;
+        }
+        return std::nullopt;
+    };
+
+    try {
+        if (ac->contains("fval")) {
+            const auto& f = (*ac)["fval"];
+            if (f.is_object() && f.contains("fval")) return readNum(f["fval"]);
+            return readNum(f);
+        }
+        if (ac->contains("ival")) {
+            const auto& i = (*ac)["ival"];
+            if (i.is_object() && i.contains("ival")) return readNum(i["ival"]);
+            return readNum(i);
+        }
+        if (ac->contains("val")) {
+            const auto& v = (*ac)["val"];
+            if (v.contains("Float")) return readNum(v["Float"].at("fval"));
+            if (v.contains("Integer")) return readNum(v["Integer"].at("ival"));
+        }
+    } catch (...) {
+        return std::nullopt;
+    }
+    return std::nullopt;
+}
+
+std::string resolveJsonColumnTableForGenericSource(
+        const std::string& qualifier,
+        const std::string& column,
+        const std::map<std::string, std::string>& aliases,
+        const std::vector<std::string>& tables,
+        const SchemaProvider* schema) {
+    if (!qualifier.empty()) {
+        auto it = aliases.find(qualifier);
+        return it == aliases.end() ? qualifier : it->second;
+    }
+
+    if (!schema) return "";
+    std::string match;
+    for (const auto& table : tables) {
+        if (!schema->hasColumn(table, column)) continue;
+        if (!match.empty()) return "";
+        match = table;
+    }
+    return match;
+}
+
+struct JsonColumnRefForGenericSource {
+    std::string qualifier;
+    std::string column;
+};
+
+std::optional<JsonColumnRefForGenericSource> jsonRawColumnRefForGenericSource(
+        const nlohmann::json& node) {
+    const nlohmann::json* cr = nullptr;
+    if (node.is_object() && node.contains("ColumnRef")) cr = &node["ColumnRef"];
+    else if (node.is_object() && node.contains("fields")) cr = &node;
+    if (!cr || !cr->contains("fields") || !(*cr)["fields"].is_array())
+        return std::nullopt;
+
+    std::vector<std::string> fields;
+    for (const auto& field : (*cr)["fields"]) {
+        if (auto s = jsonStringValueForGenericSource(field)) fields.push_back(*s);
+    }
+    if (fields.empty()) return std::nullopt;
+    JsonColumnRefForGenericSource out;
+    out.column = fields.back();
+    if (fields.size() >= 2) out.qualifier = fields[fields.size() - 2];
+    return out;
+}
+
+std::optional<std::string> jsonColumnSignatureForGenericSource(
+        const nlohmann::json& node,
+        const std::map<std::string, std::string>& aliases,
+        const std::vector<std::string>& tables,
+        const SchemaProvider* schema) {
+    auto col = jsonRawColumnRefForGenericSource(node);
+    if (!col) return std::nullopt;
+    const std::string table = resolveJsonColumnTableForGenericSource(
+        col->qualifier, col->column, aliases, tables, schema);
+    return table.empty() ? "col:" + col->column
+                         : "col:" + table + "." + col->column;
+}
+
+std::string combineBinarySignature(std::string op,
+                                   std::string left,
+                                   std::string right) {
+    if (op == "+" || op == "*") {
+        if (right < left) std::swap(left, right);
+    }
+    return "bin:" + op + "(" + left + "," + right + ")";
+}
+
+std::optional<std::string> jsonExprSignatureForGenericSource(
+        const nlohmann::json& node,
+        const std::map<std::string, std::string>& aliases,
+        const std::vector<std::string>& tables,
+        const SchemaProvider* schema) {
+    if (!node.is_object()) return std::nullopt;
+    if (node.contains("TypeCast")) {
+        return jsonExprSignatureForGenericSource(
+            node["TypeCast"].value("arg", nlohmann::json{}),
+            aliases, tables, schema);
+    }
+    if (node.contains("ColumnRef") || node.contains("fields"))
+        return jsonColumnSignatureForGenericSource(node, aliases, tables, schema);
+    if (node.contains("A_Const")) {
+        const auto& ac = node["A_Const"];
+        try {
+            auto readStringConst = [](const nlohmann::json& value)
+                    -> std::optional<std::string> {
+                if (value.is_string()) return value.get<std::string>();
+                if (value.is_object() && value.contains("sval"))
+                    return value["sval"].get<std::string>();
+                return std::nullopt;
+            };
+            auto readIntConst = [](const nlohmann::json& value)
+                    -> std::optional<int64_t> {
+                if (value.is_number_integer()) return value.get<int64_t>();
+                if (value.is_string()) return std::stoll(value.get<std::string>());
+                if (value.is_object() && value.contains("ival")) {
+                    const auto& inner = value["ival"];
+                    if (inner.is_number_integer()) return inner.get<int64_t>();
+                    if (inner.is_string()) return std::stoll(inner.get<std::string>());
+                }
+                return std::nullopt;
+            };
+            auto readFloatConst = [](const nlohmann::json& value)
+                    -> std::optional<double> {
+                if (value.is_number()) return value.get<double>();
+                if (value.is_string()) return std::stod(value.get<std::string>());
+                if (value.is_object() && value.contains("fval")) {
+                    const auto& inner = value["fval"];
+                    if (inner.is_number()) return inner.get<double>();
+                    if (inner.is_string()) return std::stod(inner.get<std::string>());
+                }
+                return std::nullopt;
+            };
+            if (ac.contains("sval")) {
+                if (auto s = readStringConst(ac["sval"])) return "lit:s:" + *s;
+            }
+            if (ac.contains("ival")) {
+                if (auto i = readIntConst(ac["ival"]))
+                    return "lit:i:" + std::to_string(*i);
+            }
+            if (ac.contains("fval")) {
+                if (auto f = readFloatConst(ac["fval"]))
+                    return "lit:f:" + formatSignatureDouble(*f);
+            }
+            if (ac.contains("val") && ac["val"].contains("String"))
+                return "lit:s:" + ac["val"]["String"].at("sval").get<std::string>();
+            if (ac.contains("val") && ac["val"].contains("Integer"))
+                return "lit:i:" + std::to_string(
+                    ac["val"]["Integer"].at("ival").get<int64_t>());
+            if (ac.contains("val") && ac["val"].contains("Float"))
+                return "lit:f:" + formatSignatureDouble(std::stod(
+                    ac["val"]["Float"].at("fval").get<std::string>()));
+        } catch (...) {
+            return std::nullopt;
+        }
+        return std::nullopt;
+    }
+    if (node.contains("FuncCall")) {
+        const auto& fc = node["FuncCall"];
+        const std::string name = jsonFuncNameForGenericSource(fc);
+        std::vector<std::string> args;
+        if (fc.contains("args") && fc["args"].is_array()) {
+            for (const auto& arg : fc["args"]) {
+                if (arg.is_object() && arg.contains("A_Star")) {
+                    args.push_back("*");
+                    continue;
+                }
+                auto sig = jsonExprSignatureForGenericSource(
+                    arg, aliases, tables, schema);
+                if (!sig) return std::nullopt;
+                args.push_back(*sig);
+            }
+        }
+        std::ostringstream oss;
+        oss << "fn:" << name << "(";
+        for (size_t i = 0; i < args.size(); ++i) {
+            if (i) oss << ",";
+            oss << args[i];
+        }
+        oss << ")";
+        return oss.str();
+    }
+    if (node.contains("A_Expr")) {
+        const auto& ae = node["A_Expr"];
+        const std::string op = jsonAExprOpForGenericSource(ae);
+        auto left = jsonExprSignatureForGenericSource(
+            ae.value("lexpr", nlohmann::json{}), aliases, tables, schema);
+        auto right = jsonExprSignatureForGenericSource(
+            ae.value("rexpr", nlohmann::json{}), aliases, tables, schema);
+        if (!left || !right || op.empty()) return std::nullopt;
+        return combineBinarySignature(op, *left, *right);
+    }
+    return std::nullopt;
+}
+
+std::string predicateSignatureFromComparison(std::string op,
+                                             std::string left,
+                                             std::string right) {
+    if (op == "=") op = "==";
+    if (op == "<>") op = "!=";
+    if (op == "==") {
+        if (right < left) std::swap(left, right);
+    }
+    return "cmp:" + op + "(" + left + "," + right + ")";
+}
+
+bool collectJsonPredicateAtomSignaturesForGenericSource(
+        const nlohmann::json& node,
+        const std::map<std::string, std::string>& aliases,
+        const std::vector<std::string>& tables,
+        const SchemaProvider* schema,
+        std::vector<std::string>& out) {
+    if (!node.is_object()) return false;
+    if (node.contains("BoolExpr") &&
+        node["BoolExpr"].value("boolop", "") == "AND_EXPR") {
+        const auto& args = node["BoolExpr"].value("args", nlohmann::json::array());
+        for (const auto& arg : args) {
+            if (!collectJsonPredicateAtomSignaturesForGenericSource(
+                    arg, aliases, tables, schema, out)) {
+                return false;
+            }
+        }
+        return true;
+    }
+    if (node.contains("A_Expr")) {
+        const auto& ae = node["A_Expr"];
+        const std::string op = jsonAExprOpForGenericSource(ae);
+        auto left = jsonExprSignatureForGenericSource(
+            ae.value("lexpr", nlohmann::json{}), aliases, tables, schema);
+        auto right = jsonExprSignatureForGenericSource(
+            ae.value("rexpr", nlohmann::json{}), aliases, tables, schema);
+        if (!left || !right || op.empty()) return false;
+        out.push_back(predicateSignatureFromComparison(op, *left, *right));
+        return true;
+    }
+    return false;
+}
+
+bool extractJsonScalarAggTargetForGenericSource(
+        const nlohmann::json& node,
+        const std::map<std::string, std::string>& aliases,
+        const std::vector<std::string>& tables,
+        const SchemaProvider* schema,
+        GenericScalarSubqueryAggTarget& out,
+        double multiplier = 1.0) {
+    if (!node.is_object()) return false;
+    if (node.contains("TypeCast")) {
+        return extractJsonScalarAggTargetForGenericSource(
+            node["TypeCast"].value("arg", nlohmann::json{}), aliases, tables,
+            schema, out, multiplier);
+    }
+    if (node.contains("FuncCall")) {
+        const auto& fc = node["FuncCall"];
+        AggFunc func = AggFunc::SUM;
+        if (!aggregateFuncName(jsonFuncNameForGenericSource(fc), func))
+            return false;
+        out.func = func;
+        out.multiplier = multiplier;
+        out.star = !fc.contains("args") || !fc["args"].is_array() ||
+                   fc["args"].empty();
+        if (!out.star) {
+            const auto& arg = fc["args"][0];
+            out.star = arg.is_object() && arg.contains("A_Star");
+        }
+        if (!out.star) {
+            auto sig = jsonExprSignatureForGenericSource(
+                fc["args"][0], aliases, tables, schema);
+            if (!sig) return false;
+            out.argSignature = *sig;
+        }
+        return true;
+    }
+    if (!node.contains("A_Expr")) return false;
+
+    const auto& ae = node["A_Expr"];
+    const std::string op = jsonAExprOpForGenericSource(ae);
+    if (op == "*") {
+        if (auto lit = jsonNumericConstForGenericSource(
+                ae.value("lexpr", nlohmann::json{}))) {
+            return extractJsonScalarAggTargetForGenericSource(
+                ae.value("rexpr", nlohmann::json{}), aliases, tables, schema,
+                out, multiplier * *lit);
+        }
+        if (auto lit = jsonNumericConstForGenericSource(
+                ae.value("rexpr", nlohmann::json{}))) {
+            return extractJsonScalarAggTargetForGenericSource(
+                ae.value("lexpr", nlohmann::json{}), aliases, tables, schema,
+                out, multiplier * *lit);
+        }
+    }
+    if (op == "/") {
+        if (auto lit = jsonNumericConstForGenericSource(
+                ae.value("rexpr", nlohmann::json{}))) {
+            if (*lit != 0.0) {
+                return extractJsonScalarAggTargetForGenericSource(
+                    ae.value("lexpr", nlohmann::json{}), aliases, tables,
+                    schema, out, multiplier / *lit);
+            }
+        }
+    }
+    return false;
+}
+
+std::optional<GenericScalarHavingSubquerySummary>
+scalarHavingSummaryFromSqlJson(const std::string& sqlJson,
+                               const SchemaProvider* schema) {
+    nlohmann::json root;
+    try {
+        root = nlohmann::json::parse(sqlJson);
+    } catch (...) {
+        return std::nullopt;
+    }
+    if (!root.contains("SelectStmt")) return std::nullopt;
+    const auto& ss = root["SelectStmt"];
+    if (ss.contains("groupClause") && !ss["groupClause"].is_null())
+        return std::nullopt;
+    if (ss.contains("havingClause") && !ss["havingClause"].is_null())
+        return std::nullopt;
+    if (ss.contains("limitCount") && !ss["limitCount"].is_null())
+        return std::nullopt;
+
+    GenericScalarHavingSubquerySummary summary;
+    std::map<std::string, std::string> aliases;
+    if (!ss.contains("fromClause") || !ss["fromClause"].is_array())
+        return std::nullopt;
+    for (const auto& from : ss["fromClause"]) {
+        if (!from.contains("RangeVar")) return std::nullopt;
+        const auto& rv = from["RangeVar"];
+        const std::string rel = rv.value("relname", "");
+        if (rel.empty()) return std::nullopt;
+        summary.tables.push_back(rel);
+        aliases[rel] = rel;
+        if (rv.contains("alias")) {
+            if (rv["alias"].contains("Alias")) {
+                aliases[rv["alias"]["Alias"].value("aliasname", rel)] = rel;
+            } else if (rv["alias"].contains("aliasname")) {
+                aliases[rv["alias"].value("aliasname", rel)] = rel;
+            }
+        }
+    }
+    if (summary.tables.empty()) return std::nullopt;
+
+    if (!ss.contains("targetList") || !ss["targetList"].is_array())
+        return std::nullopt;
+    bool foundAgg = false;
+    for (const auto& target : ss["targetList"]) {
+        if (!target.contains("ResTarget") ||
+            !target["ResTarget"].contains("val")) {
+            continue;
+        }
+        if (extractJsonScalarAggTargetForGenericSource(
+                target["ResTarget"]["val"], aliases, summary.tables, schema,
+                summary.aggregate)) {
+            foundAgg = true;
+            break;
+        }
+    }
+    if (!foundAgg) return std::nullopt;
+
+    if (ss.contains("whereClause") && !ss["whereClause"].is_null()) {
+        if (!collectJsonPredicateAtomSignaturesForGenericSource(
+                ss["whereClause"], aliases, summary.tables, schema,
+                summary.predicateSignatures)) {
+            return std::nullopt;
+        }
+        std::sort(summary.predicateSignatures.begin(),
+                  summary.predicateSignatures.end());
+    }
+    std::sort(summary.tables.begin(), summary.tables.end());
+    return summary;
+}
+
+std::vector<GenericFromSubqueryScalarExtremum>
+fromSubqueryScalarExtremaFromSqlJson(const std::string& sqlJson) {
+    std::vector<GenericFromSubqueryScalarExtremum> out;
+    nlohmann::json root;
+    try {
+        root = nlohmann::json::parse(sqlJson);
+    } catch (...) {
+        return out;
+    }
+    if (!root.contains("SelectStmt")) return out;
+    const auto& ss = root["SelectStmt"];
+    if (!ss.contains("fromClause") || !ss["fromClause"].is_array())
+        return out;
+    if (!ss.contains("targetList") || !ss["targetList"].is_array() ||
+        ss["targetList"].empty()) {
+        return out;
+    }
+
+    std::vector<std::string> sourceAliases;
+    for (const auto& from : ss["fromClause"]) {
+        if (!from.contains("RangeVar")) continue;
+        const auto& rv = from["RangeVar"];
+        std::string rel = rv.value("relname", "");
+        if (!rel.empty()) sourceAliases.push_back(std::move(rel));
+    }
+    if (sourceAliases.empty()) return out;
+
+    for (const auto& target : ss["targetList"]) {
+        if (!target.contains("ResTarget")) continue;
+        const auto& rt = target["ResTarget"];
+        if (!rt.contains("val") || !rt["val"].contains("FuncCall"))
+            continue;
+        const auto& fc = rt["val"]["FuncCall"];
+        const std::string funcName = jsonFuncNameForGenericSource(fc);
+        if (funcName != "max" && funcName != "min") continue;
+        if (!fc.contains("args") || !fc["args"].is_array() ||
+            fc["args"].empty()) {
+            continue;
+        }
+        auto arg = jsonRawColumnRefForGenericSource(fc["args"][0]);
+        if (!arg) continue;
+        for (const auto& sourceAlias : sourceAliases) {
+            out.push_back(GenericFromSubqueryScalarExtremum{
+                sourceAlias,
+                funcName == "max" ? AggFunc::MAX : AggFunc::MIN,
+                arg->column
+            });
+        }
+    }
+    return out;
+}
+
+CmpOp reverseCmpOpForGenericSource(CmpOp op) {
+    switch (op) {
+        case CmpOp::LT: return CmpOp::GT;
+        case CmpOp::LE: return CmpOp::GE;
+        case CmpOp::GT: return CmpOp::LT;
+        case CmpOp::GE: return CmpOp::LE;
+        default: return op;
+    }
+}
+
+std::optional<double> numericLiteralValueForGenericSource(const Literal& lit) {
+    if (auto* value = std::get_if<int>(&lit.value))
+        return static_cast<double>(*value);
+    if (auto* value = std::get_if<float>(&lit.value))
+        return static_cast<double>(*value);
+    return std::nullopt;
+}
+
+bool sqlExprIsInSubAggCall(
+        const ExprPtr& expr,
+        const AnalyzedQuery::InSubqueryAggInfo& info) {
+    if (!expr) return false;
+    auto* call = std::get_if<FuncCall>(&expr->node);
+    if (!call || lowerAscii(call->name) != lowerAscii(info.aggFunc))
+        return false;
+    if (lowerAscii(info.aggFunc) == "count")
+        return true;
+    if (call->args.empty() || !call->args.front())
+        return info.aggExpr.empty();
+    auto* col = std::get_if<ColRef>(&call->args.front()->node);
+    return col && col->column == info.aggExpr;
+}
+
+std::optional<GenericInSubqueryHaving> inSubqueryHavingFromAnalyzedQuery(
+        const AnalyzedQuery::InSubqueryAggInfo& info) {
+    auto* cmp = info.havingPred
+        ? std::get_if<Comparison>(&info.havingPred->node)
+        : nullptr;
+    if (!cmp) return std::nullopt;
+
+    CmpOp op = cmp->op;
+    const Literal* literal = nullptr;
+    if (sqlExprIsInSubAggCall(cmp->left, info)) {
+        literal = cmp->right ? std::get_if<Literal>(&cmp->right->node) : nullptr;
+    } else if (sqlExprIsInSubAggCall(cmp->right, info)) {
+        literal = cmp->left ? std::get_if<Literal>(&cmp->left->node) : nullptr;
+        op = reverseCmpOpForGenericSource(cmp->op);
+    }
+    if (!literal) return std::nullopt;
+    auto value = numericLiteralValueForGenericSource(*literal);
+    if (!value) return std::nullopt;
+    return GenericInSubqueryHaving{op, *value};
+}
+
+bool analyzedQueryHasAggregation(const AnalyzedQuery& aq) {
+    for (const auto& target : aq.targets) {
+        if (target.isAgg) return true;
+    }
+    return false;
+}
+
+GenericInSubqueryAggInfo inSubqueryAggFromAnalyzedQuery(
+        const AnalyzedQuery::InSubqueryAggInfo& info) {
+    return GenericInSubqueryAggInfo{
+        info.alias,
+        info.baseTable,
+        info.tableIndex,
+        info.groupCol,
+        info.aggFunc,
+        info.aggExpr,
+        static_cast<bool>(info.havingPred),
+        inSubqueryHavingFromAnalyzedQuery(info)
+    };
 }
 
 const FuncCall* aggregateCallForExpr(const ExprPtr& expr, AggFunc& func) {
@@ -588,10 +1142,77 @@ private:
     std::unordered_map<std::string, GenericRelationInstanceId> instanceByAlias_;
 };
 
+GenericFromSubqueryJoin fromSubqueryJoinFromAnalyzedQuery(const JoinClause& join) {
+    return GenericFromSubqueryJoin{
+        join.leftTable,
+        join.rightTable,
+        join.leftCol,
+        join.rightCol,
+        join.leftOuter
+    };
+}
+
+std::optional<GenericFromSubqueryAggTarget> fromSubqueryAggTargetFromAnalyzedQuery(
+        IrBuildContext& ctx,
+        const SelectTarget& target,
+        size_t targetIndex) {
+    if (!target.isAgg || !target.agg) return std::nullopt;
+    GenericFromSubqueryAggTarget out;
+    out.name = targetName(target, targetIndex);
+    out.func = target.agg->func;
+    out.arg = ctx.convertExpr(target.agg->innerExpr);
+    out.star = target.agg->isStar;
+    out.type = typeFromAgg(target.agg->func, target.agg->innerExpr);
+    return out;
+}
+
+GenericFromSubqueryAggInfo fromSubqueryAggFromAnalyzedQuery(
+        IrBuildContext& ctx,
+        const FromSubqueryAggInfo& info) {
+    GenericFromSubqueryAggInfo out;
+    out.alias = info.alias;
+    out.tables = info.tables;
+    out.tableAliases = info.tableAliases;
+    for (const auto& join : info.joins)
+        out.joins.push_back(fromSubqueryJoinFromAnalyzedQuery(join));
+    for (const auto& filter : info.filters)
+        out.filters.push_back(ctx.convertPredicate(filter));
+    for (size_t i = 0; i < info.targets.size(); ++i) {
+        if (auto target = fromSubqueryAggTargetFromAnalyzedQuery(ctx, info.targets[i], i))
+            out.aggregates.push_back(std::move(*target));
+    }
+    for (const auto& expr : info.groupBy)
+        out.groupBy.push_back(ctx.convertExpr(expr));
+    return out;
+}
+
+GenericSourceQueryInfo sourceQueryFromAnalyzedQuery(IrBuildContext& ctx,
+                                               const AnalyzedQuery& aq) {
+    GenericSourceQueryInfo source;
+    for (const auto& info : aq.inSubAggs)
+        source.inSubAggs.push_back(inSubqueryAggFromAnalyzedQuery(info));
+    for (const auto& info : aq.fromSubqueryAggs)
+        source.fromSubqueryAggs.push_back(
+            fromSubqueryAggFromAnalyzedQuery(ctx, info));
+    for (const auto& scalarSql : aq.scalarSubquerySql) {
+        GenericSourceSubquery out;
+        out.type = GenericSourceSubquery::SCALAR_SUBQUERY;
+        out.scalarHavingSummary =
+            scalarHavingSummaryFromSqlJson(scalarSql, aq.schema);
+        out.fromSubqueryScalarExtrema =
+            fromSubqueryScalarExtremaFromSqlJson(scalarSql);
+        out.decorrelatedScalar = parseDecorrelatedScalarSubquery(
+            scalarSql, aq.schema, static_cast<int>(source.subqueries.size()));
+        source.subqueries.push_back(std::move(out));
+    }
+    return source;
+}
+
 } // namespace
 
-std::optional<GenericRelPlan> buildGenericRelationalIR(const AnalyzedQuery& aq,
-                                                       std::string* error) {
+static std::optional<GenericRelPlan> buildGenericRelPlanFromAnalyzedQuery(
+        const AnalyzedQuery& aq,
+        std::string* error) {
     auto fail = [&](const std::string& msg) -> std::optional<GenericRelPlan> {
         if (error) *error = msg;
         return std::nullopt;
@@ -679,7 +1300,7 @@ std::optional<GenericRelPlan> buildGenericRelationalIR(const AnalyzedQuery& aq,
                                    rootSchema, std::move(detail));
     }
 
-    if (aq.hasAggregation() || aq.hasGroupBy()) {
+    if (analyzedQueryHasAggregation(aq) || !aq.groupBy.empty()) {
         GenericAggregateDetail detail;
         std::vector<GenericProjection> outputs;
         std::map<std::string, GenericProjection> outputByName;
@@ -802,7 +1423,22 @@ std::optional<GenericRelPlan> buildGenericRelationalIR(const AnalyzedQuery& aq,
                                    rootSchema, std::move(detail));
     }
 
+    ctx.builder.setSchema(aq.schema);
+    ctx.builder.setSourceQuery(sourceQueryFromAnalyzedQuery(ctx, aq));
     return ctx.builder.finish(root);
+}
+
+std::optional<GenericRelPlan> buildGenericRelationalIRFromSQL(
+        const std::string& sql,
+        const SchemaProvider* schema,
+        std::string* error) {
+    try {
+        auto analyzed = collectAnalyzedQuery(sql, schema);
+        return buildGenericRelPlanFromAnalyzedQuery(analyzed, error);
+    } catch (const std::exception& e) {
+        if (error) *error = e.what();
+        return std::nullopt;
+    }
 }
 
 } // namespace codegen

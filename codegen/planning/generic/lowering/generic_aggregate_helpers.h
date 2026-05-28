@@ -9,7 +9,6 @@
 
 namespace codegen {
 
-struct AnalyzedQuery;
 struct GenericGroupSpec;
 struct MultiTableGroupedAggShape;
 
@@ -97,7 +96,7 @@ bool aggregateNeedsHashGroupOutput(const GenericAggregateDetail& aggregate);
 bool canUseKeyedSingleTableGroup(const GenericAggregateDetail& aggregate);
 bool configureAggregateHaving(const GenericAggregateDetail& aggregate,
                               GenericGroupSpec& groupSpec,
-                              const AnalyzedQuery* aq,
+                              const GenericRelPlan* ir,
                               const MultiTableGroupedAggShape* shape,
                               std::string* error);
 

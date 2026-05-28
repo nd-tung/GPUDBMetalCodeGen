@@ -5,7 +5,6 @@
 #include "generic/lowering/generic_expression_metal.h"
 #include "generic/lowering/generic_plan_shapes.h"
 #include "generic/lowering/generic_scalar_placeholder.h"
-#include "query_analyzer.h"
 
 #include <algorithm>
 #include <cctype>
@@ -167,107 +166,6 @@ std::string exprOpSignatureToken(ExprOp op) {
     return "?";
 }
 
-std::optional<std::string> jsonStringValueForIr(const nlohmann::json& node) {
-    if (node.is_string()) return node.get<std::string>();
-    if (node.is_object() && node.contains("String") && node["String"].contains("sval"))
-        return node["String"]["sval"].get<std::string>();
-    return std::nullopt;
-}
-
-std::string jsonAExprOpForIr(const nlohmann::json& ae) {
-    if (!ae.contains("name") || !ae["name"].is_array() || ae["name"].empty())
-        return {};
-    if (auto s = jsonStringValueForIr(ae["name"][0])) return *s;
-    return {};
-}
-
-std::string jsonFuncNameForIr(const nlohmann::json& fc) {
-    if (!fc.contains("funcname") || !fc["funcname"].is_array() || fc["funcname"].empty())
-        return {};
-    auto s = jsonStringValueForIr(fc["funcname"].back());
-    return s ? lowerAscii(*s) : "";
-}
-
-std::optional<double> jsonNumericConstForIr(const nlohmann::json& node) {
-    const nlohmann::json* ac = nullptr;
-    if (node.is_object() && node.contains("A_Const")) ac = &node["A_Const"];
-    else if (node.is_object()) ac = &node;
-    if (!ac) return std::nullopt;
-
-    auto readNum = [](const nlohmann::json& v) -> std::optional<double> {
-        try {
-            if (v.is_number()) return v.get<double>();
-            if (v.is_string()) return std::stod(v.get<std::string>());
-        } catch (...) {
-            return std::nullopt;
-        }
-        return std::nullopt;
-    };
-
-    try {
-        if (ac->contains("fval")) {
-            const auto& f = (*ac)["fval"];
-            if (f.is_object() && f.contains("fval")) return readNum(f["fval"]);
-            return readNum(f);
-        }
-        if (ac->contains("ival")) {
-            const auto& i = (*ac)["ival"];
-            if (i.is_object() && i.contains("ival")) return readNum(i["ival"]);
-            return readNum(i);
-        }
-        if (ac->contains("val")) {
-            const auto& v = (*ac)["val"];
-            if (v.contains("Float")) return readNum(v["Float"].at("fval"));
-            if (v.contains("Integer")) return readNum(v["Integer"].at("ival"));
-        }
-    } catch (...) {
-        return std::nullopt;
-    }
-    return std::nullopt;
-}
-
-std::string resolveJsonColumnTable(const std::string& qualifier,
-                                   const std::string& column,
-                                   const std::map<std::string, std::string>& aliases,
-                                   const std::vector<std::string>& tables,
-                                   const SchemaProvider* schema) {
-    if (!qualifier.empty()) {
-        auto it = aliases.find(qualifier);
-        return it == aliases.end() ? qualifier : it->second;
-    }
-
-    if (!schema) return "";
-    std::string match;
-    for (const auto& table : tables) {
-        if (!schema->hasColumn(table, column)) continue;
-        if (!match.empty()) return "";
-        match = table;
-    }
-    return match;
-}
-
-std::optional<std::string> jsonColumnSignatureForIr(
-        const nlohmann::json& node,
-        const std::map<std::string, std::string>& aliases,
-        const std::vector<std::string>& tables,
-        const SchemaProvider* schema) {
-    const nlohmann::json* cr = nullptr;
-    if (node.is_object() && node.contains("ColumnRef")) cr = &node["ColumnRef"];
-    else if (node.is_object() && node.contains("fields")) cr = &node;
-    if (!cr || !cr->contains("fields") || !(*cr)["fields"].is_array())
-        return std::nullopt;
-
-    std::vector<std::string> fields;
-    for (const auto& field : (*cr)["fields"]) {
-        if (auto s = jsonStringValueForIr(field)) fields.push_back(*s);
-    }
-    if (fields.empty()) return std::nullopt;
-    const std::string column = fields.back();
-    const std::string qualifier = fields.size() >= 2 ? fields[fields.size() - 2] : "";
-    const std::string table = resolveJsonColumnTable(qualifier, column, aliases, tables, schema);
-    return table.empty() ? "col:" + column : "col:" + table + "." + column;
-}
-
 std::string genericColumnSignatureForIr(const GenericColumnExpr& col) {
     return col.table.empty() ? "col:" + col.column : "col:" + col.table + "." + col.column;
 }
@@ -330,108 +228,6 @@ std::optional<std::string> genericExprSignatureForIr(const GenericExprPtr& expr)
             return std::nullopt;
         }
     }, expr->node);
-}
-
-std::optional<std::string> jsonExprSignatureForIr(
-        const nlohmann::json& node,
-        const std::map<std::string, std::string>& aliases,
-        const std::vector<std::string>& tables,
-        const SchemaProvider* schema) {
-    if (!node.is_object()) return std::nullopt;
-    if (node.contains("TypeCast"))
-        return jsonExprSignatureForIr(node["TypeCast"].value("arg", nlohmann::json{}),
-                                      aliases, tables, schema);
-    if (node.contains("ColumnRef") || node.contains("fields"))
-        return jsonColumnSignatureForIr(node, aliases, tables, schema);
-    if (node.contains("A_Const")) {
-        const auto& ac = node["A_Const"];
-        try {
-            auto readStringConst = [](const nlohmann::json& value)
-                    -> std::optional<std::string> {
-                if (value.is_string()) return value.get<std::string>();
-                if (value.is_object() && value.contains("sval"))
-                    return value["sval"].get<std::string>();
-                return std::nullopt;
-            };
-            auto readIntConst = [](const nlohmann::json& value)
-                    -> std::optional<int64_t> {
-                if (value.is_number_integer()) return value.get<int64_t>();
-                if (value.is_string()) return std::stoll(value.get<std::string>());
-                if (value.is_object() && value.contains("ival")) {
-                    const auto& inner = value["ival"];
-                    if (inner.is_number_integer()) return inner.get<int64_t>();
-                    if (inner.is_string()) return std::stoll(inner.get<std::string>());
-                }
-                return std::nullopt;
-            };
-            auto readFloatConst = [](const nlohmann::json& value)
-                    -> std::optional<double> {
-                if (value.is_number()) return value.get<double>();
-                if (value.is_string()) return std::stod(value.get<std::string>());
-                if (value.is_object() && value.contains("fval")) {
-                    const auto& inner = value["fval"];
-                    if (inner.is_number()) return inner.get<double>();
-                    if (inner.is_string()) return std::stod(inner.get<std::string>());
-                }
-                return std::nullopt;
-            };
-            if (ac.contains("sval")) {
-                if (auto s = readStringConst(ac["sval"])) return "lit:s:" + *s;
-            }
-            if (ac.contains("ival")) {
-                if (auto i = readIntConst(ac["ival"])) return "lit:i:" + std::to_string(*i);
-            }
-            if (ac.contains("fval")) {
-                if (auto f = readFloatConst(ac["fval"]))
-                    return "lit:f:" + formatSignatureDouble(*f);
-            }
-            if (ac.contains("val") && ac["val"].contains("String"))
-                return "lit:s:" + ac["val"]["String"].at("sval").get<std::string>();
-            if (ac.contains("val") && ac["val"].contains("Integer"))
-                return "lit:i:" + std::to_string(ac["val"]["Integer"].at("ival").get<int64_t>());
-            if (ac.contains("val") && ac["val"].contains("Float"))
-                return "lit:f:" + formatSignatureDouble(
-                    std::stod(ac["val"]["Float"].at("fval").get<std::string>()));
-        } catch (...) {
-            return std::nullopt;
-        }
-        return std::nullopt;
-    }
-    if (node.contains("FuncCall")) {
-        const auto& fc = node["FuncCall"];
-        const std::string name = jsonFuncNameForIr(fc);
-        std::vector<std::string> args;
-        if (fc.contains("args") && fc["args"].is_array()) {
-            for (const auto& arg : fc["args"]) {
-                if (arg.is_object() && arg.contains("A_Star")) {
-                    args.push_back("*");
-                    continue;
-                }
-                auto sig = jsonExprSignatureForIr(arg, aliases, tables, schema);
-                if (!sig) return std::nullopt;
-                args.push_back(*sig);
-            }
-        }
-        std::ostringstream oss;
-        oss << "fn:" << name << "(";
-        for (size_t i = 0; i < args.size(); ++i) {
-            if (i) oss << ",";
-            oss << args[i];
-        }
-        oss << ")";
-        return oss.str();
-    }
-    if (node.contains("A_Expr")) {
-        const auto& ae = node["A_Expr"];
-        const std::string op = jsonAExprOpForIr(ae);
-        auto left = jsonExprSignatureForIr(ae.value("lexpr", nlohmann::json{}),
-                                           aliases, tables, schema);
-        auto right = jsonExprSignatureForIr(ae.value("rexpr", nlohmann::json{}),
-                                            aliases, tables, schema);
-        if (!left || !right || op.empty()) return std::nullopt;
-        return combineBinarySignature(op, *left, *right);
-    }
-    return std::nullopt;
 }
 
 std::string predicateSignatureFromComparison(std::string op,
@@ -506,171 +302,15 @@ bool collectGenericPredicateAtomSignatures(const GenericPredicatePtr& pred,
     return true;
 }
 
-bool collectJsonPredicateAtomSignatures(
-        const nlohmann::json& node,
-        const std::map<std::string, std::string>& aliases,
-        const std::vector<std::string>& tables,
-        const SchemaProvider* schema,
-        std::vector<std::string>& out) {
-    if (!node.is_object()) return false;
-    if (node.contains("BoolExpr") && node["BoolExpr"].value("boolop", "") == "AND_EXPR") {
-        const auto& args = node["BoolExpr"].value("args", nlohmann::json::array());
-        for (const auto& arg : args) {
-            if (!collectJsonPredicateAtomSignatures(arg, aliases, tables, schema, out))
-                return false;
-        }
-        return true;
-    }
-    if (node.contains("A_Expr")) {
-        const auto& ae = node["A_Expr"];
-        const std::string op = jsonAExprOpForIr(ae);
-        auto left = jsonExprSignatureForIr(ae.value("lexpr", nlohmann::json{}),
-                                           aliases, tables, schema);
-        auto right = jsonExprSignatureForIr(ae.value("rexpr", nlohmann::json{}),
-                                            aliases, tables, schema);
-        if (!left || !right || op.empty()) return false;
-        out.push_back(predicateSignatureFromComparison(op, *left, *right));
-        return true;
-    }
-    return false;
-}
-
-struct JsonScalarAggTarget {
-    AggFunc func = AggFunc::SUM;
-    bool star = false;
-    double multiplier = 1.0;
-    std::string argSignature;
-};
-
-bool extractJsonScalarAggTargetForIr(
-        const nlohmann::json& node,
-        const std::map<std::string, std::string>& aliases,
-        const std::vector<std::string>& tables,
-        const SchemaProvider* schema,
-        JsonScalarAggTarget& out,
-        double multiplier = 1.0) {
-    if (!node.is_object()) return false;
-    if (node.contains("TypeCast"))
-        return extractJsonScalarAggTargetForIr(
-            node["TypeCast"].value("arg", nlohmann::json{}), aliases, tables,
-            schema, out, multiplier);
-    if (node.contains("FuncCall")) {
-        const auto& fc = node["FuncCall"];
-        auto func = aggregateFuncFromName(jsonFuncNameForIr(fc));
-        if (!func) return false;
-        out.func = *func;
-        out.multiplier = multiplier;
-        out.star = !fc.contains("args") || !fc["args"].is_array() || fc["args"].empty();
-        if (!out.star) {
-            const auto& arg = fc["args"][0];
-            out.star = arg.is_object() && arg.contains("A_Star");
-        }
-        if (!out.star) {
-            auto sig = jsonExprSignatureForIr(fc["args"][0], aliases, tables, schema);
-            if (!sig) return false;
-            out.argSignature = *sig;
-        }
-        return true;
-    }
-    if (!node.contains("A_Expr")) return false;
-
-    const auto& ae = node["A_Expr"];
-    const std::string op = jsonAExprOpForIr(ae);
-    if (op == "*") {
-        if (auto lit = jsonNumericConstForIr(ae.value("lexpr", nlohmann::json{})))
-            return extractJsonScalarAggTargetForIr(ae.value("rexpr", nlohmann::json{}),
-                                                   aliases, tables, schema, out,
-                                                   multiplier * *lit);
-        if (auto lit = jsonNumericConstForIr(ae.value("rexpr", nlohmann::json{})))
-            return extractJsonScalarAggTargetForIr(ae.value("lexpr", nlohmann::json{}),
-                                                   aliases, tables, schema, out,
-                                                   multiplier * *lit);
-    }
-    if (op == "/") {
-        if (auto lit = jsonNumericConstForIr(ae.value("rexpr", nlohmann::json{}))) {
-            if (*lit != 0.0)
-                return extractJsonScalarAggTargetForIr(ae.value("lexpr", nlohmann::json{}),
-                                                       aliases, tables, schema, out,
-                                                       multiplier / *lit);
-        }
-    }
-    return false;
-}
-
-struct ScalarHavingSubquerySummary {
-    JsonScalarAggTarget aggregate;
-    std::vector<std::string> tables;
-    std::vector<std::string> predicateSignatures;
-};
-
-std::optional<ScalarHavingSubquerySummary> parseScalarHavingSubquerySummary(
-        const AnalyzedQuery& aq,
+std::optional<GenericScalarHavingSubquerySummary> scalarHavingSubquerySummary(
+        const GenericSourceQueryInfo& source,
         int sqIdx) {
-    if (sqIdx < 0 || sqIdx >= static_cast<int>(aq.subqueries.size()))
+    if (sqIdx < 0 || sqIdx >= static_cast<int>(source.subqueries.size()))
         return std::nullopt;
-    const auto& sq = aq.subqueries[(size_t)sqIdx];
-    if (sq.type != AnalyzedQuery::Subquery::SCALAR_SUBQUERY)
+    const auto& sq = source.subqueries[(size_t)sqIdx];
+    if (sq.type != GenericSourceSubquery::SCALAR_SUBQUERY)
         return std::nullopt;
-
-    nlohmann::json root;
-    try {
-        root = nlohmann::json::parse(sq.sql);
-    } catch (...) {
-        return std::nullopt;
-    }
-    if (!root.contains("SelectStmt")) return std::nullopt;
-    const auto& ss = root["SelectStmt"];
-    if (ss.contains("groupClause") && !ss["groupClause"].is_null()) return std::nullopt;
-    if (ss.contains("havingClause") && !ss["havingClause"].is_null()) return std::nullopt;
-    if (ss.contains("limitCount") && !ss["limitCount"].is_null()) return std::nullopt;
-
-    ScalarHavingSubquerySummary summary;
-    std::map<std::string, std::string> aliases;
-    if (!ss.contains("fromClause") || !ss["fromClause"].is_array())
-        return std::nullopt;
-    for (const auto& from : ss["fromClause"]) {
-        if (!from.contains("RangeVar")) return std::nullopt;
-        const auto& rv = from["RangeVar"];
-        const std::string rel = rv.value("relname", "");
-        if (rel.empty()) return std::nullopt;
-        summary.tables.push_back(rel);
-        aliases[rel] = rel;
-        if (rv.contains("alias")) {
-            if (rv["alias"].contains("Alias")) {
-                aliases[rv["alias"]["Alias"].value("aliasname", rel)] = rel;
-            } else if (rv["alias"].contains("aliasname")) {
-                aliases[rv["alias"].value("aliasname", rel)] = rel;
-            }
-        }
-    }
-    if (summary.tables.empty()) return std::nullopt;
-
-    if (!ss.contains("targetList") || !ss["targetList"].is_array())
-        return std::nullopt;
-    bool foundAgg = false;
-    for (const auto& target : ss["targetList"]) {
-        if (!target.contains("ResTarget") || !target["ResTarget"].contains("val"))
-            continue;
-        if (extractJsonScalarAggTargetForIr(target["ResTarget"]["val"], aliases,
-                                            summary.tables, aq.schema,
-                                            summary.aggregate)) {
-            foundAgg = true;
-            break;
-        }
-    }
-    if (!foundAgg) return std::nullopt;
-
-    if (ss.contains("whereClause") && !ss["whereClause"].is_null()) {
-        if (!collectJsonPredicateAtomSignatures(ss["whereClause"], aliases,
-                                                summary.tables, aq.schema,
-                                                summary.predicateSignatures)) {
-            return std::nullopt;
-        }
-        std::sort(summary.predicateSignatures.begin(),
-                  summary.predicateSignatures.end());
-    }
-    std::sort(summary.tables.begin(), summary.tables.end());
-    return summary;
+    return sq.scalarHavingSummary;
 }
 
 std::vector<std::string> scanTableSignaturesForHaving(
@@ -726,20 +366,20 @@ bool configureAggregateScalarHaving(const GenericAggregateDetail& aggregate,
                                     int aggIdx,
                                     CmpOp op,
                                     int sqIdx,
-                                    const AnalyzedQuery* aq,
+                                    const GenericRelPlan* ir,
                                     const MultiTableGroupedAggShape* shape,
                                     GenericGroupSpec& groupSpec,
                                     std::string* error) {
-    if (!aq || !shape) {
+    if (!ir || !shape) {
         if (error)
-            *error = "IR grouped aggregate lowerer: scalar-subquery HAVING requires analyzed subquery metadata.";
+            *error = "IR grouped aggregate lowerer: scalar-subquery HAVING requires IR source subquery metadata.";
         return false;
     }
 
     const GenericAggregateExpr* agg = nullptr;
     if (!validateHavingAggregateIndex(aggregate, aggIdx, agg, error))
         return false;
-    auto summary = parseScalarHavingSubquerySummary(*aq, sqIdx);
+    auto summary = scalarHavingSubquerySummary(ir->source, sqIdx);
     if (!summary) {
         if (error)
             *error = "IR grouped aggregate lowerer: scalar-subquery HAVING is not a supported ungrouped aggregate subquery.";
@@ -792,7 +432,7 @@ bool configureAggregateScalarHaving(const GenericAggregateDetail& aggregate,
 
 bool configureAggregateHaving(const GenericAggregateDetail& aggregate,
                               GenericGroupSpec& groupSpec,
-                              const AnalyzedQuery* aq,
+                              const GenericRelPlan* ir,
                               const MultiTableGroupedAggShape* shape,
                               std::string* error) {
     if (!aggregate.having) return true;
@@ -816,7 +456,7 @@ bool configureAggregateHaving(const GenericAggregateDetail& aggregate,
 
     if (aggIdx && sqIdx) {
         return configureAggregateScalarHaving(aggregate, *aggIdx, op, *sqIdx,
-                                              aq, shape, groupSpec, error);
+                                              ir, shape, groupSpec, error);
     }
 
     aggIdx = aggregateIndexForHavingExpr(cmp->left, aggregate);

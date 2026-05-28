@@ -19,16 +19,20 @@ std::optional<MetalQueryPlan> buildQ1PredefinedPlan() {
 
     auto agg = std::make_unique<MetalKeyedAgg>(
         std::move(filtered), "d_q1_aggs", bucketExpr,
-        /*numBuckets=*/6, /*valuesPerBucket=*/11, "66");
+        /*numBuckets=*/6, /*valuesPerBucket=*/9, "54");
 
     agg->addAggregate("sum_qty", 0, "(uint)(l_quantity[" + idxVar + "] * 100.0f)", "add", true, 100);
     agg->addAggregate("sum_base_price", 2, "(uint)(l_extendedprice[" + idxVar + "] * 100.0f)", "add", true, 100);
-    agg->addAggregate("sum_disc_price", 4,
-                      "(uint)(l_extendedprice[" + idxVar + "] * (1.0f - l_discount[" + idxVar + "]) * 100.0f)", "add", true, 100);
-    agg->addAggregate("sum_charge", 6,
-                      "(uint)(l_extendedprice[" + idxVar + "] * (1.0f - l_discount[" + idxVar + "]) * (1.0f + l_tax[" + idxVar + "]) * 100.0f)", "add", true, 100);
-    agg->addAggregate("sum_disc", 8, "(uint)(l_discount[" + idxVar + "] * 10000.0f)", "add", true, 0);
-    agg->addAggregate("count_order", 10, "1u", "add", false, 0);
+    agg->addAggregateWithMeta("sum_disc_price", 4,
+                              "l_extendedprice[" + idxVar + "] * (1.0f - l_discount[" + idxVar + "])",
+                              "add", false, 0,
+                              true, false);
+    agg->addAggregateWithMeta("sum_charge", 5,
+                              "l_extendedprice[" + idxVar + "] * (1.0f - l_discount[" + idxVar + "]) * (1.0f + l_tax[" + idxVar + "])",
+                              "add", false, 0,
+                              true, false);
+    agg->addAggregate("sum_disc", 6, "(uint)(l_discount[" + idxVar + "] * 10000.0f)", "add", true, 0);
+    agg->addAggregate("count_order", 8, "1u", "add", false, 0);
 
     appendPhase(plan, "Q1_reduce", std::move(agg));
     return plan;

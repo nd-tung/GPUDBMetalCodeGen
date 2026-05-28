@@ -4,9 +4,7 @@
 
 namespace codegen {
 
-struct AnalyzedQuery;
-
-bool hasScalarSubqueries(const AnalyzedQuery* aq);
+bool hasScalarSubqueries(const GenericRelPlan& ir);
 bool groupedAggregateNeedsScalarPreAgg(
     const MultiTableGroupedAggShape& shape);
 bool materializeNeedsScalarPreAgg(const MultiTableMaterializeShape& shape);

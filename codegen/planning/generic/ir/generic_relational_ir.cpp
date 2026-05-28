@@ -134,6 +134,14 @@ GenericNodeId GenericRelPlanBuilder::addNode(
     return id;
 }
 
+void GenericRelPlanBuilder::setSourceQuery(GenericSourceQueryInfo source) {
+    plan_.source = std::move(source);
+}
+
+void GenericRelPlanBuilder::setSchema(const SchemaProvider* schema) {
+    plan_.schema = schema;
+}
+
 GenericExprId GenericRelPlanBuilder::nextExprId() {
     return GenericExprId{nextExprId_++};
 }

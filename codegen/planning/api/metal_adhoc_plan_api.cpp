@@ -1,5 +1,5 @@
 #include "metal_adhoc_plan_api.h"
-#include "generic/ir/generic_ir_builder.h"
+#include "generic/ir/generic_relational_ir.h"
 #include "generic/lowering/generic_ir_physical_planner.h"
 #include "generic/ir/generic_ir_validator.h"
 
@@ -15,33 +15,49 @@ void appendPlannerReason(std::string& out,
     out += stage + ": " + reason;
 }
 
-std::optional<GenericRelPlan> buildValidatedGenericIr(const AnalyzedQuery& aq,
-                                                      std::string* error) {
-    std::string buildError;
-    auto ir = buildGenericRelationalIR(aq, &buildError);
-    if (!ir) {
-        if (error) *error = "Generic relational IR preflight failed: " + buildError;
-        return std::nullopt;
-    }
-
-    auto validation = validateGenericRelationalIR(*ir);
+bool validateGenericIrForPlanning(const GenericRelPlan& ir, std::string* error) {
+    auto validation = validateGenericRelationalIR(ir);
     if (!validation.ok()) {
         if (error)
             *error = "Generic relational IR preflight failed: " + validation.message();
-        return std::nullopt;
+        return false;
     }
-    return ir;
+    return true;
 }
 
-std::optional<GenericRelPlan> buildValidatedSingleTableIr(const AnalyzedQuery& aq,
-                                                          std::string* error) {
-    if (!aq.isSingleTable()) return std::nullopt;
-    return buildValidatedGenericIr(aq, error);
+size_t scanCount(const GenericRelPlan& ir) {
+    size_t count = 0;
+    for (const auto& node : ir.nodes) {
+        if (node.op == GenericRelOp::Scan) ++count;
+    }
+    return count;
 }
 
-bool hasOnlyScalarSubqueries(const AnalyzedQuery& aq) {
-    for (const auto& sq : aq.subqueries) {
-        if (sq.type != AnalyzedQuery::Subquery::SCALAR_SUBQUERY)
+bool hasJoinNodes(const GenericRelPlan& ir) {
+    for (const auto& node : ir.nodes) {
+        if (node.op == GenericRelOp::Join ||
+            node.op == GenericRelOp::SemiJoin ||
+            node.op == GenericRelOp::AntiJoin) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool isSingleTablePlan(const GenericRelPlan& ir) {
+    return scanCount(ir) == 1 && !hasJoinNodes(ir);
+}
+
+bool hasAggregateNode(const GenericRelPlan& ir) {
+    for (const auto& node : ir.nodes) {
+        if (node.op == GenericRelOp::Aggregate) return true;
+    }
+    return false;
+}
+
+bool hasOnlyScalarSubqueries(const GenericRelPlan& ir) {
+    for (const auto& sq : ir.source.subqueries) {
+        if (sq.type != GenericSourceSubquery::SCALAR_SUBQUERY)
             return false;
     }
     return true;
@@ -49,35 +65,38 @@ bool hasOnlyScalarSubqueries(const AnalyzedQuery& aq) {
 
 } // namespace
 
-std::optional<MetalQueryPlan> buildAdhocSQLPlan(const AnalyzedQuery& aq,
-                                                const std::string& label,
-                                                std::string* error) {
-    std::optional<GenericRelPlan> singleTableIr;
-    if (aq.isSingleTable()) {
-        singleTableIr = buildValidatedSingleTableIr(aq, error);
-        if (!singleTableIr) return std::nullopt;
+std::optional<MetalQueryPlan> buildAdhocGenericPlan(const GenericRelPlan& ir,
+                                                    const std::string& label,
+                                                    std::string* error) {
+    if (!validateGenericIrForPlanning(ir, error))
+        return std::nullopt;
+
+    const bool singleTable = isSingleTablePlan(ir);
+    const size_t scans = scanCount(ir);
+    const bool hasAggregation = hasAggregateNode(ir);
+
+    const GenericRelPlan* singleTableIr = nullptr;
+    if (singleTable) {
+        singleTableIr = &ir;
     }
 
-    std::string planningErrors;
-    std::optional<GenericRelPlan> multiTableMaterializeIr;
-    if (!aq.isSingleTable() && aq.tables.size() >= 2 &&
-        !aq.hasAggregation() && !aq.hasGroupBy() &&
-        aq.fromSubqueryAggs.empty() &&
-        hasOnlyScalarSubqueries(aq) &&
-        aq.inSubAggs.empty()) {
-        std::string irError;
-        multiTableMaterializeIr = buildValidatedGenericIr(aq, &irError);
-        if (!multiTableMaterializeIr)
-            appendPlannerReason(planningErrors, "multi-table materialize IR", irError);
+    const GenericRelPlan* multiTableMaterializeIr = nullptr;
+    if (!singleTable && scans >= 2 &&
+        !hasAggregation &&
+        ir.source.fromSubqueryAggs.empty() &&
+        hasOnlyScalarSubqueries(ir) &&
+        ir.source.inSubAggs.empty()) {
+        multiTableMaterializeIr = &ir;
     }
-    std::optional<GenericRelPlan> multiTableAggregateIr;
-    if (!aq.isSingleTable() && aq.tables.size() >= 2 &&
-        (aq.hasAggregation() || aq.hasGroupBy()) &&
-        aq.fromSubqueryAggs.empty()) {
-        std::string irError;
-        multiTableAggregateIr = buildValidatedGenericIr(aq, &irError);
-        if (!multiTableAggregateIr)
-            appendPlannerReason(planningErrors, "multi-table aggregate IR", irError);
+    const GenericRelPlan* multiTableAggregateIr = nullptr;
+    if (!singleTable && scans >= 2 &&
+        hasAggregation &&
+        ir.source.fromSubqueryAggs.empty()) {
+        multiTableAggregateIr = &ir;
+    }
+    const GenericRelPlan* fromSubqueryIr = nullptr;
+    if (!ir.source.fromSubqueryAggs.empty()) {
+        fromSubqueryIr = &ir;
     }
 
     std::string lowerErrors;
@@ -102,7 +121,6 @@ std::optional<MetalQueryPlan> buildAdhocSQLPlan(const AnalyzedQuery& aq,
         if (multiTableMaterializeIr) {
             std::string irLowerError;
             if (auto p = lowerMultiTableMaterializeIRToMetal(*multiTableMaterializeIr,
-                                                             aq,
                                                              &irLowerError)) {
                 return p;
             }
@@ -111,22 +129,20 @@ std::optional<MetalQueryPlan> buildAdhocSQLPlan(const AnalyzedQuery& aq,
         if (multiTableAggregateIr) {
             std::string irLowerError;
             if (auto p = lowerMultiTableGroupedAggregateIRToMetal(*multiTableAggregateIr,
-                                                                  aq,
                                                                   &irLowerError)) {
                 return p;
             }
             appendPlannerReason(lowerErrors, "multi-table grouped aggregate lowerer", irLowerError);
             irLowerError.clear();
             if (auto p = lowerMultiTableScalarAggregateIRToMetal(*multiTableAggregateIr,
-                                                                 aq,
                                                                  &irLowerError)) {
                 return p;
             }
             appendPlannerReason(lowerErrors, "multi-table scalar aggregate lowerer", irLowerError);
         }
-        if (!aq.fromSubqueryAggs.empty()) {
+        if (fromSubqueryIr) {
             std::string irLowerError;
-            if (auto p = lowerFromSubqueryAggregateIRToMetal(aq, &irLowerError)) {
+            if (auto p = lowerFromSubqueryAggregateIRToMetal(*fromSubqueryIr, &irLowerError)) {
                 return p;
             }
             appendPlannerReason(lowerErrors, "FROM-subquery aggregate lowerer", irLowerError);
@@ -136,9 +152,8 @@ std::optional<MetalQueryPlan> buildAdhocSQLPlan(const AnalyzedQuery& aq,
 
     auto plan = dispatch();
     if (!plan && error) {
-        std::string detail = !lowerErrors.empty() ? lowerErrors : planningErrors;
         *error = "Generic SQL route: query is not implemented by Generic IR GPU lowerers";
-        if (!detail.empty()) *error += " (" + detail + ")";
+        if (!lowerErrors.empty()) *error += " (" + lowerErrors + ")";
         *error += ". The ad-hoc SQL route does not use fallback query builders.";
     }
     if (!plan) return plan;
