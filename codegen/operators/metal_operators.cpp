@@ -160,7 +160,8 @@ static KeyedAggBackend keyedAggBackendOverride(KeyedAggBackend fallback,
     if (!e || !e[0]) return fallback;
     if (std::strcmp(e, "private") == 0 && canPrivateReduce)
         return KeyedAggBackend::PrivateThreadReduce;
-    if ((std::strcmp(e, "tg_atomic") == 0 ||
+    if ((std::strcmp(e, "shared") == 0 ||
+         std::strcmp(e, "tg_atomic") == 0 ||
          std::strcmp(e, "histogram") == 0) && canTgAtomicHistogram)
         return KeyedAggBackend::ThreadgroupAtomicHistogram;
     if (std::strcmp(e, "global") == 0)

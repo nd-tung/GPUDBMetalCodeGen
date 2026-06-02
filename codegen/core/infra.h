@@ -1075,11 +1075,16 @@ public:
     const float* floats(int col)          const { auto it = floatPtrs_.find(col); return it==floatPtrs_.end()?nullptr:it->second; }
     const char*  chars (int col)          const { auto it = charPtrs_.find(col);  return it==charPtrs_.end()?nullptr:it->second; }
     bool         zeroCopy()               const { return mapped_.valid(); }
+    bool         privateBuffers()         const { return privateBuffers_; }
 
     void _adoptMapped(MappedColumns&& mc, const std::vector<ColSpec>& specs);
     void _adoptCopied(MTL::Device* dev, LoadedColumns&& lc, const std::vector<ColSpec>& specs);
     bool _adoptCopiedColbin(MTL::Device* dev, const std::string& tblPath,
                             const std::vector<ColSpec>& specs);
+    bool promoteBuffersToPrivate(MTL::Device* dev,
+                                 MTL::CommandQueue* cmdQueue,
+                                 size_t* bytesUploaded = nullptr,
+                                 std::string* error = nullptr);
 
 private:
     MappedColumns                              mapped_;
@@ -1090,12 +1095,14 @@ private:
     std::unordered_map<int, const char*>       charPtrs_;
     std::vector<MTL::Buffer*>                  ownedBuffers_;
     size_t                                     rows_ = 0;
+    bool                                       privateBuffers_ = false;
 
     void releaseOwned() {
         for (auto* b : ownedBuffers_) if (b) b->release();
         ownedBuffers_.clear();
         buffers_.clear(); intPtrs_.clear(); floatPtrs_.clear(); charPtrs_.clear();
         rows_ = 0;
+        privateBuffers_ = false;
     }
     void moveFrom(QueryColumns&& o) {
         mapped_       = std::move(o.mapped_);
@@ -1106,7 +1113,9 @@ private:
         charPtrs_     = std::move(o.charPtrs_);
         ownedBuffers_ = std::move(o.ownedBuffers_);
         rows_         = o.rows_;
+        privateBuffers_ = o.privateBuffers_;
         o.rows_ = 0;
+        o.privateBuffers_ = false;
     }
 };
 
@@ -1271,6 +1280,98 @@ inline bool QueryColumns::_adoptCopiedColbin(MTL::Device* dev,
 
     ::munmap(mapBase, fileSize);
     loadStats().recordBinary(projectedBytes);
+    return true;
+}
+
+inline bool QueryColumns::promoteBuffersToPrivate(MTL::Device* dev,
+                                                  MTL::CommandQueue* cmdQueue,
+                                                  size_t* bytesUploaded,
+                                                  std::string* error) {
+    if (bytesUploaded) *bytesUploaded = 0;
+    if (privateBuffers_) return true;
+    if (!dev || !cmdQueue) {
+        if (error) *error = "missing Metal device or command queue";
+        return false;
+    }
+    if (buffers_.empty()) return true;
+
+    struct Upload {
+        int columnIndex = -1;
+        MTL::Buffer* source = nullptr;
+        MTL::Buffer* destination = nullptr;
+        size_t bytes = 0;
+    };
+    std::vector<Upload> uploads;
+    uploads.reserve(buffers_.size());
+
+    for (const auto& [columnIndex, source] : buffers_) {
+        if (!source) continue;
+        const size_t bytes = (size_t)source->length();
+        const size_t allocBytes = std::max(bytes, (size_t)1);
+        MTL::Buffer* destination =
+            dev->newBuffer(allocBytes, MTL::ResourceStorageModePrivate);
+        if (!destination) {
+            for (auto& upload : uploads) {
+                if (upload.destination) upload.destination->release();
+            }
+            if (error) {
+                *error = "failed to allocate private Metal buffer for column " +
+                         std::to_string(columnIndex);
+            }
+            return false;
+        }
+        uploads.push_back({columnIndex, source, destination, bytes});
+    }
+
+    if (uploads.empty()) {
+        privateBuffers_ = true;
+        return true;
+    }
+
+    MTL::CommandBuffer* cmdBuf = cmdQueue->commandBuffer();
+    MTL::BlitCommandEncoder* blit = cmdBuf ? cmdBuf->blitCommandEncoder() : nullptr;
+    if (!cmdBuf || !blit) {
+        for (auto& upload : uploads) {
+            if (upload.destination) upload.destination->release();
+        }
+        if (error) *error = "failed to create private upload blit encoder";
+        return false;
+    }
+
+    size_t totalBytes = 0;
+    for (const auto& upload : uploads) {
+        if (upload.bytes > 0) {
+            blit->copyFromBuffer(upload.source, 0,
+                                 upload.destination, 0,
+                                 (NS::UInteger)upload.bytes);
+            totalBytes += upload.bytes;
+        }
+    }
+    blit->endEncoding();
+    cmdBuf->commit();
+    cmdBuf->waitUntilCompleted();
+
+    if (cmdBuf->status() == MTL::CommandBufferStatusError) {
+        std::string msg = "private input upload failed";
+        if (auto* err = cmdBuf->error()) {
+            if (auto* desc = err->localizedDescription()) {
+                msg += ": ";
+                msg += desc->utf8String();
+            }
+        }
+        for (auto& upload : uploads) {
+            if (upload.destination) upload.destination->release();
+        }
+        if (error) *error = msg;
+        return false;
+    }
+
+    for (auto& upload : uploads) {
+        buffers_[upload.columnIndex] = upload.destination;
+        ownedBuffers_.push_back(upload.destination);
+    }
+    privateBuffers_ = true;
+    if (bytesUploaded) *bytesUploaded = totalBytes;
     return true;
 }
 

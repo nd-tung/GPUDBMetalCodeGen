@@ -50,6 +50,7 @@ static bool fileExists(const std::string& p) {
 static bool binaryUpToDate(const std::string& tblPath, const std::vector<ColSpec>& expectedSpecs) {
     size_t tblSz = 0; int64_t tblMt = 0;
     if (!colbin::statFile(tblPath, tblSz, tblMt)) return false;
+    if (!fileExists(colbin::binaryPath(tblPath))) return false;
     MappedFile mf;
     if (!mf.open(colbin::binaryPath(tblPath))) return false;
     if (mf.size < sizeof(colbin::FileHeader)) return false;

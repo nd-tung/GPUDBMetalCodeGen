@@ -101,6 +101,11 @@ public:
     // between host hooks to avoid profiling overhead in end-to-end timings.
     void setDetailedPhaseTiming(bool enabled) { detailedPhaseTiming_ = enabled; }
 
+    // Allocate phase-owned device/output/scratch buffers in private GPU
+    // storage. Result buffers are copied back to shared temporary buffers
+    // before MetalResultCollector reads them.
+    void setPrivateDeviceBuffers(bool enabled) { privateDeviceBuffers_ = enabled; }
+
     // Collect current buffers without re-running GPU work.
     GenericResult collectResult(const MetalCodegen& codegen) const;
 
@@ -133,6 +138,7 @@ private:
     MetalSizeResolver sizeResolver_;
     bool skipZeroInit_ = false;
     bool detailedPhaseTiming_ = false;
+    bool privateDeviceBuffers_ = false;
 
     struct TableInfo {
         MTL::Buffer* buffer = nullptr;
@@ -163,6 +169,9 @@ private:
                                  int firstPhase,
                                  int lastPhase,
                                  const BufferMap& buffers);
+
+    GenericResult collectResultFromBuffers(const MetalResultSchema& schema,
+                                           const BufferMap& buffers) const;
 
     MTL::ComputePipelineState* findPSO(const RuntimeCompiler::CompiledQuery& cq,
                                         const std::string& name);

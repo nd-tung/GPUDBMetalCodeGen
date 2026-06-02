@@ -6,6 +6,7 @@
 #include <stdexcept>
 #include <sstream>
 #include <limits>
+#include <unordered_set>
 
 namespace codegen {
 
@@ -158,7 +159,14 @@ BufferMap MetalGenericExecutor::allocatePhaseBuffers(
             }
 
             case MetalParamKind::TableSize: {
-                // Table sizes are passed via setBytes.
+                if (privateDeviceBuffers_) {
+                    // Private microbench mode avoids allocating a shared
+                    // constant buffer for row counts; bindPhaseBuffers uses
+                    // setBytes instead.
+                    break;
+                }
+                // In the default path table sizes use a tiny shared buffer.
+                // Private microbench mode binds them via setBytes above.
                 size_t rowCount = 0;
                 auto tIt = tables_.find(b.tableName);
                 if (tIt != tables_.end()) {
@@ -212,8 +220,14 @@ BufferMap MetalGenericExecutor::allocatePhaseBuffers(
                     }
                     size_t totalBytes = count * elemSize;
                     if (totalBytes == 0) totalBytes = elemSize;
+                    if (privateDeviceBuffers_) {
+                        totalBytes = (totalBytes + 3u) & ~size_t(3u);
+                    }
+                    MTL::ResourceOptions storageMode = privateDeviceBuffers_
+                        ? MTL::ResourceStorageModePrivate
+                        : MTL::ResourceStorageModeShared;
                     auto* buf = device_->newBuffer(totalBytes,
-                                                   MTL::ResourceStorageModeShared);
+                                                   storageMode);
                     if (!buf) {
                         throw std::runtime_error(
                             "MetalGenericExecutor: failed to allocate buffer '" +
@@ -254,6 +268,7 @@ void MetalGenericExecutor::zeroInitBuffersForRange(
     std::vector<ZeroTask> tasks;
     std::unordered_set<std::string> seen;
     size_t totalBytes = 0;
+    bool hasPrivateBuffer = false;
 
     for (int pi = firstPhase; pi < lastPhase; pi++) {
         const auto& phase = phases[(size_t)pi];
@@ -270,6 +285,8 @@ void MetalGenericExecutor::zeroInitBuffersForRange(
                 continue;
             tasks.push_back({it->second, length, b.fillByte});
             totalBytes += length;
+            if (it->second->storageMode() == MTL::StorageModePrivate)
+                hasPrivateBuffer = true;
         }
     }
 
@@ -277,7 +294,7 @@ void MetalGenericExecutor::zeroInitBuffersForRange(
         return;
 
     constexpr size_t kGpuZeroInitThresholdBytes = 1u << 20;
-    if (totalBytes < kGpuZeroInitThresholdBytes) {
+    if (totalBytes < kGpuZeroInitThresholdBytes && !hasPrivateBuffer) {
         for (const auto& task : tasks) {
             memset(task.buffer->contents(), task.fillByte, task.length);
             task.buffer->didModifyRange(NS::Range::Make(0, task.length));
@@ -299,6 +316,10 @@ void MetalGenericExecutor::zeroInitBuffersForRange(
             encodedFill = true;
         }
         if (alignedLength < task.length) {
+            if (task.buffer->storageMode() == MTL::StorageModePrivate) {
+                throw std::runtime_error(
+                    "MetalGenericExecutor: private zero-init buffer length is not 4-byte aligned");
+            }
             char* base = static_cast<char*>(task.buffer->contents());
             memset(base + alignedLength, fill, task.length - alignedLength);
             task.buffer->didModifyRange(
@@ -317,7 +338,104 @@ void MetalGenericExecutor::zeroInitBuffersForRange(
 }
 
 GenericResult MetalGenericExecutor::collectResult(const MetalCodegen& codegen) const {
-    return MetalResultCollector::collect(codegen.getResultSchema(), allocatedBuffers_);
+    return collectResultFromBuffers(codegen.getResultSchema(), allocatedBuffers_);
+}
+
+GenericResult MetalGenericExecutor::collectResultFromBuffers(
+    const MetalResultSchema& schema,
+    const BufferMap& buffers) const {
+    if (!privateDeviceBuffers_) {
+        return MetalResultCollector::collect(schema, buffers);
+    }
+
+    std::unordered_set<std::string> names;
+    auto addName = [&](const std::string& name) {
+        if (!name.empty()) names.insert(name);
+    };
+
+    switch (schema.kind) {
+        case MetalResultSchema::SCALAR_AGG:
+            for (const auto& entry : schema.scalarAggs) {
+                addName(entry.loBuffer);
+                addName(entry.hiBuffer);
+                addName(entry.denomLoBuffer);
+                addName(entry.denomHiBuffer);
+            }
+            break;
+        case MetalResultSchema::KEYED_AGG:
+            addName(schema.keyedAgg.bufferName);
+            break;
+        case MetalResultSchema::MATERIALIZE:
+            addName(schema.counterBuffer);
+            for (const auto& col : schema.columns)
+                addName(col.bufferName);
+            break;
+        case MetalResultSchema::NONE:
+        default:
+            break;
+    }
+
+    if (names.empty()) {
+        return MetalResultCollector::collect(schema, buffers);
+    }
+
+    BufferMap readBuffers = buffers;
+    std::vector<MTL::Buffer*> temporaryReadbacks;
+    struct CopyTask {
+        MTL::Buffer* source = nullptr;
+        MTL::Buffer* destination = nullptr;
+        size_t bytes = 0;
+    };
+    std::vector<CopyTask> copies;
+
+    for (const auto& name : names) {
+        auto it = buffers.find(name);
+        if (it == buffers.end() || !it->second)
+            continue;
+        MTL::Buffer* source = it->second;
+        if (source->storageMode() != MTL::StorageModePrivate)
+            continue;
+        const size_t bytes = (size_t)source->length();
+        MTL::Buffer* readback =
+            device_->newBuffer(std::max(bytes, (size_t)1),
+                               MTL::ResourceStorageModeShared);
+        if (!readback) {
+            for (auto* tmp : temporaryReadbacks)
+                if (tmp) tmp->release();
+            throw std::runtime_error(
+                "MetalGenericExecutor: failed to allocate result readback buffer '" +
+                name + "'");
+        }
+        temporaryReadbacks.push_back(readback);
+        readBuffers[name] = readback;
+        if (bytes > 0) copies.push_back({source, readback, bytes});
+    }
+
+    if (!copies.empty()) {
+        auto* cmdBuf = cmdQueue_->commandBuffer();
+        auto* blit = cmdBuf ? cmdBuf->blitCommandEncoder() : nullptr;
+        if (!cmdBuf || !blit) {
+            for (auto* tmp : temporaryReadbacks)
+                if (tmp) tmp->release();
+            throw std::runtime_error(
+                "MetalGenericExecutor: failed to create result readback blit encoder");
+        }
+
+        for (const auto& task : copies) {
+            blit->copyFromBuffer(task.source, 0,
+                                 task.destination, 0,
+                                 (NS::UInteger)task.bytes);
+        }
+        blit->endEncoding();
+        cmdBuf->commit();
+        cmdBuf->waitUntilCompleted();
+        checkCommandBufferStatus(cmdBuf, "result-readback");
+    }
+
+    GenericResult result = MetalResultCollector::collect(schema, readBuffers);
+    for (auto* tmp : temporaryReadbacks)
+        if (tmp) tmp->release();
+    return result;
 }
 
 void MetalGenericExecutor::bindPhaseBuffers(MTL::ComputeCommandEncoder* encoder,
@@ -344,9 +462,24 @@ void MetalGenericExecutor::bindPhaseBuffers(MTL::ComputeCommandEncoder* encoder,
             }
 
             case MetalParamKind::TableSize: {
-                auto it = buffers.find(b.name);
-                if (it != buffers.end() && it->second) {
-                    encoder->setBuffer(it->second, 0, b.bufferIndex);
+                if (privateDeviceBuffers_) {
+                    size_t rowCount = 0;
+                    auto tIt = tables_.find(b.tableName);
+                    if (tIt != tables_.end()) {
+                        rowCount = tIt->second.rowCount;
+                    } else {
+                        std::string symName = tableSizeName(b.tableName);
+                        if (sizeResolver_.hasSymbol(symName)) {
+                            rowCount = sizeResolver_.getSymbol(symName);
+                        }
+                    }
+                    uint32_t sz = static_cast<uint32_t>(rowCount);
+                    encoder->setBytes(&sz, sizeof(uint32_t), b.bufferIndex);
+                } else {
+                    auto it = buffers.find(b.name);
+                    if (it != buffers.end() && it->second) {
+                        encoder->setBuffer(it->second, 0, b.bufferIndex);
+                    }
                 }
                 break;
             }
@@ -678,7 +811,7 @@ MetalExecutionResult MetalGenericExecutor::execute(
     }
 
     auto collectStart = std::chrono::high_resolution_clock::now();
-    execResult.result = MetalResultCollector::collect(codegen.getResultSchema(), allBuffers);
+    execResult.result = collectResultFromBuffers(codegen.getResultSchema(), allBuffers);
     execResult.resultCollectTimeMs = static_cast<float>(
         std::chrono::duration<double, std::milli>(
             std::chrono::high_resolution_clock::now() - collectStart).count());

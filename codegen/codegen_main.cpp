@@ -38,6 +38,7 @@ static bool g_noPipelineCache   = false; // --no-pipeline-cache
 static bool g_profilePhases     = false; // --profile-phases
 static bool g_fastMath          = false; // --fastmath
 static bool g_printPlan         = false; // --print-plan
+static bool g_microPrivateStorage = false; // --micro-input-storage private
 static std::string g_dumpMslDir;         // --dump-msl PATH (directory or file template)
 static std::string g_checkDir;           // --check DIR  (compare result vs DIR/<query>_<sf>.csv)
 static std::string g_saveGoldenDir;      // --save-golden DIR
@@ -49,6 +50,7 @@ static size_t g_chunkRowsExplicit = 0;    // user-set --chunk rows; resets g_chu
 static bool   g_chunkDoubleBuffer = true;// --no-db uses one reusable chunk slot
 static bool   g_autoChunk = true;         // --no-auto-chunk disables budget trigger
 static bool   g_forceChunk = false;       // --force-chunk disables explicit downgrade
+static constexpr int kMaxMicrobench = 10;
 
 enum class QueryApiKind {
     PredefinedTPCH,
@@ -363,6 +365,13 @@ static bool runCodegenQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
                             QueryApiKind apiKind) {
     if (!g_csv) printf("\n=== Codegen: %s ===\n", queryName.c_str());
     const bool isPredefinedTpchRoute = apiKind == QueryApiKind::PredefinedTPCH;
+    const bool isMicrobenchRoute = queryName.rfind("MB", 0) == 0;
+    if (g_microPrivateStorage && !isMicrobenchRoute) {
+        std::cerr << "Codegen: --micro-input-storage private is only supported for mb<N> microbenchmarks"
+                  << std::endl;
+        return false;
+    }
+    const bool usePrivateStorage = g_microPrivateStorage && isMicrobenchRoute;
     // Prevent auto-chunk decisions from leaking across `all` / `mball`.
     g_chunkRows = g_chunkRowsExplicit;
     try {
@@ -448,6 +457,12 @@ static bool runCodegenQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
                 return false;
             }
             g_chunkRows = 0;
+        }
+        if (usePrivateStorage && g_chunkRows > 0) {
+            std::cerr << "Codegen: --micro-input-storage private does not support --chunk; "
+                         "private storage is a full-table microbenchmark mode"
+                      << std::endl;
+            return false;
         }
 
         // Experiment override.
@@ -540,7 +555,7 @@ static bool runCodegenQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
         loadStats().reset();
         // Chunk sizing uses projected bytes, not full file size. Physmem is
         // the trigger on UMA because reclaimable-page accounting is too tight.
-        if (plan.chunkable && (g_autoChunk || g_chunkRows > 0)) {
+        if (plan.chunkable && !usePrivateStorage && (g_autoChunk || g_chunkRows > 0)) {
             const std::string autoStreamTable = autoDetectStreamTable(*activeSchema, tableCols);
             if (!autoStreamTable.empty()) {
                 uint64_t physMemBytes = 0;
@@ -742,6 +757,7 @@ static bool runCodegenQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
         auto parseStart = std::chrono::high_resolution_clock::now();
         codegen::MetalGenericExecutor executor(device, cmdQueue);
         executor.setDetailedPhaseTiming(g_profilePhases || g_autotuneTgPerPhase);
+        executor.setPrivateDeviceBuffers(usePrivateStorage);
 
         const std::string streamTable = (g_chunkRows > 0)
             ? autoDetectStreamTable(*activeSchema, tableCols) : std::string{};
@@ -750,6 +766,8 @@ static bool runCodegenQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
         // Stream table columns are loaded per chunk below.
         double ioMs = 0.0;
         double preprocessMs = 0.0;
+        double privateInputUploadMs = 0.0;
+        size_t privateInputBytes = 0;
         std::vector<std::pair<std::string, QueryColumns>> loadedTables;
         for (auto& [tableName, colNames] : tableCols) {
             if (!streamTable.empty() && tableName == streamTable) continue;
@@ -758,6 +776,22 @@ static bool runCodegenQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
                 specs.push_back(codegen::colSpecFor(*activeSchema, tableName, colName));
             auto _ioStart = clk::now();
             auto cols = loadQueryColumns(device, tableColbinPath(*activeSchema, tableName), specs);
+            if (usePrivateStorage) {
+                size_t uploadedBytes = 0;
+                std::string uploadError;
+                auto uploadStart = clk::now();
+                if (!cols.promoteBuffersToPrivate(device, cmdQueue,
+                                                  &uploadedBytes, &uploadError)) {
+                    std::cerr << "Codegen: private input upload failed for "
+                              << tableName;
+                    if (!uploadError.empty())
+                        std::cerr << ": " << uploadError;
+                    std::cerr << std::endl;
+                    return false;
+                }
+                privateInputUploadMs += elapsedMs(uploadStart, clk::now());
+                privateInputBytes += uploadedBytes;
+            }
             ioMs += elapsedMs(_ioStart, clk::now());
             size_t rowCount = cols.rows();
             for (const auto& colName : colNames) {
@@ -768,6 +802,18 @@ static bool runCodegenQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
             }
             executor.registerTableRowCount(tableName, rowCount);
             loadedTables.emplace_back(tableName, std::move(cols));
+        }
+        if (usePrivateStorage) {
+            if (g_csv) {
+                printf("MICRO_STORAGE_CSV,%s,%s,private,%zu,%.3f\n",
+                       timing.scaleFactor.c_str(), queryName.c_str(),
+                       privateInputBytes, privateInputUploadMs);
+            } else {
+                printf("[micro-storage] %s: promoted %.1f MiB of table inputs to private buffers in %.3f ms; device/output buffers private\n",
+                       queryName.c_str(),
+                       (double)privateInputBytes / (1024.0 * 1024.0),
+                       privateInputUploadMs);
+            }
         }
 
         {
@@ -928,6 +974,8 @@ static bool runCodegenQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
         if (timing.dataLoadMs < 0.0) timing.dataLoadMs = 0.0;
         timing.ingestMs   = ingestMs;
         timing.loadSource = loadStats().source();
+        if (usePrivateStorage && !timing.loadSource.empty())
+            timing.loadSource += "+private-storage";
         timing.loadBytes  = loadStats().bytes;
         // Split data-load window into pure I/O vs CPU preprocess. Anything
         // unaccounted for in the window is attributed to preprocess.
@@ -1317,7 +1365,8 @@ int main(int argc, const char* argv[]) {
             printf("Ad-hoc SQL API:\n");
             printf("  --sql SQL     - Run supported-pattern SQL text through the analyzer route\n");
             printf("  --sql-file F  - Run supported-pattern SQL file through the analyzer route\n");
-            printf("  mb1..mb7      - Run microbenchmark SQL through the analyzer route\n");
+            printf("  mb1..mb%d      - Run microbenchmark SQL through the analyzer route\n",
+                   kMaxMicrobench);
             printf("  mball         - Run all microbenchmarks\n");
             printf("Loader flags:\n");
             printf("  --no-zerocopy        Disable zero-copy mmap path (copy into shared buffers)\n");
@@ -1327,6 +1376,10 @@ int main(int argc, const char* argv[]) {
             printf("  --no-auto-chunk      Disable budget-triggered chunking; explicit --chunk still works\n");
             printf("  --force-chunk        Keep explicit --chunk even when the direct load fits budget\n");
             printf("  --no-db              With --chunk, use one reusable chunk slot instead of two\n");
+            printf("  --micro-input-storage MODE\n");
+            printf("                       For mb<N> only, use shared or all-private kernel buffers\n");
+            printf("  --micro-private-storage Alias for --micro-input-storage private\n");
+            printf("  --micro-private-inputs  Deprecated alias for --micro-input-storage private\n");
             printf("Experiment flags:\n");
             printf("  --warmup N           Run N untimed warmup iterations (default 3)\n");
             printf("  --repeat N           Run N timed iterations, report median (default 1)\n");
@@ -1348,6 +1401,9 @@ int main(int argc, const char* argv[]) {
             printf("  --check-rel-tol N    Relative float tolerance (default 1e-4)\n");
             printf("  --scalar-atomic      Reduction ablation: every thread issues a global atomic\n");
             printf("                       (disables SIMD+TG reduce; for B2 ablation)\n");
+            printf("  --keyed-agg-backend MODE\n");
+            printf("                       Force keyed aggregation backend: auto, private,\n");
+            printf("                       shared/tg_atomic/histogram, or global\n");
             return 0;
         }
         if (arg == "--no-zerocopy")       { ::setenv("GPUDB_NO_ZEROCOPY", "1", 1); continue; }
@@ -1356,6 +1412,44 @@ int main(int argc, const char* argv[]) {
         if (arg == "--auto-chunk")        { g_autoChunk = true; continue; }
         if (arg == "--no-auto-chunk")     { g_autoChunk = false; continue; }
         if (arg == "--force-chunk")       { g_forceChunk = true; continue; }
+        auto setMicroInputStorage = [](const std::string& mode) -> bool {
+            if (mode == "shared") {
+                g_microPrivateStorage = false;
+                return true;
+            }
+            if (mode == "private") {
+                g_microPrivateStorage = true;
+                return true;
+            }
+            return false;
+        };
+        if (arg == "--micro-private-inputs") {
+            g_microPrivateStorage = true;
+            continue;
+        }
+        if (arg == "--micro-private-storage") {
+            g_microPrivateStorage = true;
+            continue;
+        }
+        if (arg == "--micro-input-storage") {
+            if (i + 1 >= argc) { std::cerr << "Missing value for --micro-input-storage\n"; return 1; }
+            std::string value = argv[++i];
+            if (!setMicroInputStorage(value)) {
+                std::cerr << "Invalid --micro-input-storage: " << value
+                          << " (expected shared or private)\n";
+                return 1;
+            }
+            continue;
+        }
+        if (arg.rfind("--micro-input-storage=", 0) == 0) {
+            std::string value = arg.substr(22);
+            if (!setMicroInputStorage(value)) {
+                std::cerr << "Invalid --micro-input-storage: " << value
+                          << " (expected shared or private)\n";
+                return 1;
+            }
+            continue;
+        }
         if (arg.rfind("--chunk=", 0) == 0) {
             if (!parseRowCountWithSuffix(arg.substr(8), g_chunkRowsExplicit)) {
                 std::cerr << "Invalid value for --chunk: " << arg.substr(8) << "\n";
@@ -1373,6 +1467,37 @@ int main(int argc, const char* argv[]) {
             continue;
         }
         if (arg == "--scalar-atomic")     { ::setenv("GPUDB_SCALAR_ATOMIC", "1", 1); continue; }
+        auto setKeyedAggBackend = [](const std::string& mode) -> bool {
+            if (mode == "auto") {
+                ::unsetenv("GPUDB_KEYED_AGG_BACKEND");
+                return true;
+            }
+            if (mode == "private" || mode == "shared" || mode == "tg_atomic" ||
+                mode == "histogram" || mode == "global") {
+                ::setenv("GPUDB_KEYED_AGG_BACKEND", mode.c_str(), 1);
+                return true;
+            }
+            return false;
+        };
+        if (arg == "--keyed-agg-backend") {
+            if (i + 1 >= argc) { std::cerr << "Missing value for --keyed-agg-backend\n"; return 1; }
+            std::string value = argv[++i];
+            if (!setKeyedAggBackend(value)) {
+                std::cerr << "Invalid --keyed-agg-backend: " << value
+                          << " (expected auto, private, shared, tg_atomic, histogram, or global)\n";
+                return 1;
+            }
+            continue;
+        }
+        if (arg.rfind("--keyed-agg-backend=", 0) == 0) {
+            std::string value = arg.substr(20);
+            if (!setKeyedAggBackend(value)) {
+                std::cerr << "Invalid --keyed-agg-backend: " << value
+                          << " (expected auto, private, shared, tg_atomic, histogram, or global)\n";
+                return 1;
+            }
+            continue;
+        }
         if (arg == "--sql") {
             if (i + 1 >= argc) { std::cerr << "Missing value for --sql\n"; return 1; }
             inlineSql = argv[++i]; hasInlineSql = true; continue;
@@ -1510,10 +1635,10 @@ int main(int argc, const char* argv[]) {
     } else if (query == "all") {
         for (int q = 1; q <= 22; q++) ok = runQuery(q) && ok;
     } else if (query == "mball") {
-        for (int m = 1; m <= 7; m++) ok = runMicrobench(m) && ok;
+        for (int m = 1; m <= kMaxMicrobench; m++) ok = runMicrobench(m) && ok;
     } else if (query.size() >= 3 && query[0] == 'm' && query[1] == 'b') {
         int mbNum = std::stoi(query.substr(2));
-        if (mbNum >= 1 && mbNum <= 99) {
+        if (mbNum >= 1 && mbNum <= kMaxMicrobench) {
             ok = runMicrobench(mbNum);
         } else {
             std::cerr << "Unknown microbench: " << query << std::endl;

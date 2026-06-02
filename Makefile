@@ -49,10 +49,13 @@ generic-only: $(TARGET)
 
 rebuild: clean all
 
-$(TARGET): $(CODEGEN_MAIN_OBJ) $(CODEGEN_LIB_OBJECTS) | $(BIN_DIR)
+$(TARGET): $(CODEGEN_MAIN_OBJ) $(CODEGEN_LIB_OBJECTS) $(PG_QUERY_LIB) | $(BIN_DIR)
 	@echo "Linking $(PROJECT_NAME)..."
 	$(CXX) $(CODEGEN_MAIN_OBJ) $(CODEGEN_LIB_OBJECTS) $(PG_QUERY_LIB) $(FRAMEWORKS) -o $@
 	@echo "Build complete: $@"
+
+$(PG_QUERY_LIB):
+	$(MAKE) -C $(PG_QUERY_DIR) libpg_query.a
 
 $(OBJ_DIR)/codegen_codegen_main.o: $(CODEGEN_DIR)/codegen_main.cpp | $(OBJ_DIR)
 	@echo "Compiling $<..."
