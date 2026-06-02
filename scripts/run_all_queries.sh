@@ -6,7 +6,8 @@
 # factors and writes a CSV report including chip/OS/GPU/memory information.
 # Also writes a compact CSV with query execution time and JIT overhead.
 # Ensures data exists before running: existing .tbl files are converted to
-# .colbin, and missing scale-factor data is generated via DuckDB dbgen.
+# .colbin, and missing scale-factor data is generated via DuckDB dbgen or
+# tpch-dbgen.
 #
 # Usage:
 #   scripts/run_all_queries.sh [sf1|sf10|sf20|sf50|sf100 ...] [-o results.csv] [-q "q1 q2"]
@@ -94,6 +95,8 @@ fi
 
 TABLES=(region nation supplier customer part partsupp orders lineitem)
 DUCKDB_BIN="${DUCKDB:-duckdb}"
+TPCH_DBGEN_REPO="${TPCH_DBGEN_REPO:-https://github.com/electrum/tpch-dbgen.git}"
+TPCH_DBGEN_DIR="${TPCH_DBGEN_DIR:-build/tpch-dbgen}"
 
 all_tables_have_ext() {
     local data_dir="$1" ext="$2" table
@@ -101,6 +104,19 @@ all_tables_have_ext() {
         [[ -s "$data_dir/${table}.${ext}" ]] || return 1
     done
     return 0
+}
+
+remove_tbl_data_for_scale() {
+    local data_dir="$1" table removed=0
+    for table in "${TABLES[@]}"; do
+        if [[ -f "$data_dir/${table}.tbl" ]]; then
+            rm -f "$data_dir/${table}.tbl"
+            removed=$((removed + 1))
+        fi
+    done
+    if [[ $removed -gt 0 ]]; then
+        echo "  Data ${data_dir##*/}: removed ${removed} .tbl files after .colbin conversion"
+    fi
 }
 
 sql_quote() {
@@ -148,18 +164,20 @@ TO '${q_out_dir}/lineitem.tbl' (HEADER false, DELIMITER '', QUOTE '');
 SQL
 }
 
-generate_tbl_data_for_scale() {
+tpch_dbgen_abs_dir() {
+    case "$TPCH_DBGEN_DIR" in
+        /*) printf "%s" "$TPCH_DBGEN_DIR" ;;
+        *)  printf "%s/%s" "$REPO_ROOT" "$TPCH_DBGEN_DIR" ;;
+    esac
+}
+
+generate_tbl_data_with_duckdb() {
     local sf_num="$1"
     local data_dir="data/SF-${sf_num}"
     local work_dir="build/dbgen_sf${sf_num}_$(bench_timestamp)"
     local tmp_dir="$work_dir/tmp"
     local db_path="$work_dir/dbgen.duckdb"
     local dbgen_sql="$work_dir/dbgen_export.sql"
-
-    if ! command -v "$DUCKDB_BIN" >/dev/null 2>&1; then
-        echo "ERROR: DuckDB not found. Install duckdb or set DUCKDB=/path/to/duckdb" >&2
-        exit 1
-    fi
 
     echo "  Data sf${sf_num}: generating .tbl via DuckDB dbgen"
     rm -rf "$data_dir" "$work_dir"
@@ -169,6 +187,61 @@ generate_tbl_data_for_scale() {
     rm -rf "$tmp_dir" "$db_path" "$db_path.wal"
 }
 
+ensure_tpch_dbgen() {
+    local dbgen_dir
+    dbgen_dir="$(tpch_dbgen_abs_dir)"
+    local dbgen_bin="$dbgen_dir/dbgen"
+
+    if [[ -x "$dbgen_bin" ]]; then
+        return
+    fi
+
+    if [[ ! -d "$dbgen_dir/.git" ]]; then
+        echo "  tpch-dbgen: cloning $TPCH_DBGEN_REPO"
+        rm -rf "$dbgen_dir"
+        mkdir -p "$(dirname "$dbgen_dir")"
+        git clone --depth 1 "$TPCH_DBGEN_REPO" "$dbgen_dir"
+    fi
+
+    echo "  tpch-dbgen: building dbgen"
+    make -C "$dbgen_dir" dbgen
+
+    if [[ ! -x "$dbgen_bin" ]]; then
+        echo "ERROR: tpch-dbgen build did not produce $dbgen_bin" >&2
+        exit 1
+    fi
+}
+
+generate_tbl_data_with_tpch_dbgen() {
+    local sf_num="$1"
+    local data_dir="data/SF-${sf_num}"
+    local dbgen_dir
+    dbgen_dir="$(tpch_dbgen_abs_dir)"
+    local dbgen_bin="$dbgen_dir/dbgen"
+    local dists_file="$dbgen_dir/dists.dss"
+
+    ensure_tpch_dbgen
+
+    echo "  Data sf${sf_num}: generating .tbl via tpch-dbgen"
+    rm -rf "$data_dir"
+    mkdir -p "$data_dir"
+    (
+        cd "$data_dir"
+        "$dbgen_bin" -q -f -s "$sf_num" -b "$dists_file"
+    )
+}
+
+generate_tbl_data_for_scale() {
+    local sf_num="$1"
+
+    if command -v "$DUCKDB_BIN" >/dev/null 2>&1; then
+        generate_tbl_data_with_duckdb "$sf_num"
+    else
+        echo "  DuckDB not found; falling back to tpch-dbgen"
+        generate_tbl_data_with_tpch_dbgen "$sf_num"
+    fi
+}
+
 ensure_data_for_scale() {
     local sf="$1"
     local sf_num="${sf#sf}"
@@ -176,6 +249,7 @@ ensure_data_for_scale() {
 
     if all_tables_have_ext "$data_dir" colbin; then
         echo "  Data $sf: found .colbin in $data_dir"
+        remove_tbl_data_for_scale "$data_dir"
         return
     fi
 
@@ -191,6 +265,8 @@ ensure_data_for_scale() {
         echo "ERROR: missing .colbin files for $sf in $data_dir after data setup" >&2
         exit 1
     fi
+
+    remove_tbl_data_for_scale "$data_dir"
 }
 
 echo "Checking benchmark data..."
