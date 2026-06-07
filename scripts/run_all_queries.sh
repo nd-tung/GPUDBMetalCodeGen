@@ -11,9 +11,9 @@
 #
 # Usage:
 #   scripts/run_all_queries.sh [sf1|sf10|sf20|sf50|sf100 ...] [-o results.csv] [-q "q1 q2"]
-#                              [--warmup N] [--repeat N]
+#                              [--outer N] [--warmup N] [--repeat N]
 #
-# Defaults: SF=sf1, all 22 queries, warmup=3, repeat=3,
+# Defaults: SF=sf1, all 22 queries, outer=1, warmup=3, repeat=3,
 #           output = build/<chip>_<timestamp>.csv
 # -----------------------------------------------------------------------------
 set -euo pipefail
@@ -22,6 +22,7 @@ set -euo pipefail
 SCALE_FACTORS=()
 OUTPUT=""
 QUERIES_OVERRIDE=""
+OUTER=1
 WARMUP=3
 REPEAT=3
 while [[ $# -gt 0 ]]; do
@@ -29,6 +30,9 @@ while [[ $# -gt 0 ]]; do
         sf1|sf10|sf20|sf50|sf100) SCALE_FACTORS+=("$1"); shift ;;
         -o|--output)    OUTPUT="$2"; shift 2 ;;
         -q|--queries)   QUERIES_OVERRIDE="$2"; shift 2 ;;
+        --outer)
+            [[ $# -ge 2 ]] || { echo "Missing value for --outer" >&2; exit 1; }
+            OUTER="$2"; shift 2 ;;
         --warmup)
             [[ $# -ge 2 ]] || { echo "Missing value for --warmup" >&2; exit 1; }
             WARMUP="$2"; shift 2 ;;
@@ -43,10 +47,10 @@ Runs all 22 TPC-H queries through the predefined codegen pipeline and writes:
 
 Usage:
   scripts/run_all_queries.sh [sf1|sf10|sf20|sf50|sf100 ...] [-o results.csv] [-q "q1 q2"]
-                             [--warmup N] [--repeat N]
+                             [--outer N] [--warmup N] [--repeat N]
 
 Defaults:
-  scale=sf1, queries=q1..q22, warmup=3, repeat=3,
+  scale=sf1, queries=q1..q22, outer=1, warmup=3, repeat=3,
   output=build/<chip>_<timestamp>.csv
 EOF
             exit 0 ;;
@@ -305,8 +309,14 @@ GIT_COMMIT="$(git rev-parse --short HEAD 2>/dev/null || echo none)"
     echo "# git_commit=$GIT_COMMIT"
     echo "# git_dirty_count=$(git status --porcelain 2>/dev/null | wc -l | tr -d ' ')"
     echo "# binary=$REPO_ROOT/$BIN"
+    echo "# outer=$OUTER"
     echo "# warmup=$WARMUP"
     echo "# repeat=$REPEAT"
+    if [[ "${GPUDB_NO_ZEROCOPY:-0}" == "1" ]]; then
+        echo "# zerocopy=disabled"
+    else
+        echo "# zerocopy=enabled"
+    fi
     echo "# timestamp=$TS"
     # gpu fields come from the first SYSINFO_CSV line below.
     echo "scale_factor,query,status,timing_query,route,analyze_ms,plan_ms,codegen_ms,metal_compile_ms,pso_ms,compile_overhead_ms,load_source,load_bytes,load_mibps,ingest_ms,data_load_ms,io_ms,preprocess_ms,buffer_setup_ms,gpu_compute_ms,cpu_compute_ms,query_compute_ms,query_execution_ms,end_to_end_ms,execute_wall_ms,execute_residual_ms,hook_cpu_ms,hook_gpu_ms,result_collect_ms,host_post_ms,validation_ms,gpu_trials_n,gpu_p10_ms,gpu_p50_ms,gpu_p90_ms,gpu_mad_ms,hot_execution_ms,gpu_name,gpu_budget_bytes"
@@ -321,6 +331,17 @@ run_one() {
     local sf="$1" q="$2"
     local log="$LOG_DIR/${sf}_${q}.log"
     echo "  -> $sf $q"
+
+    local outer_i outer_log outer_rc
+    for ((outer_i = 1; outer_i <= OUTER; outer_i++)); do
+        outer_log="$LOG_DIR/${sf}_${q}_outer${outer_i}.log"
+        outer_rc=0
+        "$BIN" --warmup 0 --repeat 1 "$sf" "$q" > "$outer_log" 2>&1 || outer_rc=$?
+        if [[ $outer_rc -ne 0 ]]; then
+            echo "     OUTER ${outer_i} failed (see $outer_log)"
+            FAILURES=$((FAILURES + 1))
+        fi
+    done
 
     local rc=0
     "$BIN" --warmup "$WARMUP" --repeat "$REPEAT" "$sf" "$q" > "$log" 2>&1 || rc=$?
@@ -372,7 +393,9 @@ run_one() {
     }' <<< "$body" >> "$OUTPUT"
     awk -v runq="$q" -F',' '{
         jit = ($6 + 0.0) + ($7 + 0.0) + ($8 + 0.0);
-        printf "%s,%s,%.3f\n", runq, $21, jit;
+        # TIMING_CSV field 35 is hot_execution_ms: execute wall + host post,
+        # excluding load/preprocess/compile for prepared in-memory comparison.
+        printf "%s,%s,%.3f\n", runq, $35, jit;
     }' <<< "$body" >> "$EXECUTION_OUTPUT"
 }
 
@@ -381,6 +404,7 @@ echo "  Host:   $HOST"
 echo "  CPU:    $CPU"
 echo "  RAM:    $RAM_GIB GiB"
 echo "  Scales: ${SCALE_FACTORS[*]}"
+echo "  Outer:  $OUTER"
 echo "  Warmup: $WARMUP"
 echo "  Repeat: $REPEAT"
 echo "  Output: $OUTPUT"
