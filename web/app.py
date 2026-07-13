@@ -423,6 +423,7 @@ def run_codegen(payload: dict[str, Any]) -> dict[str, Any]:
         str(spec["warmup"]),
         "--repeat",
         str(spec["repeat"]),
+        "--full-result",
         "--dump-msl",
         str(run_dir),
     ]

@@ -43,6 +43,7 @@ static bool g_clearMetalCache   = false; // --clear-metal-cache
 static bool g_profilePhases     = false; // --profile-phases
 static bool g_fastMath          = false; // --fastmath
 static bool g_printPlan         = false; // --print-plan
+static bool g_fullResult        = false; // --full-result
 static bool g_microPrivateStorage = false; // --micro-input-storage private
 static std::string g_dumpMslDir;         // --dump-msl PATH (directory or file template)
 static std::string g_checkDir;           // --check DIR  (compare result vs DIR/<query>_<sf>.csv)
@@ -1352,7 +1353,9 @@ static bool runCodegenQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
 
         if (!g_csv && !result.result.columns.empty()) {
             printf("\n%s Results:\n", queryName.c_str());
-            int displayLimit = plan.hostResult ? plan.hostResult->displayLimit : -1;
+            int displayLimit = g_fullResult
+                ? -1
+                : (plan.hostResult ? plan.hostResult->displayLimit : -1);
             result.result.print(displayLimit);
         }
 
@@ -1469,6 +1472,7 @@ int main(int argc, const char* argv[]) {
             printf("  --fastmath           Enable Metal -ffast-math (default: off)\n");
             printf("  --no-fastmath        Disable Metal -ffast-math (default behavior)\n");
             printf("  --print-plan         Print the MetalQueryPlan structure before codegen\n");
+            printf("  --full-result        Print every result row instead of the plan display limit\n");
             printf("  --dump-msl DIR       Write generated MSL to DIR/<query>.metal (default: debug/)\n");
             printf("  --check DIR          Compare GPU result against DIR/<query>_<sf>.csv (golden)\n");
             printf("  --save-golden DIR    Write current GPU result to DIR/<query>_<sf>.csv (overwrites)\n");
@@ -1595,6 +1599,7 @@ int main(int argc, const char* argv[]) {
         if (arg == "--fastmath")          { g_fastMath = true; continue; }
         if (arg == "--no-fastmath")       { g_fastMath = false; continue; }
         if (arg == "--print-plan")        { g_printPlan = true; continue; }
+        if (arg == "--full-result")       { g_fullResult = true; continue; }
         if (arg == "--dump-msl") {
             if (i + 1 >= argc) { std::cerr << "Missing value for --dump-msl\n"; return 1; }
             g_dumpMslDir = argv[++i]; continue;
