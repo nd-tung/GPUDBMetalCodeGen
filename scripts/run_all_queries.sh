@@ -25,6 +25,7 @@ QUERIES_OVERRIDE=""
 OUTER=1
 WARMUP=3
 REPEAT=3
+PREPARE_DATA_ONLY=0
 while [[ $# -gt 0 ]]; do
     case "$1" in
         sf1|sf10|sf20|sf50|sf100) SCALE_FACTORS+=("$1"); shift ;;
@@ -39,6 +40,8 @@ while [[ $# -gt 0 ]]; do
         --repeat)
             [[ $# -ge 2 ]] || { echo "Missing value for --repeat" >&2; exit 1; }
             REPEAT="$2"; shift 2 ;;
+        --prepare-data-only)
+            PREPARE_DATA_ONLY=1; shift ;;
         -h|--help)
             cat <<'EOF'
 Runs all 22 TPC-H queries through the predefined codegen pipeline and writes:
@@ -48,10 +51,15 @@ Runs all 22 TPC-H queries through the predefined codegen pipeline and writes:
 Usage:
   scripts/run_all_queries.sh [sf1|sf10|sf20|sf50|sf100 ...] [-o results.csv] [-q "q1 q2"]
                              [--outer N] [--warmup N] [--repeat N]
+                             [--prepare-data-only]
 
 Defaults:
   scale=sf1, queries=q1..q22, outer=1, warmup=3, repeat=3,
   output=build/<chip>_<timestamp>.csv
+
+Data:
+  --prepare-data-only  Generate/convert data for the selected scale factors,
+                       then exit before running queries.
 EOF
             exit 0 ;;
         *) echo "Unknown arg: $1" >&2; exit 1 ;;
@@ -277,6 +285,11 @@ echo "Checking benchmark data..."
 for sf in "${SCALE_FACTORS[@]}"; do
     ensure_data_for_scale "$sf"
 done
+
+if [[ "$PREPARE_DATA_ONLY" == "1" ]]; then
+    echo "Data preparation complete for: ${SCALE_FACTORS[*]}"
+    exit 0
+fi
 
 TS="$(bench_timestamp)"
 CHIP_SLUG="$(bench_chip_slug)"

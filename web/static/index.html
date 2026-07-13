@@ -1,0 +1,106 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>GPUDB Metal TPC-H</title>
+  <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <div class="brand-mark">M</div>
+      <div>
+        <h1>GPUDB Metal Codegen</h1>
+        <p>TPC-H query runner</p>
+      </div>
+    </div>
+    <div id="status" class="status">Ready</div>
+  </header>
+
+  <main class="workspace">
+    <section class="controls" aria-label="Run controls">
+      <label>
+        <span>Query</span>
+        <select id="querySelect"></select>
+      </label>
+      <label>
+        <span>Scale</span>
+        <select id="scaleSelect"></select>
+      </label>
+      <label class="small-field">
+        <span>Warmup</span>
+        <input id="warmupInput" type="number" min="0" max="25" value="0">
+      </label>
+      <label class="small-field">
+        <span>Repeat</span>
+        <input id="repeatInput" type="number" min="1" max="50" value="1">
+      </label>
+      <div class="mode-toggle" role="tablist" aria-label="Query mode">
+        <button id="tpchMode" class="active" type="button">TPC-H</button>
+        <button id="customMode" type="button">Custom SQL</button>
+      </div>
+      <button id="runButton" class="run-button" type="button">
+        <span class="play-icon" aria-hidden="true"></span>
+        <span>Run</span>
+      </button>
+    </section>
+
+    <section id="dataStrip" class="data-strip" aria-label="Data status">
+      <div class="data-copy">
+        <strong id="dataTitle">Data Status</strong>
+        <span id="dataDetails">Checking data...</span>
+      </div>
+      <button id="generateDataButton" class="secondary-button" type="button">
+        <span class="data-icon" aria-hidden="true"></span>
+        <span>Generate Data</span>
+      </button>
+    </section>
+
+    <section class="output-grid" aria-label="Run output">
+      <section class="sql-band">
+        <div class="panel-header">
+          <span>SQL Input</span>
+          <span id="sqlMeta"></span>
+        </div>
+        <textarea id="sqlInput" spellcheck="false"></textarea>
+      </section>
+
+      <article class="panel result-panel">
+        <div class="panel-header">
+          <span>Query Result</span>
+          <span id="resultMeta"></span>
+        </div>
+        <pre id="queryResult"></pre>
+      </article>
+
+      <article class="panel kernel-panel">
+        <div class="panel-header">
+          <span>Generated Kernel Code</span>
+          <span id="kernelMeta"></span>
+        </div>
+        <pre id="kernelCode"></pre>
+      </article>
+
+      <article class="panel timing-panel">
+        <div class="panel-header">
+          <span>Timing Result</span>
+          <span id="timingMeta"></span>
+        </div>
+        <div id="timingCards" class="timing-cards"></div>
+        <pre id="timingText"></pre>
+      </article>
+    </section>
+
+    <section id="diagnostics" class="diagnostics hidden">
+      <div class="panel-header">
+        <span>Diagnostics</span>
+        <span id="commandMeta"></span>
+      </div>
+      <pre id="diagnosticText"></pre>
+    </section>
+  </main>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

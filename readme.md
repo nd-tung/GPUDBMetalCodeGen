@@ -73,3 +73,16 @@ Choose output file:
 ```bash
 scripts/run_all_queries.sh sf1 sf10 sf100 -o build/my_benchmark.csv
 ```
+
+## Local Web UI
+
+Run the Python website from the repo root:
+
+```bash
+python3 web/app.py --port 8000
+```
+
+Open `http://127.0.0.1:8000`, choose a TPC-H query or switch to custom SQL,
+then run it to view generated Metal kernel code, query results, and timing
+metrics. If `build/bin/GPUDBCodegen` is missing, the web app tries to build it
+with `make` on the first run.
