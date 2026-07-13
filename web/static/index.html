@@ -44,6 +44,10 @@
         <span class="play-icon" aria-hidden="true"></span>
         <span>Run</span>
       </button>
+      <button id="suiteButton" class="secondary-button suite-button" type="button">
+        <span class="bar-icon" aria-hidden="true"></span>
+        <span>Run Full Suite</span>
+      </button>
     </section>
 
     <section id="dataStrip" class="data-strip" aria-label="Data status">
@@ -90,6 +94,14 @@
         <div id="timingCards" class="timing-cards"></div>
         <pre id="timingText"></pre>
       </article>
+    </section>
+
+    <section id="suiteChart" class="suite-chart-panel hidden">
+      <div class="panel-header">
+        <span>Full Suite Chart</span>
+        <span id="suiteMeta"></span>
+      </div>
+      <div id="suiteChartBody" class="suite-chart-body"></div>
     </section>
 
     <section id="diagnostics" class="diagnostics hidden">

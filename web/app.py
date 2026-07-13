@@ -35,6 +35,7 @@ SCALE_FACTORS = ("sf1", "sf10", "sf20", "sf50", "sf100")
 TABLES = ("region", "nation", "supplier", "customer", "part", "partsupp", "orders", "lineitem")
 BUILD_LOCK = threading.Lock()
 DATA_LOCK = threading.Lock()
+SUITE_LOCK = threading.Lock()
 
 TIMING_FIELDS = [
     "scale_factor",
@@ -253,6 +254,15 @@ def validate_payload(payload: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def validate_suite_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "scale": validate_scale(payload.get("scale")),
+        "warmup": clamp_int(payload.get("warmup"), 0, 0, 25),
+        "repeat": clamp_int(payload.get("repeat"), 1, 1, 50),
+        "timeout": clamp_int(payload.get("timeout"), CONFIG.default_timeout, 10, 1200),
+    }
+
+
 def ensure_data_ready(scale: str) -> dict[str, Any]:
     status = data_status(scale)
     if status["ready"]:
@@ -394,6 +404,115 @@ def run_codegen(payload: dict[str, Any]) -> dict[str, Any]:
         "timing_text": timing_block,
         "stdout": tail(stdout),
         "stderr": tail(stderr),
+    }
+
+
+def run_suite(payload: dict[str, Any]) -> dict[str, Any]:
+    spec = validate_suite_payload(payload)
+    current_data_status = ensure_data_ready(spec["scale"])
+    build = ensure_binary()
+
+    if not SUITE_LOCK.acquire(blocking=False):
+        raise ApiError("Full suite is already running.", status=409)
+
+    run_dir = make_run_dir()
+    results: list[dict[str, Any]] = []
+    started = time.perf_counter()
+    try:
+        for n in range(1, 23):
+            query_id = f"q{n}"
+            query_name = f"Q{n}"
+            cmd = [
+                str(BIN_PATH),
+                spec["scale"],
+                "--warmup",
+                str(spec["warmup"]),
+                "--repeat",
+                str(spec["repeat"]),
+                "--dump-msl",
+                str(run_dir),
+                query_id,
+            ]
+            query_started = time.perf_counter()
+            try:
+                proc = subprocess.run(
+                    cmd,
+                    cwd=ROOT,
+                    capture_output=True,
+                    text=True,
+                    timeout=spec["timeout"],
+                )
+                timed_out = False
+                stdout = proc.stdout or ""
+                stderr = proc.stderr or ""
+                returncode = proc.returncode
+            except subprocess.TimeoutExpired as exc:
+                timed_out = True
+                stdout = exc.stdout or ""
+                stderr = exc.stderr or ""
+                returncode = -1
+
+            wall_ms = (time.perf_counter() - query_started) * 1000.0
+            timing = parse_timing_csv(stdout)
+            ok = returncode == 0 and not timed_out and bool(timing)
+            if timed_out:
+                message = f"{query_name} timed out after {spec['timeout']} seconds."
+            elif ok:
+                message = f"{query_name} completed."
+            elif stderr.strip():
+                message = stderr.strip().splitlines()[-1]
+            elif not timing:
+                message = f"{query_name} produced no timing row."
+            else:
+                message = f"{query_name} failed."
+
+            results.append(
+                {
+                    "query": query_name,
+                    "query_id": query_id,
+                    "ok": ok,
+                    "message": message,
+                    "returncode": returncode,
+                    "timed_out": timed_out,
+                    "wall_ms": wall_ms,
+                    "timing": timing,
+                    "stderr": tail(stderr, 8000),
+                }
+            )
+    finally:
+        SUITE_LOCK.release()
+
+    wall_ms = (time.perf_counter() - started) * 1000.0
+    failures = [row for row in results if not row["ok"]]
+    values = [
+        row["timing"].get("query_execution_ms")
+        for row in results
+        if isinstance(row.get("timing"), dict)
+        and isinstance(row["timing"].get("query_execution_ms"), (int, float))
+    ]
+    return {
+        "ok": not failures and len(results) == 22,
+        "message": (
+            "Full suite completed."
+            if not failures and len(results) == 22
+            else f"Full suite finished with {len(failures)} failure(s)."
+        ),
+        "run_id": run_dir.name,
+        "scale": spec["scale"],
+        "warmup": spec["warmup"],
+        "repeat": spec["repeat"],
+        "wall_ms": wall_ms,
+        "built_backend": build["built"],
+        "build_log": build["log"],
+        "data_status": current_data_status,
+        "results": results,
+        "summary": {
+            "total": len(results),
+            "ok": len(results) - len(failures),
+            "failed": len(failures),
+            "max_query_execution_ms": max(values) if values else 0.0,
+            "min_query_execution_ms": min(values) if values else 0.0,
+        },
     }
 
 
@@ -542,7 +661,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         parsed = urlparse(self.path)
-        if parsed.path not in {"/api/run", "/api/generate-data"}:
+        if parsed.path not in {"/api/run", "/api/run-suite", "/api/generate-data"}:
             self.send_error(HTTPStatus.NOT_FOUND)
             return
 
@@ -559,7 +678,12 @@ class Handler(BaseHTTPRequestHandler):
             payload = json.loads(raw.decode("utf-8") or "{}")
             if not isinstance(payload, dict):
                 raise ApiError("JSON body must be an object.")
-            result = run_codegen(payload) if parsed.path == "/api/run" else generate_data(payload)
+            if parsed.path == "/api/run":
+                result = run_codegen(payload)
+            elif parsed.path == "/api/run-suite":
+                result = run_suite(payload)
+            else:
+                result = generate_data(payload)
             self.send_json(result, status=200 if result["ok"] else 500)
         except ApiError as exc:
             response = {"ok": False, "message": exc.message}

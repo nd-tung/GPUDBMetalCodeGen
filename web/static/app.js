@@ -3,6 +3,7 @@ const state = {
   scales: [],
   mode: "tpch",
   running: false,
+  runningSuite: false,
   generatingData: false,
 };
 
@@ -16,6 +17,7 @@ const els = {
   tpchMode: document.getElementById("tpchMode"),
   customMode: document.getElementById("customMode"),
   runButton: document.getElementById("runButton"),
+  suiteButton: document.getElementById("suiteButton"),
   dataStrip: document.getElementById("dataStrip"),
   dataTitle: document.getElementById("dataTitle"),
   dataDetails: document.getElementById("dataDetails"),
@@ -29,6 +31,9 @@ const els = {
   timingCards: document.getElementById("timingCards"),
   timingText: document.getElementById("timingText"),
   timingMeta: document.getElementById("timingMeta"),
+  suiteChart: document.getElementById("suiteChart"),
+  suiteChartBody: document.getElementById("suiteChartBody"),
+  suiteMeta: document.getElementById("suiteMeta"),
   diagnostics: document.getElementById("diagnostics"),
   diagnosticText: document.getElementById("diagnosticText"),
   commandMeta: document.getElementById("commandMeta"),
@@ -133,6 +138,14 @@ function formatNumber(value) {
   return new Intl.NumberFormat().format(value);
 }
 
+function jitOverheadMs(timing) {
+  if (!timing) return 0;
+  const codegen = typeof timing.codegen_ms === "number" ? timing.codegen_ms : 0;
+  const compile = typeof timing.metal_compile_ms === "number" ? timing.metal_compile_ms : 0;
+  const pso = typeof timing.pso_ms === "number" ? timing.pso_ms : 0;
+  return codegen + compile + pso;
+}
+
 function renderTiming(timing, wallMs) {
   const metrics = [
     ["End-to-End", formatMs(timing.end_to_end_ms)],
@@ -166,6 +179,74 @@ function renderTiming(timing, wallMs) {
   els.timingMeta.textContent = details.join("  ");
 }
 
+function renderSuiteChart(result) {
+  const rows = result.results || [];
+  const values = rows.map((row) => {
+    const timing = row.timing || {};
+    const value = typeof timing.query_execution_ms === "number"
+      ? timing.query_execution_ms
+      : 0;
+    const gpu = typeof timing.gpu_compute_ms === "number" ? timing.gpu_compute_ms : 0;
+    const cpu = typeof timing.cpu_compute_ms === "number" ? timing.cpu_compute_ms : 0;
+    const jit = jitOverheadMs(timing);
+    const other = Math.max(0, value - gpu - cpu);
+    return { ...row, value, gpu, cpu, other, jit, stackTotal: value + jit };
+  });
+  const maxValue = Math.max(1, ...values.map((row) => row.stackTotal));
+  els.suiteChartBody.replaceChildren();
+
+  const bars = document.createElement("div");
+  bars.className = "suite-bars";
+  const legend = document.createElement("div");
+  legend.className = "suite-legend";
+  legend.innerHTML = "<span><i class=\"gpu\"></i>GPU</span><span><i class=\"cpu\"></i>CPU</span><span><i class=\"other\"></i>Other Exec</span><span><i class=\"jit\"></i>JIT</span>";
+  bars.append(legend);
+
+  for (const row of values) {
+    const line = document.createElement("div");
+    line.className = `suite-bar-row ${row.ok ? "" : "failed"}`.trim();
+
+    const label = document.createElement("span");
+    label.className = "suite-label";
+    label.textContent = row.query || row.query_id || "-";
+
+    const track = document.createElement("div");
+    track.className = "suite-track";
+    for (const [name, amount] of [["gpu", row.gpu], ["cpu", row.cpu], ["other", row.other], ["jit", row.jit]]) {
+      if (amount <= 0 || !row.ok) continue;
+      const segment = document.createElement("div");
+      segment.className = `suite-segment ${name}`;
+      segment.style.width = `${Math.max(1, (amount / maxValue) * 100)}%`;
+      track.append(segment);
+    }
+
+    const value = document.createElement("span");
+    value.className = "suite-value";
+    value.textContent = row.ok ? `Exec ${formatMs(row.value)}` : "failed";
+
+    line.append(label, track, value);
+    bars.append(line);
+  }
+
+  const table = document.createElement("div");
+  table.className = "suite-table";
+  const header = document.createElement("div");
+  header.className = "suite-table-row suite-table-header";
+  header.innerHTML = "<span>Query</span><span>Query Exec</span><span>GPU</span><span>CPU</span><span>JIT</span>";
+  table.append(header);
+  for (const row of values) {
+    const timing = row.timing || {};
+    const item = document.createElement("div");
+    item.className = "suite-table-row";
+    item.innerHTML = `<span>${row.query || "-"}</span><span>${formatMs(timing.query_execution_ms)}</span><span>${formatMs(timing.gpu_compute_ms)}</span><span>${formatMs(timing.cpu_compute_ms)}</span><span>${formatMs(row.jit)}</span>`;
+    table.append(item);
+  }
+
+  els.suiteChartBody.append(bars, table);
+  els.suiteMeta.textContent = `${(result.scale || "").toUpperCase()} ${result.summary ? `${result.summary.ok}/${result.summary.total} OK` : ""}`;
+  els.suiteChart.classList.remove("hidden");
+}
+
 function showDiagnostics(result) {
   const lines = [];
   if (result.command) lines.push(`$ ${result.command}`);
@@ -182,8 +263,12 @@ function showDiagnostics(result) {
 
 function setRunning(running) {
   state.running = running;
-  els.runButton.disabled = running || state.generatingData;
+  els.runButton.disabled = running || state.generatingData || state.runningSuite;
+  els.suiteButton.disabled = running || state.generatingData || state.runningSuite;
+  els.runButton.querySelector("span:first-child").className = running ? "spinner-icon" : "play-icon";
+  els.suiteButton.querySelector("span:first-child").className = state.runningSuite ? "spinner-icon" : "bar-icon";
   els.runButton.querySelector("span:last-child").textContent = running ? "Running" : "Run";
+  els.suiteButton.querySelector("span:last-child").textContent = state.runningSuite ? "Running Suite" : "Run Full Suite";
 }
 
 async function refreshMetadata() {
@@ -219,6 +304,8 @@ async function runQuery() {
     return;
   }
   setRunning(true);
+  els.workspace.classList.remove("suite-mode");
+  els.suiteChart.classList.add("hidden");
   setStatus(state.mode === "custom" ? "Running custom SQL..." : `Running ${els.querySelect.value.toUpperCase()}...`, "running");
   els.kernelMeta.textContent = "";
   els.resultMeta.textContent = "";
@@ -271,6 +358,63 @@ async function runQuery() {
   }
 }
 
+async function runFullSuite() {
+  if (state.running || state.runningSuite) return;
+  const scale = selectedScale();
+  if (scale && !scale.ready) {
+    setStatus(`${scale.label} data is missing. Generate data first.`, "error");
+    updateDataStatus();
+    return;
+  }
+
+  state.runningSuite = true;
+  setRunning(false);
+  els.workspace.classList.add("suite-mode");
+  setStatus(`Running full suite on ${els.scaleSelect.value.toUpperCase()}...`, "running");
+  els.suiteChart.classList.remove("hidden");
+  els.suiteChartBody.replaceChildren();
+  const loading = document.createElement("div");
+  loading.className = "suite-loading";
+  loading.innerHTML = "<span class=\"spinner-icon\"></span><strong>Running Q1-Q22...</strong>";
+  els.suiteChartBody.append(loading);
+  els.suiteMeta.textContent = "running...";
+  els.diagnostics.classList.add("hidden");
+
+  const payload = {
+    scale: els.scaleSelect.value,
+    warmup: els.warmupInput.value,
+    repeat: els.repeatInput.value,
+  };
+
+  try {
+    const response = await fetch("/api/run-suite", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    const result = await response.json();
+    if (!response.ok || !result.ok) {
+      setStatus(result.message || "Full suite failed.", "error");
+      if (result.data_status) {
+        const idx = state.scales.findIndex((scale) => scale.id === result.data_status.id);
+        if (idx >= 0) state.scales[idx] = result.data_status;
+        updateDataStatus();
+      }
+    } else {
+      setStatus(result.message || "Full suite completed.");
+    }
+    renderSuiteChart(result);
+    showDiagnostics(result);
+  } catch (error) {
+    setStatus(error.message || "Full suite request failed.", "error");
+    els.diagnosticText.textContent = String(error);
+    els.diagnostics.classList.remove("hidden");
+  } finally {
+    state.runningSuite = false;
+    setRunning(false);
+  }
+}
+
 async function generateData() {
   if (state.generatingData || state.running) return;
   const scale = selectedScale();
@@ -318,6 +462,7 @@ els.tpchMode.addEventListener("click", () => {
 });
 els.customMode.addEventListener("click", () => setMode("custom"));
 els.runButton.addEventListener("click", runQuery);
+els.suiteButton.addEventListener("click", runFullSuite);
 els.generateDataButton.addEventListener("click", generateData);
 
 loadInitialData().catch((error) => {

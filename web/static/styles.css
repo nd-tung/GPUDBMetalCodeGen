@@ -115,6 +115,14 @@ h1 {
   grid-template-rows: auto minmax(0, 1fr) auto;
 }
 
+.workspace.suite-mode {
+  grid-template-rows: auto auto minmax(0, 1fr);
+}
+
+.workspace.data-ready.suite-mode {
+  grid-template-rows: auto minmax(0, 1fr);
+}
+
 .controls {
   display: flex;
   align-items: end;
@@ -215,6 +223,38 @@ input {
   opacity: 0.68;
 }
 
+.bar-icon {
+  width: 16px;
+  height: 14px;
+  display: inline-grid;
+  grid-template-columns: repeat(3, 1fr);
+  align-items: end;
+  gap: 2px;
+}
+
+.bar-icon::before,
+.bar-icon::after,
+.bar-icon {
+  color: currentColor;
+}
+
+.bar-icon::before,
+.bar-icon::after {
+  content: "";
+  display: block;
+  background: currentColor;
+  border-radius: 2px 2px 0 0;
+}
+
+.bar-icon::before {
+  height: 8px;
+}
+
+.bar-icon::after {
+  height: 12px;
+  box-shadow: -6px 4px 0 currentColor;
+}
+
 .play-icon {
   width: 0;
   height: 0;
@@ -223,9 +263,25 @@ input {
   border-left: 9px solid currentColor;
 }
 
+.spinner-icon {
+  width: 16px;
+  height: 16px;
+  border: 2px solid currentColor;
+  border-right-color: transparent;
+  border-radius: 50%;
+  animation: spin 0.8s linear infinite;
+}
+
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
 .sql-band,
 .panel,
 .diagnostics,
+.suite-chart-panel,
 .data-strip {
   min-width: 0;
   min-height: 0;
@@ -277,7 +333,7 @@ input {
 }
 
 .secondary-button {
-  height: 34px;
+  height: 38px;
   display: inline-flex;
   align-items: center;
   gap: 8px;
@@ -289,6 +345,10 @@ input {
   cursor: pointer;
   font-weight: 800;
   white-space: nowrap;
+}
+
+.suite-button {
+  padding: 0 15px;
 }
 
 .secondary-button:hover {
@@ -490,8 +550,158 @@ pre {
   grid-template-rows: 38px minmax(90px, 18vh);
 }
 
+.suite-chart-panel {
+  display: grid;
+  grid-template-rows: 38px minmax(0, 1fr);
+  min-height: 0;
+}
+
+.suite-chart-panel.hidden,
 .diagnostics.hidden {
   display: none;
+}
+
+.suite-chart-body {
+  min-height: 0;
+  overflow: auto;
+  padding: 12px;
+  display: grid;
+  grid-template-columns: minmax(360px, 1fr) minmax(320px, 0.65fr);
+  gap: 14px;
+  background: #ffffff;
+}
+
+.suite-loading {
+  grid-column: 1 / -1;
+  min-height: 160px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  color: var(--muted);
+  font-size: 14px;
+}
+
+.workspace.suite-mode .output-grid {
+  display: none;
+}
+
+.workspace.suite-mode .suite-chart-panel {
+  display: grid;
+}
+
+.suite-bars {
+  display: grid;
+  align-content: start;
+  gap: 7px;
+  min-width: 0;
+}
+
+.suite-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 800;
+}
+
+.suite-legend span {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+}
+
+.suite-legend i {
+  width: 10px;
+  height: 10px;
+  display: inline-block;
+  border-radius: 3px;
+}
+
+.suite-legend .gpu,
+.suite-segment.gpu {
+  background: #0f766e;
+}
+
+.suite-legend .cpu,
+.suite-segment.cpu {
+  background: #2563eb;
+}
+
+.suite-legend .other,
+.suite-segment.other {
+  background: #94a3b8;
+}
+
+.suite-legend .jit,
+.suite-segment.jit {
+  background: #b45309;
+}
+
+.suite-bar-row {
+  display: grid;
+  grid-template-columns: 42px minmax(0, 1fr) 106px;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  font-size: 12px;
+  font-weight: 750;
+}
+
+.suite-label,
+.suite-value {
+  color: var(--muted);
+  white-space: nowrap;
+}
+
+.suite-value {
+  text-align: right;
+}
+
+.suite-track {
+  height: 14px;
+  min-width: 0;
+  overflow: hidden;
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  display: flex;
+}
+
+.suite-segment {
+  height: 100%;
+}
+
+.suite-bar-row.failed .suite-track {
+  background: var(--danger);
+}
+
+.suite-table {
+  align-content: start;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  overflow: hidden;
+  min-width: 0;
+  font-size: 12px;
+}
+
+.suite-table-row {
+  display: grid;
+  grid-template-columns: 0.7fr 1fr 1fr 1fr 1fr;
+  gap: 8px;
+  padding: 7px 9px;
+  border-bottom: 1px solid var(--border);
+}
+
+.suite-table-row:last-child {
+  border-bottom: 0;
+}
+
+.suite-table-header {
+  color: var(--muted);
+  background: var(--surface-2);
+  font-weight: 800;
 }
 
 #diagnosticText {
@@ -542,6 +752,10 @@ pre {
 
   .timing-panel {
     min-height: 460px;
+  }
+
+  .suite-chart-body {
+    grid-template-columns: 1fr;
   }
 }
 
