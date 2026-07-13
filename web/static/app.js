@@ -9,6 +9,7 @@ const state = {
 
 const els = {
   workspace: document.querySelector(".workspace"),
+  machineInfo: document.getElementById("machineInfo"),
   status: document.getElementById("status"),
   querySelect: document.getElementById("querySelect"),
   scaleSelect: document.getElementById("scaleSelect"),
@@ -136,6 +137,15 @@ function formatMs(value) {
 function formatNumber(value) {
   if (typeof value !== "number" || Number.isNaN(value)) return "-";
   return new Intl.NumberFormat().format(value);
+}
+
+function renderSystemInfo(info) {
+  if (!info || !info.summary) {
+    els.machineInfo.textContent = "Machine info unavailable";
+    return;
+  }
+  els.machineInfo.textContent = info.summary;
+  els.machineInfo.title = info.summary;
 }
 
 function jitOverheadMs(timing) {
@@ -284,6 +294,7 @@ async function refreshMetadata() {
 async function loadInitialData() {
   setStatus("Loading metadata...");
   const data = await refreshMetadata();
+  renderSystemInfo(data.system_info);
   setMode("tpch");
   updateSqlFromSelection();
   els.kernelCode.textContent = "";

@@ -36,6 +36,7 @@ TABLES = ("region", "nation", "supplier", "customer", "part", "partsupp", "order
 BUILD_LOCK = threading.Lock()
 DATA_LOCK = threading.Lock()
 SUITE_LOCK = threading.Lock()
+SYSTEM_INFO_CACHE: dict[str, Any] | None = None
 
 TIMING_FIELDS = [
     "scale_factor",
@@ -172,6 +173,93 @@ def data_status(scale: str) -> dict[str, Any]:
 
 def load_scales() -> list[dict[str, Any]]:
     return [data_status(scale) for scale in SCALE_FACTORS]
+
+
+def command_text(args: list[str], timeout: int = 3) -> str:
+    try:
+        proc = subprocess.run(
+            args,
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+    if proc.returncode != 0:
+        return ""
+    return (proc.stdout or "").strip()
+
+
+def sysctl_value(name: str) -> str:
+    return command_text(["sysctl", "-n", name])
+
+
+def format_ram(bytes_text: str) -> tuple[int, str]:
+    try:
+        value = int(bytes_text)
+    except (TypeError, ValueError):
+        return 0, "unknown RAM"
+    gib = value / (1024**3)
+    if abs(gib - round(gib)) < 0.05:
+        return value, f"{round(gib):.0f} GB"
+    return value, f"{gib:.1f} GB"
+
+
+def find_gpu_name(value: Any) -> str:
+    preferred = ("sppci_model", "spdisplays_chipset-model", "chipset_model", "_name")
+    if isinstance(value, dict):
+        for key in preferred:
+            found = value.get(key)
+            if isinstance(found, str) and found.strip():
+                return found.strip()
+        for child in value.values():
+            found = find_gpu_name(child)
+            if found:
+                return found
+    elif isinstance(value, list):
+        for child in value:
+            found = find_gpu_name(child)
+            if found:
+                return found
+    return ""
+
+
+def load_system_info() -> dict[str, Any]:
+    global SYSTEM_INFO_CACHE
+    if SYSTEM_INFO_CACHE is not None:
+        return SYSTEM_INFO_CACHE
+
+    chip = sysctl_value("machdep.cpu.brand_string") or sysctl_value("hw.model") or "unknown chip"
+    physical_cores = sysctl_value("hw.physicalcpu") or sysctl_value("hw.ncpu")
+    logical_cores = sysctl_value("hw.logicalcpu")
+    ram_bytes, ram_label = format_ram(sysctl_value("hw.memsize"))
+
+    gpu = ""
+    profiler = command_text(["system_profiler", "SPDisplaysDataType", "-json"], timeout=8)
+    if profiler:
+        try:
+            gpu = find_gpu_name(json.loads(profiler))
+        except json.JSONDecodeError:
+            gpu = ""
+    if not gpu:
+        gpu = chip
+
+    cpu_label = f"{physical_cores} CPU cores" if physical_cores else "unknown CPU cores"
+    if logical_cores and logical_cores != physical_cores:
+        cpu_label += f" / {logical_cores} threads"
+
+    SYSTEM_INFO_CACHE = {
+        "chip": chip,
+        "cpu_cores": int(physical_cores) if physical_cores.isdigit() else 0,
+        "cpu_threads": int(logical_cores) if logical_cores.isdigit() else 0,
+        "cpu_label": cpu_label,
+        "gpu": gpu,
+        "ram_bytes": ram_bytes,
+        "ram": ram_label,
+        "summary": f"{chip} | {cpu_label} | GPU {gpu} | RAM {ram_label}",
+    }
+    return SYSTEM_INFO_CACHE
 
 
 def clamp_int(value: Any, default: int, minimum: int, maximum: int) -> int:
@@ -634,6 +722,7 @@ class Handler(BaseHTTPRequestHandler):
                     "binary_exists": BIN_PATH.exists(),
                     "binary_path": str(BIN_PATH.relative_to(ROOT)),
                     "auto_build": CONFIG.auto_build,
+                    "system_info": load_system_info(),
                 }
             )
             return
@@ -646,6 +735,9 @@ class Handler(BaseHTTPRequestHandler):
             return
         if path == "/api/health":
             self.send_json({"ok": True, "root": str(ROOT), "binary_exists": BIN_PATH.exists()})
+            return
+        if path == "/api/system-info":
+            self.send_json(load_system_info())
             return
         if path.startswith("/static/"):
             rel = path.removeprefix("/static/")

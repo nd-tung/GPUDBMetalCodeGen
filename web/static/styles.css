@@ -60,15 +60,17 @@ textarea {
   min-width: 0;
 }
 
+.brand-text {
+  min-width: 0;
+}
+
 .brand-mark {
-  width: 40px;
-  height: 40px;
-  display: grid;
-  place-items: center;
-  color: white;
-  background: linear-gradient(135deg, var(--accent), var(--accent-2));
-  border-radius: 8px;
-  font-weight: 800;
+  width: 42px;
+  height: 42px;
+  display: block;
+  flex: 0 0 42px;
+  border-radius: 10px;
+  object-fit: cover;
 }
 
 h1 {
@@ -81,6 +83,15 @@ h1 {
   margin: 2px 0 0;
   color: var(--muted);
   font-size: 13px;
+}
+
+.brand .machine-info {
+  max-width: min(840px, 64vw);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 11px;
+  line-height: 1.25;
 }
 
 .status {
