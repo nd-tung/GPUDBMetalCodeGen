@@ -26,6 +26,9 @@
 #include <algorithm>
 #include <memory>
 #include <optional>
+#include <filesystem>
+#include <vector>
+#include <unistd.h>
 
 // Runtime flags shared by main and runCodegenQuery.
 static int  g_warmup            = 3;     // --warmup N
@@ -35,6 +38,8 @@ static int  g_tgSizeOverride    = 0;     // --threadgroup-size N (0 = use plan d
 static bool g_autotuneTg        = false; // --autotune-tg  (per-query global TG sweep)
 static bool g_autotuneTgPerPhase= false; // --autotune-tg-per-phase (per-kernel TG)
 static bool g_noPipelineCache   = false; // --no-pipeline-cache
+static bool g_coldStart         = false; // --cold-start
+static bool g_clearMetalCache   = false; // --clear-metal-cache
 static bool g_profilePhases     = false; // --profile-phases
 static bool g_fastMath          = false; // --fastmath
 static bool g_printPlan         = false; // --print-plan
@@ -267,6 +272,54 @@ static bool parseRowCountWithSuffix(const std::string& text, size_t& out) {
     if (errno != 0 || end == digits.c_str() || *end != '\0' || value == 0) return false;
     out = (size_t)value * multiplier;
     return out > 0;
+}
+
+static std::optional<std::string> darwinUserCacheDir() {
+    const char* override = std::getenv("GPUDB_DARWIN_USER_CACHE_DIR");
+    if (override && override[0]) return std::string(override);
+
+#ifdef _CS_DARWIN_USER_CACHE_DIR
+    size_t len = confstr(_CS_DARWIN_USER_CACHE_DIR, nullptr, 0);
+    if (len > 0) {
+        std::string out(len, '\0');
+        size_t written = confstr(_CS_DARWIN_USER_CACHE_DIR, out.data(), out.size());
+        if (written > 0) {
+            while (!out.empty() && out.back() == '\0') out.pop_back();
+            if (!out.empty()) return out;
+        }
+    }
+#endif
+    return std::nullopt;
+}
+
+static bool clearMetalUserCaches(std::string& summary) {
+    auto rootOpt = darwinUserCacheDir();
+    if (!rootOpt) {
+        summary = "DARWIN_USER_CACHE_DIR unavailable";
+        return false;
+    }
+
+    const std::filesystem::path root(*rootOpt);
+    const std::vector<std::string> dirs = {
+        "com.apple.metal",
+        "com.apple.metalfe",
+    };
+
+    bool ok = true;
+    std::ostringstream ss;
+    ss << "root=" << root.string();
+    for (const auto& dir : dirs) {
+        const auto path = root / dir;
+        std::error_code ec;
+        uintmax_t removed = std::filesystem::remove_all(path, ec);
+        ss << ";" << dir << "=" << removed;
+        if (ec) {
+            ok = false;
+            ss << "(" << ec.message() << ")";
+        }
+    }
+    summary = ss.str();
+    return ok;
 }
 
 // Read .colbin row count and file size without mapping the payload.
@@ -514,6 +567,23 @@ static bool runCodegenQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
             std::ofstream dbg(path);
             dbg << metalSource;
             if (!g_csv) printf("  (written to %s)\n", path.c_str());
+        }
+
+        if (g_clearMetalCache) {
+            std::string cacheSummary;
+            if (!clearMetalUserCaches(cacheSummary)) {
+                std::cerr << "Codegen: failed to clear Metal user cache: "
+                          << cacheSummary << std::endl;
+                return false;
+            }
+            if (g_csv) {
+                printf("METAL_CACHE_CSV,%s,%s,%s\n",
+                       timing.scaleFactor.c_str(),
+                       timing.queryName.c_str(),
+                       cacheSummary.c_str());
+            } else {
+                printf("[metal-cache] cleared %s\n", cacheSummary.c_str());
+            }
         }
 
         // Compile Metal source.
@@ -931,7 +1001,9 @@ static bool runCodegenQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
 
             auto finalCollectStart = clk::now();
             result.result = executor.collectResult(cg);
-            resultCollectMs += elapsedMs(finalCollectStart, clk::now());
+            double finalCollectMs = elapsedMs(finalCollectStart, clk::now());
+            resultCollectMs += finalCollectMs;
+            executeWallMs += finalCollectMs;
             timing.dataLoadMs    = ioMs + streamOpenMs + chunkCopyMs + preprocessMs;
             timing.ingestMs      = loadStats().excludedMs;
             timing.loadSource    = "chunked-colbin";
@@ -1254,7 +1326,6 @@ static bool runCodegenQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
 
         HostPostOpTracker hostPostOps;
         auto runHostPost = [&](codegen::MetalExecutionResult& result,
-                               bool emitOutput,
                                HostPostOpTracker* hostPostOpsForRun) -> double {
             auto postStart = std::chrono::high_resolution_clock::now();
             std::vector<std::string> hostOps;
@@ -1262,11 +1333,6 @@ static bool runCodegenQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
                                         isPredefinedTpchRoute ? &hostOps : nullptr);
             if (isPredefinedTpchRoute && hostPostOpsForRun) {
                 for (const auto& op : hostOps) hostPostOpsForRun->mark(op);
-            }
-            if (emitOutput && !result.result.columns.empty()) {
-                printf("\n%s Results:\n", queryName.c_str());
-                int displayLimit = plan.hostResult ? plan.hostResult->displayLimit : -1;
-                result.result.print(displayLimit);
             }
             return elapsedMs(postStart, clk::now());
         };
@@ -1276,14 +1342,19 @@ static bool runCodegenQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
         const codegen::MetalExecutionResult rawResult = result;
         for (int pr = 0; pr < g_repeat; pr++) {
             codegen::MetalExecutionResult postResult = rawResult;
-            const bool emitOutput = !g_csv && pr == g_repeat - 1;
             HostPostOpTracker* tracker = (pr == g_repeat - 1) ? &hostPostOps : nullptr;
-            postTrials.push_back(runHostPost(postResult, emitOutput, tracker));
+            postTrials.push_back(runHostPost(postResult, tracker));
             if (pr == g_repeat - 1) {
                 result = std::move(postResult);
             }
         }
         timing.postMs = medianValue(postTrials);
+
+        if (!g_csv && !result.result.columns.empty()) {
+            printf("\n%s Results:\n", queryName.c_str());
+            int displayLimit = plan.hostResult ? plan.hostResult->displayLimit : -1;
+            result.result.print(displayLimit);
+        }
 
         double validationMs = 0.0;
 
@@ -1389,7 +1460,11 @@ int main(int argc, const char* argv[]) {
             printf("                       picks the size with min p50 GPU time (logs AUTOTUNE_CSV)\n");
             printf("  --autotune-tg-per-phase  Per-phase TG sweep; picks min-p50 TG independently\n");
             printf("                       for each kernel (logs AUTOTUNE_PHASE_CSV)\n");
+            printf("  --cold-start         Single-query cold JIT mode: clear Metal user cache,\n");
+            printf("                       force --warmup 0 --repeat 1, and measure first compile/PSO\n");
+            printf("  --clear-metal-cache  Remove user-level Metal cache dirs before compiling each query\n");
             printf("  --no-pipeline-cache  Recompile Metal source on every measured iteration\n");
+            printf("                       (JIT ablation only; not a cold-start measurement)\n");
             printf("  --profile-phases     Emit per-phase GPU, wall, residual, and hook timings\n");
             printf("  --fastmath           Enable Metal -ffast-math (default: off)\n");
             printf("  --no-fastmath        Disable Metal -ffast-math (default behavior)\n");
@@ -1513,6 +1588,8 @@ int main(int argc, const char* argv[]) {
             sqlFile = arg.substr(11); hasSqlFile = true; continue;
         }
         if (arg == "--csv")               { g_csv = true; continue; }
+        if (arg == "--cold-start")        { g_coldStart = true; continue; }
+        if (arg == "--clear-metal-cache") { g_clearMetalCache = true; continue; }
         if (arg == "--no-pipeline-cache") { g_noPipelineCache = true; continue; }
         if (arg == "--profile-phases")    { g_profilePhases = true; continue; }
         if (arg == "--fastmath")          { g_fastMath = true; continue; }
@@ -1581,6 +1658,34 @@ int main(int argc, const char* argv[]) {
     if (query.empty() && !hasSqlRequest) {
         std::cerr << "Usage: GPUDBCodegen [sf1|sf10|sf20|sf50|sf100] q<N>|--sql SQL|--sql-file FILE" << std::endl;
         return 1;
+    }
+
+    if (g_coldStart) {
+        if (g_noPipelineCache) {
+            std::cerr << "Codegen: --cold-start cannot be combined with "
+                         "--no-pipeline-cache. Cold-start measures the first "
+                         "compile/PSO in a fresh process; --no-pipeline-cache "
+                         "measures per-trial recompilation after an initial compile."
+                      << std::endl;
+            return 1;
+        }
+        if (g_autotuneTg || g_autotuneTgPerPhase) {
+            std::cerr << "Codegen: --cold-start cannot be combined with autotuning, "
+                         "which runs extra warmup measurements."
+                      << std::endl;
+            return 1;
+        }
+        if (query == "all" || query == "mball") {
+            std::cerr << "Codegen: --cold-start is single-query only. Run one "
+                         "fresh GPUDBCodegen process per query, e.g. loop over "
+                         "sf10 q1..q22, so process-level Metal state cannot leak "
+                         "between queries."
+                      << std::endl;
+            return 1;
+        }
+        g_clearMetalCache = true;
+        g_warmup = 0;
+        g_repeat = 1;
     }
 
     // Apply explicit fast-math selection globally before any compile() runs.

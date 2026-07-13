@@ -37,7 +37,7 @@ std::optional<MetalQueryPlan> buildQ14PredefinedPlan() {
         auto scan = makeAutoScan("lineitem", idxVar);
 
         auto filtered = maybeSelect(std::move(scan), filterCond);
-        std::string revenue = "l_extendedprice[" + idxVar + "] * (1.0f - l_discount[" + idxVar + "] * 0.01f)";
+        std::string revenue = "l_extendedprice[" + idxVar + "] * (1.0f - l_discount[" + idxVar + "])";
         auto reduce = std::make_unique<MetalTGReduce>(std::move(filtered), "d_q14");
         reduce->addAccumulator("promo",
             "bitmap_test_atomic(d_promo_bitmap, l_partkey[" + idxVar + "]) ? " + revenue + " : 0.0f", "float");
