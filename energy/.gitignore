@@ -1,0 +1,4 @@
+/build/
+/results/
+*.md
+.DS_Store
